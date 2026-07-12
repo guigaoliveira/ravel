@@ -24,6 +24,14 @@ irm https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.p
 
 If a GitHub Release asset for your OS/arch is missing, the script falls back to `cargo install` from source.
 
+### npm wrapper
+
+```bash
+npm install -g @guigaoliveira/ravel-cli
+```
+
+The package downloads the matching native binary from GitHub Releases during installation.
+
 Env knobs:
 
 | Variable | Meaning |

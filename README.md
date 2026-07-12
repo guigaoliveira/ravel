@@ -31,6 +31,12 @@ cargo install --path crates/ravel-cli --locked
 
 More installation and agent-configuration details are in [`docs/install.md`](docs/install.md).
 
+Or install the npm wrapper:
+
+```bash
+npm install -g @guigaoliveira/ravel-cli
+```
+
 ## Connect a coding agent
 
 Configure Ravel once. The installer detects Claude Code, Cursor, Codex CLI,
