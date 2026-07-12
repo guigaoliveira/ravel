@@ -148,8 +148,8 @@ pub struct AgentsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AnalysisConfig {
-    /// Optional **extra** entry-point markers (merged with built-in framework/project heuristics).
-    /// Leave empty: controllers, modules, main/bootstrap, package entry files are detected automatically.
+    /// Optional **extra** entry-point markers (merged with built-in project heuristics).
+    /// Leave empty: application entry files, controllers, main/bootstrap, and package entries are detected automatically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_points: Vec<String>,
     /// Precomputed hubs top-k written at index time.
@@ -195,7 +195,7 @@ pub const BUILTIN_NOISE_DIRS: &[&str] = &[
 pub const DEFAULT_SOURCE_EXTENSIONS: &[&str] =
     &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
-/// Default sibling-emit rules (tsc/Nest leave `*.js` next to `*.ts`).
+/// Default sibling-emit rules (TypeScript compilers may leave `*.js` next to `*.ts`).
 pub fn default_sibling_emit_rules() -> Vec<SiblingEmitRule> {
     vec![
         SiblingEmitRule {

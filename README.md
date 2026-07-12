@@ -29,6 +29,8 @@ Install from source:
 cargo install --path crates/ravel-cli --locked
 ```
 
+More installation and agent-configuration details are in [`docs/install.md`](docs/install.md).
+
 ## Connect a coding agent
 
 Configure Ravel once. The installer detects Claude Code, Cursor, Codex CLI,
@@ -65,15 +67,15 @@ ravel context PaymentService
 Indexing is per project. `ravel install` configures agents; `ravel index`
 builds the project graph.
 
-`ravel init` is optional. It creates `.ravel.toml` and `.ravelignore` for
-projects that need custom extensions, ignore rules, or sync settings. Ravel
-defaults to the TypeScript/JavaScript family, skips common dependency/build
-directories, and honors `.gitignore` when Git is available.
+`ravel init` creates `.ravel.toml`, `.ravelignore`, and the initial index in one
+step. Use `ravel init --no-index` when you only want the configuration files.
+Ravel defaults to the TypeScript/JavaScript family, skips common
+dependency/build directories, and honors `.gitignore` when Git is available.
 
 ## Keep the index current
 
-The MCP server auto-syncs Git-dirty files before requests. For CLI and scripted
-workflows:
+The MCP server watches each indexed root and syncs source changes automatically.
+For CLI and scripted workflows:
 
 ```bash
 ravel sync                 # sync Git-dirty source files
@@ -87,6 +89,7 @@ Without Git, use explicit paths with `sync` or run `watch`.
 
 | Command | Purpose |
 |---------|---------|
+| `init` | Create project configuration and build the initial index |
 | `context SYMBOL` | Symbol, callers, callees, and related impact |
 | `refactor SYMBOL` | Files and risk for a broad change |
 | `search QUERY` | Search symbols (`exact`, `prefix`, `fuzzy`, or `regex`) |

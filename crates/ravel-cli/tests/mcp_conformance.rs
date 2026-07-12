@@ -18,8 +18,8 @@ fn mcp_stdio_speaks_protocol() {
     std::fs::create_dir_all(&tmp).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ravel"))
-        .arg("mcp")
-        .current_dir(&tmp)
+        .args(["--root", tmp.to_str().unwrap(), "mcp"])
+        .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -123,5 +123,12 @@ fn mcp_stdio_speaks_protocol() {
     assert!(
         call.get("result").is_some() && call.get("error").is_none(),
         "tools/call `status` did not return a successful result: {call}"
+    );
+    let status_text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("status tool should return text content");
+    assert!(
+        status_text.contains(tmp.to_str().unwrap()),
+        "MCP did not use the CLI --root default: {status_text}"
     );
 }

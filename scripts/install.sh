@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Install prebuilt `ravel` for macOS / Linux (CodeGraph-style one-liner).
+# Install prebuilt `ravel` for macOS / Linux.
 #
 #   curl -fsSL https://raw.githubusercontent.com/<owner>/ravel/main/scripts/install.sh | sh
 #

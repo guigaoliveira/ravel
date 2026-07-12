@@ -1,7 +1,7 @@
-//! Generic entry-point discovery for projects and monorepos (not Nest-only).
+//! Generic entry-point discovery for projects and monorepos.
 //!
 //! Sources (all automatic, no config):
-//! 1. Path/name heuristics (Nest/Express/Next-style) — see `analysis::is_natural_entry_point`
+//! 1. Path/name heuristics — see `analysis::is_natural_entry_point`
 //! 2. `package.json` `main` / `module` / `browser` / `exports` / `bin` fields
 //! 3. Root `tsconfig.json` `files` array (if small)
 //!

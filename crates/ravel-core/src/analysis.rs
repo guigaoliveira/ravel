@@ -157,7 +157,7 @@ fn score_risk(depth: usize, in_degree: usize) -> (RiskLevel, u32) {
     (risk, score)
 }
 
-/// Natural project/Nest **entry points** — symbols/files that start the app or accept
+/// Natural project **entry points** — symbols/files that start the app or accept
 /// external traffic. They often have in-degree 0 (nothing in-repo imports `main.ts`) and
 /// must not show up as "orphans". Detected automatically; `extra_entry_markers` only extends.
 ///
@@ -411,7 +411,7 @@ pub fn export_package_dot(graph: &GraphIndex) -> String {
     lines.join("\n")
 }
 
-/// Map a source path to likely test companions (Nest/Jest/Vitest conventions).
+/// Map a source path to likely test companions using common naming conventions.
 pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
     const DEFAULT_TEST_PATTERNS: &[&str] = &[".spec.ts", ".test.ts", ".spec.js", ".test.js"];
     let path = path.replace('\\', "/");

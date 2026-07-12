@@ -44,6 +44,8 @@ struct EngineInner {
     /// Debounce dirty discovery for concurrent tool calls in the same tick (MCP warm).
     /// Window is short (~50ms) — **not** a latency budget; commands target &lt;200ms wall.
     dirty_cache: Mutex<Option<(std::time::Instant, Vec<PathBuf>)>>,
+    /// Serialize full and incremental publications from MCP watchers and tool calls.
+    update_lock: Mutex<()>,
 }
 
 struct PreparedPath {
@@ -74,6 +76,7 @@ impl WorkspaceEngine {
                 search_cache: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 dirty_cache: Mutex::new(None),
+                update_lock: Mutex::new(()),
             }),
         })
     }
@@ -91,6 +94,11 @@ impl WorkspaceEngine {
         FileSnapshotStorage::new(self.root.join(&self.config.storage.home))
     }
     pub fn index(&self) -> Result<IndexStats, EngineError> {
+        let _guard = self.inner.update_lock.lock().unwrap();
+        self.index_unlocked()
+    }
+
+    fn index_unlocked(&self) -> Result<IndexStats, EngineError> {
         let (artifacts, scan_stats) = scan_workspace(&self.config)?;
         let files: std::collections::BTreeMap<_, _> =
             artifacts.into_iter().map(|a| (a.path.clone(), a)).collect();
@@ -100,6 +108,11 @@ impl WorkspaceEngine {
     /// Incremental index update for daily edits (save/rename/delete).
     /// Re-parses only the given paths (or dirty discovery if `None`), re-resolves edges, republishes sidecars.
     pub fn sync(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        let _guard = self.inner.update_lock.lock().unwrap();
+        self.sync_unlocked(only_paths)
+    }
+
+    fn sync_unlocked(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let extensions = crate::config::effective_extensions(&self.config);
         let paths: Vec<PathBuf> = match only_paths {
@@ -125,11 +138,11 @@ impl WorkspaceEngine {
         let existing = match self.storage().open_current() {
             Ok(s) => s,
             Err(_) => {
-                return self.index();
+                return self.index_unlocked();
             }
         };
         let Some(mut snapshot) = existing else {
-            return self.index();
+            return self.index_unlocked();
         };
         let stats_from = |snapshot: &IndexSnapshot| IndexStats {
             files: snapshot.files.len(),

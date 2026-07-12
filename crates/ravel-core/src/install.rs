@@ -1,5 +1,5 @@
 //! Cross-agent install: detect coding agents and wire Ravel MCP + instruction snippets.
-//! Modeled after CodeGraph's `codegraph install` UX (auto-detect, global/local, print-config).
+//! Agent setup UX: auto-detection, global/local scope, and printable config.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -236,7 +236,7 @@ fn dirs_config() -> PathBuf {
 }
 
 /// MCP entry shared by Claude / Cursor / Gemini / Windsurf / VS Code style JSON.
-/// Uses `serve --mcp` (codegraph-compatible: persistent server with auto-sync).
+/// Uses `serve --mcp` for a persistent server with auto-sync.
 pub fn mcp_stdio_entry(ravel_bin: &Path) -> Value {
     json!({
         "type": "stdio",

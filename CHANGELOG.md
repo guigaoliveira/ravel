@@ -22,7 +22,7 @@ Initial public release.
 - Compact JSON output by default (`--pretty` for humans).
 - Zero-config defaults with optional `.ravel.toml` overrides (extensions, ignore, sync).
 - Git-optional operation: auto-sync when `.git` is present, `watch`/`sync <paths>` otherwise.
-- Automatic entry-point detection for framework modules/controllers and `main.ts` / `bootstrap`.
+- Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
 [Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.0.0...HEAD

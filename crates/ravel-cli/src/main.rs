@@ -22,8 +22,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create .ravel.toml + .ravelignore
-    Init,
+    /// Initialize configuration and build the project index.
+    Init {
+        /// Create configuration files without building the index.
+        #[arg(long)]
+        no_index: bool,
+    },
     /// Full workspace index (slow; use after clone or large refactors)
     Index,
     /// Incremental update: re-parse git-dirty or listed files only (daily edits)
@@ -47,7 +51,7 @@ enum Command {
         limit: usize,
     },
     /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
-    /// Prefer `ravel install` for multi-agent MCP wiring (CodeGraph-style).
+    /// Prefer `ravel install` for multi-agent MCP wiring.
     Setup {
         #[arg(long)]
         claude: bool,
@@ -93,7 +97,7 @@ enum Command {
     },
     /// Quick environment check (+ agent detection)
     Doctor,
-    /// Guess related test files for a source path (Nest/Jest/Vitest)
+    /// Guess related test files for a source path
     RelatedTests {
         path: String,
     },
@@ -172,13 +176,13 @@ enum Command {
     Schema,
     Stats,
     Watch,
-    /// ~150-token agent map (session start; CodeGraph/CRG pattern)
+    /// ~150-token agent map (session start)
     Cheatsheet,
-    /// Long-lived MCP stdio server (reuse engine cache across calls).
+    /// Long-lived MCP stdio server with per-root file watching.
     /// Default: primary tools only (explore, status, sync). Set RAVEL_MCP_TOOLS=all for full.
     Mcp,
-    /// Persistent MCP server with auto-sync via file watcher (codegraph-style).
-    /// Keeps graph in-memory, watches for changes, syncs automatically.
+    /// Persistent MCP server with per-root auto-sync via file watcher.
+    /// Keeps graphs in memory and syncs source changes automatically.
     /// Default: primary tools only. Set RAVEL_MCP_TOOLS=all for full surface.
     Serve {
         #[arg(long)]
@@ -216,7 +220,7 @@ fn main() -> anyhow::Result<()> {
     let root = cli.root.canonicalize().unwrap_or(cli.root);
     let pretty = cli.pretty;
     match cli.command {
-        Some(Command::Init) => {
+        Some(Command::Init { no_index }) => {
             std::fs::create_dir_all(&root)?;
             // Config is optional: defaults auto-detect TS/JS and ignore noise dirs.
             let path = root.join(".ravel.toml");
@@ -257,10 +261,21 @@ skip_sibling_emit = true
                      # *.generated.ts\n",
                 )?;
             }
-            println!(
-                "initialized {} (defaults: TS/JS auto, builtin noise dirs, git sync if present)",
-                root.display()
-            );
+            if no_index {
+                println!(
+                    "initialized {} (configuration only; run `ravel index` to build the graph)",
+                    root.display()
+                );
+            } else {
+                let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+                let stats = engine.index()?;
+                println!(
+                    "initialized and indexed {} ({} files, {} edges)",
+                    root.display(),
+                    stats.files,
+                    stats.edges
+                );
+            }
         }
         Some(Command::Index) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -504,31 +519,30 @@ skip_sibling_emit = true
             }
         }
         Some(Command::Cheatsheet) => {
-            // ~150 tokens — inject once per agent session (CodeGraph/CRG pattern)
+            // ~150 tokens — inject once per agent session
             print!("{}", ravel_cheatsheet());
         }
-        Some(Command::Mcp) => serve_mcp()?,
+        Some(Command::Mcp) => serve_mcp(&root)?,
         Some(Command::Serve { mcp }) => {
             if !mcp {
                 anyhow::bail!("use `ravel serve --mcp` to start the MCP server");
             }
-            // Persistent MCP server with auto-sync (codegraph serve --mcp style).
-            // Each tool call already auto-syncs via engine.auto_sync_if_dirty().
-            // Staleness info embedded in explore response via auto_synced field.
+            // Persistent MCP server with per-root file watching and Git freshness checks.
+            // Staleness info is embedded in explore response via auto_synced field.
             // Primary tools: explore, status, sync. Set RAVEL_MCP_TOOLS=all for full.
             eprintln!("ravel serve --mcp (persistent, auto-sync on each call)");
-            serve_mcp()?;
+            serve_mcp(&root)?;
         }
         None => emit_json(&health(), pretty)?,
     }
     Ok(())
 }
 
-fn serve_mcp() -> anyhow::Result<()> {
+fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(ravel_core::mcp::serve_stdio())
+        .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
 }
 
 fn ravel_cheatsheet() -> &'static str {

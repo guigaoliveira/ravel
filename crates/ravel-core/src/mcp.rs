@@ -1,6 +1,6 @@
 //! MCP stdio surface — thin wrapper over `WorkspaceEngine` (same results as CLI).
 //!
-//! **Token design (CodeGraph pattern):** tool schemas cost tokens every session.
+//! Tool schemas cost tokens every session, so the default surface stays small.
 //! Default = **primary** tool set only (`explore`, `status`, `sync`).
 //! Set `RAVEL_MCP_TOOLS=all` for the full surface.
 
@@ -12,7 +12,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex, thread, time::Duration};
 
 /// Which MCP tools to advertise (schema cost ∝ tool count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +111,7 @@ pub struct RavelMcp {
     tool_router: ToolRouter<Self>,
     engines: Mutex<HashMap<String, std::sync::Arc<WorkspaceEngine>>>,
     mode: McpToolMode,
+    default_root: Option<PathBuf>,
 }
 
 impl Default for RavelMcp {
@@ -125,6 +126,14 @@ impl RavelMcp {
     }
 
     pub fn with_mode(mode: McpToolMode) -> Self {
+        Self::with_mode_and_root(mode, None)
+    }
+
+    pub fn with_root(root: PathBuf) -> Self {
+        Self::with_mode_and_root(McpToolMode::from_env(), Some(root))
+    }
+
+    fn with_mode_and_root(mode: McpToolMode, default_root: Option<PathBuf>) -> Self {
         let tool_router = match mode {
             McpToolMode::Primary => Self::tool_router_primary(),
             McpToolMode::All => Self::tool_router_primary() + Self::tool_router_extended(),
@@ -133,11 +142,15 @@ impl RavelMcp {
             tool_router,
             engines: Mutex::new(HashMap::new()),
             mode,
+            default_root,
         }
     }
 
     fn engine(&self, root: Option<String>) -> anyhow::Result<std::sync::Arc<WorkspaceEngine>> {
-        let base = root.map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+        let base = root
+            .map(PathBuf::from)
+            .or_else(|| self.default_root.clone())
+            .unwrap_or(std::env::current_dir()?);
         // Keep the original path when canonicalize fails — collapsing every failure to "."
         // would alias distinct roots onto one cache entry.
         let root = base.canonicalize().unwrap_or(base);
@@ -149,8 +162,44 @@ impl RavelMcp {
         }
         let engine = std::sync::Arc::new(WorkspaceEngine::load(&root, &Default::default())?);
         engines.insert(key, engine.clone());
+        spawn_root_watcher(root, engine.clone());
         Ok(engine)
     }
+}
+
+fn spawn_root_watcher(root: PathBuf, engine: std::sync::Arc<WorkspaceEngine>) {
+    if !root.is_dir() || engine.config.sync.mode == "none" {
+        return;
+    }
+    let debounce = Duration::from_millis(engine.config.watch.debounce_ms.max(100));
+    let _ = thread::Builder::new()
+        .name("ravel-mcp-watch".into())
+        .spawn(move || {
+            loop {
+                let batch =
+                    match crate::watch::watch_batch(&root, debounce, Duration::from_secs(3600)) {
+                        Ok(batch) => batch,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    };
+                let extensions = crate::config::effective_extensions(&engine.config);
+                let paths: Vec<_> = batch
+                    .paths
+                    .into_iter()
+                    .filter(|path| {
+                        engine.config.is_source_with_extensions(path, &extensions)
+                            && !engine.config.is_noise(path)
+                    })
+                    .collect();
+                if batch.needs_reconcile {
+                    let _ = engine.index();
+                } else if !paths.is_empty() {
+                    let _ = engine.sync(Some(&paths));
+                }
+            }
+        });
 }
 
 // ── Primary tools (default) — fewer tools = less schema overhead ────────────
@@ -185,7 +234,7 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "PRIMARY: Incremental reindex after edits. Auto-syncs dirty files. Run after save."
+        description = "PRIMARY: Incremental reindex for explicit edits. The server also watches each root."
     )]
     async fn sync(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
@@ -266,7 +315,7 @@ impl RavelMcp {
         }
     }
 
-    #[tool(description = "List packages with framework/language tags")]
+    #[tool(description = "List packages with language and path metadata")]
     async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
             Ok(engine) => match engine.list_packages() {
@@ -432,7 +481,7 @@ impl RavelMcp {
         }
     }
 
-    #[tool(description = "Related test files for a source path (Nest/Jest/Vitest heuristics)")]
+    #[tool(description = "Related test files for a source path using common naming patterns")]
     async fn related_tests(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> String {
         match self.engine(request.root) {
             Ok(engine) => match engine.related_tests(&request.symbol) {
@@ -477,14 +526,19 @@ impl ServerHandler for RavelMcp {
                  One structural call beats many greps/file reads. \
                  Do NOT read whole files to find callers — use tools. \
                  Editing: use agent editor; ravel maps blast radius. \
+                 The server watches each indexed root; use sync for explicit paths. \
                  CLI: `ravel explore X` / `ravel refactor X`."
             ),
         )
     }
 }
 
-pub async fn serve_stdio() -> anyhow::Result<()> {
-    RavelMcp::new()
+pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
+    let server = match default_root {
+        Some(root) => RavelMcp::with_root(root),
+        None => RavelMcp::new(),
+    };
+    server
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
@@ -519,5 +573,12 @@ mod tests {
     fn all_router_builds() {
         let m = RavelMcp::with_mode(McpToolMode::All);
         assert_eq!(m.mode, McpToolMode::All);
+    }
+
+    #[test]
+    fn cli_root_is_the_default_for_mcp_requests() {
+        let root = PathBuf::from("/tmp/ravel-mcp-root");
+        let m = RavelMcp::with_root(root.clone());
+        assert_eq!(m.default_root, Some(root));
     }
 }

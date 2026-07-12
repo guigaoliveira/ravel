@@ -95,7 +95,7 @@ fn orphan_detection_respects_manifest_entries_and_natural_entry_points() {
         "export const mainDep = true;\n",
     );
 
-    // Framework-style file that exports but is not a natural entry → orphan.
+    // Application-style file that exports but is not a natural entry → orphan.
     write_file(
         workspace.path(),
         "team/runtime/src/users.controller.ts",
