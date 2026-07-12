@@ -1,0 +1,18 @@
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: "**/*.rs"
+      run: cargo fmt --all -- --check
+    clippy:
+      glob: "**/*.rs"
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    unit:
+      glob: "**/*.rs"
+      run: cargo test --workspace --lib
+pre-push:
+  commands:
+    test:
+      run: cargo test --workspace
+    clippy:
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings

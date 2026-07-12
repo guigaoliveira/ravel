@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/ravel-core", "crates/ravel-cli"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/guigaoliveira/ravel"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+blake3 = "1.8.2"
+clap = { version = "4.5.40", features = ["derive", "env"] }
+gix = { version = "0.85.0", default-features = false, features = ["revision", "status", "sha1"] }
+ignore = "0.4.23"
+moka = { version = "0.12.15", features = ["sync"] }
+notify = "9.0.0-rc.4"
+petgraph = "0.8.3"
+rayon = "1.10.0"
+rmcp = { version = "2.2.0", default-features = false, features = ["macros", "server", "transport-io"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.140"
+tantivy = "0.26.1"
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.2"
+tree-sitter = "0.26.10"
+tree-sitter-typescript = "0.23.2"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tempfile = "3.27.0"
+regex = "1"
+rustc-hash = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

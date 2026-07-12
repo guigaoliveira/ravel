@@ -1,0 +1,23 @@
+[package]
+name = "ravel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ravel — agent-first local code graph for TS/JS. CLI + MCP server, sub-200ms hot path."
+repository.workspace = true
+keywords = ["code-graph", "typescript", "mcp", "ai-agents", "cli"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "ravel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ravel-core = { path = "../ravel-core", version = "1.0.0" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

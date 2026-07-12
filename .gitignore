@@ -1,0 +1,10 @@
+/target/
+**/target/
+/.ravel/
+*.profraw
+*.pstat
+/reports/*.local.json
+/reports/
+/docs/
+/tasks.md
+/prompt.md
