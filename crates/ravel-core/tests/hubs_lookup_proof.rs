@@ -8,7 +8,7 @@ use ravel_core::model::{Edge, EdgeConfidence, EdgeKind};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-const N: u32 = 50_000; // large-monorepo-scale node count
+const N: u32 = 50_000; // large-codebase-scale node count
 const LIMIT: usize = 20;
 
 fn edge(from: String, to: String) -> Edge {

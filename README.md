@@ -7,6 +7,8 @@ navigation and impact questions without repeatedly searching the repository.
 Ravel works through the CLI and MCP. It is local, requires no API key, and does
 not modify source files.
 
+It works with standalone projects and monorepos alike.
+
 ## Installation
 
 macOS/Linux:

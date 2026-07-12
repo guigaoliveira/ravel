@@ -8,7 +8,7 @@ use std::{path::PathBuf, time::Duration};
 #[command(
     name = "ravel",
     version,
-    about = "Dependency indexer for large codebases (CLI-first for AI agents; MCP shares the same engine)"
+    about = "Local TypeScript/JavaScript code graph for coding agents (CLI + MCP)"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = ".")]

@@ -144,11 +144,11 @@ pub struct AgentsConfig {
     pub mcp_tools: Vec<String>,
 }
 
-/// Optional analysis knobs. Defaults are automatic monorepo heuristics — leave empty.
+/// Optional analysis knobs. Defaults use automatic project heuristics — leave empty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AnalysisConfig {
-    /// Optional **extra** entry-point markers (merged with built-in Nest/monorepo heuristics).
+    /// Optional **extra** entry-point markers (merged with built-in framework/project heuristics).
     /// Leave empty: controllers, modules, main/bootstrap, package entry files are detected automatically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_points: Vec<String>,
@@ -190,7 +190,7 @@ pub const BUILTIN_NOISE_DIRS: &[&str] = &[
     "venv",
 ];
 
-/// Default product extensions when `languages = ["auto"]` (TS/JS monorepos).
+/// Default product extensions when `languages = ["auto"]` (TypeScript/JavaScript projects).
 /// Override with `parser.extensions = [...]` for any set you want.
 pub const DEFAULT_SOURCE_EXTENSIONS: &[&str] =
     &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];

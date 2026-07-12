@@ -157,7 +157,7 @@ fn score_risk(depth: usize, in_degree: usize) -> (RiskLevel, u32) {
     (risk, score)
 }
 
-/// Natural monorepo/Nest **entry points** — symbols/files that start the app or accept
+/// Natural project/Nest **entry points** — symbols/files that start the app or accept
 /// external traffic. They often have in-degree 0 (nothing in-repo imports `main.ts`) and
 /// must not show up as "orphans". Detected automatically; `extra_entry_markers` only extends.
 ///

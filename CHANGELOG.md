@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Initial public release.
 
 ### Added
-- Local code graph for TypeScript / JavaScript monorepos — index once, query cheaply.
+- Local code graph for TypeScript / JavaScript codebases — index once, query cheaply.
 - Sub-200ms agent hot path over `.ravel/` sidecars (cold CLI, existing index).
 - CLI commands: `index`, `sync`, `watch`, `status`, `context`, `refactor`,
   `search`, `query`, `impact`, `hubs`, `cheatsheet`, `doctor`, `install`, `uninstall`.

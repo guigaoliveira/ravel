@@ -8,7 +8,9 @@ fn binary_help_and_version_are_available() {
         .output()
         .expect("binary should execute");
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Dependency indexer"));
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("Local TypeScript/JavaScript code graph")
+    );
     let version = Command::new(binary)
         .arg("--version")
         .output()

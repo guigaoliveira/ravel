@@ -1,6 +1,6 @@
 # Ravel — agent harness (Claude Code, Codex, Cursor, Grok, …)
 
-Local **TS/JS** code graph. Index once, query cheaply, **sync after edits**. Prefer ravel over blind multi-file grep for callers / impact / search.
+Local **TS/JS** code graph for standalone projects and monorepos. Index once, query cheaply, **sync after edits**. Prefer ravel over blind multi-file grep for callers / impact / search.
 
 ## Install
 
@@ -59,4 +59,4 @@ ravel ci --cycle-threshold 5
 
 ## Multi-project
 
-Always pass `--root /abs/path`. MCP engines are cached **per root**. Index each workspace once under its own `.ravel/`.
+Always pass `--root /abs/path`. MCP engines are cached **per root**. Index each project once under its own `.ravel/`.

@@ -1,4 +1,4 @@
-//! Generic entry-point discovery for monorepos (not Nest-only).
+//! Generic entry-point discovery for projects and monorepos (not Nest-only).
 //!
 //! Sources (all automatic, no config):
 //! 1. Path/name heuristics (Nest/Express/Next-style) — see `analysis::is_natural_entry_point`
@@ -18,7 +18,7 @@ use std::{
 /// Collect relative paths that package managers / bundlers treat as package entries.
 pub fn collect_manifest_entry_paths(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    // Prefer monorepo package roots; also root package.json
+    // Prefer package roots; also inspect the root package.json
     let mut package_jsons = Vec::new();
     if root.join("package.json").is_file() {
         package_jsons.push(root.join("package.json"));

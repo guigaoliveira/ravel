@@ -60,7 +60,7 @@ pub fn worktree_identity_or_nogit(root: &Path) -> WorktreeIdentity {
 #[derive(Debug, Clone)]
 pub struct DirtyDiscovery {
     /// Include untracked files (`??`). **Default false** — untracked scans dominate latency
-    /// on monorepos with tsc emit / build leftovers.
+    /// on TypeScript projects with tsc emit / build leftovers.
     pub include_untracked: bool,
     pub skip_sibling_emit: bool,
     pub sibling_emit: Vec<SiblingEmitRule>,
