@@ -32,6 +32,19 @@ npm install -g @guigaoliveira/ravel-cli
 
 The package downloads the matching native binary from GitHub Releases during installation.
 
+The package is published to npm as `@guigaoliveira/ravel-cli`. Release tags also
+publish it to GitHub Packages. npm is the recommended registry for general use;
+GitHub Packages requires registry authentication and is mainly useful for
+GitHub-based workflows.
+
+To install from GitHub Packages, authenticate with a GitHub personal access
+token (classic) and route the scope in `.npmrc`:
+
+```ini
+@guigaoliveira:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
 Env knobs:
 
 | Variable | Meaning |
@@ -142,5 +155,5 @@ Or set that env in the agent’s MCP config `env` block.
 | macOS Apple Silicon | `ravel-aarch64-apple-darwin.tar.gz` | |
 | Windows x64 | `ravel-x86_64-pc-windows-msvc.zip` | |
 
-Release binaries are uploaded manually to GitHub Releases. If a prebuilt asset is
-not available for your platform, the installers fall back to building from source.
+Release binaries are published by GitHub Actions. If a prebuilt asset is not
+available for your platform, the installers fall back to building from source.

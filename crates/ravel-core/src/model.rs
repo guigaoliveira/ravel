@@ -184,7 +184,7 @@ pub struct SymbolMetaDict {
     pub snapshot_id: String,
     /// Unique by original name (first file wins), sorted by name for binary search.
     pub entries: Vec<SymbolMeta>,
-    /// Additional definitions sharing a name, sorted by name for refactor plans.
+    /// Additional definitions sharing a name, sorted by name for symbol lookup.
     #[serde(default)]
     pub duplicates: Vec<SymbolMeta>,
 }

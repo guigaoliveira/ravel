@@ -12,7 +12,6 @@ use crate::{
 
 pub use crate::model::IndexStats;
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
@@ -406,98 +405,6 @@ impl WorkspaceEngine {
         }))
     }
 
-    /// Token-efficient refactor briefing: files to touch + risk counts + top edges.
-    /// One call replaces search + impact + multi-file discovery for renames/blast-radius work.
-    pub fn refactor_plan(
-        &self,
-        symbol: &str,
-        limit: usize,
-    ) -> Result<serde_json::Value, EngineError> {
-        let _ = self.auto_sync_if_dirty()?;
-        let limit = limit.clamp(1, 100);
-        let hits = self.search_raw(symbol, SearchKind::Prefix, limit.min(20))?;
-        let primary = hits
-            .first()
-            .map(|h| h.value.clone())
-            .filter(|v| v.eq_ignore_ascii_case(symbol) || v.contains(symbol))
-            .or_else(|| hits.first().map(|h| h.value.clone()))
-            .unwrap_or_else(|| symbol.to_owned());
-
-        let limits = QueryLimits {
-            depth: 3,
-            nodes: 200,
-            edges: 500,
-            page_size: 100,
-            ..Default::default()
-        };
-        let impact = self.impact_risk(&primary, &limits)?;
-        let callers = self.query_raw(&primary, true, &limits, None)?;
-
-        // Precompute the `.ext` suffixes once — the closure ran per affected item / caller and
-        // rebuilt `effective_extensions()` (a Vec alloc) plus a `format!` per extension each time.
-        let ext_suffixes: Vec<String> = crate::config::effective_extensions(&self.config)
-            .iter()
-            .map(|e| format!(".{e}"))
-            .collect();
-        let mut files: BTreeSet<String> = BTreeSet::new();
-        let push_file = |s: &str, files: &mut BTreeSet<String>| {
-            let s = s.replace('\\', "/");
-            if s.contains('/') && ext_suffixes.iter().any(|suf| s.ends_with(suf)) {
-                files.insert(s);
-            }
-        };
-        for item in &impact.affected {
-            push_file(&item.symbol, &mut files);
-        }
-        for item in &callers.items {
-            push_file(item, &mut files);
-        }
-        if let Some(meta) = self.storage().open_symbol_meta().ok().flatten() {
-            for symbol in meta.entries_for(&primary) {
-                let path = symbol.path.replace('\\', "/");
-                files.insert(path.clone());
-                // Refactor impact includes file importers even when the parser cannot prove a
-                // symbol-level call (e.g. imported DTOs, interfaces, and type-only contracts).
-                if let Ok(importers) = self.query_raw(&path, true, &limits, None) {
-                    for importer in importers.items {
-                        push_file(&importer, &mut files);
-                    }
-                }
-            }
-        }
-
-        let mut high = 0u32;
-        let mut med = 0u32;
-        let mut low = 0u32;
-        for i in &impact.affected {
-            match i.risk {
-                analysis::RiskLevel::High => high += 1,
-                analysis::RiskLevel::Medium => med += 1,
-                analysis::RiskLevel::Low => low += 1,
-            }
-        }
-
-        let files_vec: Vec<_> = files.into_iter().take(limit).collect();
-        let tests: Vec<String> = files_vec
-            .first()
-            .and_then(|f| self.related_tests(f).ok())
-            .unwrap_or_default();
-
-        // Compact keys (same spirit as `context`) — agents parse short JSON.
-        Ok(serde_json::json!({
-            "s": primary,
-            "alias": hits.iter().map(|h| &h.value).take(8).collect::<Vec<_>>(),
-            "risk": { "h": high, "m": med, "l": low },
-            "files": files_vec,
-            "tests": tests.into_iter().take(12).collect::<Vec<_>>(),
-            "callers": callers.items.iter().take(12).cloned().collect::<Vec<_>>(),
-            "hit": impact.affected.iter().take(12).map(|i| {
-                serde_json::json!({"s": i.symbol, "r": i.risk, "d": i.depth})
-            }).collect::<Vec<_>>(),
-            "n_aff": impact.total_affected,
-            "sid": impact.snapshot_id,
-        }))
-    }
     pub fn snapshot(&self) -> Result<Arc<IndexSnapshot>, EngineError> {
         if let Some(snapshot) = self.inner.snapshot_cache.lock().unwrap().as_ref() {
             return Ok(Arc::clone(snapshot));

@@ -8,7 +8,7 @@ use std::{path::PathBuf, time::Duration};
 #[command(
     name = "ravel",
     version,
-    about = "Local TypeScript/JavaScript code graph for coding agents (CLI + MCP)"
+    about = "Local TypeScript/JavaScript code graph for coding agents"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
@@ -28,7 +28,7 @@ enum Command {
         #[arg(long)]
         no_index: bool,
     },
-    /// Full workspace index (slow; use after clone or large refactors)
+    /// Full workspace index (slow; use after clone or a large set of edits)
     Index,
     /// Incremental update: re-parse git-dirty or listed files only (daily edits)
     Sync {
@@ -42,12 +42,6 @@ enum Command {
     Context {
         query: String,
         #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    /// Refactor briefing: files_to_touch + risk counts (token-cheap mass rename/blast radius)
-    Refactor {
-        symbol: String,
-        #[arg(long, default_value_t = 40)]
         limit: usize,
     },
     /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
@@ -303,10 +297,6 @@ skip_sibling_emit = true
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.context(&query, limit)?, pretty)?;
         }
-        Some(Command::Refactor { symbol, limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.refactor_plan(&symbol, limit)?, pretty)?;
-        }
         Some(Command::Setup { claude, force }) => {
             write_agent_setup(&root, claude, force)?;
             println!("agent setup written under {}", root.display());
@@ -548,7 +538,6 @@ fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
 fn ravel_cheatsheet() -> &'static str {
     r#"# ravel (token-cheap code graph)
 explore SYM  → search + callers + callees + impact (ONE call)
-refactor SYM → files_to_touch + risk
 sync         → reindex dirty files (auto on explore)
 serve --mcp  → persistent server (auto-sync, 3 primary tools)
 search Q --kind prefix | query N --reverse | impact N --risk
@@ -579,13 +568,12 @@ fn write_agent_setup(root: &std::path::Path, claude: bool, force: bool) -> anyho
 
 ```bash
 ravel --root . explore SYMBOL  # ONE call: search + callers + impact
-ravel --root . refactor SYMBOL # files_to_touch + risk before rename
 ravel --root . sync            # after edits (auto on explore)
 ravel --root . serve --mcp     # persistent MCP (stays fresh)
 ```
 
 3 primary MCP tools (explore, status, sync) — schema overhead minimal.
-Full surface: `RAVEL_MCP_TOOLS=all`. Edit with agent editor.
+Full surface: `RAVEL_MCP_TOOLS=all`. Ravel does not write source files.
 "#;
     if force || !agents.exists() {
         if agents.exists() && force {

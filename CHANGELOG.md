@@ -14,7 +14,7 @@ Initial public release.
 ### Added
 - Local code graph for TypeScript / JavaScript codebases — index once, query cheaply.
 - Sub-200ms agent hot path over `.ravel/` sidecars (cold CLI, existing index).
-- CLI commands: `index`, `sync`, `watch`, `status`, `context`, `refactor`,
+- CLI commands: `index`, `sync`, `watch`, `status`, `context`,
   `search`, `query`, `impact`, `hubs`, `cheatsheet`, `doctor`, `install`, `uninstall`.
 - MCP server (`ravel mcp`) with 3 primary tools by default; `RAVEL_MCP_TOOLS=all` for the full set.
 - One-shot agent wiring (`ravel install`) for Claude Code, Cursor, Codex, OpenCode,

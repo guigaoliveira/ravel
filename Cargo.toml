@@ -35,5 +35,7 @@ rustc-hash = "2"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# Keep parallel code generation for faster release matrix builds; thin LTO still
+# performs cross-unit optimization for the distributed binary.
+codegen-units = 16
 panic = "abort"

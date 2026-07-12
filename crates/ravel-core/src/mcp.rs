@@ -61,12 +61,6 @@ pub struct ExploreRequest {
     pub limit: Option<usize>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-pub struct RefactorRequest {
-    pub root: Option<String>,
-    pub query: String,
-    pub limit: Option<usize>,
-}
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SymbolDetailRequest {
     pub root: Option<String>,
     pub symbol: String,
@@ -251,18 +245,6 @@ impl RavelMcp {
 
 #[tool_router(router = tool_router_extended, vis = "pub")]
 impl RavelMcp {
-    #[tool(description = "Refactor plan: files_to_touch + risk for mass rename/blast-radius")]
-    async fn refactor_plan(&self, Parameters(request): Parameters<RefactorRequest>) -> String {
-        let limit = request.limit.unwrap_or(40).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.refactor_plan(&request.query, limit) {
-                Ok(v) => v.to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
     #[tool(description = "Search symbols (kind: exact|prefix|fuzzy|regex)")]
     async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> String {
         let kind = match request.kind.as_deref() {
@@ -527,7 +509,7 @@ impl ServerHandler for RavelMcp {
                  Do NOT read whole files to find callers — use tools. \
                  Editing: use agent editor; ravel maps blast radius. \
                  The server watches each indexed root; use sync for explicit paths. \
-                 CLI: `ravel explore X` / `ravel refactor X`."
+                 CLI: `ravel explore X` / `ravel impact X --risk`."
             ),
         )
     }

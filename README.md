@@ -1,143 +1,101 @@
-# Ravel
+<p align="center">
+  <img src="assets/ravel-cover.png" alt="Ravel — local code graph for AI coding agents" width="100%">
+</p>
 
-Ravel is a local code graph for TypeScript and JavaScript projects. It indexes
-symbols, imports, and code relationships so coding agents can answer
-navigation and impact questions without repeatedly searching the repository.
+<p align="center">
+  <a href="https://github.com/guigaoliveira/ravel/actions/workflows/ci.yml"><img src="https://github.com/guigaoliveira/ravel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/@guigaoliveira/ravel-cli"><img src="https://img.shields.io/npm/v/%40guigaoliveira%2Fravel-cli?logo=npm&label=npm" alt="npm version"></a>
+  <a href="https://github.com/guigaoliveira/ravel/releases"><img src="https://img.shields.io/github/v/release/guigaoliveira/ravel?logo=github" alt="GitHub release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/guigaoliveira/ravel" alt="Apache-2.0 license"></a>
+</p>
 
-Ravel works through the CLI and MCP. It is local, requires no API key, and does
-not modify source files.
+<p align="center">
+  <strong>Understand symbols, callers, dependencies, and change impact from a local index.</strong>
+</p>
 
-It works with standalone projects and monorepos alike.
+Ravel is a local code graph for TypeScript and JavaScript. It helps coding
+agents navigate projects without repeatedly crawling files with grep, glob, and
+full-file reads.
 
-## Installation
+No API key or hosted service is required. Ravel reads project files and writes
+only its `.ravel/` index and agent configuration when explicitly requested.
 
-macOS/Linux:
+## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.sh | sh
-```
-
-Windows (PowerShell):
-
-```powershell
-irm https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.ps1 | iex
-```
-
-Install from source:
-
-```bash
-cargo install --path crates/ravel-cli --locked
-```
-
-More installation and agent-configuration details are in [`docs/install.md`](docs/install.md).
-
-Or install the npm wrapper:
+The npm package downloads the matching native binary automatically:
 
 ```bash
 npm install -g @guigaoliveira/ravel-cli
+ravel --version
 ```
 
-## Connect a coding agent
+Other options:
 
-Configure Ravel once. The installer detects Claude Code, Cursor, Codex CLI,
-OpenCode, Gemini CLI, Windsurf, VS Code, and Grok.
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.sh | sh
+
+# Windows PowerShell
+irm https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.ps1 | iex
+
+# From source
+cargo install --path crates/ravel-cli --locked
+```
+
+See [installation and agent setup](docs/install.md) for platform details and
+troubleshooting.
+
+## Start
+
+From the project you want to index:
+
+```bash
+ravel init
+ravel status
+ravel context PaymentService
+```
+
+`ravel init` creates the local configuration and initial index. To connect
+supported coding agents, run this once and restart an agent that was already
+running:
 
 ```bash
 ravel install --yes
 ```
 
-The default location is global. To configure only the current project:
+## Daily use
 
 ```bash
-ravel install --target claude,cursor --location local --yes
+ravel context SYMBOL
+ravel search QUERY --kind prefix
+ravel query SYMBOL --reverse
+ravel impact SYMBOL --risk
+ravel sync
 ```
 
-Useful options:
+Queries use compact JSON by default. Add `--pretty` for human-readable output.
+Use `--root /absolute/path/to/project` when running Ravel outside the project
+directory.
 
-```bash
-ravel install --print-config codex  # print a config snippet without writing
-ravel uninstall --yes                # remove Ravel from configured agents
-```
+The default index covers `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`,
+and `.cjs` files. Common dependency/build directories are skipped and Git
+repositories also honor `.gitignore`.
 
-Restart the agent after installing or changing its MCP configuration.
+## Agent setup
 
-## Index a project
+`ravel install --yes` detects supported agent configurations and adds Ravel to
+them without touching source files. It supports global or project-local setup;
+manual configuration and uninstall instructions are in
+[docs/install.md](docs/install.md).
 
-```bash
-cd your-project
-ravel index
-ravel status
-ravel context PaymentService
-```
+## Documentation
 
-Indexing is per project. `ravel install` configures agents; `ravel index`
-builds the project graph.
-
-`ravel init` creates `.ravel.toml`, `.ravelignore`, and the initial index in one
-step. Use `ravel init --no-index` when you only want the configuration files.
-Ravel defaults to the TypeScript/JavaScript family, skips common
-dependency/build directories, and honors `.gitignore` when Git is available.
-
-## Keep the index current
-
-The MCP server watches each indexed root and syncs source changes automatically.
-For CLI and scripted workflows:
-
-```bash
-ravel sync                 # sync Git-dirty source files
-ravel sync src/services.ts # sync explicit paths
-ravel watch                # keep syncing while files change
-```
-
-Without Git, use explicit paths with `sync` or run `watch`.
-
-## Main commands
-
-| Command | Purpose |
-|---------|---------|
-| `init` | Create project configuration and build the initial index |
-| `context SYMBOL` | Symbol, callers, callees, and related impact |
-| `refactor SYMBOL` | Files and risk for a broad change |
-| `search QUERY` | Search symbols (`exact`, `prefix`, `fuzzy`, or `regex`) |
-| `query SYMBOL --reverse` | Dependencies and callers of a symbol |
-| `impact SYMBOL --risk` | Blast radius with risk classification |
-| `status` / `doctor` | Index status and diagnostics |
-| `sync` / `watch` | Incremental or continuous updates |
-
-`context` is also available as `explore`. Output is compact JSON by default;
-use `--pretty` for human-readable output.
-
-To use another project root, pass it explicitly:
-
-```bash
-ravel --root /path/to/project context PaymentService
-```
-
-## MCP
-
-`ravel install` configures MCP automatically. For a manual stdio setup:
-
-```json
-{
-  "mcpServers": {
-    "ravel": {
-      "type": "stdio",
-      "command": "ravel",
-      "args": ["--root", "/path/to/project", "serve", "--mcp"]
-    }
-  }
-}
-```
-
-The default MCP surface has three primary tools: `explore`, `status`, and
-`sync`. Set `RAVEL_MCP_TOOLS=all` to expose the full tool set.
-
-See all CLI options with:
-
-```bash
-ravel --help
-```
+- [Installation and agent setup](docs/install.md)
+- [Configuration and sync behavior](docs/config.md)
+- [Performance notes](docs/performance.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 
-Apache-2.0
+Licensed under the [Apache License 2.0](LICENSE).

@@ -1,7 +1,6 @@
 # Configuration (extensible)
 
-Ravel is **zero-config by default** for TS/JS projects, including standalone projects and
-monorepos. Everything below is optional and
+Ravel is **zero-config by default** for TypeScript/JavaScript projects. Everything below is optional and
 **user-owned** — defaults are product defaults, not a lock-in.
 
 File: `.ravel.toml` at project root (+ optional `.ravelignore`).

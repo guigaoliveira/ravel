@@ -6,9 +6,6 @@ Usage: golden_check.py <ravel-bin> <repo-root> [--symbols N]
 Golden checks (soundness against ground truth):
   - context: primary is a real prefix match; every listed caller exists in the
     symbol dict; detail (when present) matches the primary.
-  - refactor: every file in files[] exists on disk AND textually contains the
-    symbol (a rename plan must never point at a file without the name).
-
 Perf gate: every hot-path command must finish under the 200 ms ceiling
 (the README product SLA). Exit code 1 on any golden or ceiling failure.
 """
@@ -112,36 +109,6 @@ def main():
             on_disk = (root / norm_path(caller).lstrip("/")).exists() or Path(norm_path(caller)).exists()
             if caller not in values and not on_disk:
                 failures.append(f"context {sym}: caller {caller!r} not in dict nor on disk")
-
-        ref, elapsed = run_json(binary, root, ["refactor", sym])
-        gate(f"refactor {sym}", elapsed)
-        if ref is None:
-            failures.append(f"refactor {sym}: not JSON")
-            continue
-        files = []
-        for raw in ref.get("files", []):
-            fpath = Path(norm_path(raw))
-            if not fpath.is_absolute():
-                fpath = root / fpath
-            if not fpath.is_file():
-                failures.append(f"refactor {sym}: file missing on disk: {raw}")
-            files.append(norm_path(raw).lstrip("./"))
-        # Completeness: every file that textually uses the symbol must be in the
-        # plan (files[] may ALSO contain transitive dependents — that's blast
-        # radius by design, so no "contains the symbol" check on each entry).
-        try:
-            gp = subprocess.run(
-                ["git", "-C", str(root), "grep", "-lw", sym, "--", "*.ts", "*.js"],
-                capture_output=True, text=True, timeout=60)
-            direct = [l for l in gp.stdout.splitlines() if l and ".spec." not in l and "test" not in l]
-        except Exception:
-            direct = []
-        if ref.get("truncated"):
-            direct = []  # plan legitimately partial — completeness not assertable
-        if len(files) < 40 and direct:  # not truncated by the limit
-            missing = [d for d in direct if d not in files]
-            if missing:
-                failures.append(f"refactor {sym}: plan misses direct users: {missing[:3]}")
 
         _, elapsed = run(binary, root, ["query", sym, "--reverse"])
         gate(f"query {sym}", elapsed)

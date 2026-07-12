@@ -1,6 +1,6 @@
 # Ravel — agent harness (Claude Code, Codex, Cursor, Grok, …)
 
-Local **TS/JS** code graph for standalone projects and monorepos. Index once, query cheaply, **sync after edits**. Prefer ravel over blind multi-file grep for callers / impact / search.
+Local **TS/JS** code graph for projects. Index once, query cheaply, **sync after edits**. Prefer ravel over blind multi-file grep for callers / impact / search.
 
 ## Install
 
@@ -21,18 +21,16 @@ Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel ins
 | Session start | `ravel cheatsheet` then `status` |
 | After save/edit/delete | Auto on `query`/`search`/`context` (git dirty); or `sync` / `watch` |
 | Understand a symbol | **`ravel context PaymentService`** (one call) |
-| Mass rename / blast radius | **`ravel refactor Foo`** → `files[]` + risk |
 | Full rebuild (rare) | `ravel index` |
 | Live while coding | `ravel watch` (reindexes on change) |
 
 ## Prefer fewer tool calls (token budget)
 
-1. **`context SYMBOL`** — search + callers + callees + impact (**one** call)  
-2. **`refactor SYMBOL`** — `files` + risk for renames / blast radius  
-3. Only if needed: `search`, `query --reverse`, `cycles`, `hubs`, `endpoints`  
-4. **Edit with the agent’s own editor** — ravel does not replace ApplyPatch; it tells you *which* files matter  
-5. JSON is **compact by default** (`--pretty` only for humans)  
-6. MCP advertises **3 primary tools** only — `RAVEL_MCP_TOOLS=all` if you need CI/export/hubs via MCP
+1. **`context SYMBOL`** — search + callers + callees + impact (**one** call)
+2. Only if needed: `search`, `query --reverse`, `impact`, `cycles`, `hubs`, `endpoints`
+3. **Edit with the agent’s own editor** — ravel does not write source files
+4. JSON is **compact by default** (`--pretty` only for humans)
+5. MCP advertises **3 primary tools** only — `RAVEL_MCP_TOOLS=all` if you need CI/export/hubs via MCP
 
 Avoid: multi-hop Grep/Glob/Read to rediscover imports.
 
@@ -45,7 +43,7 @@ CLI is often **cheaper in tokens** than MCP (no tool schema). MCP wins for **war
 - **Entry points (auto):** application entry files/controllers, `main.ts` / `bootstrap` — not reported as orphans.
 - **Storage:** `.ravel/` sidecars — cold search/query without loading full snapshot.
 
-## Debugging / refactors
+## Debugging
 
 ```bash
 ravel search Foo --kind prefix --limit 20

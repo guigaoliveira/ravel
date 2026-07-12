@@ -101,8 +101,9 @@ mkdir -p "$INSTALL_DIR"
 install -m 755 "$BIN" "${INSTALL_DIR}/ravel"
 say "installed: ${INSTALL_DIR}/ravel"
 
+RAVEL_CMD="${INSTALL_DIR}/ravel"
 case ":$PATH:" in
-  *":${INSTALL_DIR}:"*) ;;
+  *":${INSTALL_DIR}:"*) RAVEL_CMD="ravel" ;;
   *)
     say ""
     say "NOTE: ${INSTALL_DIR} is not on PATH. Add:"
@@ -111,7 +112,8 @@ case ":$PATH:" in
 esac
 
 say ""
+say "Verify: ${RAVEL_CMD} --version"
 say "Wire agents (Claude / Cursor / Codex / OpenCode / Gemini / …):"
-say "  ravel install --yes"
+say "  ${RAVEL_CMD} install --yes"
 say "Then in each project:"
-say "  cd your-repo && ravel index && ravel status"
+say "  cd your-repo && ${RAVEL_CMD} init && ${RAVEL_CMD} status"

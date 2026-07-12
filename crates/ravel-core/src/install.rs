@@ -370,7 +370,6 @@ args = ["serve", "--mcp"]
             r#"# Grok: prefer CLI (no stable MCP path yet). Put in AGENTS.md / session:
 #   {cmd} status
 #   {cmd} context SYMBOL
-#   {cmd} refactor SYMBOL
 "#
         ),
     }
@@ -386,14 +385,13 @@ Local TS/JS graph. Index once; query cheaply; sync after edits.
 ```bash
 ravel status                   # session start
 ravel explore SYMBOL           # ONE call → search + callers + callees + impact
-ravel refactor SYMBOL          # files_to_touch + risk before rename
 ravel sync                     # after edits (auto on explore too)
 ravel serve --mcp              # persistent MCP (stays fresh, auto-sync)
 ```
 
 3 primary MCP tools (`explore`, `status`, `sync`) — low schema overhead.
 Set `RAVEL_MCP_TOOLS=all` for full surface (search, impact, cycles, hubs, …).
-Edit with agent editor — ravel maps files_to_touch, does not replace ApplyPatch.
+Edit with the agent's editor — ravel does not write source files.
 {MARKER_END}
 "#
     )

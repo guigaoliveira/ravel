@@ -65,6 +65,7 @@ try {
     $Dest = Join-Path $InstallDir "ravel.exe"
     Copy-Item $Bin.FullName $Dest -Force
     Write-Host "installed: $Dest"
+    & $Dest --version
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($userPath -notlike "*$InstallDir*") {
