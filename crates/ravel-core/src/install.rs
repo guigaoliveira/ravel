@@ -268,6 +268,10 @@ pub fn mcp_stdio_entry(ravel_bin: &Path) -> Value {
 /// Human-readable config snippet for one agent (no file writes).
 pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation) -> String {
     let cmd = ravel_bin.display();
+    let command = ravel_bin.to_string_lossy();
+    let cmd_json = serde_json::to_string(command.as_ref())
+        .expect("serializing a path string to JSON cannot fail");
+    let cmd_toml = toml::Value::String(command.into_owned()).to_string();
     match kind {
         AgentKind::Claude => match location {
             InstallLocation::Global => format!(
@@ -276,7 +280,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
   "mcpServers": {{
     "ravel": {{
       "type": "stdio",
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -289,7 +293,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
   "mcpServers": {{
     "ravel": {{
       "type": "stdio",
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -302,7 +306,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
 {{
   "mcpServers": {{
     "ravel": {{
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -317,7 +321,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
         AgentKind::Codex => format!(
             r#"# {}
 [mcp_servers.ravel]
-command = "{cmd}"
+command = {cmd_toml}
 args = ["serve", "--mcp"]
 "#,
             if location == InstallLocation::Global {
@@ -332,7 +336,7 @@ args = ["serve", "--mcp"]
   "mcp": {{
     "ravel": {{
       "type": "local",
-      "command": ["{cmd}", "serve", "--mcp"],
+      "command": [{cmd_json}, "serve", "--mcp"],
       "enabled": true
     }}
   }}
@@ -349,7 +353,7 @@ args = ["serve", "--mcp"]
 {{
   "mcpServers": {{
     "ravel": {{
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -366,7 +370,7 @@ args = ["serve", "--mcp"]
 {{
   "mcpServers": {{
     "ravel": {{
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -379,7 +383,7 @@ args = ["serve", "--mcp"]
   "servers": {{
     "ravel": {{
       "type": "stdio",
-      "command": "{cmd}",
+      "command": {cmd_json},
       "args": ["serve", "--mcp"]
     }}
   }}
@@ -1444,5 +1448,32 @@ b = 2
             let s = print_config(*kind, Path::new("/bin/ravel"), InstallLocation::Global);
             assert!(!s.is_empty(), "{}", kind.id());
         }
+    }
+
+    #[test]
+    fn print_config_escapes_windows_paths() {
+        let binary = Path::new(r"\\?\C:\agents\ravel\target\debug\ravel.exe");
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Cursor,
+            AgentKind::OpenCode,
+            AgentKind::Gemini,
+            AgentKind::Windsurf,
+            AgentKind::VsCode,
+        ] {
+            let snippet = print_config(kind, binary, InstallLocation::Global);
+            let body = snippet
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|error| panic!("{}: {error}\n{body}", kind.id()));
+        }
+
+        let codex = print_config(AgentKind::Codex, binary, InstallLocation::Global);
+        codex
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("codex: {error}\n{codex}"));
     }
 }
