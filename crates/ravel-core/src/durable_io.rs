@@ -1,4 +1,7 @@
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
+
+#[cfg(unix)]
+use std::fs;
 
 #[cfg(not(windows))]
 pub(crate) fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
