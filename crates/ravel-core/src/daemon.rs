@@ -123,15 +123,19 @@ impl RuntimeLayout {
         let short = root.as_str().get(..32).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid daemon root identity")
         })?;
-        let mut directory = base.join("ravel");
         #[cfg(unix)]
-        {
+        let directory = {
             use std::os::unix::ffi::OsStrExt;
+            let directory = base.join("ravel");
             let projected = directory.join(format!("{short}.sock"));
             if projected.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
-                directory = short_unix_runtime_directory(&base)?;
+                short_unix_runtime_directory(&base)?
+            } else {
+                directory
             }
-        }
+        };
+        #[cfg(not(unix))]
+        let directory = base.join("ravel");
         std::fs::create_dir_all(&directory)?;
         restrict_runtime_directory(&directory)?;
         let singleton_lock = directory.join(format!("{short}.lock"));
@@ -200,11 +204,11 @@ fn runtime_base() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no private runtime directory"))
 }
 
-fn restrict_runtime_directory(path: &Path) -> io::Result<()> {
+fn restrict_runtime_directory(_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }

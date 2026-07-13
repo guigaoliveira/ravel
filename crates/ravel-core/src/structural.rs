@@ -248,4 +248,40 @@ mod tests {
         let decoded: StructuralReverseIndex = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, index);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonexistent_and_rename_candidates_stay_relative_through_symlink_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        let linked_root = parent.path().join("workspace-link");
+        symlink(&workspace, &linked_root).unwrap();
+        let artifacts = BTreeMap::from([(
+            "src/caller.ts".into(),
+            artifact(
+                "src/caller.ts",
+                "import './future';\nimport './old';\nimport './new';\n",
+            ),
+        )]);
+
+        let index =
+            StructuralReverseIndex::build(&linked_root, &artifacts, &ResolverConfig::default());
+        for candidate in ["src/future.ts", "src/old.ts", "src/new.ts"] {
+            assert_eq!(
+                index.module_importers.get(candidate),
+                Some(&BTreeSet::from(["src/caller.ts".to_owned()])),
+                "candidate={candidate} keys={:?}",
+                index.module_importers.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            index
+                .affected_files(["src/old.ts", "src/new.ts"], std::iter::empty())
+                .contains("src/caller.ts")
+        );
+    }
 }

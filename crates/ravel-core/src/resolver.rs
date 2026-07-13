@@ -656,7 +656,8 @@ fn file_candidates(root: &Path, base: &Path, config: &ResolverConfig) -> Candida
     }
 }
 fn normalize(root: &Path, path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let lexical = normalize_path_components(path);
+    let canonical = canonicalize_with_missing_suffix(&lexical);
     // Canonicalize both sides of the prefix comparison. On macOS, temporary directories are
     // commonly exposed through `/var` while `canonicalize` returns `/private/var`; comparing a
     // canonical candidate with the lexical root therefore leaked an absolute-looking path into
@@ -686,6 +687,43 @@ fn normalize(root: &Path, path: &Path) -> String {
     } else {
         s.into_owned()
     }
+}
+
+fn canonicalize_with_missing_suffix(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub fn load_tsconfig(root: &Path) -> ResolverConfig {
