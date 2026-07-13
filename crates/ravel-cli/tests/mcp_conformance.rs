@@ -18,6 +18,7 @@ fn mcp_stdio_speaks_protocol() {
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/new.ts"), "export const fresh = 1;\n").unwrap();
+    let expected_root = std::fs::canonicalize(&tmp).expect("canonicalize MCP test root");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ravel"))
         .args(["--root", tmp.to_str().unwrap(), "mcp"])
@@ -138,8 +139,14 @@ fn mcp_stdio_speaks_protocol() {
     let status_text = call["result"]["content"][0]["text"]
         .as_str()
         .expect("status tool should return text content");
+    let status: serde_json::Value =
+        serde_json::from_str(status_text).expect("status tool should return JSON text");
+    let actual_root = status["root"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .expect("status should include its root");
     assert!(
-        status_text.contains(tmp.to_str().unwrap()),
+        actual_root == expected_root,
         "MCP did not use the CLI --root default: {status_text}"
     );
 
