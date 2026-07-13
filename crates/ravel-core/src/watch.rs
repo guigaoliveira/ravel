@@ -342,21 +342,29 @@ mod tests {
             }
         });
 
+        let debounce = Duration::from_millis(30);
+        let max_batch = Duration::from_secs(1);
+        let first_event_timeout = Duration::from_secs(1);
         let started = std::time::Instant::now();
         let batch = watcher
-            .next_batch(
-                Duration::from_millis(30),
-                Duration::from_secs(1),
-                8,
-                Duration::from_secs(1),
-            )
+            .next_batch(debounce, first_event_timeout, 8, max_batch)
             .unwrap();
+        // Measure the watcher return, not producer teardown. Joining first made this assertion
+        // depend on filesystem callback and scheduler latency after the batch had already met
+        // its bound (notably on macOS ARM runners).
+        let batch_elapsed = started.elapsed();
         producer.join().unwrap();
 
         assert!(!batch.needs_reconcile);
         assert!(!batch.paths.is_empty());
         assert!(batch.paths.len() <= 8);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            batch_elapsed
+                <= first_event_timeout
+                    .saturating_add(max_batch)
+                    .saturating_add(debounce),
+            "batch exceeded first-event timeout plus configured batch deadline: {batch_elapsed:?}"
+        );
     }
 
     #[test]

@@ -657,10 +657,17 @@ fn file_candidates(root: &Path, base: &Path, config: &ResolverConfig) -> Candida
 }
 fn normalize(root: &Path, path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Canonicalize both sides of the prefix comparison. On macOS, temporary directories are
+    // commonly exposed through `/var` while `canonicalize` returns `/private/var`; comparing a
+    // canonical candidate with the lexical root therefore leaked an absolute-looking path into
+    // the scanner's root-relative namespace.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     // Scanner artifacts use root-relative paths. Keep resolver candidates in that same
     // namespace; absolute candidates made every relative import look unresolved in a real
     // workspace even though the file existed on disk.
-    let relative = canonical.strip_prefix(root).unwrap_or(&canonical);
+    let relative = canonical
+        .strip_prefix(&canonical_root)
+        .unwrap_or(&canonical);
     let mut normalized = PathBuf::new();
     for component in relative.components() {
         match component {
@@ -769,6 +776,31 @@ mod tests {
                 && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         }));
         assert_eq!(reverse.affected_by("src/b.ts"), vec!["src/a.ts"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_relative_paths_when_root_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir().unwrap();
+        let canonical_root = parent.path().join("workspace");
+        fs::create_dir_all(canonical_root.join("src")).unwrap();
+        fs::write(canonical_root.join("src/a.ts"), "import { B } from './b';").unwrap();
+        fs::write(canonical_root.join("src/b.ts"), "export class B {}").unwrap();
+        let linked_root = parent.path().join("workspace-link");
+        symlink(&canonical_root, &linked_root).unwrap();
+
+        let a = parse_source("src/a.ts", b"import { B } from './b';");
+        let b = parse_source("src/b.ts", b"export class B {}");
+        let map: BTreeMap<String, FileArtifact> = [(a.path.clone(), a), (b.path.clone(), b)].into();
+
+        let edges = resolve_edges(&linked_root, &map, &ResolverConfig::default());
+        assert!(edges.iter().any(|edge| {
+            edge.from == "src/a.ts"
+                && edge.to == "src/b.ts"
+                && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
+        }));
     }
 
     #[test]

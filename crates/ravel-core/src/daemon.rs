@@ -120,12 +120,20 @@ impl RuntimeLayout {
     }
 
     pub fn in_directory(base: PathBuf, root: &RootIdentity) -> io::Result<Self> {
-        let directory = base.join("ravel");
-        std::fs::create_dir_all(&directory)?;
-        restrict_runtime_directory(&directory)?;
         let short = root.as_str().get(..32).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid daemon root identity")
         })?;
+        let mut directory = base.join("ravel");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let projected = directory.join(format!("{short}.sock"));
+            if projected.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+                directory = short_unix_runtime_directory(&base)?;
+            }
+        }
+        std::fs::create_dir_all(&directory)?;
+        restrict_runtime_directory(&directory)?;
         let singleton_lock = directory.join(format!("{short}.lock"));
         #[cfg(unix)]
         let endpoint = {
@@ -148,6 +156,29 @@ impl RuntimeLayout {
             singleton_lock,
         })
     }
+}
+
+#[cfg(unix)]
+fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    // Unix socket limits apply to the pathname passed to bind, even when the user's private
+    // TMPDIR is deeply nested (notably on macOS). Namespace the short fallback by the owner of
+    // that private runtime base; the directory is subsequently verified and restricted to 0700.
+    let uid = std::fs::metadata(base)?.uid();
+    let directory = PathBuf::from(format!("/tmp/ravel-{uid}"));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe daemon runtime fallback directory",
+        ));
+    }
+    Ok(directory)
 }
 
 fn runtime_base() -> io::Result<PathBuf> {
@@ -900,6 +931,36 @@ mod tests {
             RuntimeLayout::in_directory(runtime.path().into(), &second)
                 .unwrap()
                 .endpoint
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_layout_uses_a_safe_short_socket_for_long_runtime_base() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+        let runtime = tempdir().unwrap();
+        let long_base = runtime.path().join("x".repeat(180));
+        std::fs::create_dir_all(&long_base).unwrap();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let first = RootIdentity::discover(first.path()).unwrap();
+        let second = RootIdentity::discover(second.path()).unwrap();
+
+        let layout = RuntimeLayout::in_directory(long_base.clone(), &first).unwrap();
+        let same = RuntimeLayout::in_directory(long_base.clone(), &first).unwrap();
+        let other = RuntimeLayout::in_directory(long_base, &second).unwrap();
+        let LocalEndpoint::Unix(endpoint) = &layout.endpoint;
+        assert!(endpoint.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+        assert_eq!(layout, same);
+        assert_ne!(layout.endpoint, other.endpoint);
+        assert_eq!(
+            std::fs::metadata(&layout.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 
