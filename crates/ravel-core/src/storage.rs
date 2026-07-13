@@ -378,7 +378,7 @@ impl FileSnapshotStorage {
                 message: error.to_string(),
             }
         })?;
-        fs::rename(&search_tmp, &search_path)
+        atomic_replace(&search_tmp, &search_path)
             .map_err(|source| self.io(source, search_path.clone()))?;
         sync_parent_directory(&search_path)
             .map_err(|source| self.io(source, search_path.clone()))?;
@@ -1266,10 +1266,7 @@ impl FileSnapshotStorage {
             .sync_all()
             .map_err(|source| self.io(source, store_tmp.clone()))?;
         drop(store);
-        if store_path.exists() {
-            fs::remove_file(&store_path).map_err(|source| self.io(source, store_path.clone()))?;
-        }
-        fs::rename(&store_tmp, &store_path)
+        atomic_replace(&store_tmp, &store_path)
             .map_err(|source| self.io(source, store_path.clone()))?;
         let index_name = format!("snapshot-{id}.artifacts.bin");
         self.atomic_write_bincode(&self.root.join(&index_name), &index)?;
@@ -2256,7 +2253,7 @@ impl FileSnapshotStorage {
             .map_err(|source| self.io(source, tmp.clone()))?;
         let checksum = writer.hasher.finalize().to_hex().to_string();
         drop(writer);
-        fs::rename(&tmp, path).map_err(|source| self.io(source, path.to_path_buf()))?;
+        atomic_replace(&tmp, path).map_err(|source| self.io(source, path.to_path_buf()))?;
         Ok(checksum)
     }
 }
@@ -2527,13 +2524,56 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(tmp, path)?;
+    atomic_replace(&tmp, path)?;
     sync_parent_directory(path)
 }
 
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // MoveFileExW preserves atomic replacement of an existing CURRENT/sidecar while
+    // WRITE_THROUGH waits for the move metadata to reach durable storage.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    // Windows does not allow opening a directory with std::fs::File. atomic_replace uses
+    // MOVEFILE_WRITE_THROUGH, which provides the corresponding durability barrier.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2543,6 +2583,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Instant;
     use tempfile::tempdir;
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("CURRENT");
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"second");
+    }
 
     fn snapshot() -> IndexSnapshot {
         IndexSnapshot {

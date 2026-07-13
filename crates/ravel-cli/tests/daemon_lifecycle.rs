@@ -7,6 +7,21 @@ use std::{
 };
 use tempfile::tempdir;
 
+const TEST_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn acquire_lease_until(
+    client: &ravel_core::daemon::DaemonClient,
+    deadline: Instant,
+) -> ravel_core::daemon::DaemonClientLease {
+    loop {
+        match client.acquire_lease() {
+            Ok(lease) => return lease,
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(error) => panic!("daemon lease capacity was not replenished: {error}"),
+        }
+    }
+}
+
 fn command(binary: &str, root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(binary)
         .arg("--root")
@@ -321,6 +336,10 @@ fn daemon_lease_limit_is_hard_and_does_not_consume_more_connections() {
         .arg(root.path())
         .args(["daemon-serve", "--transient"])
         .env("RAVEL_DAEMON_MAX_CONNECTIONS", "40")
+        .env(
+            "RAVEL_DAEMON_REQUEST_TIMEOUT_MS",
+            TEST_DAEMON_REQUEST_TIMEOUT.as_millis().to_string(),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -345,7 +364,9 @@ fn daemon_lease_limit_is_hard_and_does_not_consume_more_connections() {
         "rejected leases consumed request capacity"
     );
     drop(leases.pop());
-    let replacement = client.acquire_lease().unwrap();
+    // Closing the client socket and observing EOF are asynchronous across the IPC boundary.
+    // Retry until the daemon's configured request deadline rather than assuming immediate EOF.
+    let replacement = acquire_lease_until(&client, Instant::now() + TEST_DAEMON_REQUEST_TIMEOUT);
     drop(replacement);
     drop(leases);
     drop(daemon.stdin.take());
