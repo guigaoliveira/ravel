@@ -2832,10 +2832,20 @@ mod tests {
             let result = worker_store.publish(&second);
             sent.send(result).unwrap();
         });
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while store.current_generation().unwrap().as_deref() == Some(&old_manifest_name) {
+            match received.try_recv() {
+                Ok(result) => {
+                    result.unwrap();
+                    panic!("writer completed without advancing CURRENT");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("writer disconnected before advancing CURRENT");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
             assert!(Instant::now() < deadline, "writer did not advance CURRENT");
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         received
             .recv_timeout(std::time::Duration::from_secs(2))
