@@ -713,7 +713,7 @@ fn uncontended_sync_has_no_configured_coalesce_delay() {
     let dir = tempdir().unwrap();
     fs::write(
         dir.path().join(".ravel.toml"),
-        "[sync]\ncoalesce_ms = 500\n",
+        "[sync]\ncoalesce_ms = 2000\n",
     )
     .unwrap();
     seed(dir.path());
@@ -724,7 +724,11 @@ fn uncontended_sync_has_no_configured_coalesce_delay() {
     engine
         .sync(Some(&[dir.path().join("src/fast.ts")]))
         .unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "uncontended sync appears to have paid the configured 2s coalesce delay: {elapsed:?}"
+    );
 }
 
 #[test]
