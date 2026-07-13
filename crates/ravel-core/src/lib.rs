@@ -7,6 +7,7 @@ pub mod boundaries;
 pub mod cache;
 pub mod config;
 pub mod daemon;
+mod durable_io;
 pub mod engine;
 pub mod entries;
 pub mod generation_components;

@@ -161,16 +161,14 @@ impl GenerationPackWriter {
                 source,
             })?;
         drop(writer);
-        fs::rename(&tmp, path).map_err(|source| PackError::Io {
+        crate::durable_io::atomic_replace(&tmp, path).map_err(|source| PackError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| PackError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })
+        crate::durable_io::sync_parent_directory(path).map_err(|source| PackError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -474,5 +472,18 @@ mod tests {
         fs::write(path.with_extension("pack.tmp-crash"), b"crash").unwrap();
         let mut reader = GenerationPackReader::open(path).unwrap();
         assert_eq!(reader.read("stable", 2).unwrap().unwrap(), b"ok");
+    }
+
+    #[test]
+    fn repeated_publish_atomically_replaces_existing_pack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        for payload in [b"A".as_slice(), b"B".as_slice(), b"A".as_slice()] {
+            let mut writer = GenerationPackWriter::new();
+            writer.add("value", payload.to_vec()).unwrap();
+            writer.publish(&path).unwrap();
+            let mut reader = GenerationPackReader::open(&path).unwrap();
+            assert_eq!(reader.read("value", 1).unwrap().unwrap(), payload);
+        }
     }
 }
