@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-12
+
+### Added
+- Shared per-workspace daemon with transient MCP leases, persistent CLI control,
+  per-root caching, bounded connections, and watcher leadership failover.
+- Incremental generation packs, artifact deltas, structural reverse indexes,
+  atomic failpoint coverage, and bounded generation garbage collection.
+- Configurable bounds for watcher storms, sync tickets, daemon connections,
+  retained generations, and artifact-store amplification.
+
+### Changed
+- Explicit sync batching is contention-driven; a single writer no longer waits
+  for a fixed coalescing window.
+- Changed-path no-op checks use point lookups instead of materializing all file
+  hashes. Worktree identity and large sidecars are cached per engine.
+- Structural acceleration is resident-only on sync, avoiding a cold path that
+  used more time and memory than the exact fallback.
+- Common CLI/MCP reads use compact sidecars and bounded/LRU caches; packages,
+  fuzzy search, graph limits, impact counts, and byte limits were tightened.
+- Installers and release artifacts verify SHA-256 checksums; release workflows
+  pin actions and validate packages before publication.
+
+### Fixed
+- Cross-process writer races, stale-generation cache reads, watcher event storms,
+  daemon lease exhaustion, blocked daemon startup, and GC/reader deadlocks.
+- Add/delete/rename equivalence, idempotent A-to-B-to-A publication, stale hubs,
+  Git path handling, co-change history, boundary matching, and fuzzy ranking.
+- Concurrent agent configuration writes and archive extraction validation.
+
 ## [1.0.0] - 2026-07-12
 
 Initial public release.
@@ -25,5 +54,6 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/guigaoliveira/ravel/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/guigaoliveira/ravel/releases/tag/v1.0.0

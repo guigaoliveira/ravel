@@ -8,21 +8,21 @@ Local **TS/JS** code graph for projects. Index once, query cheaply, **sync after
 # Binary (macOS/Linux) — or see README.md for Windows / cargo
 curl -fsSL https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.sh | sh
 
-ravel install --yes                 # wire MCP: Claude, Cursor, Codex, OpenCode, Gemini, …
+ravel install                       # wire MCP: Claude, Cursor, Codex, OpenCode, Gemini, …
 cd /path/to/repo && ravel index
 ```
 
-Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel install --yes`.
+Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel install`.
 
 ## Daily loop
 
 | When | Command |
 |------|---------|
 | Session start | `ravel cheatsheet` then `status` |
-| After save/edit/delete | Auto on `query`/`search`/`context` (git dirty); or `sync` / `watch` |
+| After save/edit/delete | MCP watches automatically; CLI: `ravel sync path/to/file.ts` |
 | Understand a symbol | **`ravel context PaymentService`** (one call) |
 | Full rebuild (rare) | `ravel index` |
-| Live while coding | `ravel watch` (reindexes on change) |
+| Live CLI-only session | `ravel watch` (incrementally syncs source changes) |
 
 ## Prefer fewer tool calls (token budget)
 
@@ -57,4 +57,5 @@ ravel ci --cycle-threshold 5
 
 ## Multi-project
 
-Always pass `--root /abs/path`. MCP engines are cached **per root**. Index each project once under its own `.ravel/`.
+Always pass `--root /abs/path`. Index each project once under its own `.ravel/`.
+MCP sessions for the same canonical root share one transient daemon, watcher, cache, and serialized writer; different worktrees remain isolated.

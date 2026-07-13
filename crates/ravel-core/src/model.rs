@@ -166,6 +166,22 @@ pub struct IndexStats {
     pub snapshot_id: String,
 }
 
+/// Precomputed schema counts for cold CLI/MCP reads without hydrating the full snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaSummary {
+    pub format_version: u32,
+    pub snapshot_id: String,
+    pub files: usize,
+    pub edges: usize,
+    pub packages: usize,
+    pub node_kinds: BTreeMap<String, usize>,
+    pub edge_kinds: BTreeMap<String, usize>,
+}
+
+impl SchemaSummary {
+    pub const FORMAT_VERSION: u32 = 1;
+}
+
 /// First-seen symbol metadata for cold `node_detail` without full snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolMeta {
@@ -267,10 +283,15 @@ impl FileList {
     }
 
     pub fn in_package(&self, package: &str) -> Vec<String> {
+        self.in_package_limit(package, usize::MAX)
+    }
+
+    pub fn in_package_limit(&self, package: &str, limit: usize) -> Vec<String> {
         let prefix = format!("/{package}/");
         self.paths
             .iter()
             .filter(|path| path.contains(&prefix))
+            .take(limit)
             .cloned()
             .collect()
     }

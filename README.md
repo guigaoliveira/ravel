@@ -10,92 +10,118 @@
 </p>
 
 <p align="center">
-  <strong>Understand symbols, callers, dependencies, and change impact from a local index.</strong>
+  <strong>Fast, local code context for AI coding agents.</strong>
 </p>
 
-Ravel is a local code graph for TypeScript and JavaScript. It helps coding
-agents navigate projects without repeatedly crawling files with grep, glob, and
-full-file reads.
+Ravel indexes symbols and relationships so agents can find callers,
+dependencies, and change impact without crawling the repository every time.
+Use it through the CLI or any MCP client.
 
-No API key or hosted service is required. Ravel reads project files and writes
-only its `.ravel/` index and agent configuration when explicitly requested.
+## Why Ravel?
+
+Agents waste time and tokens rebuilding context with repeated searches and file
+reads. Ravel indexes once and returns the relevant graph directly.
+
+It is written in Rust and built for fast repeated queries: compact sidecars,
+incremental sync, and a small MCP surface. Everything runs locally. No API key,
+hosted service, external database, or source upload.
 
 ## Install
 
-The npm package downloads the matching native binary automatically:
-
 ```bash
 npm install -g @guigaoliveira/ravel-cli
-ravel --version
-```
 
-Other options:
-
-```bash
-# macOS / Linux
+# macOS / Linux, without npm
 curl -fsSL https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.sh | sh
 
-# Windows PowerShell
+# Windows PowerShell, without npm
 irm https://raw.githubusercontent.com/guigaoliveira/ravel/main/scripts/install.ps1 | iex
-
-# From source
-cargo install --path crates/ravel-cli --locked
 ```
 
-See [installation and agent setup](docs/install.md) for platform details and
-troubleshooting.
+Prebuilt binaries cover Linux (glibc and musl), macOS, and Windows on x64 and
+ARM64. The npm installer requires Node.js 16 or newer.
 
-## Start
-
-From the project you want to index:
+Connect your agents and index a project:
 
 ```bash
+ravel install
+cd /path/to/project
 ravel init
-ravel status
 ravel context PaymentService
 ```
 
-`ravel init` creates the local configuration and initial index. To connect
-supported coding agents, run this once and restart an agent that was already
-running:
+`ravel install` detects Claude Code, Cursor, Codex, OpenCode, Gemini, Windsurf,
+VS Code, and Grok. Restart agents that were already running.
+
+## Use
 
 ```bash
-ravel install --yes
+ravel context SYMBOL                  # callers, callees, and impact
+ravel search QUERY --kind prefix      # symbol names: exact, prefix, fuzzy, or regex
+ravel query SYMBOL --reverse          # reverse dependencies
+ravel impact SYMBOL --risk            # blast radius and risk
+ravel diff-impact HEAD~1              # impact of a Git diff
+ravel sync path/to/file.ts            # fastest explicit sync after an edit
 ```
 
-## Daily use
+Output is compact JSON by default. Add `--pretty` for humans. Use
+`--root /absolute/path` for another project. MCP watches each requested root
+automatically unless `sync.mode = "none"`. In CLI-only workflows, `search`, `query`, and `context` auto-sync
+Git changes; use `ravel sync <paths>` after known edits or `ravel watch` for
+continuous updates.
+
+## Benchmarks
+
+| Project | What was measured | Corpus | Result |
+| --- | --- | --- | --- |
+| Ravel | Warm read latency | 21k-file monorepo, 235k edges | search **14 ms**, query **20 ms**, impact **23 ms**, context **53 ms** |
+| Ravel | Changed-path sync | 21k-file stress corpus | no-op/content **<10 ms**; structural edits **130–300 ms**, depending on warm state and affected graph |
+
+These are local tool-latency measurements, not an agent-workflow comparison or
+universal SLA. Structural edits include add, delete, and rename; cost grows with
+the affected graph. See the
+[raw measurements](https://github.com/guigaoliveira/ravel/blob/3e514a1/reports/perf-sla-2026-07-11.md)
+and [performance notes](docs/performance.md).
+
+## Language support
+
+| Language | Extensions |
+| --- | --- |
+| TypeScript | `.ts`, `.mts`, `.cts` |
+| TSX | `.tsx` |
+| JavaScript | `.js`, `.mjs`, `.cjs` |
+| JSX | `.jsx` |
+
+All are detected automatically with symbol, import, call, and graph analysis.
+
+## MCP
+
+`ravel install` configures MCP automatically. Ravel exposes only
+`explore`, `status`, and `sync` by default to reduce tool-schema overhead.
+Multiple agents and processes may share the same indexed root: updates are
+serialized and published atomically, so readers keep the last complete index.
+MCP clients for the same root share one transient local daemon, watcher, warm
+cache, and writer. The daemon exits after the last MCP session disconnects;
+`ravel daemon start|status|stop` controls a persistent CLI daemon explicitly.
 
 ```bash
-ravel context SYMBOL
-ravel search QUERY --kind prefix
-ravel query SYMBOL --reverse
-ravel impact SYMBOL --risk
-ravel sync
+RAVEL_MCP_TOOLS=all ravel mcp  # expose every analysis tool
 ```
 
-Queries use compact JSON by default. Add `--pretty` for human-readable output.
-Use `--root /absolute/path/to/project` when running Ravel outside the project
-directory.
+## Community
 
-The default index covers `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`,
-and `.cjs` files. Common dependency/build directories are skipped and Git
-repositories also honor `.gitignore`.
-
-## Agent setup
-
-`ravel install --yes` detects supported agent configurations and adds Ravel to
-them without touching source files. It supports global or project-local setup;
-manual configuration and uninstall instructions are in
-[docs/install.md](docs/install.md).
+Found a bug or have an idea? [Open an issue](https://github.com/guigaoliveira/ravel/issues).
+Contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
+a pull request.
 
 ## Documentation
 
-- [Installation and agent setup](docs/install.md)
-- [Configuration and sync behavior](docs/config.md)
-- [Performance notes](docs/performance.md)
-- [Contributing](CONTRIBUTING.md)
+- [Installation](docs/install.md)
+- [Configuration](docs/config.md)
+- [Performance](docs/performance.md)
+- [Token efficiency](docs/token-efficiency.md)
 - [Changelog](CHANGELOG.md)
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+[Apache-2.0](LICENSE)

@@ -3,7 +3,7 @@
 
 use crate::{
     graph::{GraphIndex, QueryLimits},
-    model::{IndexSnapshot, SymbolMetaDict},
+    model::{IndexSnapshot, SchemaSummary, SymbolMetaDict},
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -122,7 +122,9 @@ pub fn impact_with_risk(
     Ok(ImpactReport {
         root: node.into(),
         snapshot_id: page.snapshot_id,
-        total_affected: affected.len(),
+        // `items` is only the first bounded page; visited nodes describe the complete traversal
+        // admitted by the configured budgets.
+        total_affected: page.visited_nodes.saturating_sub(1),
         affected,
         truncated: page.truncated,
         reason: page.reason,
@@ -371,6 +373,55 @@ pub fn list_packages(snapshot: &IndexSnapshot) -> Vec<PackageInfo> {
     packages
 }
 
+pub fn schema_summary(snapshot: &IndexSnapshot) -> SchemaSummary {
+    let mut node_kinds = BTreeMap::new();
+    let mut edge_kinds = BTreeMap::new();
+    for artifact in snapshot.files.values() {
+        for symbol in &artifact.symbols {
+            *node_kinds.entry(symbol.kind.to_string()).or_default() += 1;
+        }
+    }
+    for edge in &snapshot.edges {
+        *edge_kinds.entry(format!("{:?}", edge.kind)).or_default() += 1;
+    }
+    SchemaSummary {
+        format_version: SchemaSummary::FORMAT_VERSION,
+        snapshot_id: snapshot.id.stable_key(),
+        files: snapshot.files.len(),
+        edges: snapshot.edges.len(),
+        packages: list_packages(snapshot).len(),
+        node_kinds,
+        edge_kinds,
+    }
+}
+
+/// Package summary from the compact file-list sidecar. Language is fully determined by the
+/// supported source extension, so this produces the same result without hydrating artifacts.
+pub fn list_packages_from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<PackageInfo> {
+    let mut map: BTreeMap<String, PackageInfo> = BTreeMap::new();
+    for path in paths {
+        let package = package_from_path(path);
+        let language = if [".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| path.ends_with(extension))
+        {
+            "javascript"
+        } else {
+            "typescript"
+        };
+        let entry = map.entry(package.clone()).or_insert_with(|| PackageInfo {
+            name: package,
+            files: 0,
+            languages: Vec::new(),
+        });
+        entry.files += 1;
+        if !entry.languages.iter().any(|existing| existing == language) {
+            entry.languages.push(language.to_owned());
+        }
+    }
+    map.into_values().collect()
+}
+
 fn package_from_path(path: &str) -> String {
     // Single pass, no intermediate Vec: segment after the first apps|libs|packages marker.
     let mut it = path.split('/');
@@ -533,6 +584,35 @@ mod tests {
     }
 
     #[test]
+    fn impact_total_is_not_reduced_to_first_page_size() {
+        let snap = IndexSnapshot {
+            id: SnapshotId {
+                root: "r".into(),
+                worktree: "w".into(),
+                revision: "v".into(),
+                content_state: "c".into(),
+                schema_version: 1,
+                grammar_version: "g".into(),
+                config_hash: "h".into(),
+            },
+            files: BTreeMap::new(),
+            edges: vec![edge("a", "root"), edge("b", "root")],
+        };
+        let graph = GraphIndex::from_snapshot(&snap);
+        let report = impact_with_risk(
+            &graph,
+            "root",
+            &QueryLimits {
+                page_size: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.affected.len(), 1);
+        assert_eq!(report.total_affected, 2);
+    }
+
+    #[test]
     fn natural_entry_points_cover_common_ts_entries() {
         assert!(is_natural_entry_point("main", "apps/api-users/src/main.ts"));
         assert!(is_natural_entry_point(
@@ -543,5 +623,56 @@ mod tests {
             "UsersService",
             "apps/api-users/src/users.service.ts"
         ));
+    }
+
+    #[test]
+    fn package_summary_from_paths_preserves_counts_and_languages() {
+        let packages = list_packages_from_paths([
+            "apps/api/src/main.ts",
+            "apps/api/src/legacy.js",
+            "libs/core/src/index.ts",
+        ]);
+        assert_eq!(
+            packages,
+            vec![
+                PackageInfo {
+                    name: "api".into(),
+                    files: 2,
+                    languages: vec!["typescript".into(), "javascript".into()],
+                },
+                PackageInfo {
+                    name: "core".into(),
+                    files: 1,
+                    languages: vec!["typescript".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_summary_counts_kinds_once_at_publish_time() {
+        let mut snapshot = IndexSnapshot {
+            id: SnapshotId {
+                root: "r".into(),
+                worktree: "w".into(),
+                revision: "v".into(),
+                content_state: "c".into(),
+                schema_version: 1,
+                grammar_version: "g".into(),
+                config_hash: "h".into(),
+            },
+            files: BTreeMap::new(),
+            edges: vec![edge("a", "b")],
+        };
+        snapshot.files.insert(
+            "apps/api/src/service.ts".into(),
+            crate::scanner::parse_source("apps/api/src/service.ts", b"export class Service {}"),
+        );
+        let summary = schema_summary(&snapshot);
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.edges, 1);
+        assert_eq!(summary.packages, 1);
+        assert_eq!(summary.node_kinds["class_declaration"], 1);
+        assert_eq!(summary.edge_kinds["Import"], 1);
     }
 }

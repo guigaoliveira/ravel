@@ -16,6 +16,8 @@ fn mcp_stdio_speaks_protocol() {
     // Run the server in an empty dir — protocol conformance must not need a pre-built index.
     let tmp = std::env::temp_dir().join(format!("ravel-mcp-conf-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(tmp.join("src/new.ts"), "export const fresh = 1;\n").unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ravel"))
         .args(["--root", tmp.to_str().unwrap(), "mcp"])
@@ -31,6 +33,7 @@ fn mcp_stdio_speaks_protocol() {
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sync","arguments":{"paths":["src/new.ts"]}}}"#,
     ];
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -60,7 +63,7 @@ fn mcp_stdio_speaks_protocol() {
     let mut by_id: HashMap<u64, serde_json::Value> = HashMap::new();
     let mut seen_lines: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && by_id.len() < 3 {
+    while Instant::now() < deadline && by_id.len() < 4 {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(line) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -115,6 +118,14 @@ fn mcp_stdio_speaks_protocol() {
         explore["inputSchema"]["properties"].get("kind").is_none(),
         "explore schema must not advertise the search-only kind field: {explore}"
     );
+    let sync = list["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "sync"))
+        .expect("primary sync tool is present");
+    assert!(
+        sync["inputSchema"]["properties"].get("paths").is_some(),
+        "sync schema must accept explicit edited paths: {sync}"
+    );
 
     // 3. tools/call → a real invocation returns a JSON-RPC result (not an error).
     let call = by_id
@@ -130,5 +141,17 @@ fn mcp_stdio_speaks_protocol() {
     assert!(
         status_text.contains(tmp.to_str().unwrap()),
         "MCP did not use the CLI --root default: {status_text}"
+    );
+
+    // 4. Explicit paths include new/untracked files without an expensive untracked scan.
+    let sync_call = by_id
+        .get(&4)
+        .unwrap_or_else(|| panic!("no sync response.\n--- stdout ---\n{}", dump()));
+    let sync_text = sync_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("sync tool should return text content");
+    assert!(
+        sync_text.contains("\"files\":1"),
+        "MCP explicit sync did not index the new file: {sync_text}"
     );
 }

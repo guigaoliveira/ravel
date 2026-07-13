@@ -101,6 +101,15 @@ pub struct SyncConfig {
     pub include_untracked: bool,
     /// When untracked is on: skip emit next to a source sibling (`sibling_emit` rules).
     pub skip_sibling_emit: bool,
+    /// Reuse dirty-path discovery across near-simultaneous warm MCP calls.
+    pub discovery_cache_ms: u64,
+    /// Small batching window for explicit syncs from concurrent processes in one workspace.
+    pub coalesce_ms: u64,
+    pub queue_max_ticket_bytes: u64,
+    pub queue_max_tickets: usize,
+    pub queue_max_paths: usize,
+    pub queue_cleanup_limit: usize,
+    pub queue_stale_seconds: u64,
     /// Pairs: untracked emit extension → source extensions that mark it as junk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sibling_emit: Vec<SiblingEmitRule>,
@@ -119,6 +128,8 @@ pub struct SiblingEmitRule {
 pub struct StorageConfig {
     pub home: PathBuf,
     pub retention: usize,
+    /// Rewrite the append-only artifact store when physical/live bytes reaches this ratio.
+    pub artifact_store_max_amplification: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -129,6 +140,12 @@ pub struct CacheConfig {
 #[serde(default)]
 pub struct WatchConfig {
     pub debounce_ms: u64,
+    /// Maximum filesystem events buffered per workspace. Overflow triggers a full reconcile.
+    pub queue_capacity: usize,
+    /// Maximum distinct paths retained in one exact incremental batch.
+    pub max_batch_paths: usize,
+    /// Maximum time spent coalescing one batch, even when events never become quiet.
+    pub max_batch_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -240,13 +257,16 @@ pub fn is_noise_path_with(
 pub fn effective_extensions(config: &Config) -> Vec<String> {
     // Explicit extensions always win — full user control.
     if !config.parser.extensions.is_empty() {
-        return config
+        let mut extensions: Vec<_> = config
             .parser
             .extensions
             .iter()
             .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-            .filter(|e| !e.is_empty())
+            .filter(|e| !e.is_empty() && !e.contains(['/', '\\']) && e.len() <= 16)
             .collect();
+        extensions.sort();
+        extensions.dedup();
+        return extensions;
     }
     let langs = &config.parser.languages;
     let auto = langs.is_empty() || langs.iter().any(|l| l == "auto" || l == "*");
@@ -396,6 +416,13 @@ impl Default for SyncConfig {
             auto: true,
             include_untracked: false, // tracked-only dirty = sub-200ms auto-sync path
             skip_sibling_emit: true,
+            discovery_cache_ms: 50,
+            coalesce_ms: 0,
+            queue_max_ticket_bytes: 1024 * 1024,
+            queue_max_tickets: 1024,
+            queue_max_paths: 4096,
+            queue_cleanup_limit: 64,
+            queue_stale_seconds: 3600,
             sibling_emit: Vec::new(),
         }
     }
@@ -405,6 +432,7 @@ impl Default for StorageConfig {
         Self {
             home: PathBuf::from(".ravel"),
             retention: 3,
+            artifact_store_max_amplification: 4,
         }
     }
 }
@@ -417,7 +445,12 @@ impl Default for CacheConfig {
 }
 impl Default for WatchConfig {
     fn default() -> Self {
-        Self { debounce_ms: 150 }
+        Self {
+            debounce_ms: 150,
+            queue_capacity: 4_096,
+            max_batch_paths: 4_096,
+            max_batch_ms: 1_000,
+        }
     }
 }
 impl Default for LimitsConfig {
@@ -516,11 +549,32 @@ impl Config {
                 "node, edge and byte limits must be greater than zero",
             ));
         }
-        if self.watch.debounce_ms > 60_000 {
+        if self.watch.queue_capacity == 0
+            || self.watch.max_batch_paths == 0
+            || self.watch.max_batch_ms == 0
+        {
             return Err(invalid(
-                "watch.debounce_ms",
-                &self.watch.debounce_ms.to_string(),
-                "must not exceed 60000",
+                "watch",
+                "0",
+                "queue_capacity, max_batch_paths and max_batch_ms must be greater than zero",
+            ));
+        }
+        if self.sync.queue_max_ticket_bytes == 0
+            || self.sync.queue_max_tickets == 0
+            || self.sync.queue_max_paths == 0
+            || self.sync.queue_cleanup_limit == 0
+        {
+            return Err(invalid(
+                "sync.queue_limits",
+                "0",
+                "ticket bytes, tickets, paths and cleanup limit must be greater than zero",
+            ));
+        }
+        if self.storage.retention == 0 || self.storage.artifact_store_max_amplification == 0 {
+            return Err(invalid(
+                "storage",
+                "0",
+                "retention and artifact_store_max_amplification must be greater than zero",
             ));
         }
         if self.project.root.as_os_str().is_empty() {
@@ -565,6 +619,15 @@ fn apply_env(config: &mut Config, values: &BTreeMap<String, String>) -> Result<(
     }
     if let Some(value) = values.get("RAVEL_WATCH_DEBOUNCE") {
         config.watch.debounce_ms = parse_num("RAVEL_WATCH_DEBOUNCE", value)?;
+    }
+    if let Some(value) = values.get("RAVEL_WATCH_QUEUE_CAPACITY") {
+        config.watch.queue_capacity = parse_num("RAVEL_WATCH_QUEUE_CAPACITY", value)?;
+    }
+    if let Some(value) = values.get("RAVEL_WATCH_MAX_BATCH_PATHS") {
+        config.watch.max_batch_paths = parse_num("RAVEL_WATCH_MAX_BATCH_PATHS", value)?;
+    }
+    if let Some(value) = values.get("RAVEL_WATCH_MAX_BATCH_MS") {
+        config.watch.max_batch_ms = parse_num("RAVEL_WATCH_MAX_BATCH_MS", value)?;
     }
     if let Some(value) = values.get("RAVEL_MAX_NODES") {
         config.limits.max_nodes = parse_num("RAVEL_MAX_NODES", value)?;
@@ -671,7 +734,14 @@ mod tests {
         c.parser.languages = vec!["typescript".into()];
         c.parser.extensions = vec!["vue".into(), ".Svelte".into()];
         let ext = effective_extensions(&c);
-        assert_eq!(ext, vec!["vue".to_string(), "svelte".to_string()]);
+        assert_eq!(ext, vec!["svelte".to_string(), "vue".to_string()]);
+    }
+
+    #[test]
+    fn explicit_extensions_are_normalized_and_deduplicated() {
+        let mut c = Config::default();
+        c.parser.extensions = vec![".TS".into(), "ts".into(), "../secret".into()];
+        assert_eq!(effective_extensions(&c), vec!["ts"]);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 #   RAVEL_GITHUB_REPO   owner/repo (default: guigaoliveira/ravel)
 #   RAVEL_VERSION       tag without v, or "latest" (default: latest)
 #   RAVEL_INSTALL_DIR   install directory (default: ~/.local/bin)
+#   RAVEL_BINARY        local binary to install (offline)
 #   RAVEL_FROM_SOURCE=1 force cargo install from this checkout / git
 set -eu
 
@@ -25,7 +26,15 @@ detect_target() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m)
   case "$os" in
-    linux) os=unknown-linux-gnu ;;
+    linux)
+      if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        os=unknown-linux-gnu
+      else
+        # A static musl binary also runs on glibc hosts. Prefer it whenever
+        # libc cannot be identified (minimal containers commonly lack ldd).
+        os=unknown-linux-musl
+      fi
+      ;;
     darwin) os=apple-darwin ;;
     *) err "unsupported OS: $os (use install.ps1 on Windows, or cargo install)" ;;
   esac
@@ -59,12 +68,24 @@ install_from_cargo() {
       || cargo install --git "https://github.com/${REPO}.git" --locked --force
   fi
   say "installed (cargo). Ensure ~/.cargo/bin is on PATH."
-  say "next: ravel install --yes && cd <project> && ravel index"
+  say "next: ravel install && cd <project> && ravel index"
   exit 0
 }
 
 if [ "${RAVEL_FROM_SOURCE:-0}" = "1" ]; then
   install_from_cargo
+fi
+
+if [ -n "${RAVEL_BINARY:-}" ]; then
+  [ -f "$RAVEL_BINARY" ] || err "RAVEL_BINARY is not a file: $RAVEL_BINARY"
+  mkdir -p "$INSTALL_DIR"
+  install -m 755 "$RAVEL_BINARY" "${INSTALL_DIR}/ravel"
+  say "installed offline: ${INSTALL_DIR}/ravel"
+  case ":$PATH:" in
+    *":${INSTALL_DIR}:"*) ;;
+    *) say "NOTE: ${INSTALL_DIR} is not on PATH. Add: export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
+  esac
+  exit 0
 fi
 
 TARGET=$(detect_target)
@@ -87,6 +108,18 @@ if ! download "$URL" "${TMP}/${ASSET}" 2>/dev/null; then
   say "prebuilt asset not found — falling back to cargo install from source"
   install_from_cargo
 fi
+
+download "${BASE}/SHA256SUMS" "${TMP}/SHA256SUMS" || err "release checksum file unavailable"
+EXPECTED=$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1; exit }' "${TMP}/SHA256SUMS")
+[ -n "$EXPECTED" ] || err "checksum missing for ${ASSET}"
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "${TMP}/${ASSET}" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "${TMP}/${ASSET}" | awk '{print $1}')
+else
+  err "need sha256sum or shasum to verify release"
+fi
+[ "$ACTUAL" = "$EXPECTED" ] || err "checksum mismatch for ${ASSET}"
 
 tar -xzf "${TMP}/${ASSET}" -C "$TMP"
 BIN=""
@@ -114,6 +147,6 @@ esac
 say ""
 say "Verify: ${RAVEL_CMD} --version"
 say "Wire agents (Claude / Cursor / Codex / OpenCode / Gemini / …):"
-say "  ${RAVEL_CMD} install --yes"
+say "  ${RAVEL_CMD} install"
 say "Then in each project:"
 say "  cd your-repo && ${RAVEL_CMD} init && ${RAVEL_CMD} status"

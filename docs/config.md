@@ -23,7 +23,8 @@ File: `.ravel.toml` at project root (+ optional `.ravelignore`).
 | `search` / `query` / `context` (read) | **No** | Sidecars |
 | `sync` with paths | **No** | Explicit list |
 | `sync` no args / auto-sync | **Only if** repo has `.git` and `mode` allows | Dirty discovery |
-| `watch` | **No** | OS events (best non-git freshness) |
+| CLI `watch` | **No** | OS events for a long-lived CLI-only session |
+| MCP server | **No** | Watches every indexed root automatically |
 
 **Default `sync.mode = "auto"`:** use git **only when** `.git` exists; otherwise behave like
 `none` (no spawn, no error). Non-git users are first-class.
@@ -32,8 +33,8 @@ File: `.ravel.toml` at project root (+ optional `.ravelignore`).
 
 1. Skip if `auto = false` or no index (stats sidecar check only).
 2. Skip if not a git repo (cached probe).
-3. `git status` for dirty paths (cached ~750ms in warm MCP).
-4. Compare against **`file_hashes` sidecar** (small) — **do not** load full snapshot if hashes match.
+3. `git status` for dirty paths (cached for `sync.discovery_cache_ms`, 50ms by default).
+4. Point-read hashes for only the dirty paths from the artifact locator — **do not** materialize the full path/hash index.
 5. Only then reparse changed files + republish.
 
 If you never want git:
@@ -44,7 +45,14 @@ mode = "none"
 auto = false
 ```
 
-Then: `ravel sync path/a.ts` or `ravel watch`.
+Then: `ravel sync path/a.ts`; for CLI-only continuous updates, use `ravel watch`.
+
+MCP sessions share one transient daemon, engine, watcher, and writer per
+canonical root. It starts automatically and exits after the final MCP lease
+disconnects and pending writes drain. `sync.mode = "none"` disables daemon
+auto-watch; explicit `sync(paths)` and standalone CLI `ravel watch` remain
+available. Different roots and worktrees use independent daemons, indexes, and
+locks.
 
 ## Full example
 
@@ -70,9 +78,32 @@ mode = "auto"              # auto | git | none
 auto = true
 include_untracked = false  # default fast path (tracked only); true = slower
 skip_sibling_emit = true
+discovery_cache_ms = 50    # reuse near-simultaneous warm MCP discovery
+coalesce_ms = 0            # compatibility only; batching is contention-driven, without sleep
+queue_max_ticket_bytes = 1048576
+queue_max_tickets = 1024
+queue_max_paths = 4096
+queue_cleanup_limit = 64
+queue_stale_seconds = 3600
 # [[sync.sibling_emit]]
 # emit = "js"
 # sources = ["ts", "tsx"]
+
+[watch]
+debounce_ms = 150
+# Bounded event buffer. Overflow falls back to a safe but potentially expensive full index.
+queue_capacity = 4096
+# Bound exact incremental batches even if the filesystem never becomes quiet.
+max_batch_paths = 4096
+max_batch_ms = 1000
+# Environment overrides: RAVEL_WATCH_QUEUE_CAPACITY,
+# RAVEL_WATCH_MAX_BATCH_PATHS, RAVEL_WATCH_MAX_BATCH_MS.
+
+[storage]
+retention = 3
+# Compact the append-only artifact store based on measured physical/live byte amplification,
+# not an edit-count threshold. Lower values trade more rewrite I/O for less disk usage.
+artifact_store_max_amplification = 4
 
 [analysis]
 # entry_points = ["MyCustomBootstrap"]  # extras on top of heuristics
@@ -95,4 +126,8 @@ hubs_top_k = 1000
 |-----|---------|
 | `RAVEL_HOME` | storage home dir name |
 | `RAVEL_LOG_LEVEL` | log level |
+| `RAVEL_DAEMON_MAX_CONNECTIONS` | hard cap for all daemon connections; defaults to `max(8, CPUs * 4)` |
+| `RAVEL_DAEMON_MAX_LEASES` | hard cap for persistent MCP leases; defaults to the connection cap minus one request slot |
+| `RAVEL_DAEMON_REQUEST_TIMEOUT_MS` | handshake/request read timeout; established leases are not timed out |
+| `RAVEL_MCP_MAX_CACHED_ROOTS` | maximum cached workspace roots per MCP process; defaults to `8`; least-recently-used inactive roots are evicted |
 | `RAVEL_MCP_TOOLS` | `primary` / `all` (MCP surface) |

@@ -1,5 +1,7 @@
 pre-commit:
-  parallel: true
+  # Clippy and tests share Cargo's target directory. Running them concurrently
+  # makes cold local builds contend for CPU, disk, and Cargo locks.
+  parallel: false
   commands:
     rustfmt:
       glob: "**/*.rs"

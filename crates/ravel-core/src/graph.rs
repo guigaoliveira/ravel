@@ -431,6 +431,7 @@ impl GraphIndex {
         // Accumulate node IDs, not cloned names — we clone only the returned page below.
         let mut item_ids: Vec<u32> = Vec::new();
         let mut visited_edges = 0usize;
+        let mut output_bytes = 0u64;
         let mut truncated = false;
         let mut reason = None;
         let mut steps = 0usize;
@@ -451,28 +452,40 @@ impl GraphIndex {
                 reason = Some("depth".into());
                 break;
             }
-            if !seen.insert(current) {
+            if seen.contains(&current) {
                 continue;
             }
-            if capture_depths {
-                depths.insert(current, depth);
-            }
-            if seen.len() > limits.nodes {
+            // Enforce hard budgets before admitting work. The previous post-insert checks
+            // reported `visited_nodes = limit + 1` / `visited_edges = limit + 1`.
+            if seen.len() >= limits.nodes {
                 truncated = true;
                 reason = Some("nodes".into());
                 break;
+            }
+            if current != start {
+                let node_bytes = self.nodes[current as usize].len() as u64;
+                if output_bytes.saturating_add(node_bytes) > limits.bytes {
+                    truncated = true;
+                    reason = Some("bytes".into());
+                    break;
+                }
+                output_bytes += node_bytes;
+            }
+            seen.insert(current);
+            if capture_depths {
+                depths.insert(current, depth);
             }
             if current != start {
                 item_ids.push(current);
             }
             if let Some(neighbors) = graph.get(current as usize) {
                 for &next in neighbors {
-                    visited_edges += 1;
-                    if visited_edges > limits.edges {
+                    if visited_edges >= limits.edges {
                         truncated = true;
                         reason = Some("edges".into());
                         break;
                     }
+                    visited_edges += 1;
                     queue.push_back((next, depth + 1));
                 }
             }
@@ -565,7 +578,34 @@ mod tests {
         };
         let result = graph.callers_of("a", &limits, None).unwrap();
         assert!(result.truncated);
+        assert_eq!(result.visited_nodes, 1);
         assert_eq!(graph.package_cycles().len(), 1);
+    }
+
+    #[test]
+    fn edge_budget_is_a_hard_limit() {
+        let graph = graph();
+        let limits = QueryLimits {
+            edges: 1,
+            ..Default::default()
+        };
+        let result = graph.impact_analysis("a", &limits, None).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.reason.as_deref(), Some("edges"));
+        assert_eq!(result.visited_edges, 1);
+    }
+
+    #[test]
+    fn byte_budget_is_enforced_before_materializing_names() {
+        let graph = graph();
+        let limits = QueryLimits {
+            bytes: 0,
+            ..Default::default()
+        };
+        let result = graph.impact_analysis("a", &limits, None).unwrap();
+        assert!(result.items.is_empty());
+        assert!(result.truncated);
+        assert_eq!(result.reason.as_deref(), Some("bytes"));
     }
 
     #[test]

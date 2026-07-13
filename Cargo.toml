@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ravel-core", "crates/ravel-cli"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -13,8 +13,9 @@ repository = "https://github.com/guigaoliveira/ravel"
 anyhow = "1.0.98"
 blake3 = "1.8.2"
 clap = { version = "4.5.40", features = ["derive", "env"] }
-gix = { version = "0.85.0", default-features = false, features = ["revision", "status", "sha1"] }
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 ignore = "0.4.23"
+interprocess = "2.4.2"
 moka = { version = "0.12.15", features = ["sync"] }
 notify = "9.0.0-rc.4"
 petgraph = "0.8.3"
@@ -22,7 +23,7 @@ rayon = "1.10.0"
 rmcp = { version = "2.2.0", default-features = false, features = ["macros", "server", "transport-io"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
-tantivy = "0.26.1"
+tantivy = { version = "0.26.1", default-features = false, features = ["mmap", "lz4-compression"] }
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.2"
@@ -39,3 +40,12 @@ lto = "thin"
 # performs cross-unit optimization for the distributed binary.
 codegen-units = 16
 panic = "abort"
+
+[profile.dev]
+# Full variable-level debug info makes this dependency-heavy CLI slower to link
+# and consumes substantially more target/ space. Line tables preserve useful
+# backtraces while keeping the everyday edit/build loop lighter.
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

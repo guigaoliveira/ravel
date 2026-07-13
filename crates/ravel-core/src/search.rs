@@ -88,7 +88,7 @@ impl SymbolDict {
 ///
 /// | Op     | Time                         | Memory          |
 /// |--------|------------------------------|-----------------|
-/// | exact  | O(1) avg                     | O(N) lower map  |
+/// | exact  | O(log N + K)                 | uses lower vec  |
 /// | prefix | O(log N + K)                 | uses lower vec  |
 /// | fuzzy  | O(B · L) length-bucket scan  | O(N) buckets    |
 /// | regex  | O(N) worst, early by limit*  | —               |
@@ -161,10 +161,11 @@ impl DictRuntime {
                     if let Some(idxs) = self.by_len.get(&key) {
                         for &i in idxs {
                             let low = &self.dict.lower[i as usize];
-                            if levenshtein_at_most(&q, low, 2) {
+                            if let Some(distance) = levenshtein_at_most(&q, low, 2) {
                                 hits.push(SearchHit {
                                     value: self.dict.names[i as usize].clone(),
-                                    score_micros: 500_000,
+                                    // Exact fuzzy matches outrank one- and two-edit matches.
+                                    score_micros: 900_000 - distance as u64 * 100_000,
                                 });
                             }
                         }
@@ -200,6 +201,8 @@ impl DictRuntime {
 pub struct SearchIndex {
     dict: Option<DictRuntime>,
     tantivy: Option<TantivyBackend>,
+    /// Keeps on-disk generation files alive for the full Tantivy reader lifetime.
+    generation_guard: Option<crate::generation_gc::GenerationGuard>,
 }
 
 struct TantivyBackend {
@@ -216,6 +219,7 @@ impl std::fmt::Debug for SearchIndex {
                 &self.dict.as_ref().map(|d| d.dict.names.len()),
             )
             .field("has_tantivy", &self.tantivy.is_some())
+            .field("has_generation_guard", &self.generation_guard.is_some())
             .finish()
     }
 }
@@ -225,6 +229,7 @@ impl SearchIndex {
         Self {
             dict: Some(DictRuntime::build(dict)),
             tantivy: None,
+            generation_guard: None,
         }
     }
 
@@ -238,6 +243,7 @@ impl SearchIndex {
         Ok(Self {
             dict: Some(DictRuntime::build(dict)),
             tantivy,
+            generation_guard: None,
         })
     }
 
@@ -261,7 +267,13 @@ impl SearchIndex {
                 name,
                 stored,
             }),
+            generation_guard: None,
         })
+    }
+
+    pub fn with_generation_guard(mut self, guard: crate::generation_gc::GenerationGuard) -> Self {
+        self.generation_guard = Some(guard);
+        self
     }
 
     pub fn with_dict_and_tantivy_dir(
@@ -441,18 +453,25 @@ impl TantivyBackend {
 }
 
 fn finish_hits(mut hits: Vec<SearchHit>, limit: usize) -> Result<Vec<SearchHit>, SearchError> {
-    hits.sort_by(|left, right| left.value.cmp(&right.value));
+    hits.sort_by(|left, right| {
+        right
+            .score_micros
+            .cmp(&left.score_micros)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    // Backends index unique symbol spellings. Keep this defensive dedup for malformed/legacy
+    // indexes; equal values also have equal deterministic scores and are adjacent.
     hits.dedup_by(|a, b| a.value == b.value);
     hits.truncate(limit);
     Ok(hits)
 }
 
-fn levenshtein_at_most(a: &[char], b: &str, max_dist: usize) -> bool {
+fn levenshtein_at_most(a: &[char], b: &str, max_dist: usize) -> Option<usize> {
     let b: Vec<char> = b.chars().collect();
     let n = a.len();
     let m = b.len();
     if n.abs_diff(m) > max_dist {
-        return false;
+        return None;
     }
     let mut prev: Vec<usize> = (0..=m).collect();
     let mut curr = vec![0; m + 1];
@@ -465,11 +484,11 @@ fn levenshtein_at_most(a: &[char], b: &str, max_dist: usize) -> bool {
             row_min = row_min.min(curr[j]);
         }
         if row_min > max_dist {
-            return false;
+            return None;
         }
         std::mem::swap(&mut prev, &mut curr);
     }
-    prev[m] <= max_dist
+    (prev[m] <= max_dist).then_some(prev[m])
 }
 
 #[cfg(test)]
@@ -603,6 +622,21 @@ mod tests {
         assert!(index.search("", SearchKind::Prefix, 2).unwrap().is_empty());
         let hits = index.search("a", SearchKind::Prefix, 10).unwrap();
         assert_eq!(hits[0].value, "Apple");
+    }
+
+    #[test]
+    fn fuzzy_results_rank_by_edit_distance_then_name() {
+        let dict =
+            SymbolDict::from_names(vec!["cart".into(), "cat".into(), "cast".into()], "s".into());
+        let index = SearchIndex::from_symbol_dict(dict);
+        let hits = index.search("cat", SearchKind::Fuzzy, 10).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cat", "cart", "cast"]
+        );
+        assert!(hits[0].score_micros > hits[1].score_micros);
     }
 
     #[test]

@@ -16,7 +16,10 @@ fn binary_help_and_version_are_available() {
         .output()
         .expect("binary should execute");
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains("ravel 1.0.0"));
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("ravel {}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

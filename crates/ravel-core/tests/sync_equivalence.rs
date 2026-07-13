@@ -383,3 +383,457 @@ fn sync_re_resolves_importer_when_imported_file_is_deleted() {
 
     assert_eq!(fingerprint(&inc_engine), fingerprint(&full_engine));
 }
+
+#[test]
+fn batched_rename_matches_full_index() {
+    assert_sync_matches_full_index(
+        "rename old and new paths in one watcher batch",
+        |root| {
+            fs::rename(root.join("src/b.ts"), root.join("src/renamed.ts")).unwrap();
+            vec![root.join("src/b.ts"), root.join("src/renamed.ts")]
+        },
+        |root| {
+            seed(root);
+            fs::rename(root.join("src/b.ts"), root.join("src/renamed.ts")).unwrap();
+        },
+    );
+}
+
+#[test]
+fn structural_add_updates_ambiguous_symbol_confidence_exactly() {
+    assert_sync_matches_full_index(
+        "adding a duplicate definition changes existing reference confidence",
+        |root| {
+            write(
+                root,
+                "src/definition.ts",
+                "export function targetFn() { return 1; }\n",
+            );
+            write(
+                root,
+                "src/caller.ts",
+                "export function callerFn() { return targetFn(); }\n",
+            );
+            let engine = engine(root);
+            engine.index().unwrap();
+            write(
+                root,
+                "src/duplicate.ts",
+                "export function targetFn() { return 2; }\n",
+            );
+            vec![root.join("src/duplicate.ts")]
+        },
+        |root| {
+            seed(root);
+            write(
+                root,
+                "src/definition.ts",
+                "export function targetFn() { return 1; }\n",
+            );
+            write(
+                root,
+                "src/caller.ts",
+                "export function callerFn() { return targetFn(); }\n",
+            );
+            write(
+                root,
+                "src/duplicate.ts",
+                "export function targetFn() { return 2; }\n",
+            );
+        },
+    );
+}
+
+#[test]
+fn collapsed_rename_storm_matches_final_tree() {
+    assert_sync_matches_full_index(
+        "many rename events collapsed into one final-state batch",
+        |root| {
+            let mut changed = Vec::new();
+            let mut old = root.join("src/c.ts");
+            changed.push(old.clone());
+            for generation in 0..32 {
+                let new = root.join(format!("src/churn-{generation}.ts"));
+                fs::rename(&old, &new).unwrap();
+                changed.push(new.clone());
+                old = new;
+            }
+            changed
+        },
+        |root| {
+            seed(root);
+            fs::rename(root.join("src/c.ts"), root.join("src/churn-31.ts")).unwrap();
+        },
+    );
+}
+
+#[test]
+fn structural_tombstone_recreate_then_content_delta_matches_full_index() {
+    let inc = tempdir().unwrap();
+    seed(inc.path());
+    let inc_engine = engine(inc.path());
+    inc_engine.index().unwrap();
+    let path = inc.path().join("src/c.ts");
+    fs::remove_file(&path).unwrap();
+    inc_engine.sync(Some(std::slice::from_ref(&path))).unwrap();
+    assert!(
+        !inc_engine
+            .snapshot()
+            .unwrap()
+            .files
+            .contains_key("src/c.ts")
+    );
+    write(inc.path(), "src/c.ts", "export const recreated = 3;\n");
+    inc_engine.sync(Some(std::slice::from_ref(&path))).unwrap();
+    write(inc.path(), "src/c.ts", "export const recreated = 33;\n");
+    inc_engine.sync(Some(std::slice::from_ref(&path))).unwrap();
+
+    let full = tempdir().unwrap();
+    seed(full.path());
+    write(full.path(), "src/c.ts", "export const recreated = 33;\n");
+    let full_engine = engine(full.path());
+    full_engine.index().unwrap();
+    assert_eq!(fingerprint(&inc_engine), fingerprint(&full_engine));
+    assert!(inc_engine.validate().is_ok());
+}
+
+/// Manual baseline for structural-index work:
+/// `cargo test -p ravel-core --test sync_equivalence structural_rename_churn_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn structural_rename_churn_benchmark() {
+    let dir = tempdir().unwrap();
+    let file_count = std::env::var("RAVEL_BENCH_FILES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000);
+    let iterations = std::env::var("RAVEL_BENCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    for index in 0..file_count {
+        write(
+            dir.path(),
+            &format!("src/file-{index}.ts"),
+            &format!("export const value{index} = {index};\n"),
+        );
+    }
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+    let started = std::time::Instant::now();
+    for generation in 0..iterations {
+        let (old, new) = if generation % 2 == 0 {
+            ("src/file-0.ts", "src/file-zero.ts")
+        } else {
+            ("src/file-zero.ts", "src/file-0.ts")
+        };
+        fs::rename(dir.path().join(old), dir.path().join(new)).unwrap();
+        engine
+            .sync(Some(&[dir.path().join(old), dir.path().join(new)]))
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+    eprintln!(
+        "structural rename churn: files={file_count} iterations={iterations} total_ms={} mean_ms={:.2}",
+        elapsed.as_millis(),
+        elapsed.as_secs_f64() * 1_000.0 / f64::from(iterations)
+    );
+    assert_eq!(engine.stats().unwrap().files, file_count);
+}
+
+#[test]
+fn concurrent_syncs_serialize_without_losing_changes() {
+    let inc = tempdir().unwrap();
+    seed(inc.path());
+    let inc_engine = engine(inc.path());
+    inc_engine.index().unwrap();
+    write(inc.path(), "src/d.ts", "export const d = 4;\n");
+    write(inc.path(), "src/e.ts", "export const e = 5;\n");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = ["src/d.ts", "src/e.ts"]
+        .into_iter()
+        .map(|relative| {
+            let engine = inc_engine.clone();
+            let barrier = barrier.clone();
+            let path = inc.path().join(relative);
+            std::thread::spawn(move || {
+                barrier.wait();
+                engine.sync(Some(&[path])).unwrap();
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let full = tempdir().unwrap();
+    seed(full.path());
+    write(full.path(), "src/d.ts", "export const d = 4;\n");
+    write(full.path(), "src/e.ts", "export const e = 5;\n");
+    let full_engine = engine(full.path());
+    full_engine.index().unwrap();
+
+    assert_eq!(fingerprint(&inc_engine), fingerprint(&full_engine));
+}
+
+#[test]
+fn independent_engines_serialize_updates_without_losing_changes() {
+    let inc = tempdir().unwrap();
+    seed(inc.path());
+    let first = engine(inc.path());
+    first.index().unwrap();
+    let second = engine(inc.path());
+    write(inc.path(), "src/d.ts", "export const d = 4;\n");
+    write(inc.path(), "src/e.ts", "export const e = 5;\n");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles = [
+        (first, inc.path().join("src/d.ts")),
+        (second, inc.path().join("src/e.ts")),
+    ]
+    .into_iter()
+    .map(|(engine, path)| {
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            engine.sync(Some(&[path])).unwrap();
+        })
+    })
+    .collect::<Vec<_>>();
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let snapshot = engine(inc.path()).snapshot().unwrap();
+    assert!(snapshot.files.contains_key("src/d.ts"));
+    assert!(snapshot.files.contains_key("src/e.ts"));
+}
+
+#[test]
+fn resident_engine_observes_snapshot_published_by_another_engine() {
+    let dir = tempdir().unwrap();
+    seed(dir.path());
+    write(
+        dir.path(),
+        "src/swap.ts",
+        "export function oldSymbol() { return 1; }\n",
+    );
+    let writer = engine(dir.path());
+    writer.index().unwrap();
+    let reader = engine(dir.path());
+
+    // Populate the reader's resident graph and search caches before the external update.
+    assert!(reader.graph().unwrap().contains_node("src/a.ts"));
+    assert!(
+        reader
+            .search("newSymbol", ravel_core::search::SearchKind::Exact, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let before_generation = reader.storage().current_generation().unwrap();
+
+    // Same-size edit: generation identity must depend on content, not byte count.
+    write(
+        dir.path(),
+        "src/swap.ts",
+        "export function newSymbol() { return 1; }\n",
+    );
+    writer
+        .sync(Some(&[dir.path().join("src/swap.ts")]))
+        .unwrap();
+    let after_generation = reader.storage().current_generation().unwrap();
+    assert_ne!(before_generation, after_generation);
+    let writer_hits = writer
+        .search("newSymbol", ravel_core::search::SearchKind::Exact, 10)
+        .unwrap();
+    assert!(!writer_hits.is_empty(), "writer hits={writer_hits:?}");
+
+    let hits = reader
+        .search("newSymbol", ravel_core::search::SearchKind::Exact, 10)
+        .unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.value == "newSymbol"),
+        "reader did not refresh external symbol; hits={hits:?}, generation={:?}",
+        reader.storage().current_generation().unwrap()
+    );
+}
+
+#[test]
+fn explicit_sync_rejects_paths_outside_workspace() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    seed(dir.path());
+    write(
+        outside.path(),
+        "outside.ts",
+        "export const outside = true;\n",
+    );
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+
+    let error = engine
+        .sync(Some(&[outside.path().join("outside.ts")]))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ravel_core::engine::EngineError::PathOutsideWorkspace { .. }
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn sync_recovers_and_drains_a_persisted_pending_batch() {
+    let dir = tempdir().unwrap();
+    seed(dir.path());
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+    let queued = dir.path().join("src/queued.ts");
+    let direct = dir.path().join("src/direct.ts");
+    write(dir.path(), "src/queued.ts", "export const queued = true;\n");
+    write(dir.path(), "src/direct.ts", "export const direct = true;\n");
+
+    let pending = dir.path().join(".ravel/pending-sync/stale.json");
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    std::fs::write(&pending, serde_json::to_vec(&vec![queued]).unwrap()).unwrap();
+
+    engine.sync(Some(&[direct])).unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    assert!(snapshot.files.contains_key("src/queued.ts"));
+    assert!(snapshot.files.contains_key("src/direct.ts"));
+    assert!(!pending.exists());
+}
+
+#[test]
+fn uncontended_sync_has_no_configured_coalesce_delay() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join(".ravel.toml"),
+        "[sync]\ncoalesce_ms = 500\n",
+    )
+    .unwrap();
+    seed(dir.path());
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+    write(dir.path(), "src/fast.ts", "export const fast = true;\n");
+    let started = std::time::Instant::now();
+    engine
+        .sync(Some(&[dir.path().join("src/fast.ts")]))
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn invalid_ticket_is_quarantined_without_poisoning_valid_sync() {
+    let dir = tempdir().unwrap();
+    seed(dir.path());
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+    let queue = dir.path().join(".ravel/pending-sync");
+    fs::create_dir_all(&queue).unwrap();
+    fs::write(
+        queue.join("poison.json"),
+        serde_json::to_vec(&vec![PathBuf::from("../outside.ts")]).unwrap(),
+    )
+    .unwrap();
+    write(dir.path(), "src/valid.ts", "export const valid = true;\n");
+    engine
+        .sync(Some(&[dir.path().join("src/valid.ts")]))
+        .unwrap();
+    assert!(
+        engine
+            .snapshot()
+            .unwrap()
+            .files
+            .contains_key("src/valid.ts")
+    );
+    assert!(queue.join("poison.invalid").exists());
+}
+
+#[test]
+fn eight_independent_agents_converge_without_lost_paths() {
+    let dir = tempdir().unwrap();
+    seed(dir.path());
+    engine(dir.path()).index().unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let mut handles = Vec::new();
+    for agent in 0..8 {
+        let path = dir.path().join(format!("src/agent-{agent}.ts"));
+        fs::write(&path, format!("export const agent{agent} = {agent};\n")).unwrap();
+        let root = dir.path().to_path_buf();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let engine = engine(&root);
+            barrier.wait();
+            engine.sync(Some(&[path])).unwrap();
+        }));
+    }
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let snapshot = engine(dir.path()).snapshot().unwrap();
+    for agent in 0..8 {
+        assert!(
+            snapshot
+                .files
+                .contains_key(&format!("src/agent-{agent}.ts"))
+        );
+    }
+}
+
+#[test]
+fn repeated_content_only_syncs_keep_matching_a_full_index() {
+    let inc = tempdir().unwrap();
+    let full = tempdir().unwrap();
+    seed(inc.path());
+    seed(full.path());
+    let incremental_engine = engine(inc.path());
+    incremental_engine.index().unwrap();
+
+    for suffix in ["// first\n", "// second\n", "// third\n"] {
+        let inc_path = inc.path().join("src/a.ts");
+        let full_path = full.path().join("src/a.ts");
+        let mut inc_source = std::fs::read_to_string(&inc_path).unwrap();
+        let mut full_source = std::fs::read_to_string(&full_path).unwrap();
+        inc_source.push_str(suffix);
+        full_source.push_str(suffix);
+        std::fs::write(&inc_path, inc_source).unwrap();
+        std::fs::write(&full_path, full_source).unwrap();
+        incremental_engine.sync(Some(&[inc_path])).unwrap();
+    }
+
+    let incremental = incremental_engine.snapshot().unwrap();
+    let full_engine = engine(full.path());
+    full_engine.index().unwrap();
+    let rebuilt = full_engine.snapshot().unwrap();
+    assert_eq!(incremental.files, rebuilt.files);
+    assert_eq!(incremental.edges, rebuilt.edges);
+}
+
+#[test]
+fn artifact_delta_exposes_current_symbol_complexity_to_context() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/service.ts",
+        "export function calculate(value: number) { return value; }\n",
+    );
+    let engine = engine(dir.path());
+    engine.index().unwrap();
+    write(
+        dir.path(),
+        "src/service.ts",
+        "export function calculate(value: number) { if (value > 0) return value; return 0; }\n",
+    );
+    engine
+        .sync(Some(&[dir.path().join("src/service.ts")]))
+        .unwrap();
+
+    let detail = engine.node_detail("calculate").unwrap().unwrap();
+    assert_eq!(detail.complexity.unwrap().cyclomatic, 2);
+}

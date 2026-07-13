@@ -1,8 +1,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ravel_core::{
-    config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health, search::SearchKind,
+    analysis, config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health,
+    search::SearchKind,
 };
 use std::{path::PathBuf, time::Duration};
+
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const DAEMON_READY_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,8 +59,8 @@ enum Command {
     /// Wire Ravel MCP into coding agents (Claude, Cursor, Codex, OpenCode, Gemini, …)
     ///
     /// Examples:
-    ///   ravel install --yes
-    ///   ravel install --target claude,cursor --location global --yes
+    ///   ravel install
+    ///   ravel install --target claude,cursor --location global
     ///   ravel install --print-config codex
     Install {
         /// Agents: auto | all | csv (claude,cursor,codex,opencode,gemini,windsurf,vscode,grok)
@@ -66,7 +70,7 @@ enum Command {
         #[arg(long, default_value = "global")]
         location: String,
         /// Non-interactive
-        #[arg(long, short = 'y')]
+        #[arg(long, short = 'y', hide = true)]
         yes: bool,
         /// Print MCP snippet for one agent and exit (no writes)
         #[arg(long, value_name = "AGENT")]
@@ -84,7 +88,7 @@ enum Command {
         target: String,
         #[arg(long, default_value = "global")]
         location: String,
-        #[arg(long, short = 'y')]
+        #[arg(long, short = 'y', hide = true)]
         yes: bool,
         #[arg(long)]
         no_instructions: bool,
@@ -175,6 +179,18 @@ enum Command {
     /// Long-lived MCP stdio server with per-root file watching.
     /// Default: primary tools only (explore, status, sync). Set RAVEL_MCP_TOOLS=all for full.
     Mcp,
+    /// Manage the shared daemon for this workspace.
+    Daemon {
+        #[arg(value_enum, default_value_t = DaemonAction::Status)]
+        action: DaemonAction,
+    },
+    /// Internal daemon entrypoint used by the client startup coordinator.
+    #[command(hide = true)]
+    DaemonServe {
+        /// Exit automatically after the final MCP lease disconnects.
+        #[arg(long)]
+        transient: bool,
+    },
     /// Persistent MCP server with per-root auto-sync via file watcher.
     /// Keeps graphs in memory and syncs source changes automatically.
     /// Default: primary tools only. Set RAVEL_MCP_TOOLS=all for full surface.
@@ -190,6 +206,13 @@ enum SearchMode {
     Prefix,
     Fuzzy,
     Regex,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DaemonAction {
+    Start,
+    Status,
+    Stop,
 }
 impl From<SearchMode> for SearchKind {
     fn from(value: SearchMode) -> Self {
@@ -241,7 +264,9 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false  # keep false for <200ms hot path
+include_untracked = false
+discovery_cache_ms = 50
+coalesce_ms = 5
 skip_sibling_emit = true
 "#,
                 )?;
@@ -277,11 +302,18 @@ skip_sibling_emit = true
             emit_json(&stats, pretty)?;
         }
         Some(Command::Sync { paths }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let abs: Vec<PathBuf> = paths
                 .into_iter()
                 .map(|p| if p.is_absolute() { p } else { root.join(p) })
                 .collect();
+            if let Some(value) = daemon_call_if_running(
+                &root,
+                ravel_core::daemon::DaemonOperation::Sync { paths: abs.clone() },
+            )? {
+                emit_json(&value, pretty)?;
+                return Ok(());
+            }
+            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let stats = if abs.is_empty() {
                 engine.sync(None)?
             } else {
@@ -290,17 +322,33 @@ skip_sibling_emit = true
             emit_json(&stats, pretty)?;
         }
         Some(Command::Status) => {
+            if let Some(value) =
+                daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Status)?
+            {
+                emit_json(&value, pretty)?;
+                return Ok(());
+            }
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.status()?, pretty)?;
         }
         Some(Command::Context { query, limit }) => {
+            if let Some(value) = daemon_call_if_running(
+                &root,
+                ravel_core::daemon::DaemonOperation::Context {
+                    query: query.clone(),
+                    limit,
+                },
+            )? {
+                emit_json(&value, pretty)?;
+                return Ok(());
+            }
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.context(&query, limit)?, pretty)?;
         }
         Some(Command::Setup { claude, force }) => {
             write_agent_setup(&root, claude, force)?;
             println!("agent setup written under {}", root.display());
-            println!("tip: run `ravel install --yes` to wire MCP into Claude/Cursor/Codex/…");
+            println!("tip: run `ravel install` to wire MCP into Claude/Cursor/Codex/…");
         }
         Some(Command::Install {
             target,
@@ -419,7 +467,13 @@ skip_sibling_emit = true
         }
         Some(Command::Packages) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.list_packages()?, pretty)?;
+            let packages = match engine.storage().open_file_list()? {
+                Some(files) => {
+                    analysis::list_packages_from_paths(files.paths.iter().map(String::as_str))
+                }
+                None => engine.list_packages()?,
+            };
+            emit_json(&packages, pretty)?;
         }
         Some(Command::DiffImpact { from, to, depth }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -482,14 +536,24 @@ skip_sibling_emit = true
                 "watching {} (reindex on change; Ctrl-C to stop)",
                 root.display()
             );
+            let watch_config = engine.config.clone();
+            let storage_root = root.join(&engine.config.storage.home);
+            let watcher = ravel_core::watch::PersistentWatcher::new_filtered(
+                &root,
+                engine.config.watch.queue_capacity,
+                move |path| !path.starts_with(&storage_root) && !watch_config.is_noise(path),
+            )?;
             loop {
-                let batch = ravel_core::watch::watch_batch(
-                    &root,
-                    Duration::from_millis(200),
+                let batch = watcher.next_batch(
+                    Duration::from_millis(engine.config.watch.debounce_ms),
                     Duration::from_secs(3600),
+                    engine.config.watch.max_batch_paths,
+                    Duration::from_millis(engine.config.watch.max_batch_ms),
                 );
-                let Ok(result) = batch else {
-                    continue;
+                let result = match batch {
+                    Ok(result) => result,
+                    Err(ravel_core::watch::WatchError::Timeout) => continue,
+                    Err(error) => return Err(error.into()),
                 };
                 let cfg = &engine.config;
                 let paths: Vec<_> = result
@@ -513,6 +577,24 @@ skip_sibling_emit = true
             print!("{}", ravel_cheatsheet());
         }
         Some(Command::Mcp) => serve_mcp(&root)?,
+        Some(Command::Daemon { action }) => match action {
+            DaemonAction::Start => {
+                let _ = ensure_daemon(&root, false)?;
+                emit_json(&serde_json::json!({ "running": true }), pretty)?;
+            }
+            DaemonAction::Status => {
+                let running = ravel_core::daemon::DaemonClient::for_root(&root)
+                    .is_ok_and(|client| client.is_ready());
+                emit_json(&serde_json::json!({ "running": running }), pretty)?;
+            }
+            DaemonAction::Stop => {
+                let stopped =
+                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?
+                        .is_some();
+                emit_json(&serde_json::json!({ "stopped": stopped }), pretty)?;
+            }
+        },
+        Some(Command::DaemonServe { transient }) => ravel_core::daemon::serve(&root, transient)?,
         Some(Command::Serve { mcp }) => {
             if !mcp {
                 anyhow::bail!("use `ravel serve --mcp` to start the MCP server");
@@ -520,7 +602,9 @@ skip_sibling_emit = true
             // Persistent MCP server with per-root file watching and Git freshness checks.
             // Staleness info is embedded in explore response via auto_synced field.
             // Primary tools: explore, status, sync. Set RAVEL_MCP_TOOLS=all for full.
-            eprintln!("ravel serve --mcp (persistent, auto-sync on each call)");
+            eprintln!(
+                "ravel serve --mcp (persistent per-root watch; explore checks Git freshness)"
+            );
             serve_mcp(&root)?;
         }
         None => emit_json(&health(), pretty)?,
@@ -535,11 +619,65 @@ fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
         .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
 }
 
+fn daemon_call_if_running(
+    root: &std::path::Path,
+    operation: ravel_core::daemon::DaemonOperation,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    use ravel_core::daemon::DaemonCallError;
+    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
+    match client.call(operation) {
+        Ok(value) => Ok(Some(value)),
+        Err(DaemonCallError::Transport(_)) => Ok(None),
+        Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
+    }
+}
+
+fn ensure_daemon(
+    root: &std::path::Path,
+    transient: bool,
+) -> anyhow::Result<Option<ravel_core::daemon::DaemonClientLease>> {
+    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
+    if client.is_ready() {
+        if !transient {
+            client.call(ravel_core::daemon::DaemonOperation::PromotePersistent)?;
+            return Ok(None);
+        }
+        return client.acquire_lease().map(Some).map_err(Into::into);
+    }
+    let executable = std::env::current_exe()?;
+    let mut child = std::process::Command::new(executable)
+        .arg("--root")
+        .arg(root)
+        .arg("daemon-serve")
+        .args(transient.then_some("--transient"))
+        .stdin(if transient {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if transient {
+            if let Ok(lease) = client.acquire_lease() {
+                drop(child.stdin.take());
+                return Ok(Some(lease));
+            }
+        } else if client.is_ready() {
+            return Ok(None);
+        }
+        std::thread::sleep(DAEMON_READY_POLL);
+    }
+    anyhow::bail!("Ravel daemon did not become ready")
+}
+
 fn ravel_cheatsheet() -> &'static str {
     r#"# ravel (token-cheap code graph)
 explore SYM  → search + callers + callees + impact (ONE call)
 sync         → reindex dirty files (auto on explore)
-serve --mcp  → persistent server (auto-sync, 3 primary tools)
+serve --mcp  → persistent server (per-root watch, 3 primary tools)
 search Q --kind prefix | query N --reverse | impact N --risk
 status | cycles | hubs --limit 10 | orphans --limit 10
 JSON compact default; --pretty humans only

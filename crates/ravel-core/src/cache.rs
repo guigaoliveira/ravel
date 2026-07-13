@@ -20,7 +20,7 @@ impl ArtifactCache {
                 .support_invalidation_closures()
                 .max_capacity(max_bytes.max(1))
                 .weigher(|_, value: &Arc<FileArtifact>| {
-                    value.bytes_read.min(u32::MAX as u64) as u32
+                    value.bytes_read.clamp(1, u32::MAX as u64) as u32
                 })
                 .build(),
         }

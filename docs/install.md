@@ -50,7 +50,7 @@ Env knobs:
 | Variable | Meaning |
 |----------|---------|
 | `RAVEL_GITHUB_REPO` | `owner/repo` (default `guigaoliveira/ravel`) |
-| `RAVEL_VERSION` | `latest` or `1.0.0` |
+| `RAVEL_VERSION` | `latest` or a release such as `1.1.0` |
 | `RAVEL_INSTALL_DIR` | binary destination |
 | `RAVEL_FROM_SOURCE=1` | skip prebuilt; force cargo |
 
@@ -70,13 +70,13 @@ GitHub release installer or build from source when a platform asset is absent.
 
 ```bash
 # Auto-detect Claude Code, Cursor, Codex, OpenCode, Gemini, Windsurf, VS Code, Grok
-ravel install --yes
+ravel install
 
 # Explicit
-ravel install --target claude,cursor,codex --location global --yes
+ravel install --target claude,cursor,codex --location global
 
 # Project-local MCP only
-ravel install --target claude --location local --yes
+ravel install --target claude --location local
 
 # Preview without writing
 ravel install --print-config cursor
@@ -107,8 +107,8 @@ so agents don’t depend on PATH quirks. Project root is the agent’s cwd (`--r
 ### Uninstall agents
 
 ```bash
-ravel uninstall --yes
-ravel uninstall --target cursor --location global --yes
+ravel uninstall
+ravel uninstall --target cursor --location global
 ```
 
 `.ravel/` indexes are **not** deleted.
@@ -125,8 +125,14 @@ ravel context PaymentService
 
 Daily:
 
-- `context` / `search` / `query` auto-sync git-dirty sources
-- or `ravel sync` / `ravel watch`
+- MCP watches indexed roots automatically; use `sync(paths)` when the edited paths are known
+- CLI queries auto-sync git-dirty sources; `ravel sync <paths>` is the fastest explicit path
+- `ravel watch` is for a long-lived CLI-only session
+
+For multiple projects, pass the MCP tool's absolute `root`; relying on the MCP
+process working directory is host-dependent. Multiple MCP clients for one root
+share a transient local daemon, watcher, cache, and writer automatically.
+For a persistent CLI-only daemon, use `ravel daemon start|status|stop`.
 
 ## Doctor
 

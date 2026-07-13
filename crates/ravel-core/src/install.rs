@@ -5,9 +5,29 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     env, fs,
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     process::Command,
 };
+
+fn lock_config(path: &Path) -> anyhow::Result<File> {
+    use fs4::fs_std::FileExt;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("config"))
+        .to_os_string();
+    name.push(".ravel.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(name))?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
 
 pub const MCP_SERVER_NAME: &str = "ravel";
 pub const MARKER_BEGIN: &str = "<!-- ravel-agent-begin -->";
@@ -631,29 +651,39 @@ fn ensure_claude_allowlist(path: &Path) -> anyhow::Result<()> {
         // Don't create settings.json from scratch (user may not want defaults).
         return Ok(());
     }
+    let _lock = lock_config(path)?;
+    if !path.exists() {
+        return Ok(());
+    }
     let text = fs::read_to_string(path)?;
-    let mut root: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let mut root: Value = serde_json::from_str(&text)?;
     // Guard every downcast: a settings.json that parses to a non-object (`[]`, scalar), or
     // whose `permissions`/`allow` are the wrong JSON type, must not panic — coerce instead.
-    if !root.is_object() {
-        root = json!({});
-    }
+    anyhow::ensure!(
+        root.is_object(),
+        "{} must contain a JSON object",
+        path.display()
+    );
     let permissions = root
         .as_object_mut()
         .unwrap()
         .entry("permissions")
         .or_insert_with(|| json!({}));
-    if !permissions.is_object() {
-        *permissions = json!({});
-    }
+    anyhow::ensure!(
+        permissions.is_object(),
+        "{}.permissions must be an object",
+        path.display()
+    );
     let allow = permissions
         .as_object_mut()
         .unwrap()
         .entry("allow")
         .or_insert_with(|| json!([]));
-    if !allow.is_array() {
-        *allow = json!([]);
-    }
+    anyhow::ensure!(
+        allow.is_array(),
+        "{}.permissions.allow must be an array",
+        path.display()
+    );
     let arr = allow.as_array_mut().unwrap();
     let entry = "mcp__ravel__*";
     if !arr.iter().any(|v| v.as_str() == Some(entry)) {
@@ -688,23 +718,28 @@ fn upsert_json_mcp_servers(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _lock = lock_config(path)?;
     let mut root: Value = if path.exists() {
         let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+        serde_json::from_str(&text)?
     } else {
         json!({})
     };
-    if !root.is_object() {
-        root = json!({});
-    }
+    anyhow::ensure!(
+        root.is_object(),
+        "{} must contain a JSON object",
+        path.display()
+    );
     let servers = root
         .as_object_mut()
         .unwrap()
         .entry("mcpServers")
         .or_insert_with(|| json!({}));
-    if !servers.is_object() {
-        *servers = json!({});
-    }
+    anyhow::ensure!(
+        servers.is_object(),
+        "{}.mcpServers must be an object",
+        path.display()
+    );
     servers
         .as_object_mut()
         .unwrap()
@@ -719,6 +754,7 @@ fn remove_json_mcp_key(
     actions: &mut Vec<InstallAction>,
     key: &str,
 ) -> anyhow::Result<()> {
+    let _lock = lock_config(path)?;
     if !path.exists() {
         actions.push(InstallAction {
             agent: kind.id().into(),
@@ -763,14 +799,19 @@ fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> any
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _lock = lock_config(&path)?;
     let mut text = if path.exists() {
         fs::read_to_string(&path)?
     } else {
         String::new()
     };
+    if !text.trim().is_empty() {
+        toml::from_str::<toml::Value>(&text)?;
+    }
+    let command = serde_json::to_string(&opts.ravel_bin.to_string_lossy())?;
     let block = format!(
         "\n[mcp_servers.ravel]\ncommand = \"{}\"\nargs = [\"serve\", \"--mcp\"]\n",
-        opts.ravel_bin.display()
+        command.trim_matches('"')
     );
     if text.contains("[mcp_servers.ravel]") {
         // Replace existing block (simple line-based strip until next [section)
@@ -781,7 +822,8 @@ fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> any
         }
         text.push_str(block.trim_start());
     }
-    fs::write(&path, text)?;
+    toml::from_str::<toml::Value>(&text)?;
+    write_text_atomic(&path, &text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
         path: path.display().to_string(),
@@ -796,6 +838,7 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         InstallLocation::Global => home_dir().join(".codex").join("config.toml"),
         InstallLocation::Local => opts.project_root.join(".codex").join("config.toml"),
     };
+    let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
             agent: "codex".into(),
@@ -806,6 +849,7 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         return Ok(());
     }
     let text = fs::read_to_string(&path)?;
+    toml::from_str::<toml::Value>(&text)?;
     if !text.contains("[mcp_servers.ravel]") {
         actions.push(InstallAction {
             agent: "codex".into(),
@@ -816,7 +860,10 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         return Ok(());
     }
     let new_text = replace_toml_table(&text, "mcp_servers.ravel", "");
-    fs::write(&path, new_text)?;
+    if !new_text.trim().is_empty() {
+        toml::from_str::<toml::Value>(&new_text)?;
+    }
+    write_text_atomic(&path, &new_text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
         path: path.display().to_string(),
@@ -886,22 +933,23 @@ fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _lock = lock_config(&path)?;
     let mut root: Value = if path.exists() {
         serde_json::from_str(&fs::read_to_string(&path)?)?
     } else {
         json!({ "$schema": "https://opencode.ai/config.json" })
     };
-    if !root.is_object() {
-        root = json!({});
-    }
+    anyhow::ensure!(
+        root.is_object(),
+        "{} must contain a JSON object",
+        path.display()
+    );
     let mcp = root
         .as_object_mut()
         .unwrap()
         .entry("mcp")
         .or_insert_with(|| json!({}));
-    if !mcp.is_object() {
-        *mcp = json!({});
-    }
+    anyhow::ensure!(mcp.is_object(), "{}.mcp must be an object", path.display());
     mcp.as_object_mut().unwrap().insert(
         MCP_SERVER_NAME.into(),
         json!({
@@ -928,6 +976,7 @@ fn uninstall_opencode(
         InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
         InstallLocation::Local => opts.project_root.join("opencode.json"),
     };
+    let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
             agent: "opencode".into(),
@@ -983,14 +1032,17 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _lock = lock_config(&path)?;
     let mut root: Value = if path.exists() {
         serde_json::from_str(&fs::read_to_string(&path)?)?
     } else {
         json!({})
     };
-    if !root.is_object() {
-        root = json!({});
-    }
+    anyhow::ensure!(
+        root.is_object(),
+        "{} must contain a JSON object",
+        path.display()
+    );
     // VS Code 1.99+ uses "servers"; some forks still use mcpServers.
     let key = if root.get("servers").is_some() {
         "servers"
@@ -1004,9 +1056,11 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
         .unwrap()
         .entry(key)
         .or_insert_with(|| json!({}));
-    if !servers.is_object() {
-        *servers = json!({});
-    }
+    anyhow::ensure!(
+        servers.is_object(),
+        "{}.{key} must be an object",
+        path.display()
+    );
     servers
         .as_object_mut()
         .unwrap()
@@ -1026,6 +1080,7 @@ fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
         InstallLocation::Local => opts.project_root.join(".vscode").join("mcp.json"),
         InstallLocation::Global => dirs_config().join("Code").join("User").join("mcp.json"),
     };
+    let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
             agent: "vscode".into(),
@@ -1168,7 +1223,17 @@ fn replace_marked_section(text: &str, replacement: &str) -> String {
 
 fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {
     let pretty = serde_json::to_string_pretty(value)?;
-    fs::write(path, format!("{pretty}\n"))?;
+    write_text_atomic(path, &format!("{pretty}\n"))
+}
+
+fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -1187,7 +1252,7 @@ pub fn doctor_agents(project_root: &Path) -> Value {
                 "detected": agent_looks_installed(*a),
             })
         }).collect::<Vec<_>>(),
-        "hint": "ravel install --yes   # wire MCP into detected agents",
+        "hint": "ravel install   # wire MCP into detected agents",
     })
 }
 
@@ -1224,6 +1289,95 @@ mod tests {
         let v2: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(v2["mcpServers"].get("ravel").is_none());
         assert!(v2["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn invalid_json_is_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(&path, "{ contains: secrets").unwrap();
+        assert!(upsert_json_mcp_servers(&path, Path::new("/usr/bin/ravel"), true).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "{ contains: secrets");
+    }
+
+    #[test]
+    fn concurrent_config_updates_preserve_both_writers() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let install_path = path.clone();
+        let install_barrier = barrier.clone();
+        let install = std::thread::spawn(move || {
+            install_barrier.wait();
+            upsert_json_mcp_servers(&install_path, Path::new("/usr/bin/ravel"), true).unwrap();
+        });
+        let agent_path = path.clone();
+        let agent = std::thread::spawn(move || {
+            barrier.wait();
+            let _lock = lock_config(&agent_path).unwrap();
+            let mut value: Value =
+                serde_json::from_str(&fs::read_to_string(&agent_path).unwrap()).unwrap();
+            value["mcpServers"]["other"] = json!({ "command": "other" });
+            write_json_pretty(&agent_path, &value).unwrap();
+        });
+        install.join().unwrap();
+        agent.join().unwrap();
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["other"]["command"], "other");
+        assert_eq!(value["mcpServers"]["ravel"]["command"], "/usr/bin/ravel");
+    }
+
+    #[test]
+    fn concurrent_install_uninstall_keeps_config_valid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let install_path = path.clone();
+        let install = std::thread::spawn(move || {
+            for _ in 0..20 {
+                upsert_json_mcp_servers(&install_path, Path::new("/usr/bin/ravel"), true).unwrap();
+            }
+        });
+        let uninstall_path = path.clone();
+        let uninstall = std::thread::spawn(move || {
+            for _ in 0..20 {
+                remove_json_mcp_key(
+                    AgentKind::Cursor,
+                    &uninstall_path,
+                    &mut Vec::new(),
+                    "mcpServers",
+                )
+                .unwrap();
+            }
+        });
+        install.join().unwrap();
+        uninstall.join().unwrap();
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["other"]["command"], "x");
+    }
+
+    #[test]
+    fn invalid_codex_toml_is_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join(".codex");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        fs::write(&path, "api_key = \"").unwrap();
+        let opts = InstallOptions {
+            targets: vec![AgentKind::Codex],
+            location: InstallLocation::Local,
+            project_root: dir.path().to_path_buf(),
+            ravel_bin: PathBuf::from("/usr/bin/ravel"),
+            write_instructions: false,
+            claude_permissions: false,
+        };
+        assert!(install_codex(&opts, &mut Vec::new()).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "api_key = \"");
     }
 
     #[test]

@@ -12,12 +12,18 @@ cheaper than a full rebuild.
 
 | Mechanism | Role |
 |-----------|------|
-| Sidecars (`stats`, `graph`, `symbols`, `hubs`, `file_hashes`) | Avoid 84MB full snapshot |
+| Sidecars (`stats`, `graph`, `symbols`, `hubs`, artifact locator) | Avoid loading the full snapshot for common reads and changed-path hash checks |
 | `sync.include_untracked = false` (default) | No multi-thousand untracked walks |
 | Hash sidecar no-op | Dirty paths with same content → no republish |
 | `status` never spawns `git status` | Session start stays cheap |
 | Git optional (`mode = auto`) | No git → zero discovery cost |
-| MCP engine cache | Warm multi-query sessions avoid repeated startup work |
+| Shared per-root daemon | MCP sessions reuse one watcher, engine cache, and serialized writer |
+| Resident-only structural acceleration | Avoid global acceleration-pack hydration when a cold exact fallback is cheaper |
+
+On the 21k-file stress corpus used during the 1.1.0 work, no-op and content-only
+syncs stayed below 10ms. Structural add/delete/rename measured roughly
+130–300ms depending on whether the daemon was warm. These numbers are a local
+regression baseline, not a guarantee for other graphs or machines.
 
 ## Out of the hot path
 
@@ -46,4 +52,5 @@ auto = true
 include_untracked = false  # set true only if you need new-file auto-sync without watch
 ```
 
-Without git: use `ravel watch` or `ravel sync path/to/file.ts`.
+Without git: MCP watches requested roots automatically. For CLI-only workflows,
+use `ravel watch` or `ravel sync path/to/file.ts`.

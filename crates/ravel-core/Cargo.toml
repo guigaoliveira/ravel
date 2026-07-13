@@ -12,8 +12,9 @@ categories = ["development-tools"]
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-gix.workspace = true
+fs4.workspace = true
 ignore.workspace = true
+interprocess.workspace = true
 moka.workspace = true
 notify.workspace = true
 petgraph.workspace = true
@@ -22,6 +23,7 @@ rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tantivy.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
@@ -29,6 +31,3 @@ tree-sitter-typescript.workspace = true
 bincode = "1"
 regex = { workspace = true }
 rustc-hash = { workspace = true }
-
-[dev-dependencies]
-tempfile.workspace = true

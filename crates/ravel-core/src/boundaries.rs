@@ -216,7 +216,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         return true;
     }
     if !pattern.contains('*') {
-        return pattern == value || value.contains(pattern);
+        return pattern == value;
     }
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.is_empty() {
@@ -335,6 +335,13 @@ packages = ["controller-b"]
         let findings =
             evaluate_boundaries(dir.path(), &snap, &g, &Suppressions::default()).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn literal_pattern_is_exact_not_substring() {
+        assert!(glob_match("api", "api"));
+        assert!(!glob_match("api", "rapidapi"));
+        assert!(glob_match("*api", "rapidapi"));
     }
 
     #[test]

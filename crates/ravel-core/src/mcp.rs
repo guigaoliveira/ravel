@@ -4,7 +4,7 @@
 //! Default = **primary** tool set only (`explore`, `status`, `sync`).
 //! Set `RAVEL_MCP_TOOLS=all` for the full surface.
 
-use crate::{engine::WorkspaceEngine, graph::QueryLimits, search::SearchKind};
+use crate::{analysis, engine::WorkspaceEngine, graph::QueryLimits, search::SearchKind};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -12,7 +12,30 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+const DEFAULT_MCP_MAX_CACHED_ROOTS: usize = 8;
+
+fn max_cached_roots_from_env() -> usize {
+    parse_max_cached_roots(std::env::var("RAVEL_MCP_MAX_CACHED_ROOTS").ok().as_deref())
+}
+
+fn parse_max_cached_roots(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MCP_MAX_CACHED_ROOTS)
+}
 
 /// Which MCP tools to advertise (schema cost ∝ tool count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +62,12 @@ impl McpToolMode {
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RootRequest {
     pub root: Option<String>,
+}
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct SyncRequest {
+    pub root: Option<String>,
+    /// Explicit edited paths. Relative paths are resolved from the workspace root.
+    pub paths: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
@@ -103,9 +132,69 @@ pub struct CoChangeRequest {
 #[derive(Debug)]
 pub struct RavelMcp {
     tool_router: ToolRouter<Self>,
-    engines: Mutex<HashMap<String, std::sync::Arc<WorkspaceEngine>>>,
+    engines: Arc<Mutex<HashMap<String, EngineBinding>>>,
+    daemons: Arc<Mutex<HashMap<String, DaemonBinding>>>,
+    cache_clock: AtomicU64,
+    max_cached_roots: usize,
     mode: McpToolMode,
     default_root: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct DaemonBinding {
+    client: crate::daemon::DaemonClient,
+    _lease: crate::daemon::DaemonClientLease,
+    active: Arc<AtomicUsize>,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct EngineBinding {
+    engine: Arc<WorkspaceEngine>,
+    stop_watcher: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+    last_used: u64,
+}
+
+impl Drop for EngineBinding {
+    fn drop(&mut self) {
+        self.stop_watcher.store(true, Ordering::Release);
+    }
+}
+
+struct EngineUse {
+    engine: Arc<WorkspaceEngine>,
+    active: Arc<AtomicUsize>,
+    cache: Arc<Mutex<HashMap<String, EngineBinding>>>,
+    max_cached_roots: usize,
+}
+
+impl Deref for EngineUse {
+    type Target = WorkspaceEngine;
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl Drop for EngineUse {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        evict_inactive_engine(&mut self.cache.lock().unwrap(), self.max_cached_roots);
+    }
+}
+
+struct DaemonUse {
+    client: crate::daemon::DaemonClient,
+    active: Arc<AtomicUsize>,
+    cache: Arc<Mutex<HashMap<String, DaemonBinding>>>,
+    max_cached_roots: usize,
+}
+
+impl Drop for DaemonUse {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        evict_inactive_daemon(&mut self.cache.lock().unwrap(), self.max_cached_roots);
+    }
 }
 
 impl Default for RavelMcp {
@@ -134,13 +223,20 @@ impl RavelMcp {
         };
         Self {
             tool_router,
-            engines: Mutex::new(HashMap::new()),
+            engines: Arc::new(Mutex::new(HashMap::new())),
+            daemons: Arc::new(Mutex::new(HashMap::new())),
+            cache_clock: AtomicU64::new(0),
+            max_cached_roots: max_cached_roots_from_env(),
             mode,
             default_root,
         }
     }
 
-    fn engine(&self, root: Option<String>) -> anyhow::Result<std::sync::Arc<WorkspaceEngine>> {
+    fn next_cache_tick(&self) -> u64 {
+        self.cache_clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn engine(&self, root: Option<String>) -> anyhow::Result<EngineUse> {
         let base = root
             .map(PathBuf::from)
             .or_else(|| self.default_root.clone())
@@ -150,34 +246,191 @@ impl RavelMcp {
         let root = base.canonicalize().unwrap_or(base);
         let key = root.to_string_lossy().into_owned();
         let mut engines = self.engines.lock().unwrap();
-        if let Some(engine) = engines.get(&key) {
-            // Cheap Arc clone instead of cloning the whole engine (and its Config) per call.
-            return Ok(engine.clone());
+        let tick = self.next_cache_tick();
+        if let Some(binding) = engines.get_mut(&key) {
+            binding.last_used = tick;
+            binding.active.fetch_add(1, Ordering::AcqRel);
+            return Ok(EngineUse {
+                engine: binding.engine.clone(),
+                active: binding.active.clone(),
+                cache: self.engines.clone(),
+                max_cached_roots: self.max_cached_roots,
+            });
         }
-        let engine = std::sync::Arc::new(WorkspaceEngine::load(&root, &Default::default())?);
-        engines.insert(key, engine.clone());
-        spawn_root_watcher(root, engine.clone());
-        Ok(engine)
+        evict_inactive_engine(&mut engines, self.max_cached_roots.saturating_sub(1));
+        let engine = Arc::new(WorkspaceEngine::load(&root, &Default::default())?);
+        let active = Arc::new(AtomicUsize::new(1));
+        let stop_watcher = Arc::new(AtomicBool::new(false));
+        spawn_root_watcher(root, engine.clone(), stop_watcher.clone());
+        engines.insert(
+            key,
+            EngineBinding {
+                engine: engine.clone(),
+                stop_watcher,
+                active: active.clone(),
+                last_used: tick,
+            },
+        );
+        Ok(EngineUse {
+            engine,
+            active,
+            cache: self.engines.clone(),
+            max_cached_roots: self.max_cached_roots,
+        })
+    }
+
+    fn daemon_client(&self, root: Option<&str>) -> Option<DaemonUse> {
+        let base = root
+            .map(PathBuf::from)
+            .or_else(|| self.default_root.clone())
+            .or_else(|| std::env::current_dir().ok())?;
+        let root = base.canonicalize().unwrap_or(base);
+        let key = root.to_string_lossy().into_owned();
+        let mut daemons = self.daemons.lock().unwrap();
+        let tick = self.next_cache_tick();
+        if let Some(binding) = daemons.get_mut(&key) {
+            binding.last_used = tick;
+            binding.active.fetch_add(1, Ordering::AcqRel);
+            return Some(DaemonUse {
+                client: binding.client.clone(),
+                active: binding.active.clone(),
+                cache: self.daemons.clone(),
+                max_cached_roots: self.max_cached_roots,
+            });
+        }
+        evict_inactive_daemon(&mut daemons, self.max_cached_roots.saturating_sub(1));
+        let (client, lease) = crate::daemon::ensure_transient(&root).ok()?;
+        let active = Arc::new(AtomicUsize::new(1));
+        daemons.insert(
+            key,
+            DaemonBinding {
+                client: client.clone(),
+                _lease: lease,
+                active: active.clone(),
+                last_used: tick,
+            },
+        );
+        Some(DaemonUse {
+            client,
+            active,
+            cache: self.daemons.clone(),
+            max_cached_roots: self.max_cached_roots,
+        })
+    }
+
+    fn forget_daemon(&self, root: Option<&str>) {
+        let Some(base) = root
+            .map(PathBuf::from)
+            .or_else(|| self.default_root.clone())
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return;
+        };
+        let root = base.canonicalize().unwrap_or(base);
+        self.daemons
+            .lock()
+            .unwrap()
+            .remove(root.to_string_lossy().as_ref());
+    }
+
+    fn call_daemon(
+        &self,
+        root: Option<&str>,
+        operation: crate::daemon::DaemonOperation,
+    ) -> Result<serde_json::Value, String> {
+        let client = self
+            .daemon_client(root)
+            .ok_or_else(|| "shared daemon could not be started".to_owned())?;
+        match client.client.call(operation.clone()) {
+            Ok(value) => Ok(value),
+            Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
+            Err(crate::daemon::DaemonCallError::Transport(_)) => {
+                self.forget_daemon(root);
+                let retry = self
+                    .daemon_client(root)
+                    .ok_or_else(|| "shared daemon could not be restarted".to_owned())?;
+                retry
+                    .client
+                    .call(operation)
+                    .map_err(|error| error.to_string())
+            }
+        }
     }
 }
 
-fn spawn_root_watcher(root: PathBuf, engine: std::sync::Arc<WorkspaceEngine>) {
+fn evict_inactive_daemon(cache: &mut HashMap<String, DaemonBinding>, target_len: usize) {
+    while cache.len() > target_len {
+        let candidate = cache
+            .iter()
+            .filter(|(_, value)| value.active.load(Ordering::Acquire) == 0)
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone());
+        let Some(key) = candidate else { break };
+        cache.remove(&key);
+    }
+}
+
+fn evict_inactive_engine(cache: &mut HashMap<String, EngineBinding>, target_len: usize) {
+    while cache.len() > target_len {
+        let candidate = cache
+            .iter()
+            .filter(|(_, value)| value.active.load(Ordering::Acquire) == 0)
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone());
+        let Some(key) = candidate else { break };
+        cache.remove(&key);
+    }
+}
+
+fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<AtomicBool>) {
     if !root.is_dir() || engine.config.sync.mode == "none" {
         return;
     }
-    let debounce = Duration::from_millis(engine.config.watch.debounce_ms.max(100));
+    let debounce = Duration::from_millis(engine.config.watch.debounce_ms);
+    let max_batch = Duration::from_millis(engine.config.watch.max_batch_ms);
+    let max_batch_paths = engine.config.watch.max_batch_paths;
+    let queue_capacity = engine.config.watch.queue_capacity;
+    let watch_config = engine.config.clone();
+    let storage_root = root.join(&engine.config.storage.home);
     let _ = thread::Builder::new()
         .name("ravel-mcp-watch".into())
         .spawn(move || {
-            loop {
-                let batch =
-                    match crate::watch::watch_batch(&root, debounce, Duration::from_secs(3600)) {
-                        Ok(batch) => batch,
-                        Err(_) => {
-                            thread::sleep(Duration::from_millis(100));
-                            continue;
-                        }
-                    };
+            // MCP clients normally launch one stdio server each. Keep exactly one filesystem
+            // watcher per workspace across those processes; the blocking followers take over
+            // automatically when the leader exits and the OS releases its file lock.
+            let _watch_leader = match acquire_watcher_leadership(&root, &engine, &stop) {
+                Some(lock) => lock,
+                None => return,
+            };
+            let watcher = match crate::watch::PersistentWatcher::new_filtered(
+                &root,
+                queue_capacity,
+                move |path| !path.starts_with(&storage_root) && !watch_config.is_noise(path),
+            ) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    engine.record_update_error("watch", &error.to_string());
+                    return;
+                }
+            };
+            while !stop.load(Ordering::Acquire) {
+                let batch = match watcher.next_batch(
+                    debounce,
+                    Duration::from_secs(1),
+                    max_batch_paths,
+                    max_batch,
+                ) {
+                    Ok(batch) => batch,
+                    Err(crate::watch::WatchError::Timeout) => continue,
+                    Err(crate::watch::WatchError::Closed) => {
+                        engine.record_update_error("watch", "watch channel closed");
+                        return;
+                    }
+                    Err(error) => {
+                        engine.record_update_error("watch", &error.to_string());
+                        return;
+                    }
+                };
                 let extensions = crate::config::effective_extensions(&engine.config);
                 let paths: Vec<_> = batch
                     .paths
@@ -188,12 +441,58 @@ fn spawn_root_watcher(root: PathBuf, engine: std::sync::Arc<WorkspaceEngine>) {
                     })
                     .collect();
                 if batch.needs_reconcile {
-                    let _ = engine.index();
+                    if let Err(error) = engine.index() {
+                        engine.record_update_error("watch index", &error.to_string());
+                    }
                 } else if !paths.is_empty() {
-                    let _ = engine.sync(Some(&paths));
+                    if let Err(error) = engine.sync(Some(&paths)) {
+                        engine.record_update_error("watch sync", &error.to_string());
+                    }
                 }
             }
         });
+}
+
+fn acquire_watcher_leadership(
+    root: &std::path::Path,
+    engine: &WorkspaceEngine,
+    stop: &AtomicBool,
+) -> Option<std::fs::File> {
+    use fs4::fs_std::FileExt;
+    use std::fs::OpenOptions;
+
+    let storage = root.join(&engine.config.storage.home);
+    if let Err(error) = std::fs::create_dir_all(&storage) {
+        engine.record_update_error("watch leader", &error.to_string());
+        return None;
+    }
+    let file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(storage.join("watch.lock"))
+    {
+        Ok(file) => file,
+        Err(error) => {
+            engine.record_update_error("watch leader", &error.to_string());
+            return None;
+        }
+    };
+    while !stop.load(Ordering::Acquire) {
+        match file.try_lock_exclusive() {
+            Ok(true) => return Some(file),
+            Ok(false) => thread::sleep(Duration::from_millis(100)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                engine.record_update_error("watch leader", &error.to_string());
+                return None;
+            }
+        }
+    }
+    None
 }
 
 // ── Primary tools (default) — fewer tools = less schema overhead ────────────
@@ -205,12 +504,15 @@ impl RavelMcp {
     )]
     async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> String {
         let limit = request.limit.unwrap_or(10).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.context(&request.query, limit) {
-                Ok(v) => v.to_string(),
-                Err(error) => error_json(error.to_string()),
+        match self.call_daemon(
+            request.root.as_deref(),
+            crate::daemon::DaemonOperation::Context {
+                query: request.query.clone(),
+                limit,
             },
-            Err(error) => error_json(error.to_string()),
+        ) {
+            Ok(value) => value.to_string(),
+            Err(error) => error_json(error),
         }
     }
 
@@ -218,25 +520,31 @@ impl RavelMcp {
         description = "PRIMARY: Index status (indexed?, files/edges/snapshot_id). Session start."
     )]
     async fn status(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.status() {
-                Ok(v) => v.to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+        match self.call_daemon(
+            request.root.as_deref(),
+            crate::daemon::DaemonOperation::Status,
+        ) {
+            Ok(value) => value.to_string(),
+            Err(error) => error_json(error),
         }
     }
 
     #[tool(
-        description = "PRIMARY: Incremental reindex for explicit edits. The server also watches each root."
+        description = "PRIMARY: Incremental reindex. Pass edited paths for immediate, reliable sync; otherwise discovers Git-dirty files."
     )]
-    async fn sync(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.sync(None) {
-                Ok(s) => serde_json::to_string(&s).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+    async fn sync(&self, Parameters(request): Parameters<SyncRequest>) -> String {
+        let paths = request
+            .paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        match self.call_daemon(
+            request.root.as_deref(),
+            crate::daemon::DaemonOperation::Sync { paths },
+        ) {
+            Ok(value) => value.to_string(),
+            Err(error) => error_json(error),
         }
     }
 }
@@ -300,8 +608,18 @@ impl RavelMcp {
     #[tool(description = "List packages with language and path metadata")]
     async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
-            Ok(engine) => match engine.list_packages() {
-                Ok(pkgs) => serde_json::to_string(&pkgs).unwrap_or_else(|_| "[]".into()),
+            Ok(engine) => match engine.storage().open_file_list() {
+                Ok(Some(files)) => {
+                    let packages =
+                        analysis::list_packages_from_paths(files.paths.iter().map(String::as_str));
+                    serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
+                }
+                Ok(None) => match engine.list_packages() {
+                    Ok(packages) => {
+                        serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
+                    }
+                    Err(error) => error_json(error.to_string()),
+                },
                 Err(error) => error_json(error.to_string()),
             },
             Err(error) => error_json(error.to_string()),
@@ -329,11 +647,18 @@ impl RavelMcp {
     async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> String {
         let limit = request.limit.unwrap_or(50).max(1);
         match self.engine(request.root) {
-            Ok(engine) => match engine.files_in_package(&request.name) {
-                Ok(files) => {
-                    let page: Vec<_> = files.into_iter().take(limit).collect();
-                    serde_json::to_string(&page).unwrap_or_else(|_| "[]".into())
+            Ok(engine) => match engine.storage().open_file_list() {
+                Ok(Some(files)) => {
+                    serde_json::to_string(&files.in_package_limit(&request.name, limit))
+                        .unwrap_or_else(|_| "[]".into())
                 }
+                Ok(None) => match engine.files_in_package(&request.name) {
+                    Ok(files) => {
+                        serde_json::to_string(&files.into_iter().take(limit).collect::<Vec<_>>())
+                            .unwrap_or_else(|_| "[]".into())
+                    }
+                    Err(error) => error_json(error.to_string()),
+                },
                 Err(error) => error_json(error.to_string()),
             },
             Err(error) => error_json(error.to_string()),
@@ -508,7 +833,7 @@ impl ServerHandler for RavelMcp {
                  One structural call beats many greps/file reads. \
                  Do NOT read whole files to find callers — use tools. \
                  Editing: use agent editor; ravel maps blast radius. \
-                 The server watches each indexed root; use sync for explicit paths. \
+                 Each requested root is watched unless sync.mode=none; use sync for explicit paths. \
                  CLI: `ravel explore X` / `ravel impact X --risk`."
             ),
         )
@@ -520,6 +845,9 @@ pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
         Some(root) => RavelMcp::with_root(root),
         None => RavelMcp::new(),
     };
+    // Establish the default-root lease while stdio is alive. Tool calls remain lazy for any
+    // additional roots, but the primary workspace daemon is ready before the MCP client asks.
+    drop(server.daemon_client(None));
     server
         .serve(rmcp::transport::stdio())
         .await?
@@ -562,5 +890,80 @@ mod tests {
         let root = PathBuf::from("/tmp/ravel-mcp-root");
         let m = RavelMcp::with_root(root.clone());
         assert_eq!(m.default_root, Some(root));
+    }
+
+    #[test]
+    fn cached_root_limit_is_configurable_and_rejects_zero() {
+        assert_eq!(parse_max_cached_roots(Some("3")), 3);
+        assert_eq!(
+            parse_max_cached_roots(Some("0")),
+            DEFAULT_MCP_MAX_CACHED_ROOTS
+        );
+        assert_eq!(
+            parse_max_cached_roots(Some("invalid")),
+            DEFAULT_MCP_MAX_CACHED_ROOTS
+        );
+    }
+
+    #[test]
+    fn engine_cache_evicts_oldest_inactive_binding_and_stops_its_watcher() {
+        fn binding(root: &std::path::Path, last_used: u64, active: usize) -> EngineBinding {
+            EngineBinding {
+                engine: Arc::new(WorkspaceEngine::load(root, &Default::default()).unwrap()),
+                stop_watcher: Arc::new(AtomicBool::new(false)),
+                active: Arc::new(AtomicUsize::new(active)),
+                last_used,
+            }
+        }
+
+        let first_root = tempfile::tempdir().unwrap();
+        let busy_root = tempfile::tempdir().unwrap();
+        let newest_root = tempfile::tempdir().unwrap();
+        let first = binding(first_root.path(), 1, 0);
+        let first_stop = first.stop_watcher.clone();
+        let mut cache = HashMap::from([
+            ("first".to_owned(), first),
+            ("busy".to_owned(), binding(busy_root.path(), 0, 1)),
+            ("newest".to_owned(), binding(newest_root.path(), 2, 0)),
+        ]);
+
+        evict_inactive_engine(&mut cache, 2);
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key("first"));
+        assert!(
+            cache.contains_key("busy"),
+            "an active binding must not be evicted"
+        );
+        assert!(
+            first_stop.load(Ordering::Acquire),
+            "eviction must stop the root watcher"
+        );
+    }
+
+    #[test]
+    fn watcher_leadership_is_exclusive_and_fails_over() {
+        let root = tempfile::tempdir().unwrap();
+        let leader =
+            crate::watch::acquire_leadership(root.path(), std::path::Path::new(".ravel")).unwrap();
+        let follower_root = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            let lock =
+                crate::watch::acquire_leadership(&follower_root, std::path::Path::new(".ravel"))
+                    .unwrap();
+            sender.send(lock).unwrap();
+        });
+
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second watcher acquired leadership while the first was alive"
+        );
+        drop(leader);
+        let replacement = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("follower did not take over after leader exit");
+        drop(replacement);
+        follower.join().unwrap();
     }
 }
