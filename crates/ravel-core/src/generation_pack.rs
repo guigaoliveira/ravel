@@ -509,11 +509,17 @@ mod tests {
         fs::write(&path, &original[..original.len() - 1]).unwrap();
         assert!(GenerationPackReader::open(&path).is_err());
         fs::write(&path, &original).unwrap();
-        let mut reader = GenerationPackReader::open(&path).unwrap();
-        let offset = reader.entries["a"].offset as usize;
+        // Drop the reader before overwriting: Windows refuses to replace a file
+        // while its mmap section is open (os error 1224). A record's stored
+        // blake3 is verified on `read`, so a fresh reader still rejects the flip.
+        let offset = {
+            let reader = GenerationPackReader::open(&path).unwrap();
+            reader.entries["a"].offset as usize
+        };
         let mut corrupt = original;
         corrupt[offset] ^= 1;
         fs::write(&path, corrupt).unwrap();
+        let mut reader = GenerationPackReader::open(&path).unwrap();
         assert!(reader.read("a", 100).is_err());
     }
 

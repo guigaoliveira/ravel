@@ -57,9 +57,18 @@ const MAX_STATS_BYTES: u64 = 16 * 1024 * 1024;
 static STRUCTURAL_PUBLISH_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 static STRUCTURAL_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The failpoint stage is process-global, so gate it on the armed store's path too:
+// other tests publish structurally in parallel and must not trip an injection meant
+// for a different temp `.ravel`.
+#[cfg(test)]
+static STRUCTURAL_FAILPOINT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 fn structural_publish_failpoint(stage: u8, path: &Path) -> Result<(), StorageError> {
     if STRUCTURAL_PUBLISH_FAILPOINT.load(Ordering::Relaxed) == stage {
+        #[cfg(test)]
+        if STRUCTURAL_FAILPOINT_PATH.lock().unwrap().as_deref() != Some(path) {
+            return Ok(());
+        }
         return Err(StorageError::Invalid {
             path: path.to_path_buf(),
             message: format!("injected structural publish failure at stage {stage}"),
@@ -5553,6 +5562,7 @@ mod tests {
             shard_bits: 0,
             shards: BTreeMap::new(),
         };
+        *STRUCTURAL_FAILPOINT_PATH.lock().unwrap() = Some(store.current_path());
         for stage in 1..=3 {
             STRUCTURAL_PUBLISH_FAILPOINT.store(stage, Ordering::Relaxed);
             assert!(
@@ -5570,6 +5580,7 @@ mod tests {
             assert_eq!(store.open_current().unwrap().unwrap().id, base.id);
         }
         STRUCTURAL_PUBLISH_FAILPOINT.store(0, Ordering::Relaxed);
+        *STRUCTURAL_FAILPOINT_PATH.lock().unwrap() = None;
     }
 
     #[test]
