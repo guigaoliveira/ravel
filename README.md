@@ -72,16 +72,14 @@ continuous updates.
 
 ## Benchmarks
 
-| Project | What was measured | Corpus | Result |
-| --- | --- | --- | --- |
-| Ravel | Warm read latency | 21k-file monorepo, 235k edges | search **14 ms**, query **20 ms**, impact **23 ms**, context **53 ms** |
-| Ravel | Changed-path sync | 21k-file stress corpus | no-op/content **<10 ms**; structural edits **130–300 ms**, depending on warm state and affected graph |
+| Measured | Corpus | Result |
+| --- | --- | --- |
+| Warm read latency | 21k files, 235k edges | search 14 ms · query 20 ms · impact 23 ms · context 53 ms |
+| Changed-path sync | 21k files | no-op/content-only <10 ms · structural edits 130–300 ms |
 
-These are local tool-latency measurements, not an agent-workflow comparison or
-universal SLA. Structural edits include add, delete, and rename; cost grows with
-the affected graph. See the
-[raw measurements](https://github.com/guigaoliveira/ravel/blob/3e514a1/reports/perf-sla-2026-07-11.md)
-and [performance notes](docs/performance.md).
+Local tool latency on one machine, not an agent-workflow benchmark or an SLA.
+Structural edits (add, delete, rename) scale with the affected graph. See the
+[performance notes](docs/performance.md).
 
 ## Language support
 
@@ -123,7 +121,6 @@ a pull request.
 - [Installation](docs/install.md)
 - [Configuration](docs/config.md)
 - [Performance](docs/performance.md)
-- [Token efficiency](docs/token-efficiency.md)
 - [Changelog](CHANGELOG.md)
 
 ## License
