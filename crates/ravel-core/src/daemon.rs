@@ -397,26 +397,54 @@ impl DaemonClient {
 /// lease keeps that daemon alive for the caller and is released automatically after a crash or
 /// normal drop.
 pub fn ensure_transient(root: &Path) -> Result<(DaemonClient, DaemonClientLease), DaemonCallError> {
+    let (client, lease) = ensure_running(root, true)?;
+    let lease = lease.ok_or_else(|| {
+        DaemonCallError::Transport(io::Error::other(
+            "transient daemon started without a client lease",
+        ))
+    })?;
+    Ok((client, lease))
+}
+
+/// Ensure one daemon is ready. Concurrent callers share the singleton; persistent callers also
+/// promote a transient daemon that won the startup race.
+pub fn ensure_running(
+    root: &Path,
+    transient: bool,
+) -> Result<(DaemonClient, Option<DaemonClientLease>), DaemonCallError> {
     let client = DaemonClient::for_root(root).map_err(DaemonCallError::Transport)?;
-    if let Ok(lease) = client.acquire_lease() {
-        return Ok((client, lease));
+    if client.is_ready() {
+        if transient {
+            return client.acquire_lease().map(|lease| (client, Some(lease)));
+        }
+        client.call(DaemonOperation::PromotePersistent)?;
+        return Ok((client, None));
     }
     let executable = std::env::current_exe().map_err(DaemonCallError::Transport)?;
     let mut child = std::process::Command::new(executable)
         .arg("--root")
         .arg(root)
         .arg("daemon-serve")
-        .arg("--transient")
-        .stdin(std::process::Stdio::piped())
+        .args(transient.then_some("--transient"))
+        .stdin(if transient {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(DaemonCallError::Transport)?;
     let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if let Ok(lease) = client.acquire_lease() {
-            drop(child.stdin.take());
-            return Ok((client, lease));
+        if transient {
+            if let Ok(lease) = client.acquire_lease() {
+                drop(child.stdin.take());
+                return Ok((client, Some(lease)));
+            }
+        } else if client.is_ready() {
+            client.call(DaemonOperation::PromotePersistent)?;
+            return Ok((client, None));
         }
         if child
             .try_wait()
@@ -429,7 +457,7 @@ pub fn ensure_transient(root: &Path) -> Result<(DaemonClient, DaemonClientLease)
     }
     Err(DaemonCallError::Transport(io::Error::new(
         io::ErrorKind::TimedOut,
-        "transient daemon did not become ready",
+        "daemon did not become ready",
     )))
 }
 
@@ -708,10 +736,17 @@ fn spawn_daemon_watcher(
                     continue;
                 }
                 let _request = RequestGuard::new(&state);
+                crate::timing::note("watch.batch", || {
+                    format!(
+                        "paths={} needs_reconcile={}",
+                        paths.len(),
+                        batch.needs_reconcile
+                    )
+                });
                 let result = if batch.needs_reconcile {
-                    engine.index()
+                    engine.reconcile()
                 } else {
-                    engine.sync(Some(&paths))
+                    engine.sync_resident(Some(&paths))
                 };
                 if let Err(error) = result {
                     engine.record_update_error("daemon watch update", &error.to_string());
@@ -795,7 +830,7 @@ fn handle_connection(
             .context(&query, limit)
             .map_err(|error| error.to_string()),
         DaemonOperation::Sync { paths } => engine
-            .sync((!paths.is_empty()).then_some(paths.as_slice()))
+            .sync_resident((!paths.is_empty()).then_some(paths.as_slice()))
             .map_err(|error| error.to_string())
             .and_then(|stats| serde_json::to_value(stats).map_err(|error| error.to_string())),
         DaemonOperation::Lease => unreachable!(),

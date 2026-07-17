@@ -69,22 +69,19 @@ impl StructuralReverseIndex {
             resolver_fingerprint: resolver_fingerprint(resolver),
             ..Self::default()
         };
-        let mut traces_by_file: BTreeMap<&str, Vec<&ResolutionTrace>> = BTreeMap::new();
-        for trace in traces {
-            traces_by_file
-                .entry(trace.importer.as_str())
-                .or_default()
-                .push(trace);
-        }
+        // Resolver traces are emitted in the same path order as `artifacts`. Walk the contiguous
+        // ranges directly instead of allocating a workspace-wide map of per-file Vecs.
+        let mut trace_cursor = 0usize;
         for (path, artifact) in artifacts {
-            let contribution = FileContribution::from_artifact(
-                artifact,
-                traces_by_file
-                    .get(path.as_str())
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            );
+            let trace_start = trace_cursor;
+            while traces
+                .get(trace_cursor)
+                .is_some_and(|trace| trace.importer == *path)
+            {
+                trace_cursor += 1;
+            }
+            let contribution =
+                FileContribution::from_artifact(artifact, traces[trace_start..trace_cursor].iter());
             for candidate in &contribution.module_candidates {
                 index
                     .module_importers

@@ -2,7 +2,7 @@
 //!
 //! Layout: fixed header, aligned opaque records, trailing directory, fixed footer. The footer
 //! authenticates the directory; every directory entry authenticates its record. This module is
-//! intentionally not wired into snapshot storage yet.
+//! used by snapshot storage for independently readable generation components.
 
 use std::{
     collections::BTreeMap,
@@ -48,41 +48,27 @@ struct Entry {
     checksum: [u8; 32],
 }
 
-/// Builds one immutable pack and atomically renames it into place.
-pub struct GenerationPackWriter {
-    records: BTreeMap<String, Vec<u8>>,
+/// Writes records immediately instead of retaining every serialized component until publish.
+/// Large structural generations otherwise hold universe, reverse shards, and graph shards twice:
+/// once as Rust values and once as `Vec<u8>` records.
+pub(crate) struct StreamingGenerationPackWriter {
+    path: PathBuf,
+    parent: PathBuf,
+    tmp: PathBuf,
+    writer: BufWriter<fs::File>,
+    position: u64,
+    entries: BTreeMap<String, Entry>,
 }
 
-impl GenerationPackWriter {
-    pub fn new() -> Self {
-        Self {
-            records: BTreeMap::new(),
-        }
-    }
-
-    pub fn add(
-        &mut self,
-        key: impl Into<String>,
-        bytes: impl Into<Vec<u8>>,
-    ) -> Result<(), PackError> {
-        let key = key.into();
-        if key.is_empty() || key.len() > MAX_KEY_BYTES {
-            return Err(PackError::Invalid {
-                path: PathBuf::new(),
-                message: format!("record key length must be 1..={MAX_KEY_BYTES}"),
-            });
-        }
-        if self.records.insert(key.clone(), bytes.into()).is_some() {
-            return Err(PackError::DuplicateKey(key));
-        }
-        Ok(())
-    }
-
-    pub fn publish(self, path: impl AsRef<Path>) -> Result<(), PackError> {
-        let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| PackError::Io {
-            path: parent.to_path_buf(),
+impl StreamingGenerationPackWriter {
+    pub(crate) fn new(path: impl AsRef<Path>) -> Result<Self, PackError> {
+        let path = path.as_ref().to_path_buf();
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        fs::create_dir_all(&parent).map_err(|source| PackError::Io {
+            path: parent.clone(),
             source,
         })?;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -100,84 +86,105 @@ impl GenerationPackWriter {
                 path: tmp.clone(),
                 source,
             })?;
-        let mut position = HEADER_LEN;
-        let mut entries = BTreeMap::new();
-        for (key, bytes) in self.records {
-            let padding = padding_for(position, u64::from(ALIGNMENT));
-            if padding != 0 {
-                writer
-                    .write_all(&[0; ALIGNMENT as usize][..padding as usize])
-                    .map_err(|source| PackError::Io {
-                        path: tmp.clone(),
-                        source,
-                    })?;
-                position += padding;
-            }
-            let len = bytes.len() as u64;
-            writer.write_all(&bytes).map_err(|source| PackError::Io {
-                path: tmp.clone(),
-                source,
-            })?;
-            entries.insert(
-                key,
-                Entry {
-                    offset: position,
-                    len,
-                    checksum: *blake3::hash(&bytes).as_bytes(),
-                },
-            );
-            position = position
-                .checked_add(len)
-                .ok_or_else(|| PackError::Invalid {
-                    path: tmp.clone(),
-                    message: "pack offset overflow".into(),
-                })?;
-        }
+        Ok(Self {
+            path,
+            parent,
+            tmp,
+            writer,
+            position: HEADER_LEN,
+            entries: BTreeMap::new(),
+        })
+    }
 
-        let directory_offset = position;
-        let directory = encode_directory(&entries, &tmp)?;
-        writer
+    pub(crate) fn add(
+        &mut self,
+        key: impl Into<String>,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<(), PackError> {
+        let key = key.into();
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(PackError::Invalid {
+                path: self.path.clone(),
+                message: format!("record key length must be 1..={MAX_KEY_BYTES}"),
+            });
+        }
+        if self.entries.contains_key(&key) {
+            return Err(PackError::DuplicateKey(key));
+        }
+        let padding = padding_for(self.position, u64::from(ALIGNMENT));
+        if padding != 0 {
+            self.writer
+                .write_all(&[0; ALIGNMENT as usize][..padding as usize])
+                .map_err(|source| PackError::Io {
+                    path: self.tmp.clone(),
+                    source,
+                })?;
+            self.position += padding;
+        }
+        let bytes = bytes.as_ref();
+        let len = bytes.len() as u64;
+        self.writer
+            .write_all(bytes)
+            .map_err(|source| PackError::Io {
+                path: self.tmp.clone(),
+                source,
+            })?;
+        self.entries.insert(
+            key,
+            Entry {
+                offset: self.position,
+                len,
+                checksum: *blake3::hash(bytes).as_bytes(),
+            },
+        );
+        self.position = self
+            .position
+            .checked_add(len)
+            .ok_or_else(|| PackError::Invalid {
+                path: self.path.clone(),
+                message: "pack offset overflow".into(),
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn publish(mut self) -> Result<(), PackError> {
+        let directory = encode_directory(&self.entries, &self.tmp)?;
+        self.writer
             .write_all(&directory)
+            .and_then(|_| self.writer.write_all(FOOTER_MAGIC))
+            .and_then(|_| self.writer.write_all(&self.position.to_le_bytes()))
+            .and_then(|_| {
+                self.writer
+                    .write_all(&(directory.len() as u64).to_le_bytes())
+            })
+            .and_then(|_| self.writer.write_all(blake3::hash(&directory).as_bytes()))
+            .and_then(|_| self.writer.flush())
             .map_err(|source| PackError::Io {
-                path: tmp.clone(),
+                path: self.tmp.clone(),
                 source,
             })?;
-        writer
-            .write_all(FOOTER_MAGIC)
-            .and_then(|_| writer.write_all(&directory_offset.to_le_bytes()))
-            .and_then(|_| writer.write_all(&(directory.len() as u64).to_le_bytes()))
-            .and_then(|_| writer.write_all(blake3::hash(&directory).as_bytes()))
-            .and_then(|_| writer.flush())
-            .map_err(|source| PackError::Io {
-                path: tmp.clone(),
-                source,
-            })?;
-        // Exactly one data durability barrier per pack. Rename happens only after it succeeds.
-        writer
+        self.writer
             .get_ref()
             .sync_data()
             .map_err(|source| PackError::Io {
-                path: tmp.clone(),
+                path: self.tmp.clone(),
                 source,
             })?;
-        drop(writer);
-        crate::durable_io::atomic_replace(&tmp, path).map_err(|source| PackError::Io {
-            path: path.to_path_buf(),
-            source,
+        drop(self.writer);
+        crate::durable_io::atomic_replace(&self.tmp, &self.path).map_err(|source| {
+            PackError::Io {
+                path: self.path.clone(),
+                source,
+            }
         })?;
-        crate::durable_io::sync_parent_directory(path).map_err(|source| PackError::Io {
-            path: parent.to_path_buf(),
+        crate::durable_io::sync_parent_directory(&self.path).map_err(|source| PackError::Io {
+            path: self.parent,
             source,
         })
     }
 }
 
-impl Default for GenerationPackWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[derive(Debug)]
 pub struct GenerationPackReader {
     path: PathBuf,
     file: fs::File,
@@ -414,10 +421,10 @@ mod tests {
     fn roundtrip_alignment_and_bounded_reads() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("generation.pack");
-        let mut writer = GenerationPackWriter::new();
-        writer.add("a", b"abc".to_vec()).unwrap();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add("a", b"abc").unwrap();
         writer.add("large", vec![7; 100]).unwrap();
-        writer.publish(&path).unwrap();
+        writer.publish().unwrap();
         let mut reader = GenerationPackReader::open(&path).unwrap();
         assert_eq!(reader.keys().collect::<Vec<_>>(), vec!["a", "large"]);
         assert_eq!(reader.read("a", 3).unwrap().unwrap(), b"abc");
@@ -432,9 +439,9 @@ mod tests {
     fn truncation_and_record_corruption_are_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("generation.pack");
-        let mut writer = GenerationPackWriter::new();
-        writer.add("a", b"payload".to_vec()).unwrap();
-        writer.publish(&path).unwrap();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add("a", b"payload").unwrap();
+        writer.publish().unwrap();
         let original = fs::read(&path).unwrap();
         fs::write(&path, &original[..original.len() - 1]).unwrap();
         assert!(GenerationPackReader::open(&path).is_err());
@@ -451,9 +458,9 @@ mod tests {
     fn directory_checksum_corruption_is_rejected_before_decode() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("generation.pack");
-        let mut writer = GenerationPackWriter::new();
-        writer.add("a", b"payload".to_vec()).unwrap();
-        writer.publish(&path).unwrap();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add("a", b"payload").unwrap();
+        writer.publish().unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let footer = bytes.len() - FOOTER_LEN as usize;
         let directory_offset = u64_at(&bytes[footer..], 8) as usize;
@@ -466,9 +473,9 @@ mod tests {
     fn incomplete_temp_never_replaces_published_pack() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("generation.pack");
-        let mut writer = GenerationPackWriter::new();
-        writer.add("stable", b"ok".to_vec()).unwrap();
-        writer.publish(&path).unwrap();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add("stable", b"ok").unwrap();
+        writer.publish().unwrap();
         fs::write(path.with_extension("pack.tmp-crash"), b"crash").unwrap();
         let mut reader = GenerationPackReader::open(path).unwrap();
         assert_eq!(reader.read("stable", 2).unwrap().unwrap(), b"ok");
@@ -479,9 +486,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("generation.pack");
         for payload in [b"A".as_slice(), b"B".as_slice(), b"A".as_slice()] {
-            let mut writer = GenerationPackWriter::new();
-            writer.add("value", payload.to_vec()).unwrap();
-            writer.publish(&path).unwrap();
+            let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+            writer.add("value", payload).unwrap();
+            writer.publish().unwrap();
             let mut reader = GenerationPackReader::open(&path).unwrap();
             assert_eq!(reader.read("value", 1).unwrap().unwrap(), payload);
         }

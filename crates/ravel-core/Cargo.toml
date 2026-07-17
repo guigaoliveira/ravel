@@ -27,6 +27,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
+tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
 bincode = "1"
 regex = { workspace = true }

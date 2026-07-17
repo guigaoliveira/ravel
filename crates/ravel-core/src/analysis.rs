@@ -203,11 +203,11 @@ pub fn orphans(
     manifest_entry_files: &BTreeSet<String>,
 ) -> Vec<String> {
     let manifest_entries = crate::entries::ManifestEntryIndex::new(manifest_entry_files);
-    // Borrow from `symbols` (which outlives this map) instead of cloning every name+path.
-    let mut defined: BTreeMap<&str, &str> = BTreeMap::new(); // name -> path
+    // Borrow from `symbols` (which outlives this map) instead of cloning every id/name/path.
+    let mut defined: BTreeMap<&str, (&str, &str)> = BTreeMap::new(); // id -> (name, path)
     if let Some(meta) = symbols {
-        for e in &meta.entries {
-            defined.insert(e.name.as_str(), e.path.as_str());
+        for e in meta.entries.iter().chain(meta.duplicates.iter()) {
+            defined.insert(e.id.as_str(), (e.name.as_str(), e.path.as_str()));
         }
     }
     let is_entry = |name: &str, path: &str| -> bool {
@@ -224,20 +224,19 @@ pub fn orphans(
     };
 
     let mut out = Vec::new();
-    for (id, name) in graph.node_names().enumerate() {
-        let id = id as u32;
+    for (id, name) in graph.node_entries() {
         if graph.in_degree_id(id) == 0 && graph.out_degree_id(id) > 0 {
-            let path = defined.get(name).copied().unwrap_or(name);
-            if is_entry(name, path) {
+            let (display_name, path) = defined.get(name).copied().unwrap_or((name, name));
+            if is_entry(display_name, path) {
                 continue;
             }
             // Prefer symbol-ish nodes when we have meta; still report file hubs with no callers
-            out.push(name.to_owned());
+            out.push(display_name.to_owned());
         }
     }
     if let Some(meta) = symbols {
-        for e in &meta.entries {
-            if !graph.contains_node(&e.name) {
+        for e in meta.entries.iter().chain(meta.duplicates.iter()) {
+            if !graph.contains_node(&e.id) {
                 if is_entry(&e.name, &e.path) {
                     continue;
                 }
@@ -266,8 +265,7 @@ pub fn hubs_from_graph(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut heap: BinaryHeap<Reverse<(usize, String, usize)>> = BinaryHeap::new();
-    for (id, name) in graph.node_names().enumerate() {
-        let id = id as u32;
+    for (id, name) in graph.node_entries() {
         let in_d = graph.in_degree_id(id);
         if in_d == 0 {
             continue;
@@ -309,10 +307,15 @@ pub fn enrich_hubs(
     kind_filter: Option<&str>,
 ) -> Vec<HubEntry> {
     if let Some(meta) = symbols {
-        let by_name: FxHashMap<&str, &crate::model::SymbolMeta> =
-            meta.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+        let by_id: FxHashMap<&str, &crate::model::SymbolMeta> = meta
+            .entries
+            .iter()
+            .chain(meta.duplicates.iter())
+            .map(|e| (e.id.as_str(), e))
+            .collect();
         for h in &mut hubs {
-            if let Some(m) = by_name.get(h.name.as_str()) {
+            if let Some(m) = by_id.get(h.name.as_str()) {
+                h.name = m.qualified_name.clone();
                 h.kind = Some(m.kind.to_string());
                 h.path = Some(m.path.clone());
             }
@@ -560,6 +563,9 @@ mod tests {
                 reason: "t".into(),
             },
             type_only: false,
+            source_path: None,
+            span: None,
+            provenance: crate::model::EdgeProvenance::Ast,
         }
     }
 

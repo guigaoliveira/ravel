@@ -21,6 +21,9 @@ fn edge(from: String, to: String) -> Edge {
             reason: "bench".into(),
         },
         type_only: false,
+        source_path: None,
+        span: None,
+        provenance: ravel_core::model::EdgeProvenance::Ast,
     }
 }
 

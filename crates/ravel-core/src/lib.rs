@@ -10,7 +10,6 @@ pub mod daemon;
 mod durable_io;
 pub mod engine;
 pub mod entries;
-pub mod generation_components;
 pub mod generation_gc;
 pub mod generation_pack;
 pub mod git;
@@ -26,6 +25,7 @@ pub mod search;
 pub mod storage;
 pub mod structural;
 pub mod structural_reverse;
+pub mod timing;
 pub mod watch;
 
 use serde::{Deserialize, Serialize};

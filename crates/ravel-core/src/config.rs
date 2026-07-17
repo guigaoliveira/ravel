@@ -103,8 +103,6 @@ pub struct SyncConfig {
     pub skip_sibling_emit: bool,
     /// Reuse dirty-path discovery across near-simultaneous warm MCP calls.
     pub discovery_cache_ms: u64,
-    /// Small batching window for explicit syncs from concurrent processes in one workspace.
-    pub coalesce_ms: u64,
     pub queue_max_ticket_bytes: u64,
     pub queue_max_tickets: usize,
     pub queue_max_paths: usize,
@@ -417,7 +415,6 @@ impl Default for SyncConfig {
             include_untracked: false, // tracked-only dirty = sub-200ms auto-sync path
             skip_sibling_emit: true,
             discovery_cache_ms: 50,
-            coalesce_ms: 0,
             queue_max_ticket_bytes: 1024 * 1024,
             queue_max_tickets: 1024,
             queue_max_paths: 4096,

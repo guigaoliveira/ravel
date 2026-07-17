@@ -1,4 +1,5 @@
-use crate::model::{EdgeConfidence, EdgeKind, IndexSnapshot};
+use crate::model::{EdgeConfidence, EdgeKind, IndexSnapshot, symbol_path_from_id};
+use rustc_hash::FxHashSet;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -22,10 +23,16 @@ pub fn validate_snapshot(
     suppressions: &Suppressions,
 ) -> Vec<PolicyFinding> {
     let mut findings = Vec::new();
+    let symbol_ids: FxHashSet<&str> = snapshot
+        .files
+        .values()
+        .flat_map(|artifact| artifact.symbols.iter().map(|symbol| symbol.id.as_str()))
+        .collect();
     for edge in &snapshot.edges {
         // `snapshot.files` is already a keyed map — no need to collect a second BTreeSet.
         if matches!(edge.confidence, EdgeConfidence::Resolved { .. })
             && !snapshot.files.contains_key(edge.to.as_str())
+            && !symbol_ids.contains(edge.to.as_str())
         {
             findings.push(PolicyFinding {
                 code: "dangling_edge".into(),
@@ -34,7 +41,9 @@ pub fn validate_snapshot(
                 message: "resolved edge points to a missing file".into(),
             });
         }
-        if edge.kind == EdgeKind::Import && edge.from.split('/').next() != edge.to.split('/').next()
+        let target_path = symbol_path_from_id(&edge.to).unwrap_or(&edge.to);
+        if edge.kind == EdgeKind::Import
+            && edge.from.split('/').next() != target_path.split('/').next()
         {
             findings.push(PolicyFinding {
                 code: "cross_package".into(),
@@ -96,6 +105,9 @@ mod tests {
                     reason: "x".into(),
                 },
                 type_only: false,
+                source_path: None,
+                span: None,
+                provenance: crate::model::EdgeProvenance::Ast,
             }],
         };
         let findings = validate_snapshot(&snapshot, &Suppressions::default());

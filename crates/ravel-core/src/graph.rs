@@ -1,11 +1,14 @@
-use crate::model::{Edge, IndexSnapshot};
+use crate::{
+    incremental_graph::{IncrementalGraphOverlay, OwnedEdge},
+    model::{Edge, EdgeConfidence, EdgeKind, EdgeProvenance, IndexSnapshot, Span},
+};
 use petgraph::{
     algo::{kosaraju_scc, toposort},
     graph::{DiGraph, NodeIndex},
 };
 use rustc_hash::FxHashMap;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -64,6 +67,33 @@ pub struct CompactGraph {
     pub forward: Vec<Vec<u32>>,
     pub reverse: Vec<Vec<u32>>,
     pub edge_count: u32,
+    pub relations: Vec<CompactRelation>,
+    pub forward_relation_ids: Vec<Vec<u32>>,
+    pub reverse_relation_ids: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CompactRelation {
+    pub from: u32,
+    pub to: u32,
+    pub kind: EdgeKind,
+    pub source_path: Option<u32>,
+    pub span: Option<Span>,
+    /// 0 resolved, 1 candidate, 2 unresolved.
+    pub confidence: u8,
+    pub type_only: bool,
+    pub provenance: EdgeProvenance,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct RelationView {
+    pub node: String,
+    pub kind: EdgeKind,
+    pub source_path: Option<String>,
+    pub span: Option<Span>,
+    pub confidence: &'static str,
+    pub type_only: bool,
+    pub provenance: EdgeProvenance,
 }
 
 /// Borrowed, serialize-only mirror of [`CompactGraph`] (identical field order/types → same
@@ -75,6 +105,9 @@ pub struct CompactGraphRef<'a> {
     pub forward: &'a [Vec<u32>],
     pub reverse: &'a [Vec<u32>],
     pub edge_count: u32,
+    pub relations: &'a [CompactRelation],
+    pub forward_relation_ids: &'a [Vec<u32>],
+    pub reverse_relation_ids: &'a [Vec<u32>],
 }
 
 #[derive(Debug)]
@@ -85,6 +118,14 @@ pub struct GraphIndex {
     forward: Vec<Vec<u32>>,
     reverse: Vec<Vec<u32>>,
     edge_count: usize,
+    relations: Vec<CompactRelation>,
+    forward_relation_ids: Vec<Vec<u32>>,
+    reverse_relation_ids: Vec<Vec<u32>>,
+    relation_file_overlays: BTreeMap<String, Option<BTreeSet<Arc<OwnedEdge>>>>,
+    relation_overlay_nodes: BTreeSet<String>,
+    overlay_forward_relations: BTreeMap<String, Vec<Arc<OwnedEdge>>>,
+    overlay_reverse_relations: BTreeMap<String, Vec<Arc<OwnedEdge>>>,
+    inactive_nodes: BTreeSet<u32>,
     snapshot_id: String,
     package_graph: OnceLock<DiGraph<String, ()>>,
 }
@@ -102,12 +143,16 @@ impl GraphIndex {
         let mut nodes: Vec<Arc<str>> = Vec::with_capacity(cap);
         let mut forward: Vec<Vec<u32>> = Vec::with_capacity(cap);
         let mut reverse: Vec<Vec<u32>> = Vec::with_capacity(cap);
+        let mut forward_relation_ids: Vec<Vec<u32>> = Vec::with_capacity(cap);
+        let mut reverse_relation_ids: Vec<Vec<u32>> = Vec::with_capacity(cap);
 
         let intern = |name: &str,
                       nodes: &mut Vec<Arc<str>>,
                       node_index: &mut FxHashMap<Arc<str>, u32>,
                       forward: &mut Vec<Vec<u32>>,
-                      reverse: &mut Vec<Vec<u32>>|
+                      reverse: &mut Vec<Vec<u32>>,
+                      forward_relation_ids: &mut Vec<Vec<u32>>,
+                      reverse_relation_ids: &mut Vec<Vec<u32>>|
          -> u32 {
             if let Some(&id) = node_index.get(name) {
                 return id;
@@ -118,8 +163,12 @@ impl GraphIndex {
             node_index.insert(name, id);
             forward.push(Vec::new());
             reverse.push(Vec::new());
+            forward_relation_ids.push(Vec::new());
+            reverse_relation_ids.push(Vec::new());
             id
         };
+
+        let mut relations = Vec::with_capacity(edges.len());
 
         for edge in edges {
             let from = intern(
@@ -128,6 +177,8 @@ impl GraphIndex {
                 &mut node_index,
                 &mut forward,
                 &mut reverse,
+                &mut forward_relation_ids,
+                &mut reverse_relation_ids,
             );
             let to = intern(
                 &edge.to,
@@ -135,10 +186,72 @@ impl GraphIndex {
                 &mut node_index,
                 &mut forward,
                 &mut reverse,
+                &mut forward_relation_ids,
+                &mut reverse_relation_ids,
             );
+            let source_path = edge.source_path.as_deref().map(|path| {
+                intern(
+                    path,
+                    &mut nodes,
+                    &mut node_index,
+                    &mut forward,
+                    &mut reverse,
+                    &mut forward_relation_ids,
+                    &mut reverse_relation_ids,
+                )
+            });
             forward[from as usize].push(to);
             reverse[to as usize].push(from);
+            let relation_id = relations.len() as u32;
+            relations.push(CompactRelation {
+                from,
+                to,
+                kind: edge.kind.clone(),
+                source_path,
+                span: edge.span,
+                confidence: match edge.confidence {
+                    EdgeConfidence::Resolved { .. } => 0,
+                    EdgeConfidence::Candidate { .. } => 1,
+                    EdgeConfidence::Unresolved { .. } => 2,
+                },
+                type_only: edge.type_only,
+                provenance: edge.provenance.clone(),
+            });
+            forward_relation_ids[from as usize].push(relation_id);
+            reverse_relation_ids[to as usize].push(relation_id);
         }
+
+        // Multiple AST sites may connect the same two declarations. Traversal and risk operate
+        // on unique neighbors; counting duplicate sites as separate dependencies inflates degree
+        // and can change risk without changing the actual blast radius.
+        for neighbors in forward.iter_mut().chain(reverse.iter_mut()) {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+        // Agent context consumes a bounded prefix. Persist semantic sites before module plumbing
+        // so a high-import symbol still exposes its calls/instantiations without scanning or
+        // allocating the full degree at query time.
+        let relation_key = |relation_id: &u32| {
+            let relation = &relations[*relation_id as usize];
+            (
+                relation_display_priority(&relation.kind),
+                relation
+                    .source_path
+                    .and_then(|path| nodes.get(path as usize))
+                    .map(AsRef::as_ref)
+                    .unwrap_or(""),
+                relation.span,
+                relation.from,
+                relation.to,
+            )
+        };
+        for relation_ids in forward_relation_ids
+            .iter_mut()
+            .chain(reverse_relation_ids.iter_mut())
+        {
+            relation_ids.sort_unstable_by_key(&relation_key);
+        }
+        let edge_count = relations.len();
 
         // Neighbor order is not required for correct query pages (items are sorted).
         Self {
@@ -146,7 +259,15 @@ impl GraphIndex {
             node_index,
             forward,
             reverse,
-            edge_count: edges.len(),
+            edge_count,
+            relations,
+            forward_relation_ids,
+            reverse_relation_ids,
+            relation_file_overlays: BTreeMap::new(),
+            relation_overlay_nodes: BTreeSet::new(),
+            overlay_forward_relations: BTreeMap::new(),
+            overlay_reverse_relations: BTreeMap::new(),
+            inactive_nodes: BTreeSet::new(),
             snapshot_id,
             package_graph: OnceLock::new(),
         }
@@ -168,6 +289,14 @@ impl GraphIndex {
             forward: compact.forward,
             reverse: compact.reverse,
             edge_count,
+            relations: compact.relations,
+            forward_relation_ids: compact.forward_relation_ids,
+            reverse_relation_ids: compact.reverse_relation_ids,
+            relation_file_overlays: BTreeMap::new(),
+            relation_overlay_nodes: BTreeSet::new(),
+            overlay_forward_relations: BTreeMap::new(),
+            overlay_reverse_relations: BTreeMap::new(),
+            inactive_nodes: BTreeSet::new(),
             snapshot_id: compact.snapshot_id,
             package_graph: OnceLock::new(),
         }
@@ -180,6 +309,9 @@ impl GraphIndex {
             forward: self.forward.clone(),
             reverse: self.reverse.clone(),
             edge_count: self.edge_count as u32,
+            relations: self.relations.clone(),
+            forward_relation_ids: self.forward_relation_ids.clone(),
+            reverse_relation_ids: self.reverse_relation_ids.clone(),
         }
     }
 
@@ -192,7 +324,234 @@ impl GraphIndex {
             forward: &self.forward,
             reverse: &self.reverse,
             edge_count: self.edge_count as u32,
+            relations: &self.relations,
+            forward_relation_ids: &self.forward_relation_ids,
+            reverse_relation_ids: &self.reverse_relation_ids,
         }
+    }
+
+    /// Return at most `limit` detailed sites while reporting the complete relation count.
+    /// This keeps high-degree agent queries O(limit) in allocations instead of O(degree).
+    pub fn direct_relations_limit(
+        &self,
+        node: &str,
+        reverse: bool,
+        limit: usize,
+    ) -> (Vec<RelationView>, usize) {
+        let Some(&node_id) = self.node_index.get(node) else {
+            return (Vec::new(), 0);
+        };
+        let relation_ids = if reverse {
+            self.reverse_relation_ids.get(node_id as usize)
+        } else {
+            self.forward_relation_ids.get(node_id as usize)
+        };
+        if self.relation_overlay_nodes.contains(node) {
+            let mut items = relation_ids
+                .into_iter()
+                .flatten()
+                .filter_map(|relation_id| self.relations.get(*relation_id as usize))
+                .filter(|relation| {
+                    relation
+                        .source_path
+                        .and_then(|id| self.nodes.get(id as usize))
+                        .is_none_or(|path| !self.relation_file_overlays.contains_key(path.as_ref()))
+                })
+                .map(|relation| self.relation_view(relation, reverse))
+                .collect::<Vec<_>>();
+            let overlay_relations = if reverse {
+                self.overlay_reverse_relations.get(node)
+            } else {
+                self.overlay_forward_relations.get(node)
+            };
+            items.extend(
+                overlay_relations
+                    .into_iter()
+                    .flatten()
+                    .map(|edge| RelationView {
+                        node: if reverse {
+                            edge.from.clone()
+                        } else {
+                            edge.to.clone()
+                        },
+                        kind: edge.kind.clone(),
+                        source_path: edge.source_path.clone(),
+                        span: edge.span,
+                        confidence: match edge.confidence_kind {
+                            0 => "resolved",
+                            1 => "candidate",
+                            _ => "unresolved",
+                        },
+                        type_only: edge.type_only,
+                        provenance: edge.provenance.clone(),
+                    }),
+            );
+            items.sort_unstable_by(|left, right| {
+                (
+                    relation_display_priority(&left.kind),
+                    left.source_path.as_deref().unwrap_or(""),
+                    left.span,
+                    left.node.as_str(),
+                )
+                    .cmp(&(
+                        relation_display_priority(&right.kind),
+                        right.source_path.as_deref().unwrap_or(""),
+                        right.span,
+                        right.node.as_str(),
+                    ))
+            });
+            let total = items.len();
+            items.truncate(limit);
+            return (items, total);
+        }
+        let total = relation_ids.map_or(0, Vec::len);
+        let items = relation_ids
+            .into_iter()
+            .flatten()
+            .take(limit)
+            .filter_map(|relation_id| self.relations.get(*relation_id as usize))
+            .map(|relation| self.relation_view(relation, reverse))
+            .collect();
+        (items, total)
+    }
+
+    fn relation_view(&self, relation: &CompactRelation, reverse: bool) -> RelationView {
+        let related = if reverse { relation.from } else { relation.to };
+        RelationView {
+            node: self.nodes[related as usize].to_string(),
+            kind: relation.kind.clone(),
+            source_path: relation
+                .source_path
+                .and_then(|id| self.nodes.get(id as usize))
+                .map(ToString::to_string),
+            span: relation.span,
+            confidence: match relation.confidence {
+                0 => "resolved",
+                1 => "candidate",
+                _ => "unresolved",
+            },
+            type_only: relation.type_only,
+            provenance: relation.provenance.clone(),
+        }
+    }
+
+    /// Apply a persisted per-file graph delta without expanding the global edge set.
+    pub(crate) fn apply_incremental_overlay(
+        &mut self,
+        overlay: &IncrementalGraphOverlay,
+        snapshot_id: &str,
+        edge_count: usize,
+    ) {
+        for path in &overlay.file_tombstones {
+            self.relation_file_overlays.insert(path.clone(), None);
+        }
+        for (path, edges) in &overlay.file_upserts {
+            self.relation_file_overlays.insert(
+                path.clone(),
+                Some(edges.iter().cloned().map(Arc::new).collect()),
+            );
+        }
+        self.relation_overlay_nodes.extend(
+            overlay
+                .edge_counts
+                .keys()
+                .flat_map(|edge| [edge.from.clone(), edge.to.clone()]),
+        );
+
+        let mut touched_ids = BTreeSet::new();
+        let full_nodes: BTreeSet<_> = overlay
+            .forward_refcounts
+            .keys()
+            .chain(overlay.reverse_refcounts.keys())
+            .map(String::as_str)
+            .collect();
+        for node in full_nodes {
+            let id = self.intern_node(node);
+            touched_ids.insert(id);
+            if let Some(neighbors) = overlay.forward_refcounts.get(node) {
+                self.forward[id as usize] = neighbors
+                    .iter()
+                    .flat_map(|neighbors| neighbors.keys())
+                    .map(|neighbor| self.intern_node(neighbor))
+                    .collect();
+            }
+            if let Some(neighbors) = overlay.reverse_refcounts.get(node) {
+                self.reverse[id as usize] = neighbors
+                    .iter()
+                    .flat_map(|neighbors| neighbors.keys())
+                    .map(|neighbor| self.intern_node(neighbor))
+                    .collect();
+            }
+        }
+        for (changes, forward) in [
+            (&overlay.forward_changes, true),
+            (&overlay.reverse_changes, false),
+        ] {
+            for (node, neighbors) in changes {
+                let id = self.intern_node(node);
+                touched_ids.insert(id);
+                let resolved: Vec<(u32, bool)> = neighbors
+                    .iter()
+                    .map(|(neighbor, count)| (self.intern_node(neighbor), count.is_some()))
+                    .collect();
+                let list = if forward {
+                    &mut self.forward[id as usize]
+                } else {
+                    &mut self.reverse[id as usize]
+                };
+                for (neighbor_id, present) in resolved {
+                    if present {
+                        if !list.contains(&neighbor_id) {
+                            list.push(neighbor_id);
+                        }
+                    } else {
+                        list.retain(|&existing| existing != neighbor_id);
+                    }
+                }
+            }
+        }
+        for id in touched_ids {
+            if self.forward[id as usize].is_empty() && self.reverse[id as usize].is_empty() {
+                self.inactive_nodes.insert(id);
+            } else {
+                self.inactive_nodes.remove(&id);
+            }
+        }
+        self.edge_count = edge_count;
+        self.snapshot_id.clear();
+        self.snapshot_id.push_str(snapshot_id);
+        self.package_graph = OnceLock::new();
+    }
+
+    /// Build node-local relation lookups once after all persisted overlays have been applied.
+    pub(crate) fn finish_incremental_overlays(&mut self) {
+        self.overlay_forward_relations.clear();
+        self.overlay_reverse_relations.clear();
+        for edge in self.relation_file_overlays.values().flatten().flatten() {
+            self.overlay_forward_relations
+                .entry(edge.from.clone())
+                .or_default()
+                .push(Arc::clone(edge));
+            self.overlay_reverse_relations
+                .entry(edge.to.clone())
+                .or_default()
+                .push(Arc::clone(edge));
+        }
+    }
+
+    fn intern_node(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.node_index.get(name) {
+            return id;
+        }
+        let id = self.nodes.len() as u32;
+        let name: Arc<str> = Arc::from(name);
+        self.nodes.push(Arc::clone(&name));
+        self.node_index.insert(name, id);
+        self.forward.push(Vec::new());
+        self.reverse.push(Vec::new());
+        self.forward_relation_ids.push(Vec::new());
+        self.reverse_relation_ids.push(Vec::new());
+        id
     }
 
     pub fn callers_of(
@@ -275,11 +634,25 @@ impl GraphIndex {
     }
 
     pub fn contains_node(&self, name: &str) -> bool {
-        self.node_index.contains_key(name)
+        self.node_index
+            .get(name)
+            .is_some_and(|id| !self.inactive_nodes.contains(id))
     }
 
     pub fn node_names(&self) -> impl Iterator<Item = &str> {
-        self.nodes.iter().map(AsRef::as_ref)
+        self.node_entries().map(|(_, name)| name)
+    }
+
+    /// Active compact node IDs paired with their names.
+    ///
+    /// Consumers that use ID-based adjacency must not derive IDs with
+    /// `node_names().enumerate()`: inactive overlay nodes make the dense
+    /// iterator position diverge from the stable compact ID.
+    pub fn node_entries(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.nodes.iter().enumerate().filter_map(|(id, name)| {
+            let id = id as u32;
+            (!self.inactive_nodes.contains(&id)).then_some((id, name.as_ref()))
+        })
     }
 
     pub fn in_degree(&self, name: &str) -> usize {
@@ -314,16 +687,21 @@ impl GraphIndex {
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len().saturating_sub(self.inactive_nodes.len())
     }
 
     /// Node name → compact ID. Returns `None` if the name is not in the graph.
     pub fn node_id(&self, name: &str) -> Option<u32> {
-        self.node_index.get(name).copied()
+        self.node_index
+            .get(name)
+            .copied()
+            .filter(|id| !self.inactive_nodes.contains(id))
     }
 
     pub fn node_name(&self, id: u32) -> Option<&str> {
-        self.nodes.get(id as usize).map(AsRef::as_ref)
+        (!self.inactive_nodes.contains(&id))
+            .then(|| self.nodes.get(id as usize).map(AsRef::as_ref))
+            .flatten()
     }
 
     /// In-degree lookup when the caller already has the compact node ID.
@@ -369,6 +747,9 @@ impl GraphIndex {
                 rustc_hash::FxHashSet::default();
 
             for (from_idx, neighbors) in self.forward.iter().enumerate() {
+                if self.inactive_nodes.contains(&(from_idx as u32)) {
+                    continue;
+                }
                 let from_index = match package_nodes.get(node_pkg[from_idx].as_str()) {
                     Some(&idx) => idx,
                     None => {
@@ -378,6 +759,9 @@ impl GraphIndex {
                     }
                 };
                 for &to_idx in neighbors {
+                    if self.inactive_nodes.contains(&to_idx) {
+                        continue;
+                    }
                     let to_pkg = node_pkg[to_idx as usize].as_str();
                     let to_index = match package_nodes.get(to_pkg) {
                         Some(&idx) => idx,
@@ -410,7 +794,11 @@ impl GraphIndex {
         let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
 
         // Unknown node: empty expansion, still a valid bounded page.
-        let Some(&start) = self.node_index.get(node) else {
+        let Some(&start) = self
+            .node_index
+            .get(node)
+            .filter(|id| !self.inactive_nodes.contains(id))
+        else {
             return Ok((
                 QueryPage {
                     snapshot_id: self.snapshot_id.clone(),
@@ -516,7 +904,24 @@ impl GraphIndex {
     }
 }
 
+fn relation_display_priority(kind: &EdgeKind) -> u8 {
+    match kind {
+        EdgeKind::Calls => 0,
+        EdgeKind::Instantiates => 1,
+        EdgeKind::Decorates => 2,
+        EdgeKind::References => 3,
+        EdgeKind::TypeOf => 4,
+        EdgeKind::Extends | EdgeKind::Implements => 5,
+        EdgeKind::Import => 6,
+        EdgeKind::ReExport => 7,
+    }
+}
+
 fn package_name(path: &str) -> String {
+    let path = path
+        .strip_prefix("symbol://")
+        .and_then(|value| value.split_once('#').map(|(path, _)| path))
+        .unwrap_or(path);
     // No intermediate Vec: return the segment after the first apps|libs|packages
     // marker, else the first segment, else "workspace". `split` is lazy/zero-alloc.
     let first = path.split('/').next();
@@ -566,6 +971,16 @@ mod tests {
                 reason: "test".into(),
             },
             type_only: false,
+            source_path: Some("site.ts".into()),
+            span: Some(Span {
+                start_byte: 10,
+                end_byte: 11,
+                start_line: 2,
+                start_column: 4,
+                end_line: 2,
+                end_column: 5,
+            }),
+            provenance: EdgeProvenance::Ast,
         }
     }
 
@@ -580,6 +995,19 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.visited_nodes, 1);
         assert_eq!(graph.package_cycles().len(), 1);
+    }
+
+    #[test]
+    fn bounded_relation_views_prioritize_semantic_sites_over_import_plumbing() {
+        let mut import = edge("consumer.ts", "target");
+        import.kind = EdgeKind::Import;
+        let mut call = edge("caller", "target");
+        call.kind = EdgeKind::Calls;
+        let graph = GraphIndex::from_edges(&[import, call], "snapshot".into());
+        let (relations, total) = graph.direct_relations_limit("target", true, 1);
+        assert_eq!(total, 2);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].kind, EdgeKind::Calls);
     }
 
     #[test]
@@ -627,6 +1055,12 @@ mod tests {
             .unwrap();
         assert_eq!(page.items, vec!["b".to_string(), "c".to_string()]);
         assert_eq!(restored.edge_count(), 3);
+        let (relations, total) = restored.direct_relations_limit("a", false, usize::MAX);
+        assert_eq!(total, 1);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].node, "b");
+        assert_eq!(relations[0].source_path.as_deref(), Some("site.ts"));
+        assert_eq!(relations[0].span.unwrap().start_line, 2);
     }
 
     #[test]

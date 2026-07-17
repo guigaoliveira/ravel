@@ -5,8 +5,7 @@ use ravel_core::{
 };
 use std::{path::PathBuf, time::Duration};
 
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
-const DAEMON_READY_POLL: Duration = Duration::from_millis(20);
+const CLI_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -206,6 +205,7 @@ enum SearchMode {
     Prefix,
     Fuzzy,
     Regex,
+    Terms,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -221,6 +221,7 @@ impl From<SearchMode> for SearchKind {
             SearchMode::Prefix => Self::Prefix,
             SearchMode::Fuzzy => Self::Fuzzy,
             SearchMode::Regex => Self::Regex,
+            SearchMode::Terms => Self::Terms,
         }
     }
 }
@@ -266,7 +267,6 @@ mode = "auto"              # auto | git | none
 auto = true
 include_untracked = false
 discovery_cache_ms = 50
-coalesce_ms = 5
 skip_sibling_emit = true
 "#,
                 )?;
@@ -546,7 +546,7 @@ skip_sibling_emit = true
             loop {
                 let batch = watcher.next_batch(
                     Duration::from_millis(engine.config.watch.debounce_ms),
-                    Duration::from_secs(3600),
+                    CLI_WATCH_IDLE_TIMEOUT,
                     engine.config.watch.max_batch_paths,
                     Duration::from_millis(engine.config.watch.max_batch_ms),
                 );
@@ -565,7 +565,7 @@ skip_sibling_emit = true
                     continue;
                 }
                 let stats = if result.needs_reconcile || paths.is_empty() {
-                    engine.index()?
+                    engine.reconcile()?
                 } else {
                     engine.sync(Some(&paths))?
                 };
@@ -636,46 +636,14 @@ fn ensure_daemon(
     root: &std::path::Path,
     transient: bool,
 ) -> anyhow::Result<Option<ravel_core::daemon::DaemonClientLease>> {
-    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
-    if client.is_ready() {
-        if !transient {
-            client.call(ravel_core::daemon::DaemonOperation::PromotePersistent)?;
-            return Ok(None);
-        }
-        return client.acquire_lease().map(Some).map_err(Into::into);
-    }
-    let executable = std::env::current_exe()?;
-    let mut child = std::process::Command::new(executable)
-        .arg("--root")
-        .arg(root)
-        .arg("daemon-serve")
-        .args(transient.then_some("--transient"))
-        .stdin(if transient {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if transient {
-            if let Ok(lease) = client.acquire_lease() {
-                drop(child.stdin.take());
-                return Ok(Some(lease));
-            }
-        } else if client.is_ready() {
-            return Ok(None);
-        }
-        std::thread::sleep(DAEMON_READY_POLL);
-    }
-    anyhow::bail!("Ravel daemon did not become ready")
+    ravel_core::daemon::ensure_running(root, transient)
+        .map(|(_, lease)| lease)
+        .map_err(Into::into)
 }
 
 fn ravel_cheatsheet() -> &'static str {
     r#"# ravel (token-cheap code graph)
-explore SYM  → search + callers + callees + impact (ONE call)
+explore Q    → exact/qualified symbol or natural terms + source + relations (ONE call)
 sync         → reindex dirty files (auto on explore)
 serve --mcp  → persistent server (per-root watch, 3 primary tools)
 search Q --kind prefix | query N --reverse | impact N --risk

@@ -79,7 +79,6 @@ auto = true
 include_untracked = false  # default fast path (tracked only); true = slower
 skip_sibling_emit = true
 discovery_cache_ms = 50    # reuse near-simultaneous warm MCP discovery
-coalesce_ms = 0            # compatibility only; batching is contention-driven, without sleep
 queue_max_ticket_bytes = 1048576
 queue_max_tickets = 1024
 queue_max_paths = 4096

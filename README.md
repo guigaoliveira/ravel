@@ -56,8 +56,8 @@ VS Code, and Grok. Restart agents that were already running.
 ## Use
 
 ```bash
-ravel context SYMBOL                  # callers, callees, and impact
-ravel search QUERY --kind prefix      # symbol names: exact, prefix, fuzzy, or regex
+ravel context QUERY                   # exact/qualified symbol or natural terms + source/relations
+ravel search QUERY --kind terms       # exact, prefix, fuzzy, regex, or lexical terms
 ravel query SYMBOL --reverse          # reverse dependencies
 ravel impact SYMBOL --risk            # blast radius and risk
 ravel diff-impact HEAD~1              # impact of a Git diff
@@ -92,7 +92,11 @@ and [performance notes](docs/performance.md).
 | JavaScript | `.js`, `.mjs`, `.cjs` |
 | JSX | `.jsx` |
 
-All are detected automatically with symbol, import, call, and graph analysis.
+All are detected automatically. Static extraction covers ESM and CommonJS
+imports/exports, declarations and types, calls and construction, decorators,
+class elements, JSX component references, resource management, import
+attributes, and TypeScript 5.9 `import defer`. Dynamic dispatch remains
+conservatively unresolved rather than producing guessed edges.
 
 ## MCP
 

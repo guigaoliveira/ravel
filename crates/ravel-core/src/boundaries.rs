@@ -269,6 +269,9 @@ mod tests {
                 reason: "t".into(),
             },
             type_only: false,
+            source_path: None,
+            span: None,
+            provenance: crate::model::EdgeProvenance::Ast,
         }
     }
 

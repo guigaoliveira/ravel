@@ -35,6 +35,7 @@ fn mcp_stdio_speaks_protocol() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sync","arguments":{"paths":["src/new.ts"]}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"explore","arguments":{"query":"fresh"}}}"#,
     ];
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -64,7 +65,7 @@ fn mcp_stdio_speaks_protocol() {
     let mut by_id: HashMap<u64, serde_json::Value> = HashMap::new();
     let mut seen_lines: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && by_id.len() < 4 {
+    while Instant::now() < deadline && by_id.len() < 5 {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(line) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -161,4 +162,14 @@ fn mcp_stdio_speaks_protocol() {
         sync_text.contains("\"files\":1"),
         "MCP explicit sync did not index the new file: {sync_text}"
     );
+
+    let explore_call = by_id
+        .get(&5)
+        .unwrap_or_else(|| panic!("no explore response.\n--- stdout ---\n{}", dump()));
+    let explore_text = explore_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("explore tool should return text content");
+    let explore: serde_json::Value =
+        serde_json::from_str(explore_text).expect("explore should return JSON text");
+    assert_eq!(explore["detail"]["name"], "fresh", "{explore_text}");
 }

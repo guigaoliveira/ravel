@@ -42,6 +42,16 @@ fn fingerprint(engine: &WorkspaceEngine) -> Vec<String> {
         let mut fwd = graph.neighbors_forward(n);
         fwd.sort();
         out.push(format!("adj {n} -> {}", fwd.join(",")));
+        for (direction, reverse) in [("out", false), ("in", true)] {
+            let mut relations = graph
+                .direct_relations_limit(n, reverse, usize::MAX)
+                .0
+                .into_iter()
+                .map(|relation| serde_json::to_string(&relation).unwrap())
+                .collect::<Vec<_>>();
+            relations.sort();
+            out.push(format!("relations-{direction} {n}={}", relations.join("|")));
+        }
     }
     let mut orphans = engine.orphans(1000).expect("orphans");
     orphans.sort();
@@ -59,10 +69,12 @@ fn fingerprint(engine: &WorkspaceEngine) -> Vec<String> {
         ("prefix", ravel_core::search::SearchKind::Prefix),
         ("fuzzy", ravel_core::search::SearchKind::Fuzzy),
         ("regex", ravel_core::search::SearchKind::Regex),
+        ("terms", ravel_core::search::SearchKind::Terms),
     ] {
+        let query = if label == "terms" { "src value a" } else { "a" };
         out.push(format!(
             "search-{label}={}",
-            serde_json::to_string(&engine.search("a", kind, 100).expect("search")).unwrap()
+            serde_json::to_string(&engine.search(query, kind, 100).expect("search")).unwrap()
         ));
     }
     out.push(format!(
@@ -161,6 +173,88 @@ fn sync_matches_full_index_on_body_edit() {
                 "export const b = 1;\nexport const extra = 42;\n",
             );
         },
+    );
+}
+
+#[test]
+fn resident_structural_delta_matches_full_index_without_global_publish() {
+    let incremental = tempdir().unwrap();
+    seed(incremental.path());
+    let incremental_engine = engine(incremental.path());
+    incremental_engine.index().unwrap();
+    write(
+        incremental.path(),
+        "src/a.ts",
+        "// shifted relation sites\nimport { b } from './b';\nexport const a = b;\n",
+    );
+    incremental_engine
+        .sync_resident(Some(&[incremental.path().join("src/a.ts")]))
+        .unwrap();
+
+    let full = tempdir().unwrap();
+    seed(full.path());
+    write(
+        full.path(),
+        "src/a.ts",
+        "// shifted relation sites\nimport { b } from './b';\nexport const a = b;\n",
+    );
+    let full_engine = engine(full.path());
+    full_engine.index().unwrap();
+
+    assert_eq!(fingerprint(&incremental_engine), fingerprint(&full_engine));
+}
+
+#[test]
+fn resident_add_and_delete_match_full_indexes() {
+    let incremental = tempdir().unwrap();
+    seed(incremental.path());
+    let incremental_engine = engine(incremental.path());
+    incremental_engine.index().unwrap();
+    write(incremental.path(), "src/d.ts", "export const d = 4;\n");
+    write(
+        incremental.path(),
+        "src/main.ts",
+        "import { a } from './a';\nimport { d } from './d';\nexport const main = a + d;\n",
+    );
+    incremental_engine
+        .sync_resident(Some(&[
+            incremental.path().join("src/d.ts"),
+            incremental.path().join("src/main.ts"),
+        ]))
+        .unwrap();
+
+    let added = tempdir().unwrap();
+    seed(added.path());
+    write(added.path(), "src/d.ts", "export const d = 4;\n");
+    write(
+        added.path(),
+        "src/main.ts",
+        "import { a } from './a';\nimport { d } from './d';\nexport const main = a + d;\n",
+    );
+    let added_engine = engine(added.path());
+    added_engine.index().unwrap();
+    assert_eq!(fingerprint(&incremental_engine), fingerprint(&added_engine));
+
+    std::fs::remove_file(incremental.path().join("src/d.ts")).unwrap();
+    write(
+        incremental.path(),
+        "src/main.ts",
+        "import { a } from './a';\nexport const main = a;\n",
+    );
+    incremental_engine
+        .sync_resident(Some(&[
+            incremental.path().join("src/d.ts"),
+            incremental.path().join("src/main.ts"),
+        ]))
+        .unwrap();
+
+    let removed = tempdir().unwrap();
+    seed(removed.path());
+    let removed_engine = engine(removed.path());
+    removed_engine.index().unwrap();
+    assert_eq!(
+        fingerprint(&incremental_engine),
+        fingerprint(&removed_engine)
     );
 }
 
@@ -706,29 +800,6 @@ fn sync_recovers_and_drains_a_persisted_pending_batch() {
     assert!(snapshot.files.contains_key("src/queued.ts"));
     assert!(snapshot.files.contains_key("src/direct.ts"));
     assert!(!pending.exists());
-}
-
-#[test]
-fn uncontended_sync_has_no_configured_coalesce_delay() {
-    let dir = tempdir().unwrap();
-    fs::write(
-        dir.path().join(".ravel.toml"),
-        "[sync]\ncoalesce_ms = 2000\n",
-    )
-    .unwrap();
-    seed(dir.path());
-    let engine = engine(dir.path());
-    engine.index().unwrap();
-    write(dir.path(), "src/fast.ts", "export const fast = true;\n");
-    let started = std::time::Instant::now();
-    engine
-        .sync(Some(&[dir.path().join("src/fast.ts")]))
-        .unwrap();
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_millis(1500),
-        "uncontended sync appears to have paid the configured 2s coalesce delay: {elapsed:?}"
-    );
 }
 
 #[test]

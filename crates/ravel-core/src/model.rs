@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub(crate) const INDEX_SCHEMA_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Diagnostic {
     pub code: String,
@@ -10,7 +12,7 @@ pub struct Diagnostic {
     pub span: Option<Span>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span {
     pub start_byte: u32,
     pub end_byte: u32,
@@ -30,17 +32,98 @@ pub struct Complexity {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Symbol {
+    /// Stable logical workspace identity. Display/search code must use `name`/`qualified_name`,
+    /// not this opaque key. Overload signatures and merged declarations intentionally share it.
+    pub id: String,
     pub name: String,
+    /// Owner-qualified display name (`CheckoutService.execute`). Equal to `name` for top-level
+    /// declarations.
+    pub qualified_name: String,
     pub kind: Arc<str>,
     pub span: Span,
     pub exported: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<Complexity>,
+    /// Lexical block that owns this declaration. `None` means file/function/member scope.
+    pub scope: Option<Span>,
+}
+
+pub fn symbol_semantic_namespace(kind: &str) -> &'static str {
+    if matches!(kind, "interface_declaration" | "type_alias_declaration") {
+        "type"
+    } else {
+        "value"
+    }
+}
+
+pub fn stable_symbol_id_for_kind(
+    path: &str,
+    qualified_name: &str,
+    kind: &str,
+    scope: Option<Span>,
+) -> String {
+    let namespace = symbol_semantic_namespace(kind);
+    scope.map_or_else(
+        || format!("symbol://{path}#{namespace}:{qualified_name}"),
+        |scope| {
+            format!(
+                "symbol://{path}#{namespace}:{qualified_name}@scope:{}:{}",
+                scope.start_byte, scope.end_byte
+            )
+        },
+    )
+}
+
+pub fn symbol_path_from_id(id: &str) -> Option<&str> {
+    id.strip_prefix("symbol://")?
+        .split_once('#')
+        .map(|(path, _)| path)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ImportBindingKind {
+    Default,
+    Named,
+    Namespace,
+    ImportEquals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportBinding {
+    /// Name exported by the target module (`default`, `*`, or a named export).
+    pub imported: String,
+    /// Name visible in the importing file.
+    pub local: String,
+    pub kind: ImportBindingKind,
+    pub type_only: bool,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Import {
     pub specifier: String,
+    pub type_only: bool,
+    pub span: Span,
+    /// Empty for side-effect-only imports.
+    pub bindings: Vec<ImportBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExportBindingKind {
+    Declaration,
+    Default,
+    Named,
+    Namespace,
+    Star,
+    CommonJs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportBinding {
+    /// Local/imported name. `*` for star exports and `default` for anonymous defaults.
+    pub local: String,
+    /// Name exposed by this module.
+    pub exported: String,
+    pub kind: ExportBindingKind,
     pub type_only: bool,
     pub span: Span,
 }
@@ -51,6 +134,7 @@ pub struct Export {
     pub specifier: Option<String>,
     pub type_only: bool,
     pub span: Span,
+    pub bindings: Vec<ExportBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,8 +149,6 @@ pub struct FileArtifact {
     pub imports: Vec<Import>,
     pub exports: Vec<Export>,
     /// Symbol-level references (calls / extends / implements) captured during parse.
-    /// NOTE: no `skip_serializing_if` — bincode is positional and would desync.
-    #[serde(default)]
     pub symbol_refs: Vec<SymbolRef>,
     pub bytes_read: u64,
 }
@@ -81,6 +163,14 @@ pub enum EdgeKind {
     Extends,
     /// class → interface it implements.
     Implements,
+    /// symbol → constructor called with `new`.
+    Instantiates,
+    /// symbol → statically named runtime value (for example a JSX component).
+    References,
+    /// symbol → type used in an annotation/signature.
+    TypeOf,
+    /// declaration/member → decorator function/class.
+    Decorates,
 }
 
 impl EdgeKind {
@@ -91,17 +181,23 @@ impl EdgeKind {
             Self::Calls => "Calls",
             Self::Extends => "Extends",
             Self::Implements => "Implements",
+            Self::Instantiates => "Instantiates",
+            Self::References => "References",
+            Self::TypeOf => "TypeOf",
+            Self::Decorates => "Decorates",
         }
     }
 }
 
 /// A raw symbol-level reference captured at scan time (before workspace resolution).
-/// `from` = the enclosing symbol's name; `to` = the referenced name (call target / base type).
+/// `from_id` identifies the enclosing declaration; `to` is the referenced name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolRef {
-    pub from: String,
+    /// Stable id of the enclosing declaration.
+    pub from_id: String,
     pub to: String,
     pub kind: EdgeKind,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,6 +207,13 @@ pub enum EdgeConfidence {
     Unresolved { score: f32, reason: Arc<str> },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EdgeProvenance {
+    Ast,
+    Resolution,
+    Heuristic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Edge {
     pub from: String,
@@ -118,6 +221,10 @@ pub struct Edge {
     pub kind: EdgeKind,
     pub confidence: EdgeConfidence,
     pub type_only: bool,
+    /// File and syntax span that produced the relationship, when available.
+    pub source_path: Option<String>,
+    pub span: Option<Span>,
+    pub provenance: EdgeProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -185,12 +292,13 @@ impl SchemaSummary {
 /// First-seen symbol metadata for cold `node_detail` without full snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolMeta {
+    pub id: String,
     pub name: String,
+    pub qualified_name: String,
     pub kind: Arc<str>,
     pub path: String,
     pub span: Span,
     pub exported: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complexity: Option<Complexity>,
 }
 
@@ -201,12 +309,56 @@ pub struct SymbolMetaDict {
     /// Unique by original name (first file wins), sorted by name for binary search.
     pub entries: Vec<SymbolMeta>,
     /// Additional definitions sharing a name, sorted by name for symbol lookup.
-    #[serde(default)]
     pub duplicates: Vec<SymbolMeta>,
+    /// Encoded entry locations sorted by stable id / qualified name for O(log S) cold lookups.
+    pub id_order: Vec<u32>,
+    pub qualified_order: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SymbolMetaOverlay {
+    pub(crate) snapshot_id: String,
+    pub(crate) removed_ids: Vec<String>,
+    pub(crate) upserts: Vec<SymbolMeta>,
+}
+
+impl SymbolMetaOverlay {
+    pub(crate) fn from_artifact_changes(
+        snapshot_id: String,
+        changes: &[(Option<&FileArtifact>, Option<&FileArtifact>)],
+    ) -> Self {
+        let removed_ids = changes
+            .iter()
+            .flat_map(|(old, _)| old.iter().flat_map(|artifact| &artifact.symbols))
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        let upserts = changes
+            .iter()
+            .flat_map(|(_, new)| {
+                new.iter().flat_map(|artifact| {
+                    artifact.symbols.iter().map(|symbol| SymbolMeta {
+                        id: symbol.id.clone(),
+                        name: symbol.name.clone(),
+                        qualified_name: symbol.qualified_name.clone(),
+                        kind: Arc::clone(&symbol.kind),
+                        path: artifact.path.clone(),
+                        span: symbol.span,
+                        exported: symbol.exported,
+                        complexity: symbol.complexity.clone(),
+                    })
+                })
+            })
+            .collect();
+        Self {
+            snapshot_id,
+            removed_ids,
+            upserts,
+        }
+    }
 }
 
 impl SymbolMetaDict {
-    pub const FORMAT_VERSION: u32 = 2;
+    pub const FORMAT_VERSION: u32 = 5;
 
     pub fn from_snapshot(snapshot: &IndexSnapshot) -> Self {
         use std::collections::BTreeMap;
@@ -215,7 +367,9 @@ impl SymbolMetaDict {
         for (path, artifact) in &snapshot.files {
             for symbol in &artifact.symbols {
                 let meta = SymbolMeta {
+                    id: symbol.id.clone(),
                     name: symbol.name.clone(),
+                    qualified_name: symbol.qualified_name.clone(),
                     kind: symbol.kind.clone(),
                     path: path.clone(),
                     span: symbol.span,
@@ -233,12 +387,16 @@ impl SymbolMetaDict {
             }
         }
         duplicates.sort_by(|a, b| (&a.name, &a.path, a.span).cmp(&(&b.name, &b.path, b.span)));
-        Self {
+        let mut result = Self {
             format_version: Self::FORMAT_VERSION,
             snapshot_id: snapshot.id.stable_key(),
             entries: by_name.into_values().collect(),
             duplicates,
-        }
+            id_order: Vec::new(),
+            qualified_order: Vec::new(),
+        };
+        result.rebuild_orders();
+        result
     }
 
     pub fn get(&self, name: &str) -> Option<&SymbolMeta> {
@@ -258,6 +416,117 @@ impl SymbolMetaDict {
         self.get(name)
             .into_iter()
             .chain(self.duplicates[duplicates_start..duplicates_end].iter())
+    }
+
+    pub fn get_by_id(&self, id: &str) -> Option<&SymbolMeta> {
+        let start = self
+            .id_order
+            .partition_point(|location| self.at(*location).id.as_str() < id);
+        self.id_order[start..]
+            .iter()
+            .map(|location| self.at(*location))
+            .take_while(|entry| entry.id == id)
+            .last()
+    }
+
+    pub fn entries_for_qualified(&self, qualified: &str) -> Vec<&SymbolMeta> {
+        let start = self
+            .qualified_order
+            .partition_point(|location| self.at(*location).qualified_name.as_str() < qualified);
+        self.qualified_order[start..]
+            .iter()
+            .map(|location| self.at(*location))
+            .take_while(|entry| entry.qualified_name == qualified)
+            .collect()
+    }
+
+    pub(crate) fn is_well_formed(&self) -> bool {
+        let expected = self.entries.len() + self.duplicates.len();
+        self.id_order.len() == expected && self.qualified_order.len() == expected
+    }
+
+    pub(crate) fn apply_overlays(&mut self, overlays: Vec<SymbolMetaOverlay>) {
+        let mut removed = std::collections::BTreeSet::new();
+        let mut upserts = BTreeMap::new();
+        let mut snapshot_id = None;
+        for overlay in overlays {
+            for id in overlay.removed_ids {
+                removed.insert(id.clone());
+                upserts.remove(&id);
+            }
+            for entry in overlay.upserts {
+                removed.insert(entry.id.clone());
+                upserts.insert(entry.id.clone(), entry);
+            }
+            snapshot_id = Some(overlay.snapshot_id);
+        }
+        let Some(snapshot_id) = snapshot_id else {
+            return;
+        };
+        let mut all = std::mem::take(&mut self.entries);
+        all.extend(std::mem::take(&mut self.duplicates));
+        all.retain(|entry| !removed.contains(&entry.id));
+        all.extend(upserts.into_values());
+        all.sort_by(|left, right| {
+            (&left.name, &left.path, left.span, &left.id).cmp(&(
+                &right.name,
+                &right.path,
+                right.span,
+                &right.id,
+            ))
+        });
+        let mut last_name: Option<String> = None;
+        for entry in all {
+            if last_name.as_deref() == Some(entry.name.as_str()) {
+                self.duplicates.push(entry);
+            } else {
+                last_name = Some(entry.name.clone());
+                self.entries.push(entry);
+            }
+        }
+        self.snapshot_id = snapshot_id;
+        self.rebuild_orders();
+    }
+
+    fn rebuild_orders(&mut self) {
+        assert!(self.entries.len() < (1usize << 31));
+        assert!(self.duplicates.len() < (1usize << 31));
+        let mut locations = Vec::with_capacity(self.entries.len() + self.duplicates.len());
+        locations.extend((0..self.entries.len()).map(|index| index as u32));
+        locations.extend((0..self.duplicates.len()).map(|index| (1 << 31) | index as u32));
+        let entries = &self.entries;
+        let duplicates = &self.duplicates;
+        let at = |encoded: u32| {
+            let duplicate = encoded & (1 << 31) != 0;
+            let index = (encoded & !(1 << 31)) as usize;
+            if duplicate {
+                &duplicates[index]
+            } else {
+                &entries[index]
+            }
+        };
+        self.id_order = locations.clone();
+        self.id_order.sort_unstable_by(|left, right| {
+            let left = at(*left);
+            let right = at(*right);
+            (&left.id, left.span).cmp(&(&right.id, right.span))
+        });
+        self.qualified_order = locations;
+        self.qualified_order.sort_unstable_by(|left, right| {
+            let left = at(*left);
+            let right = at(*right);
+            (&left.qualified_name, left.span).cmp(&(&right.qualified_name, right.span))
+        });
+    }
+
+    fn at(&self, encoded: u32) -> &SymbolMeta {
+        let duplicate = encoded & (1 << 31) != 0;
+        let index = (encoded & !(1 << 31)) as usize;
+        if duplicate {
+            &self.duplicates[index]
+        } else {
+            &self.entries[index]
+        }
     }
 }
 

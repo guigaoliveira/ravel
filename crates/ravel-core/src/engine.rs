@@ -2,25 +2,30 @@ use crate::{
     analysis::{self, CiReport, CycleInfo, HubEntry, ImpactReport, PackageInfo},
     config::{Config, Flags},
     graph::{GraphIndex, QueryLimits, QueryPage},
-    incremental_graph::IncrementalGraphOverlay,
-    incremental_graph::IncrementalGraphState,
-    model::{IndexSnapshot, SnapshotId},
+    incremental_graph::{IncrementalGraphOverlay, IncrementalGraphState, OwnedEdge},
+    model::{INDEX_SCHEMA_VERSION, IndexSnapshot, SnapshotId},
     policy::{PolicyFinding, Suppressions, validate_snapshot},
     resolver::{
-        load_tsconfig, resolve_edges, resolve_edges_with_structural_data,
-        resolve_subset_with_structural_data,
+        OverlayResolutionLookup, ResolutionLookup, ResolutionUniverseOverlay, load_tsconfig,
+        resolve_edges_with_structural_data, resolve_subset_with_structural_data,
     },
     scanner::scan_workspace,
-    search::{SearchHit, SearchIndex, SearchKind},
-    storage::{FileSnapshotStorage, SnapshotStorage, StorageError, StructuralAcceleration},
+    search::{SearchHit, SearchIndex, SearchKind, SearchTermOverlay, SymbolTermDocument},
+    storage::{
+        FileSnapshotStorage, ResidentStructuralDelta, SnapshotStorage, StorageError,
+        StructuralPackReader,
+    },
     structural::StructuralReverseIndex,
     structural_reverse::{ReverseOverlaySet, ReverseShardSet},
 };
 
 pub use crate::model::IndexStats;
+use rustc_hash::FxHashSet;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -68,7 +73,7 @@ struct EngineInner {
     snapshot_cache: Mutex<Option<Arc<IndexSnapshot>>>,
     graph_cache: Mutex<Option<Arc<GraphIndex>>>,
     search_cache: Mutex<Option<Arc<SearchIndex>>>,
-    symbol_meta_cache: Mutex<Option<Arc<crate::model::SymbolMetaDict>>>,
+    symbol_meta_cache: Mutex<Option<Arc<SymbolMetaRuntime>>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -87,14 +92,34 @@ struct EngineInner {
     last_update_error: Mutex<Option<String>>,
     /// `CURRENT` generation observed by this process. Each MCP client may run its own server.
     observed_generation: Mutex<Option<String>>,
-    structural_cache: Mutex<
-        Option<(
-            String,
-            crate::resolver::ResolutionUniverse,
-            ReverseShardSet,
-            IncrementalGraphState,
-        )>,
-    >,
+    structural_cache: Mutex<Option<(String, Arc<StructuralPackReader>)>>,
+    /// Coalesce best-effort generation cleanup outside agent-facing sync latency.
+    maintenance_scheduled: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SymbolMetaRuntime {
+    dict: Arc<crate::model::SymbolMetaDict>,
+}
+
+impl SymbolMetaRuntime {
+    fn new(dict: crate::model::SymbolMetaDict) -> Self {
+        debug_assert!(dict.is_well_formed());
+        Self {
+            dict: Arc::new(dict),
+        }
+    }
+
+    fn get_by_id(&self, id: &str) -> Option<&crate::model::SymbolMeta> {
+        self.dict.get_by_id(id)
+    }
+
+    fn exact_id_or_qualified(&self, query: &str) -> Vec<&crate::model::SymbolMeta> {
+        if let Some(entry) = self.get_by_id(query) {
+            return vec![entry];
+        }
+        self.dict.entries_for_qualified(query)
+    }
 }
 
 struct PreparedPath {
@@ -102,6 +127,52 @@ struct PreparedPath {
     relative: String,
     bytes: Option<Vec<u8>>,
     unchanged: bool,
+}
+
+const MAX_CONTEXT_SOURCE_BYTES: usize = 12 * 1024;
+const MAX_CONTEXT_SOURCE_LINES: usize = 200;
+
+/// Read only the selected declaration. Context must not hydrate every caller body: the agent can
+/// open a related site when it decides to follow that edge.
+fn symbol_source_excerpt(
+    root: &Path,
+    symbol: &crate::model::SymbolMeta,
+) -> Option<serde_json::Value> {
+    let mut file = File::open(root.join(&symbol.path)).ok()?;
+    file.seek(SeekFrom::Start(symbol.span.start_byte as u64))
+        .ok()?;
+    let declared_len = symbol
+        .span
+        .end_byte
+        .saturating_sub(symbol.span.start_byte)
+        .max(1) as usize;
+    let read_len = declared_len.min(MAX_CONTEXT_SOURCE_BYTES);
+    let mut bytes = vec![0; read_len];
+    let bytes_read = file.read(&mut bytes).ok()?;
+    bytes.truncate(bytes_read);
+    let text = String::from_utf8_lossy(&bytes);
+    let start_line = symbol.span.start_line as usize + 1;
+    let mut numbered = String::with_capacity(text.len().saturating_add(32));
+    let mut line_count = 0usize;
+    let mut has_more_lines = false;
+    for (offset, line) in text.lines().enumerate() {
+        if offset == MAX_CONTEXT_SOURCE_LINES {
+            has_more_lines = true;
+            break;
+        }
+        if offset > 0 {
+            numbered.push('\n');
+        }
+        let _ = write!(numbered, "{}: {line}", start_line + offset);
+        line_count += 1;
+    }
+    let truncated = declared_len > bytes_read || has_more_lines;
+    Some(serde_json::json!({
+        "text": numbered,
+        "start_line": start_line,
+        "end_line": start_line + line_count.saturating_sub(1),
+        "truncated": truncated,
+    }))
 }
 
 fn symbol_name_set_changed<'a>(
@@ -127,6 +198,68 @@ fn symbol_name_set_changed<'a>(
             old != new
         }
     })
+}
+
+fn public_resolution_contract_changed(
+    old: Option<&crate::model::FileArtifact>,
+    new: Option<&crate::model::FileArtifact>,
+) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => {
+            let same_symbols = old
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.exported)
+                .map(|symbol| {
+                    (
+                        symbol.id.as_str(),
+                        symbol.name.as_str(),
+                        symbol.qualified_name.as_str(),
+                        symbol.kind.as_ref(),
+                    )
+                })
+                .eq(new
+                    .symbols
+                    .iter()
+                    .filter(|symbol| symbol.exported)
+                    .map(|symbol| {
+                        (
+                            symbol.id.as_str(),
+                            symbol.name.as_str(),
+                            symbol.qualified_name.as_str(),
+                            symbol.kind.as_ref(),
+                        )
+                    }));
+            let same_exports = old
+                .exports
+                .iter()
+                .flat_map(|export| {
+                    export.bindings.iter().map(move |binding| {
+                        (
+                            export.specifier.as_deref(),
+                            binding.local.as_str(),
+                            binding.exported.as_str(),
+                            &binding.kind,
+                            binding.type_only,
+                        )
+                    })
+                })
+                .eq(new.exports.iter().flat_map(|export| {
+                    export.bindings.iter().map(move |binding| {
+                        (
+                            export.specifier.as_deref(),
+                            binding.local.as_str(),
+                            binding.exported.as_str(),
+                            &binding.kind,
+                            binding.type_only,
+                        )
+                    })
+                }));
+            !same_symbols || !same_exports
+        }
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 /// Shared, cloneable workspace engine with in-memory snapshot and graph caching.
@@ -158,6 +291,7 @@ impl WorkspaceEngine {
                 last_update_error: Mutex::new(None),
                 observed_generation: Mutex::new(None),
                 structural_cache: Mutex::new(None),
+                maintenance_scheduled: AtomicBool::new(false),
             }),
         })
     }
@@ -212,13 +346,19 @@ impl WorkspaceEngine {
     pub fn index(&self) -> Result<IndexStats, EngineError> {
         let _guard = self.inner.update_lock.lock().unwrap();
         let _process_guard = self.acquire_workspace_update_lock()?;
+        let index_start = std::time::Instant::now();
         let result = self.index_unlocked();
+        crate::timing::stage("index.total", index_start, String::new);
         self.finish_update("index", &result);
         result
     }
 
     fn index_unlocked(&self) -> Result<IndexStats, EngineError> {
+        let scan_start = std::time::Instant::now();
         let (artifacts, scan_stats) = scan_workspace(&self.config)?;
+        crate::timing::stage("index.scan", scan_start, || {
+            format!("files={} bytes={}", artifacts.len(), scan_stats.bytes_read)
+        });
         let files: std::collections::BTreeMap<_, _> =
             artifacts.into_iter().map(|a| (a.path.clone(), a)).collect();
         self.publish_from_artifacts(
@@ -236,18 +376,48 @@ impl WorkspaceEngine {
     /// Incremental index update for daily edits (save/rename/delete).
     /// Re-parses only the given paths (or dirty discovery if `None`), re-resolves edges, republishes sidecars.
     pub fn sync(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        self.sync_inner(only_paths)
+    }
+
+    /// Daemon entry point retained as an explicit intent marker for callers. Structural state is
+    /// shard-lazy for both daemon and CLI syncs, so behavior and cost are otherwise identical.
+    pub fn sync_resident(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        self.sync_inner(only_paths)
+    }
+
+    /// Recover from a watch lost-event (rescan) signal. The signal only means "changed paths are
+    /// unknown", not "the index is invalid": on git-backed roots dirty discovery re-enumerates
+    /// the changed set in milliseconds and the incremental sync tiers do the rest. A full
+    /// reindex here would hold the update lock for seconds per rescan — and its own sidecar
+    /// writes can overflow the backend event queue and re-trigger the rescan signal in a loop.
+    /// The full rebuild remains the fallback only where discovery cannot see changes.
+    pub fn reconcile(&self) -> Result<IndexStats, EngineError> {
+        if self.config.sync_allows_git() && self.is_git_repo_cached() {
+            self.sync_inner(None)
+        } else {
+            self.index()
+        }
+    }
+
+    fn sync_inner(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        let sync_total = std::time::Instant::now();
         let queued = only_paths.filter(|paths| !paths.is_empty());
+        let lock_wait = std::time::Instant::now();
         let _guard = self.inner.update_lock.lock().unwrap();
+        crate::timing::stage("sync.engine_lock_wait", lock_wait, String::new);
         if let Some(paths) = queued
             && let Some(_process_guard) = self.try_acquire_workspace_update_lock()?
         {
             // N=1: no ticket and no timer. Stale tickets are folded into this publication.
             let result = self.sync_queued_locked(paths, None);
             self.finish_update("sync", &result);
+            crate::timing::stage("sync.inner_total", sync_total, String::new);
             return result;
         }
         let own_ticket = queued.map(|paths| self.enqueue_sync(paths)).transpose()?;
+        let ws_lock_wait = std::time::Instant::now();
         let _process_guard = self.acquire_workspace_update_lock()?;
+        crate::timing::stage("sync.workspace_lock_wait", ws_lock_wait, String::new);
         // Another writer may already have drained our ticket and committed its paths while we
         // waited for the workspace lock. In that case the current generation is our result.
         if own_ticket.as_ref().is_some_and(|ticket| !ticket.exists()) {
@@ -267,7 +437,30 @@ impl WorkspaceEngine {
             self.sync_unlocked(only_paths)
         };
         self.finish_update("sync", &result);
+        crate::timing::stage("sync.inner_total", sync_total, String::new);
         result
+    }
+
+    fn hydrate_structural_cache(&self) -> Result<(), EngineError> {
+        let storage = self.storage();
+        let Some(generation) = storage.current_generation()? else {
+            return Ok(());
+        };
+        if self
+            .inner
+            .structural_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(cached, ..)| cached == &generation)
+        {
+            return Ok(());
+        }
+        let Some(reader) = storage.open_structural_reader()? else {
+            return Ok(());
+        };
+        *self.inner.structural_cache.lock().unwrap() = Some((generation, reader));
+        Ok(())
     }
 
     fn sync_queued_locked(
@@ -577,6 +770,23 @@ impl WorkspaceEngine {
         }
     }
 
+    fn schedule_generation_maintenance(&self) {
+        if self
+            .inner
+            .maintenance_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let storage = self.storage();
+        let inner = Arc::clone(&self.inner);
+        std::thread::spawn(move || {
+            let _ = storage.gc_generations();
+            inner.maintenance_scheduled.store(false, Ordering::Release);
+        });
+    }
+
     fn sync_unlocked(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let extensions = crate::config::effective_extensions(&self.config);
@@ -596,7 +806,11 @@ impl WorkspaceEngine {
         };
 
         // Read/hash each path once. The prepared bytes are reused below if publication is needed.
+        let sync_start = std::time::Instant::now();
         let (fast_noop, prepared) = self.prepare_paths(&paths)?;
+        crate::timing::stage("sync.prepare_paths", sync_start, || {
+            format!("paths={}", paths.len())
+        });
         if fast_noop {
             if let Ok(Some(stats)) = self.storage().open_stats() {
                 return Ok(stats);
@@ -610,20 +824,16 @@ impl WorkspaceEngine {
             return Ok(stats);
         }
 
-        let resolver_config = load_tsconfig(&self.root);
-        let current_generation = self.storage().current_generation().ok().flatten();
-        // Structural acceleration is a resident optimization only. Hydrating universe, reverse
-        // shards and graph packs in a cold one-shot sync costs more time and over twice the RSS
-        // of the exact snapshot fallback. A warm daemon may reuse state it already owns, but a
-        // cold CLI never opens global acceleration packs merely to process a small edit.
-        let mut acceleration = self
-            .inner
-            .structural_cache
-            .lock()
-            .unwrap()
-            .take()
-            .filter(|(generation, ..)| Some(generation) == current_generation.as_ref())
-            .map(|(_, universe, reverse, graph)| (universe, reverse, graph));
+        let hydrate_start = std::time::Instant::now();
+        self.hydrate_structural_cache()?;
+        crate::timing::stage("sync.hydrate_structural_cache", hydrate_start, String::new);
+        let delta_start = std::time::Instant::now();
+        if let Some(stats) = self.try_resident_structural_delta(&prepared)? {
+            crate::timing::stage("sync.structural_delta.total", delta_start, String::new);
+            return Ok(stats);
+        }
+        crate::timing::stage("sync.structural_delta.bailed", delta_start, String::new);
+        crate::timing::note("sync.fallback", || "partial-rebuild path".into());
 
         let cache_is_current = *self.inner.observed_generation.lock().unwrap()
             == self.storage().current_generation().ok().flatten();
@@ -684,10 +894,7 @@ impl WorkspaceEngine {
             let scanned = if bytes.len() as u64 > max_bytes {
                 crate::scanner::scan_file(&prepared.path, max_bytes)
             } else {
-                Ok(crate::scanner::parse_source(
-                    &prepared.path.to_string_lossy(),
-                    &bytes,
-                ))
+                Ok(crate::scanner::parse_source(&rel, &bytes))
             };
             match scanned {
                 Ok(mut artifact) => {
@@ -699,8 +906,26 @@ impl WorkspaceEngine {
                             || previous
                                 .symbols
                                 .iter()
-                                .map(|symbol| symbol.name.as_str())
-                                .ne(artifact.symbols.iter().map(|symbol| symbol.name.as_str()))
+                                .map(|symbol| {
+                                    (
+                                        symbol.id.as_str(),
+                                        symbol.name.as_str(),
+                                        symbol.qualified_name.as_str(),
+                                        symbol.kind.as_ref(),
+                                        symbol.span,
+                                        symbol.exported,
+                                    )
+                                })
+                                .ne(artifact.symbols.iter().map(|symbol| {
+                                    (
+                                        symbol.id.as_str(),
+                                        symbol.name.as_str(),
+                                        symbol.qualified_name.as_str(),
+                                        symbol.kind.as_ref(),
+                                        symbol.span,
+                                        symbol.exported,
+                                    )
+                                }))
                     });
                     snapshot.files.insert(rel, artifact);
                     any_changed = true;
@@ -749,7 +974,6 @@ impl WorkspaceEngine {
                     )
                 })
         };
-        let mut acceleration_overlay = None;
         let old_names = overlay_paths.iter().flat_map(|path| {
             old_changed
                 .get(path)
@@ -764,96 +988,47 @@ impl WorkspaceEngine {
                 .into_iter()
                 .flat_map(|artifact| artifact.symbols.iter().map(|symbol| symbol.name.as_str()))
         });
-        let symbol_names_changed = symbol_name_set_changed(
-            old_names,
-            new_names,
-            acceleration
-                .as_ref()
-                .map(|(universe, _, _)| &universe.symbol_definers),
-        );
-        let mut next_structural_cache = None;
-        let reusable_edges = if edge_inputs_changed
-            && let Some((mut universe, mut reverse, mut graph)) = acceleration.take()
-        {
-            let mut changed_symbols = BTreeSet::new();
-            let mut universe_overlay = crate::resolver::ResolutionUniverseOverlay::default();
-            for path in &overlay_paths {
-                let old = old_changed.get(path).and_then(Option::as_ref);
-                let new = snapshot.files.get(path);
-                changed_symbols.extend(old.into_iter().flat_map(|artifact| {
-                    artifact.symbols.iter().map(|symbol| symbol.name.clone())
-                }));
-                changed_symbols.extend(new.into_iter().flat_map(|artifact| {
-                    artifact.symbols.iter().map(|symbol| symbol.name.clone())
-                }));
-                universe.replace_artifact_with_overlay(old, new, &mut universe_overlay);
-            }
-            let affected = reverse.affected_files(
-                overlay_paths.iter().map(String::as_str),
-                changed_symbols.iter().map(String::as_str),
-            );
-            let subset = affected
-                .iter()
-                .filter_map(|path| {
-                    snapshot
-                        .files
-                        .get(path)
-                        .cloned()
-                        .map(|artifact| (path.clone(), artifact))
-                })
-                .collect();
-            if let Some((traces, contributions)) = resolve_subset_with_structural_data(
-                &self.root,
-                &subset,
-                &universe,
-                &resolver_config,
-            ) {
-                let updates = affected
-                    .iter()
-                    .map(|path| {
-                        (
-                            path.clone(),
-                            snapshot
-                                .files
-                                .get(path)
-                                .map(|_| contributions.get(path).cloned().unwrap_or_default()),
-                        )
-                    })
-                    .collect();
-                let graph_overlay = graph.replace_files(updates);
-                let mut traces_by_file: std::collections::BTreeMap<_, Vec<_>> =
-                    std::collections::BTreeMap::new();
-                for trace in &traces {
-                    traces_by_file
-                        .entry(trace.importer.as_str())
-                        .or_default()
-                        .push(trace);
-                }
-                let reverse_updates = affected
-                    .iter()
-                    .map(|path| {
-                        let contribution = snapshot.files.get(path).map(|artifact| {
-                            crate::structural::FileContribution::from_artifact(
-                                artifact,
-                                traces_by_file
-                                    .get(path.as_str())
-                                    .into_iter()
-                                    .flatten()
-                                    .copied(),
+        let symbol_names_changed = symbol_name_set_changed(old_names, new_names, None);
+        let old_search_shape: BTreeSet<_> = overlay_paths
+            .iter()
+            .flat_map(|path| {
+                old_changed
+                    .get(path)
+                    .and_then(Option::as_ref)
+                    .into_iter()
+                    .flat_map(move |artifact| {
+                        artifact.symbols.iter().map(move |symbol| {
+                            (
+                                path.as_str(),
+                                symbol.name.as_str(),
+                                symbol.qualified_name.as_str(),
+                                symbol.kind.as_ref(),
                             )
-                        });
-                        (path.clone(), contribution)
+                        })
                     })
-                    .collect();
-                let reverse_overlay = reverse.replace_files(reverse_updates);
-                let edges = graph.edges();
-                next_structural_cache = Some((universe, reverse, graph));
-                acceleration_overlay = Some((universe_overlay, reverse_overlay, graph_overlay));
-                Some(edges)
-            } else {
-                None
-            }
-        } else if !edge_inputs_changed {
+            })
+            .collect();
+        let new_search_shape: BTreeSet<_> = overlay_paths
+            .iter()
+            .flat_map(|path| {
+                snapshot
+                    .files
+                    .get(path)
+                    .into_iter()
+                    .flat_map(move |artifact| {
+                        artifact.symbols.iter().map(move |symbol| {
+                            (
+                                path.as_str(),
+                                symbol.name.as_str(),
+                                symbol.qualified_name.as_str(),
+                                symbol.kind.as_ref(),
+                            )
+                        })
+                    })
+            })
+            .collect();
+        let search_terms_changed = symbol_names_changed || old_search_shape != new_search_shape;
+        let reusable_edges = if !edge_inputs_changed {
             Some(snapshot.edges)
         } else {
             None
@@ -875,24 +1050,16 @@ impl WorkspaceEngine {
             })
             .collect::<Vec<_>>();
         let content_state = self.storage().prospective_content_state(&content_changes);
-        let result = self.publish_from_artifacts(
+        self.publish_from_artifacts(
             snapshot.files,
             bytes,
             parse_errors,
             reusable_edges,
             Some(&overlay_paths),
-            acceleration_overlay,
-            symbol_names_changed,
+            None,
+            search_terms_changed,
             content_state,
-        );
-        if result.is_ok()
-            && let Some((universe, reverse, graph)) = next_structural_cache
-            && let Ok(Some(generation)) = self.storage().current_generation()
-        {
-            *self.inner.structural_cache.lock().unwrap() =
-                Some((generation, universe, reverse, graph));
-        }
-        result
+        )
     }
 
     fn try_artifact_only_sync(
@@ -911,8 +1078,7 @@ impl WorkspaceEngine {
             let Some(previous) = storage.open_artifact(&prepared.relative)? else {
                 return Ok(None);
             };
-            let mut artifact =
-                crate::scanner::parse_source(&prepared.path.to_string_lossy(), bytes);
+            let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
             artifact.path = prepared.relative.clone();
             // These fields feed global graph/search/detail sidecars. If any changes, the
             // current format must use the full correctness path until those indexes are sharded.
@@ -922,7 +1088,11 @@ impl WorkspaceEngine {
                     .iter()
                     .zip(&artifact.symbols)
                     .any(|(old, new)| {
-                        old.name != new.name || old.kind != new.kind || old.exported != new.exported
+                        old.id != new.id
+                            || old.name != new.name
+                            || old.qualified_name != new.qualified_name
+                            || old.kind != new.kind
+                            || old.exported != new.exported
                     });
             if previous.language != artifact.language
                 || symbol_shape_changed
@@ -937,12 +1107,375 @@ impl WorkspaceEngine {
         if deltas.is_empty() {
             return Ok(None);
         }
-        let stats = storage.publish_artifact_deltas(&deltas)?;
+        let stats = storage.publish_artifact_deltas_deferred_gc(&deltas)?;
+        self.schedule_generation_maintenance();
         storage.compact_artifacts_if_amplified(
             self.config.storage.artifact_store_max_amplification,
             self.config.storage.retention,
         )?;
         Ok(stats)
+    }
+
+    /// Fast structural path for in-place edits. It loads only changed/affected artifacts and
+    /// publishes component overlays; the full snapshot is reconstructed only on explicit demand.
+    fn try_resident_structural_delta(
+        &self,
+        prepared: &[PreparedPath],
+    ) -> Result<Option<IndexStats>, EngineError> {
+        let storage = self.storage();
+        let mut changes = Vec::new();
+        for prepared in prepared.iter().filter(|prepared| !prepared.unchanged) {
+            let old = storage.open_artifact(&prepared.relative)?;
+            let new = prepared.bytes.as_ref().map(|bytes| {
+                let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
+                artifact.path = prepared.relative.clone();
+                artifact
+            });
+            if old.is_none() && new.is_none() {
+                continue;
+            }
+            if old
+                .as_ref()
+                .zip(new.as_ref())
+                .is_some_and(|(old, new)| old.language != new.language)
+            {
+                return Ok(None);
+            }
+            changes.push((prepared.relative.clone(), old, new));
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(current_generation) = storage.current_generation()? else {
+            return Ok(None);
+        };
+        let reader = self
+            .inner
+            .structural_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(generation, ..)| generation == &current_generation)
+            .map(|(_, reader)| Arc::clone(reader));
+        let Some(reader) = reader else {
+            return Ok(None);
+        };
+        let resolver_config = load_tsconfig(&self.root);
+        if !reader.matches(&resolver_config) {
+            return Ok(None);
+        }
+
+        let changed_paths: BTreeSet<_> = changes.iter().map(|(path, ..)| path.clone()).collect();
+        let mut changed_symbols = BTreeSet::new();
+        let mut contract_changed_paths = BTreeSet::new();
+        for (path, old, new) in &changes {
+            if public_resolution_contract_changed(old.as_ref(), new.as_ref()) {
+                contract_changed_paths.insert(path.clone());
+                changed_symbols.extend(
+                    old.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .chain(new.iter().flat_map(|artifact| artifact.symbols.iter()))
+                        .filter(|symbol| symbol.exported)
+                        .map(|symbol| symbol.name.clone()),
+                );
+            }
+        }
+        let universe_overlay = ResolutionUniverseOverlay::from_artifact_changes(
+            reader.as_ref(),
+            changes
+                .iter()
+                .map(|(_, old, new)| (old.as_ref(), new.as_ref())),
+        );
+        let universe = OverlayResolutionLookup::new(reader.as_ref(), &universe_overlay);
+        let affected_start = std::time::Instant::now();
+        let mut affected = reader.affected_files(
+            contract_changed_paths.iter().map(String::as_str),
+            changed_symbols.iter().map(String::as_str),
+        );
+        affected.extend(changed_paths.iter().cloned());
+        crate::timing::stage("delta.affected_files", affected_start, || {
+            format!(
+                "affected={} changed_symbols={} contract_changed={}",
+                affected.len(),
+                changed_symbols.len(),
+                contract_changed_paths.len()
+            )
+        });
+
+        let changed_artifacts: BTreeMap<_, _> = changes
+            .iter()
+            .map(|(path, _, new)| (path.as_str(), new.as_ref()))
+            .collect();
+        let mut subset = BTreeMap::new();
+        for path in &affected {
+            let artifact = if let Some(new) = changed_artifacts.get(path.as_str()) {
+                let Some(new) = new else {
+                    continue;
+                };
+                (*new).clone()
+            } else if let Some(artifact) = storage.open_artifact(path)? {
+                artifact
+            } else {
+                return Ok(None);
+            };
+            subset.insert(path.clone(), artifact);
+        }
+        let resolve_start = std::time::Instant::now();
+        let Some((traces, mut contributions)) =
+            resolve_subset_with_structural_data(&self.root, &subset, &universe, &resolver_config)
+        else {
+            return Ok(None);
+        };
+        crate::timing::stage("delta.resolve_subset", resolve_start, || {
+            format!("subset={} traces={}", subset.len(), traces.len())
+        });
+        let graph_updates: BTreeMap<_, _> = affected
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    subset.contains_key(path).then(|| {
+                        contributions
+                            .remove(path)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(OwnedEdge::from)
+                            .collect()
+                    }),
+                )
+            })
+            .collect();
+        let graph_start = std::time::Instant::now();
+        let mut graph = reader.graph_for_updates(&graph_updates);
+        crate::timing::stage("delta.graph_for_updates", graph_start, || {
+            format!("updates={}", graph_updates.len())
+        });
+        let graph_edges_before = graph.edge_count();
+        let replace_start = std::time::Instant::now();
+        let graph_overlay = graph.replace_owned_files(graph_updates);
+        crate::timing::stage("delta.graph_replace", replace_start, || {
+            format!(
+                "upserts={} edge_counts={}",
+                graph_overlay.file_upserts.len(),
+                graph_overlay.edge_counts.len()
+            )
+        });
+        let graph_edges_after = graph.edge_count();
+        let mut trace_cursor = 0usize;
+        let mut reverse_updates = BTreeMap::new();
+        for path in &affected {
+            let trace_start = trace_cursor;
+            while traces
+                .get(trace_cursor)
+                .is_some_and(|trace| trace.importer == *path)
+            {
+                trace_cursor += 1;
+            }
+            let contribution = subset.get(path).map(|artifact| {
+                crate::structural::FileContribution::from_artifact(
+                    artifact,
+                    traces[trace_start..trace_cursor].iter(),
+                )
+            });
+            reverse_updates.insert(path.clone(), contribution);
+        }
+        let reverse_start = std::time::Instant::now();
+        let mut reverse = reader.reverse_for_updates(&reverse_updates);
+        let reverse_overlay = reverse.replace_files(reverse_updates);
+        crate::timing::stage("delta.reverse", reverse_start, String::new);
+
+        let Some(old_stats) = storage.open_stats()? else {
+            return Ok(None);
+        };
+        let (bytes, parse_errors) =
+            changes.iter().fold(
+                (old_stats.bytes, old_stats.parse_errors),
+                |(bytes, errors), (_, old, new)| {
+                    (
+                        bytes
+                            .saturating_sub(old.as_ref().map_or(0, |artifact| artifact.bytes_read))
+                            .saturating_add(new.as_ref().map_or(0, |artifact| artifact.bytes_read)),
+                        errors
+                            .saturating_sub(old.as_ref().map_or(0, |artifact| {
+                                usize::from(!artifact.diagnostics.is_empty())
+                            }))
+                            .saturating_add(new.as_ref().map_or(0, |artifact| {
+                                usize::from(!artifact.diagnostics.is_empty())
+                            })),
+                    )
+                },
+            );
+        let content_changes = changes
+            .iter()
+            .map(|(path, old, new)| {
+                (
+                    path.clone(),
+                    old.as_ref().map(|artifact| artifact.source_hash.clone()),
+                    new.as_ref().map(|artifact| artifact.source_hash.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(content_state) = storage.prospective_content_state(&content_changes) else {
+            return Ok(None);
+        };
+        let identity = self.worktree_identity_cached();
+        let mut snapshot_id = storage
+            .read_manifest()?
+            .ok_or_else(|| StorageError::Invalid {
+                path: self.storage_path(),
+                message: "structural delta requires a current manifest".into(),
+            })?
+            .snapshot_id;
+        snapshot_id.root = identity.root.to_string_lossy().into_owned();
+        snapshot_id.worktree = identity.worktree;
+        snapshot_id.revision = identity.revision;
+        snapshot_id.content_state = content_state;
+        snapshot_id.grammar_version = crate::scanner::GRAMMAR_VERSION.into();
+        snapshot_id.config_hash = self.inner.config_hash.clone();
+        let generation = snapshot_id.stable_key();
+        let stats = IndexStats {
+            files: changes
+                .iter()
+                .fold(old_stats.files, |files, (_, old, new)| {
+                    files
+                        .saturating_sub(usize::from(old.is_some() && new.is_none()))
+                        .saturating_add(usize::from(old.is_none() && new.is_some()))
+                }),
+            edges: if graph_edges_after >= graph_edges_before {
+                old_stats
+                    .edges
+                    .saturating_add(graph_edges_after - graph_edges_before)
+            } else {
+                old_stats
+                    .edges
+                    .saturating_sub(graph_edges_before - graph_edges_after)
+            },
+            bytes,
+            parse_errors,
+            snapshot_id: generation.clone(),
+        };
+        let meta_changes = changes
+            .iter()
+            .map(|(_, old, new)| (old.as_ref(), new.as_ref()))
+            .collect::<Vec<_>>();
+        let symbol_meta_overlay = crate::model::SymbolMetaOverlay::from_artifact_changes(
+            generation.clone(),
+            &meta_changes,
+        );
+        let search_changed = changes.iter().any(|(_, old, new)| match (old, new) {
+            (Some(old), Some(new)) => {
+                old.symbols.len() != new.symbols.len()
+                    || old.symbols.iter().zip(&new.symbols).any(|(old, new)| {
+                        old.id != new.id
+                            || old.name != new.name
+                            || old.qualified_name != new.qualified_name
+                            || old.kind != new.kind
+                    })
+            }
+            _ => true,
+        });
+        let search_overlay = search_changed.then(|| {
+            let removed_ids = changes
+                .iter()
+                .flat_map(|(_, old, _)| {
+                    old.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| symbol.id.clone())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let added_names = changes
+                .iter()
+                .flat_map(|(_, _, new)| {
+                    new.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| symbol.name.clone())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let removed_names = changes
+                .iter()
+                .flat_map(|(_, old, _)| {
+                    old.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| symbol.name.clone())
+                })
+                .filter(|name| universe.symbol_definer_count(name) == 0)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let documents = changes
+                .iter()
+                .flat_map(|(path, _, new)| {
+                    new.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| SymbolTermDocument::from_symbol(path, symbol))
+                })
+                .collect();
+            SearchTermOverlay {
+                snapshot_id: generation.clone(),
+                removed_ids,
+                added_names,
+                removed_names,
+                documents,
+            }
+        });
+        let artifacts = changes
+            .iter()
+            .map(|(path, _, new)| (path.clone(), new.clone()))
+            .collect::<Vec<_>>();
+        if let Some(error) = reader.take_error() {
+            self.record_update_error("structural shard", &error);
+            return Ok(None);
+        }
+        let publish_start = std::time::Instant::now();
+        if !storage.publish_resident_structural_delta(ResidentStructuralDelta {
+            snapshot_id: &snapshot_id,
+            artifacts: &artifacts,
+            graph: &graph_overlay,
+            universe: &universe_overlay,
+            reverse: &reverse_overlay,
+            symbol_meta: &symbol_meta_overlay,
+            search: search_overlay.as_ref(),
+            stats: &stats,
+        })? {
+            return Ok(None);
+        }
+        crate::timing::stage("delta.publish", publish_start, String::new);
+
+        // Advance the resident structural reader to the new generation by applying the overlay
+        // we just published. Dropping it instead would force the next sync to re-hydrate and
+        // re-decode every touched shard from the base pack. Our local Arc must be released
+        // first; `try_unwrap` fails only when a concurrent reader still holds one, and then we
+        // fall back to invalidation.
+        let _ = universe;
+        drop(reader);
+        let advance_start = std::time::Instant::now();
+        {
+            let mut cache_slot = self.inner.structural_cache.lock().unwrap();
+            *cache_slot = cache_slot.take().and_then(|(_, cached)| {
+                let mut owned = Arc::try_unwrap(cached).ok()?;
+                let generation = storage.current_generation().ok().flatten()?;
+                owned
+                    .apply_published_delta(&graph_overlay, &universe_overlay, &reverse_overlay)
+                    .then_some(())?;
+                Some((generation, Arc::new(owned)))
+            });
+        }
+        crate::timing::stage("delta.advance_reader", advance_start, String::new);
+        *self.inner.snapshot_cache.lock().unwrap() = None;
+        *self.inner.graph_cache.lock().unwrap() = None;
+        *self.inner.symbol_meta_cache.lock().unwrap() = None;
+        if search_overlay.is_some() {
+            *self.inner.search_cache.lock().unwrap() = None;
+        }
+        *self.inner.dirty_cache.lock().unwrap() = None;
+        self.remember_published_generation();
+        self.schedule_generation_maintenance();
+        Ok(Some(stats))
     }
 
     /// Prepare changed-path bytes once and decide whether the entire sync is a no-op.
@@ -1012,7 +1545,7 @@ impl WorkspaceEngine {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "publication inputs are explicit until the component migration removes legacy sidecars"
+        reason = "publication inputs explicitly define one atomic generation"
     )]
     fn publish_from_artifacts(
         &self,
@@ -1021,40 +1554,14 @@ impl WorkspaceEngine {
         parse_errors: usize,
         reusable_edges: Option<Vec<crate::model::Edge>>,
         overlay_paths: Option<&BTreeSet<String>>,
-        acceleration_overlay: Option<(
+        structural_overlay: Option<(
             crate::resolver::ResolutionUniverseOverlay,
             ReverseOverlaySet,
             IncrementalGraphOverlay,
         )>,
-        symbol_names_changed: bool,
+        search_terms_changed: bool,
         content_state_override: Option<String>,
     ) -> Result<IndexStats, EngineError> {
-        let resolver = load_tsconfig(&self.root);
-        let (edges, acceleration_parts) = if overlay_paths.is_some() {
-            (
-                reusable_edges.unwrap_or_else(|| resolve_edges(&self.root, &files, &resolver)),
-                None,
-            )
-        } else {
-            let (resolved_edges, traces, contributions, universe) =
-                resolve_edges_with_structural_data(&self.root, &files, &resolver);
-            let reverse_index =
-                StructuralReverseIndex::build_from_traces(&files, &resolver, &traces);
-            let reverse = ReverseShardSet::from_index(&reverse_index, 8).map_err(|error| {
-                EngineError::Storage(StorageError::Invalid {
-                    path: self.root.join(&self.config.storage.home),
-                    message: error.to_string(),
-                })
-            })?;
-            (
-                reusable_edges.unwrap_or(resolved_edges),
-                Some((
-                    universe,
-                    reverse,
-                    IncrementalGraphState::from_contributions(&contributions),
-                )),
-            )
-        };
         // Works without git — identity falls back to path + "nogit".
         let identity = self.worktree_identity_cached();
         let content_state = content_state_override.unwrap_or_else(|| {
@@ -1075,39 +1582,88 @@ impl WorkspaceEngine {
             worktree: identity.worktree,
             revision: identity.revision,
             content_state,
-            schema_version: 2,
+            schema_version: INDEX_SCHEMA_VERSION,
             grammar_version: crate::scanner::GRAMMAR_VERSION.into(),
             config_hash: self.inner.config_hash.clone(),
         };
-        let snapshot = IndexSnapshot { id, files, edges };
         let storage = self.storage();
-        let staged_overlay = acceleration_overlay.as_ref().map(
+        let (edges, staged_pack) = if overlay_paths.is_some()
+            && let Some(edges) = reusable_edges
+        {
+            (edges, None)
+        } else {
+            let resolver = load_tsconfig(&self.root);
+            let resolve_start = std::time::Instant::now();
+            let (resolved_edges, traces, universe) =
+                resolve_edges_with_structural_data(&self.root, &files, &resolver);
+            crate::timing::stage("index.resolve_edges", resolve_start, || {
+                format!("edges={} traces={}", resolved_edges.len(), traces.len())
+            });
+            // Stream each structural state into the staged pack as soon as it is built and
+            // drop it before building the next: universe, reverse, and graph held live
+            // together set the full-index RSS plateau (~3.3GB on the real corpus).
+            let mut stager = storage.begin_structural_pack_base(id.stable_key())?;
+            let stage_start = std::time::Instant::now();
+            stager.stage_universe(universe)?;
+            crate::timing::stage("index.stage_universe", stage_start, String::new);
+            let reverse_start = std::time::Instant::now();
+            let reverse_index =
+                StructuralReverseIndex::build_from_traces(&files, &resolver, &traces);
+            crate::timing::stage("index.reverse_build", reverse_start, String::new);
+            drop(traces);
+            let reverse_shard_start = std::time::Instant::now();
+            let reverse = ReverseShardSet::from_owned_index(reverse_index, 8).map_err(|error| {
+                EngineError::Storage(StorageError::Invalid {
+                    path: self.root.join(&self.config.storage.home),
+                    message: error.to_string(),
+                })
+            })?;
+            crate::timing::stage("index.reverse_shard", reverse_shard_start, String::new);
+            let stage_start = std::time::Instant::now();
+            stager.stage_reverse(reverse)?;
+            crate::timing::stage("index.stage_reverse", stage_start, String::new);
+            let graph_start = std::time::Instant::now();
+            let graph = IncrementalGraphState::from_edges(&resolved_edges);
+            crate::timing::stage("index.graph_from_edges", graph_start, String::new);
+            let stage_start = std::time::Instant::now();
+            let graph_staged = stager.stage_graph(graph);
+            crate::timing::stage("index.stage_graph", stage_start, String::new);
+            graph_staged?;
+            (resolved_edges, Some(stager.finish()?))
+        };
+        let snapshot = IndexSnapshot { id, files, edges };
+        let staged_overlay = structural_overlay.as_ref().map(
             |(universe_overlay, reverse_overlay, graph_overlay)| {
                 (graph_overlay, universe_overlay, reverse_overlay)
             },
         );
-        let published_overlay = overlay_paths
-            .map(|paths| {
-                storage.publish_structural_overlay(
-                    &snapshot,
-                    paths,
-                    staged_overlay,
-                    symbol_names_changed,
-                    Some((bytes_read, parse_errors)),
-                )
-            })
-            .transpose()?
-            .unwrap_or(false);
+        let published_overlay = if staged_pack.is_none() {
+            overlay_paths
+                .map(|paths| {
+                    storage.publish_structural_overlay_deferred_gc(
+                        &snapshot,
+                        paths,
+                        staged_overlay,
+                        search_terms_changed,
+                        Some((bytes_read, parse_errors)),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if published_overlay {
+            self.schedule_generation_maintenance();
+        }
         if !published_overlay {
+            let publish_start = std::time::Instant::now();
             storage.publish(&snapshot)?;
-            if let Some((universe, reverse, graph)) = acceleration_parts {
-                storage.publish_structural_pack_base(StructuralAcceleration {
-                    format_version: StructuralAcceleration::FORMAT_VERSION,
-                    snapshot_id: snapshot.id.stable_key(),
-                    universe,
-                    reverse,
-                    graph,
-                })?;
+            crate::timing::stage("index.publish", publish_start, String::new);
+            if let Some(staged_pack) = staged_pack {
+                let attach_start = std::time::Instant::now();
+                storage.attach_structural_pack_base(staged_pack)?;
+                crate::timing::stage("index.attach_pack", attach_start, String::new);
             }
         }
         let stats = IndexStats {
@@ -1178,39 +1734,219 @@ impl WorkspaceEngine {
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
         let synced = self.auto_sync_if_dirty()?;
         let limit = limit.clamp(1, 50);
-        // Use raw paths — auto_sync already ran.
-        let hits = self.search_raw(query, SearchKind::Prefix, limit)?;
-        let primary = hits
+        // Use raw paths — auto_sync already ran. Context combines deterministic spelling
+        // lookup with definition-level term evidence: a one-word concept may occur in a path or
+        // qualified name, while prose intent words must not turn the query into a hard AND.
+        let mut hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+        let mut term_hits =
+            self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+        if !term_hits.is_empty() {
+            let ranking_graph = self.graph()?;
+            for hit in &mut term_hits {
+                if let Some(id) = hit.definition_id.as_deref() {
+                    let degree = ranking_graph.direct_relations_limit(id, true, 0).1
+                        + ranking_graph.direct_relations_limit(id, false, 0).1;
+                    hit.score_micros = hit
+                        .score_micros
+                        .saturating_add((degree as u64).min(40) * 500)
+                        .min(999_999);
+                }
+            }
+        }
+        hits.extend(term_hits);
+        hits.sort_by(|left, right| {
+            right
+                .score_micros
+                .cmp(&left.score_micros)
+                .then_with(|| left.value.cmp(&right.value))
+                .then_with(|| left.definition_id.cmp(&right.definition_id))
+        });
+        hits.dedup_by(|left, right| {
+            left.value == right.value && left.definition_id == right.definition_id
+        });
+        if let Some(best_term_score) = hits
+            .iter()
+            .filter(|hit| hit.reason.as_deref() == Some("term-coverage"))
+            .map(|hit| hit.score_micros)
+            .max()
+        {
+            // Keep close alternatives for honest ambiguity, but do not promote documents that
+            // matched only generic residue from a natural-language query.
+            let floor = best_term_score.saturating_sub(50_000);
+            hits.retain(|hit| {
+                hit.reason.as_deref() != Some("term-coverage") || hit.score_micros >= floor
+            });
+        }
+        let symbol_runtime = self.symbol_meta_runtime()?.unwrap_or_else(|| {
+            Arc::new(SymbolMetaRuntime::new(crate::model::SymbolMetaDict {
+                format_version: crate::model::SymbolMetaDict::FORMAT_VERSION,
+                snapshot_id: String::new(),
+                entries: Vec::new(),
+                duplicates: Vec::new(),
+                id_order: Vec::new(),
+                qualified_order: Vec::new(),
+            }))
+        });
+        let symbol_meta = Arc::clone(&symbol_runtime.dict);
+        let exact_identity = symbol_runtime.exact_id_or_qualified(query);
+        let exact_primary = (exact_identity.len() == 1).then(|| exact_identity[0]);
+        let required_terms = crate::search::query_tokens(query);
+        let mut candidates = Vec::new();
+        let mut candidate_entries = Vec::new();
+        let mut candidate_scores = Vec::new();
+        let mut candidate_reasons = Vec::new();
+        let mut candidate_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut seen_ids = BTreeSet::new();
+        let mut candidate_total = 0usize;
+        for entry in &exact_identity {
+            *candidate_counts.entry(entry.name.clone()).or_default() += 1;
+            candidate_total += 1;
+            seen_ids.insert(entry.id.clone());
+            if candidates.len() < limit {
+                candidate_entries.push((*entry).clone());
+                candidate_scores.push(1_250_000_u64);
+                candidate_reasons.push("exact-qualified".to_owned());
+                candidates.push(serde_json::json!({
+                    "id": entry.id,
+                    "name": entry.name,
+                    "qualified": entry.qualified_name,
+                    "kind": entry.kind,
+                    "path": entry.path,
+                    "line": entry.span.start_line + 1,
+                    "end_line": entry.span.end_line + 1,
+                    "score": 1_250_000_u64,
+                    "why": "exact-qualified",
+                }));
+            }
+        }
+        let mut add_candidate = |entry: &crate::model::SymbolMeta, hit: &SearchHit| {
+            if seen_ids.insert(entry.id.clone()) {
+                *candidate_counts.entry(entry.name.clone()).or_default() += 1;
+                candidate_total += 1;
+                if candidates.len() < limit {
+                    candidate_entries.push(entry.clone());
+                    candidate_scores.push(hit.score_micros);
+                    candidate_reasons.push(hit.reason.clone().unwrap_or_default());
+                    candidates.push(serde_json::json!({
+                        "id": entry.id,
+                        "name": entry.name,
+                        "qualified": entry.qualified_name,
+                        "kind": entry.kind,
+                        "path": entry.path,
+                        "line": entry.span.start_line + 1,
+                        "end_line": entry.span.end_line + 1,
+                        "score": hit.score_micros,
+                        "why": hit.reason,
+                    }));
+                }
+            }
+        };
+        for hit in &hits {
+            if let Some(id) = hit.definition_id.as_deref() {
+                if let Some(entry) = symbol_runtime.get_by_id(id) {
+                    add_candidate(entry, hit);
+                }
+                continue;
+            }
+            for entry in symbol_meta.entries_for(&hit.value) {
+                if hit.reason.as_deref() != Some("term-coverage")
+                    || crate::search::symbol_meta_matches_query_tokens(&required_terms, entry)
+                {
+                    add_candidate(entry, hit);
+                }
+            }
+        }
+
+        let primary = exact_identity
             .first()
-            .map(|h| h.value.clone())
+            .map(|entry| entry.name.clone())
+            .or_else(|| candidate_entries.first().map(|entry| entry.name.clone()))
             .unwrap_or_else(|| query.to_owned());
-        let limits = QueryLimits {
+        let mut matches = Vec::new();
+        let mut matched_names: FxHashSet<&str> = FxHashSet::default();
+        for entry in &exact_identity {
+            if matched_names.insert(entry.name.as_str()) {
+                matches.push(entry.name.clone());
+            }
+        }
+        for hit in &hits {
+            if candidate_counts.contains_key(&hit.value) && matched_names.insert(hit.value.as_str())
+            {
+                matches.push(hit.value.clone());
+            }
+        }
+
+        // A simple spelling can name hundreds of methods. Choosing the first path would create a
+        // convincing but false context. Resolve only a unique definition or an exact qualified id.
+        let primary_meta = exact_primary.or_else(|| {
+            let first = candidate_entries.first()?;
+            if candidate_reasons
+                .first()
+                .is_some_and(|why| why == "term-coverage")
+            {
+                let uniquely_ranked = candidate_scores
+                    .get(1)
+                    .is_none_or(|runner_up| candidate_scores[0] > *runner_up);
+                return uniquely_ranked.then_some(first);
+            }
+            (candidate_counts.get(&primary) == Some(&1)).then_some(first)
+        });
+        let ambiguous = primary_meta.is_none()
+            && candidate_counts
+                .get(&primary)
+                .is_some_and(|count| *count > 1);
+        let graph_primary = primary_meta.map(|entry| entry.id.as_str());
+        let impact_limits = QueryLimits {
             depth: 2,
             nodes: 50,
             edges: 200,
             page_size: 20,
             ..Default::default()
         };
-        let callers = self.query_raw(&primary, true, &limits, None).ok();
-        let callees = self.query_raw(&primary, false, &limits, None).ok();
-        let impact = self.impact_risk(&primary, &limits).ok();
-        let detail = self.node_detail(&primary).ok().flatten();
-        // SymbolMeta keeps the defining path in a sidecar, so expose it here and save the
-        // agent a second search/read just to locate the symbol's file.
-        let detail_path = self
-            .symbol_meta()
-            .ok()
-            .flatten()
-            .and_then(|meta| meta.get(&primary).map(|symbol| symbol.path.clone()));
-        // Compact: names only in nested pages (agents don't need full QueryPage fields thrice).
-        let callers_names: Vec<String> = callers
-            .as_ref()
-            .map(|p| p.items.iter().take(limit).cloned().collect())
+        let display_node = |node: &str| {
+            symbol_runtime
+                .get_by_id(node)
+                .map(|entry| entry.qualified_name.clone())
+                .unwrap_or_else(|| node.to_owned())
+        };
+        let graph = graph_primary.map(|_| self.graph()).transpose()?;
+        let impact = graph_primary.and_then(|node| {
+            graph
+                .as_deref()
+                .and_then(|graph| analysis::impact_with_risk(graph, node, &impact_limits).ok())
+        });
+        let (incoming_sites, incoming_total) = graph_primary
+            .and_then(|node| {
+                graph
+                    .as_deref()
+                    .map(|graph| graph.direct_relations_limit(node, true, limit))
+            })
             .unwrap_or_default();
-        let callees_names: Vec<String> = callees
-            .as_ref()
-            .map(|p| p.items.iter().take(limit).cloned().collect())
+        let (outgoing_sites, outgoing_total) = graph_primary
+            .and_then(|node| {
+                graph
+                    .as_deref()
+                    .map(|graph| graph.direct_relations_limit(node, false, limit))
+            })
             .unwrap_or_default();
+        let relation_names = |relations: &[crate::graph::RelationView]| {
+            let mut seen = BTreeSet::new();
+            relations
+                .iter()
+                .filter(|relation| {
+                    !matches!(
+                        relation.kind,
+                        crate::model::EdgeKind::Import | crate::model::EdgeKind::ReExport
+                    )
+                })
+                .filter_map(|relation| {
+                    let display = display_node(&relation.node);
+                    seen.insert(display.clone()).then_some(display)
+                })
+                .collect::<Vec<_>>()
+        };
+        let callers_names = relation_names(&incoming_sites);
+        let callees_names = relation_names(&outgoing_sites);
         let impact_top: Vec<_> = impact
             .as_ref()
             .map(|r| {
@@ -1219,7 +1955,7 @@ impl WorkspaceEngine {
                     .take(limit)
                     .map(|i| {
                         serde_json::json!({
-                            "s": i.symbol,
+                            "s": display_node(&i.symbol),
                             "risk": i.risk,
                             "d": i.depth,
                         })
@@ -1227,23 +1963,79 @@ impl WorkspaceEngine {
                     .collect()
             })
             .unwrap_or_default();
+        let relation_json = |relations: Vec<crate::graph::RelationView>| {
+            relations
+                .into_iter()
+                .map(|relation| {
+                    let related = symbol_runtime.get_by_id(&relation.node);
+                    serde_json::json!({
+                        "id": relation.node,
+                        "name": related.map(|entry| entry.qualified_name.as_str()).unwrap_or(&relation.node),
+                        "kind": relation.kind.as_str(),
+                        "path": related.map(|entry| entry.path.as_str()),
+                        "site": {
+                            "path": relation.source_path,
+                            "line": relation.span.map(|span| span.start_line + 1),
+                            "end_line": relation.span.map(|span| span.end_line + 1),
+                        },
+                        "confidence": relation.confidence,
+                        "provenance": relation.provenance,
+                        "type_only": relation.type_only,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let incoming_relations = relation_json(incoming_sites);
+        let outgoing_relations = relation_json(outgoing_sites);
+        let caller_count = callers_names.len();
+        let source = primary_meta.and_then(|symbol| symbol_source_excerpt(&self.root, symbol));
+        let candidates_truncated = candidate_total > candidates.len();
+        let no_result = candidate_total == 0;
         Ok(serde_json::json!({
             "q": query,
             "primary": primary,
-            "matches": hits.iter().map(|h| &h.value).collect::<Vec<_>>(),
-            "detail": detail.as_ref().map(|d| serde_json::json!({
-                "name": d.name, "kind": d.kind, "exported": d.exported, "path": detail_path
+            "matches": matches,
+            "candidates": candidates,
+            "ambiguous": ambiguous,
+            "detail": primary_meta.map(|d| serde_json::json!({
+                "id": d.id, "name": d.name, "qualified": d.qualified_name,
+                "kind": d.kind, "exported": d.exported, "path": d.path,
+                "line": d.span.start_line + 1, "end_line": d.span.end_line + 1
             })),
+            "source": source,
             "callers": callers_names,
             "callees": callees_names,
+            "relations": {
+                "incoming": incoming_relations,
+                "outgoing": outgoing_relations,
+            },
             "impact": impact_top,
-            "n_callers": callers
-                .as_ref()
-                .map(|p| p.visited_nodes.saturating_sub(1))
-                .unwrap_or(0),
+            "n_callers": caller_count,
             "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
             "auto_synced": synced.is_some(),
             "sync_warning": self.last_update_error(),
+            "warnings": if ambiguous {
+                vec!["ambiguous symbol name; select a candidate id or qualified name"]
+            } else if no_result {
+                vec!["no definition matched search evidence"]
+            } else {
+                Vec::<&str>::new()
+            },
+            "truncation": {
+                "candidates": candidates_truncated,
+                "incoming": incoming_total > limit,
+                "outgoing": outgoing_total > limit,
+            },
+            "coverage": {
+                "imports_exports": "static",
+                "calls": "static_syntax",
+                "types": "static_syntax",
+                "instantiation": "static_syntax",
+                "decorators": "static_syntax",
+                "value_references": "partial",
+                "dynamic_dispatch": "unsupported",
+                "authoritative_zero": false,
+            },
             "sid": self.stats().map(|s| s.snapshot_id).ok(),
         }))
     }
@@ -1284,12 +2076,18 @@ impl WorkspaceEngine {
         let mut cache = self.inner.search_cache.lock().unwrap();
         if let Some(index) = cache.as_ref() {
             // Upgrade path: cached dict-only but fuzzy/regex needs Tantivy.
-            let needs_tantivy = matches!(kind, SearchKind::Fuzzy | SearchKind::Regex);
+            let needs_tantivy = matches!(
+                kind,
+                SearchKind::Fuzzy | SearchKind::Regex | SearchKind::Terms
+            );
             if !needs_tantivy || index.backend_label() != "dict" {
                 return Ok(Arc::clone(index));
             }
         }
-        let needs_tantivy = matches!(kind, SearchKind::Fuzzy | SearchKind::Regex);
+        let needs_tantivy = matches!(
+            kind,
+            SearchKind::Fuzzy | SearchKind::Regex | SearchKind::Terms
+        );
         let index = if let Some(index) = self.storage().open_search_index(needs_tantivy)? {
             Arc::new(index)
         } else {
@@ -1326,6 +2124,12 @@ impl WorkspaceEngine {
     }
 
     fn symbol_meta(&self) -> Result<Option<Arc<crate::model::SymbolMetaDict>>, EngineError> {
+        Ok(self
+            .symbol_meta_runtime()?
+            .map(|runtime| Arc::clone(&runtime.dict)))
+    }
+
+    fn symbol_meta_runtime(&self) -> Result<Option<Arc<SymbolMetaRuntime>>, EngineError> {
         self.refresh_external_generation()?;
         let mut cache = self.inner.symbol_meta_cache.lock().unwrap();
         if let Some(meta) = cache.as_ref() {
@@ -1334,9 +2138,28 @@ impl WorkspaceEngine {
         let Some(meta) = self.storage().open_symbol_meta()? else {
             return Ok(None);
         };
-        let meta = Arc::new(meta);
+        let meta = Arc::new(SymbolMetaRuntime::new(meta));
         *cache = Some(Arc::clone(&meta));
         Ok(Some(meta))
+    }
+
+    fn resolve_graph_node(&self, graph: &GraphIndex, node: &str) -> String {
+        if graph.contains_node(node) {
+            return node.to_owned();
+        }
+        self.symbol_meta_runtime()
+            .ok()
+            .flatten()
+            .and_then(|runtime| {
+                let qualified = runtime.exact_id_or_qualified(node);
+                if qualified.len() == 1 {
+                    return Some(qualified[0].id.clone());
+                }
+                let mut by_name = runtime.dict.entries_for(node);
+                let first = by_name.next()?;
+                by_name.next().is_none().then(|| first.id.clone())
+            })
+            .unwrap_or_else(|| node.to_owned())
     }
     pub fn query(
         &self,
@@ -1358,10 +2181,11 @@ impl WorkspaceEngine {
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<QueryPage, EngineError> {
         let graph = self.graph()?;
+        let resolved_node = self.resolve_graph_node(&graph, node);
         Ok(if reverse {
-            graph.callers_of(node, limits, cancel)?
+            graph.callers_of(&resolved_node, limits, cancel)?
         } else {
-            graph.impact_analysis(node, limits, cancel)?
+            graph.impact_analysis(&resolved_node, limits, cancel)?
         })
     }
 
@@ -1465,22 +2289,32 @@ impl WorkspaceEngine {
     }
     pub fn node_detail(&self, symbol: &str) -> Result<Option<crate::model::Symbol>, EngineError> {
         // Prefer compact symbol_meta sidecar (no full snapshot / MCP snapshot_cache).
-        if let Some(meta) = self.symbol_meta()? {
-            return match meta.get(symbol) {
+        if let Some(runtime) = self.symbol_meta_runtime()? {
+            return match runtime
+                .get_by_id(symbol)
+                .or_else(|| runtime.dict.get(symbol))
+            {
                 Some(m) => {
                     // Delta generations keep the global name→path sidecar when symbol shape is
                     // unchanged, then read current span/complexity from the artifact overlay.
                     if let Some(artifact) = self.storage().open_artifact(&m.path)?
-                        && let Some(current) = artifact.symbols.iter().find(|s| s.name == symbol)
+                        && let Some(current) = artifact
+                            .symbols
+                            .iter()
+                            .filter(|s| s.id == m.id || s.name == symbol)
+                            .max_by_key(|s| s.span)
                     {
                         return Ok(Some(current.clone()));
                     }
                     Ok(Some(crate::model::Symbol {
+                        id: m.id.clone(),
                         name: m.name.clone(),
+                        qualified_name: m.qualified_name.clone(),
                         kind: m.kind.clone(),
                         span: m.span,
                         exported: m.exported,
                         complexity: m.complexity.clone(),
+                        scope: None,
                     }))
                 }
                 None => Ok(None),
@@ -1526,7 +2360,8 @@ impl WorkspaceEngine {
         limits: &QueryLimits,
     ) -> Result<ImpactReport, EngineError> {
         let graph = self.graph()?;
-        Ok(analysis::impact_with_risk(&graph, node, limits)?)
+        let resolved_node = self.resolve_graph_node(&graph, node);
+        Ok(analysis::impact_with_risk(&graph, &resolved_node, limits)?)
     }
 
     pub fn hubs(
@@ -1798,6 +2633,156 @@ mod sync_queue_tests {
 }
 
 #[cfg(test)]
+mod resident_sync_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, WorkspaceEngine, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let service = root.path().join("service.ts");
+        std::fs::write(&service, "export const answer = () => 42;\n").unwrap();
+        std::fs::write(
+            root.path().join("consumer.ts"),
+            "import { answer } from './service';\nexport const value = answer();\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        (root, engine, service)
+    }
+
+    #[test]
+    fn resident_sync_publishes_structural_overlays_and_keeps_exact_edges() {
+        let (root, engine, service) = fixture();
+        let base = engine.storage().read_manifest().unwrap().unwrap();
+        let base_pack = base.structural_packs.unwrap().base;
+
+        std::fs::write(
+            &service,
+            "// shifted declaration\nexport const answer = () => 42;\n",
+        )
+        .unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+
+        let current = engine.storage().read_manifest().unwrap().unwrap();
+        let chain = current.structural_packs.unwrap();
+        assert_eq!(chain.base, base_pack);
+        assert_eq!(chain.overlays.len(), 1);
+        assert_eq!(engine.stats().unwrap().edges, 3);
+
+        let cold_reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let context = cold_reader.context("answer", 10).unwrap();
+        assert!(
+            context["relations"]["incoming"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relation| relation["kind"] == "Calls")
+        );
+    }
+
+    #[test]
+    fn resident_content_only_sync_does_not_hydrate_workspace_structural_state() {
+        let (_root, engine, service) = fixture();
+        assert!(engine.inner.structural_cache.lock().unwrap().is_none());
+
+        std::fs::write(&service, "export const answer = () => 43;\n").unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+
+        assert!(engine.inner.structural_cache.lock().unwrap().is_none());
+        assert_eq!(
+            engine.context("answer", 10).unwrap()["detail"]["name"],
+            "answer"
+        );
+    }
+
+    #[test]
+    fn resident_rename_is_visible_to_cold_search_without_rebuilding_the_base() {
+        let (root, engine, service) = fixture();
+        let before = engine.storage().read_manifest().unwrap().unwrap();
+        let base_search = before.search_dir.unwrap();
+
+        std::fs::write(&service, "export const result = () => 42;\n").unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+
+        let current = engine.storage().read_manifest().unwrap().unwrap();
+        assert_eq!(current.search_dir.as_deref(), Some(base_search.as_str()));
+        assert_eq!(current.search_overlays.len(), 1);
+
+        let cold_reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert!(
+            cold_reader
+                .search_raw("answer", SearchKind::Exact, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cold_reader
+                .search_raw("result", SearchKind::Exact, 10)
+                .unwrap()[0]
+                .value,
+            "result"
+        );
+        assert_eq!(
+            cold_reader
+                .search_raw("result service", SearchKind::Terms, 10)
+                .unwrap()[0]
+                .value,
+            "result"
+        );
+
+        std::fs::write(&service, "export const finalResult = () => 42;\n").unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+        let second_reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert!(
+            second_reader
+                .search_raw("result", SearchKind::Exact, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            second_reader
+                .search_raw("final result service", SearchKind::Terms, 10)
+                .unwrap()[0]
+                .value,
+            "finalResult"
+        );
+    }
+
+    #[test]
+    fn cold_structural_sync_appends_a_sharded_overlay_without_rebuilding_the_base() {
+        let (_root, engine, service) = fixture();
+        let base = engine
+            .storage()
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .structural_packs
+            .unwrap()
+            .base;
+        std::fs::write(&service, "export const answer = (value = 42) => value;\n").unwrap();
+
+        engine.sync(Some(&[service])).unwrap();
+
+        let current = engine.storage().read_manifest().unwrap().unwrap();
+        let chain = current
+            .structural_packs
+            .as_ref()
+            .unwrap_or_else(|| panic!("sync must retain structural shards: {current:?}"));
+        assert_eq!(chain.base, base);
+        assert_eq!(chain.overlays.len(), 1);
+        assert_eq!(chain.current_snapshot, current.snapshot_id.stable_key());
+    }
+}
+
+#[cfg(test)]
 mod symbol_name_delta_tests {
     use super::symbol_name_set_changed;
     use std::collections::BTreeMap;
@@ -1882,5 +2867,169 @@ mod generation_cache_lock_tests {
         drop(observed);
         worker.join().unwrap();
         assert!(completed_without_reentry.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod agent_context_tests {
+    use super::*;
+
+    #[test]
+    fn context_explains_ranked_definition_and_direct_relation_sites() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("service.ts"),
+            "export function getPendingLegalPersonOnboarding() { return true; }\n\
+             export function find() { return false; }\n\
+             export class First { execute() { return 1; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("consumer.ts"),
+            "import { getPendingLegalPersonOnboarding } from './service';\n\
+             export function loadPendingOnboarding() {\n\
+               return getPendingLegalPersonOnboarding();\n\
+             }\n\
+             export class Second { execute() { return 2; } }\n",
+        )
+        .unwrap();
+
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let exact = engine
+            .context("getPendingLegalPersonOnboarding", 10)
+            .unwrap();
+        assert_eq!(exact["ambiguous"], false);
+        assert_eq!(exact["detail"]["path"], "service.ts");
+        assert!(
+            exact["source"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("getPendingLegalPersonOnboarding")
+        );
+        let incoming = exact["relations"]["incoming"].as_array().unwrap();
+        assert!(incoming.iter().any(|relation| {
+            relation["kind"] == "Calls"
+                && relation["site"]["path"] == "consumer.ts"
+                && relation["site"]["line"] == 3
+        }));
+        let impact = engine
+            .impact_risk(
+                "getPendingLegalPersonOnboarding",
+                &QueryLimits {
+                    depth: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(impact.total_affected > 0, "{impact:?}");
+
+        let terms = engine
+            .context("pending legal person onboarding function", 10)
+            .unwrap();
+        assert_eq!(
+            terms["matches"].as_array().unwrap()[0],
+            "getPendingLegalPersonOnboarding"
+        );
+        let intent_word = engine
+            .context("find pending legal person onboarding function", 10)
+            .unwrap();
+        assert_eq!(
+            intent_word["detail"]["name"],
+            "getPendingLegalPersonOnboarding"
+        );
+
+        let ambiguous = engine.context("execute", 10).unwrap();
+        assert_eq!(ambiguous["ambiguous"], true);
+        assert!(ambiguous["detail"].is_null());
+        assert!(
+            ambiguous["relations"]["incoming"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let qualified = engine.context("First.execute", 10).unwrap();
+        assert_eq!(qualified["ambiguous"], false);
+        assert_eq!(qualified["detail"]["qualified"], "First.execute");
+        assert_eq!(qualified["candidates"][0]["why"], "exact-qualified");
+    }
+
+    #[test]
+    fn incremental_rename_updates_path_terms_without_stale_search_hits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let old_path = root.path().join("src/pending_onboarding.ts");
+        let new_path = root.path().join("src/archive.ts");
+        std::fs::write(&old_path, "export const handler = () => true;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        assert_eq!(
+            engine
+                .search_raw("pending onboarding", SearchKind::Terms, 10)
+                .unwrap()[0]
+                .value,
+            "handler"
+        );
+
+        std::fs::rename(&old_path, &new_path).unwrap();
+        engine
+            .sync(Some(&[old_path.clone(), new_path.clone()]))
+            .unwrap();
+        assert!(
+            engine
+                .search_raw("pending onboarding", SearchKind::Terms, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn single_concept_context_uses_path_evidence_after_prefix_stage() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("features/onboarding")).unwrap();
+        std::fs::write(
+            root.path().join("features/onboarding/handler.ts"),
+            "export function processRequest() { return true; }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let context = engine.context("onboarding", 10).unwrap();
+        assert_eq!(context["ambiguous"], false);
+        assert_eq!(context["detail"]["name"], "processRequest");
+        assert_eq!(context["candidates"][0]["why"], "term-coverage");
+    }
+
+    #[test]
+    fn term_mode_filters_homonyms_at_definition_level() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("apps/admin")).unwrap();
+        std::fs::create_dir_all(root.path().join("apps/users/onboarding")).unwrap();
+        std::fs::write(
+            root.path().join("apps/admin/service.ts"),
+            "export class AdminService { execute() {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("apps/users/onboarding/service.ts"),
+            "export class OnboardingService { execute() {} }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let context = engine
+            .context("users onboarding execute method", 10)
+            .unwrap();
+        assert_eq!(context["ambiguous"], false);
+        assert_eq!(context["detail"]["qualified"], "OnboardingService.execute");
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            context["candidates"][0]["path"],
+            "apps/users/onboarding/service.ts"
+        );
     }
 }

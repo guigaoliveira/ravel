@@ -441,7 +441,7 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     })
                     .collect();
                 if batch.needs_reconcile {
-                    if let Err(error) = engine.index() {
+                    if let Err(error) = engine.reconcile() {
                         engine.record_update_error("watch index", &error.to_string());
                     }
                 } else if !paths.is_empty() {
@@ -500,7 +500,7 @@ fn acquire_watcher_leadership(
 #[tool_router(router = tool_router_primary, vis = "pub")]
 impl RavelMcp {
     #[tool(
-        description = "PRIMARY (one call → answers). Search symbol + callers + callees + impact radius. Prefer over multi-grep/Read."
+        description = "PRIMARY (one call → answers). Exact/qualified symbol or natural-term search, selected source, typed caller/callee sites, and bounded impact. Ambiguous names return candidates instead of guessing."
     )]
     async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> String {
         let limit = request.limit.unwrap_or(10).max(1);
@@ -553,12 +553,13 @@ impl RavelMcp {
 
 #[tool_router(router = tool_router_extended, vis = "pub")]
 impl RavelMcp {
-    #[tool(description = "Search symbols (kind: exact|prefix|fuzzy|regex)")]
+    #[tool(description = "Search symbols (kind: exact|prefix|fuzzy|regex|terms)")]
     async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> String {
         let kind = match request.kind.as_deref() {
             Some("prefix") => SearchKind::Prefix,
             Some("fuzzy") => SearchKind::Fuzzy,
             Some("regex") => SearchKind::Regex,
+            Some("terms") => SearchKind::Terms,
             _ => SearchKind::Exact,
         };
         let limit = request.limit.unwrap_or(20).max(1);
@@ -830,7 +831,7 @@ impl ServerHandler for RavelMcp {
             format!(
                 "Ravel = token-efficient code graph (TS/JS). Mode: {mode}. \
                  Prefer: explore | status | sync. \
-                 One structural call beats many greps/file reads. \
+                 Explore accepts a symbol/qualified name or natural terms and returns bounded evidence. \
                  Do NOT read whole files to find callers — use tools. \
                  Editing: use agent editor; ravel maps blast radius. \
                  Each requested root is watched unless sync.mode=none; use sync for explicit paths. \
