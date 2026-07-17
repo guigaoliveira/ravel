@@ -1,19 +1,10 @@
+use crate::generation_pack::GenerationPackReader;
 use crate::model::IndexSnapshot;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use thiserror::Error;
 
-const TANTIVY_WRITER_HEAP_BYTES: usize = 15_000_000;
-/// Per-thread heap for the multi-threaded index writer. Tantivy requires ≥15 MB per thread;
-/// 32 MB keeps segments large enough to limit merge churn without inflating RSS materially.
-const TANTIVY_WRITER_HEAP_PER_THREAD: usize = 32_000_000;
-/// Cap writer threads so a large host does not spawn a segment merge fan-out that competes with
-/// the rest of the (now parallel) publish for cores and disk bandwidth.
-const TANTIVY_MAX_WRITER_THREADS: usize = 8;
-const TERM_CANDIDATE_MULTIPLIER: usize = 32;
-const TERM_CANDIDATE_FLOOR: usize = 1_024;
-const NAME_CANDIDATE_MULTIPLIER: usize = 8;
-const NAME_CANDIDATE_FLOOR: usize = 256;
 const SCORE_EXACT_CASE: u64 = 1_300_000;
 const SCORE_EXACT_CASE_INSENSITIVE: u64 = 1_200_000;
 const SCORE_PREFIX_CASE: u64 = 1_100_000;
@@ -56,7 +47,17 @@ pub enum SearchError {
 /// - This struct is a **single shard**. At huge N, publish multiple shards (by hash prefix)
 ///   and open only the shards needed for a query — never materialize 1B names in one Vec.
 /// - Parallel lowercase keys avoid re-normalizing O(N) names on every process open.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SymbolDict {
     pub format_version: u32,
     pub snapshot_id: String,
@@ -67,11 +68,74 @@ pub struct SymbolDict {
     /// Parallel token text used by the persistent term index. It aggregates segmented names,
     /// qualified names, declaration kinds, and paths for every definition sharing the spelling.
     pub terms: Vec<String>,
-    /// Definition-level documents prevent terms from different homonyms satisfying one query.
-    term_documents: Vec<SymbolTermDocument>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub(crate) struct TermIndex {
+    pub(crate) format_version: u32,
+    pub(crate) snapshot_id: String,
+    /// Definition-level documents prevent terms from different homonyms satisfying one query.
+    documents: Vec<TermDocument>,
+    /// Sorted token dictionary for definition-level term search.
+    term_tokens: Vec<String>,
+    /// Parallel postings into `term_documents`, sorted and deduplicated per token.
+    term_postings: Vec<Vec<TermPosting>>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+struct TermDocument {
+    id: String,
+    name: String,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+struct TermPosting {
+    document_index: u32,
+    fields: u8,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SymbolTermDocument {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -79,10 +143,11 @@ pub(crate) struct SymbolTermDocument {
     pub(crate) qualified_terms: String,
     pub(crate) path_terms: String,
     pub(crate) kind_terms: String,
+    pub(crate) degree: u32,
 }
 
 impl SymbolTermDocument {
-    pub(crate) fn from_symbol(path: &str, symbol: &crate::model::Symbol) -> Self {
+    pub(crate) fn from_symbol(path: &str, symbol: &crate::model::Symbol, degree: u32) -> Self {
         let field_terms = |value: &str| {
             let mut tokens = BTreeSet::new();
             add_search_tokens(&mut tokens, value);
@@ -95,6 +160,7 @@ impl SymbolTermDocument {
             qualified_terms: field_terms(&symbol.qualified_name),
             path_terms: field_terms(path),
             kind_terms: field_terms(symbol.kind.as_ref()),
+            degree,
         }
     }
 }
@@ -108,42 +174,50 @@ pub(crate) struct SearchTermOverlay {
     pub(crate) documents: Vec<SymbolTermDocument>,
 }
 
+impl SearchTermOverlay {
+    pub(crate) fn compose(overlays: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut removed_ids = BTreeSet::new();
+        let mut documents = BTreeMap::new();
+        let mut added_names = BTreeSet::new();
+        let mut removed_names = BTreeSet::new();
+        let mut snapshot_id = None;
+        for overlay in overlays {
+            for name in overlay.removed_names {
+                added_names.remove(&name);
+                removed_names.insert(name);
+            }
+            for name in overlay.added_names {
+                removed_names.remove(&name);
+                added_names.insert(name);
+            }
+            removed_ids.extend(overlay.removed_ids.iter().cloned());
+            for id in overlay.removed_ids {
+                documents.remove(&id);
+            }
+            for document in overlay.documents {
+                removed_ids.insert(document.id.clone());
+                documents.insert(document.id.clone(), document);
+            }
+            snapshot_id = Some(overlay.snapshot_id);
+        }
+        snapshot_id.map(|snapshot_id| Self {
+            snapshot_id,
+            removed_ids: removed_ids.into_iter().collect(),
+            added_names: added_names.into_iter().collect(),
+            removed_names: removed_names.into_iter().collect(),
+            documents: documents.into_values().collect(),
+        })
+    }
+}
+
 impl SymbolDict {
-    pub const FORMAT_VERSION: u32 = 5;
+    pub const FORMAT_VERSION: u32 = 6;
 
     pub fn from_snapshot(snapshot: &IndexSnapshot) -> Self {
-        // Aggregate each spelling once while retaining deterministic token order.
-        let mut by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut term_documents = Vec::new();
-        for (path, artifact) in &snapshot.files {
-            for symbol in &artifact.symbols {
-                let document = SymbolTermDocument::from_symbol(path, symbol);
-                let tokens = by_name.entry(symbol.name.clone()).or_default();
-                for terms in [
-                    &document.name_terms,
-                    &document.qualified_terms,
-                    &document.path_terms,
-                    &document.kind_terms,
-                ] {
-                    tokens.extend(terms.split_whitespace().map(ToOwned::to_owned));
-                }
-                term_documents.push(document);
-            }
-        }
-        term_documents.sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
-        let mut dict = Self::from_entries(
-            by_name
-                .into_iter()
-                .map(|(name, terms)| (name, terms.into_iter().collect::<Vec<_>>().join(" ")))
-                .collect(),
-            snapshot.id.stable_key(),
-        );
-        dict.term_documents = term_documents;
-        dict
+        Self::from_snapshot_names_only(snapshot)
     }
 
-    /// Prefix/exact dictionary for persisted readers. Definition-level term documents are
-    /// streamed directly into Tantivy and must not be retained alongside the snapshot.
+    /// Prefix/exact dictionary for persisted readers.
     pub fn from_snapshot_names_only(snapshot: &IndexSnapshot) -> Self {
         let names = snapshot
             .files
@@ -170,8 +244,6 @@ impl SymbolDict {
     }
 
     fn from_entries(entries: Vec<(String, String)>, snapshot_id: String) -> Self {
-        // Lowercase each name exactly once, sort by (lower, original), then split. The old
-        // comparator called `to_lowercase()` twice per comparison — O(N log N) allocations.
         let mut paired: Vec<(String, String, String)> = entries
             .into_iter()
             .map(|(name, terms)| (name.to_lowercase(), name, terms))
@@ -191,25 +263,75 @@ impl SymbolDict {
             names,
             lower,
             terms,
-            term_documents: Vec::new(),
         }
     }
 
     pub(crate) fn is_well_formed(&self) -> bool {
         self.lower.len() == self.names.len() && self.terms.len() == self.names.len()
     }
+}
 
-    pub(crate) fn apply_name_overlays(&mut self, overlays: &[SearchTermOverlay]) {
-        let mut names: BTreeSet<_> = std::mem::take(&mut self.names).into_iter().collect();
-        let mut snapshot_id = self.snapshot_id.clone();
-        for overlay in overlays {
-            for name in &overlay.removed_names {
-                names.remove(name);
+impl TermIndex {
+    pub(crate) const FORMAT_VERSION: u32 = 3;
+
+    pub(crate) fn from_snapshot(snapshot: &IndexSnapshot) -> Self {
+        let mut term_documents = Vec::new();
+        for (path, artifact) in &snapshot.files {
+            for symbol in &artifact.symbols {
+                let document = SymbolTermDocument::from_symbol(path, symbol, 0);
+                term_documents.push(document);
             }
-            names.extend(overlay.added_names.iter().cloned());
-            snapshot_id = overlay.snapshot_id.clone();
         }
-        *self = Self::from_names(names.into_iter().collect(), snapshot_id);
+        term_documents.sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        let mut postings: BTreeMap<String, Vec<TermPosting>> = BTreeMap::new();
+        for (document_index, document) in term_documents.iter().enumerate() {
+            let mut document_tokens = BTreeMap::<&str, u8>::new();
+            for (terms, field) in [
+                (&document.name_terms, 1),
+                (&document.qualified_terms, 2),
+                (&document.path_terms, 4),
+                (&document.kind_terms, 8),
+            ] {
+                for token in terms.split_whitespace() {
+                    *document_tokens.entry(token).or_default() |= field;
+                }
+            }
+            for (token, fields) in document_tokens {
+                postings
+                    .entry(token.to_owned())
+                    .or_default()
+                    .push(TermPosting {
+                        document_index: document_index as u32,
+                        fields,
+                    });
+            }
+        }
+        Self {
+            format_version: Self::FORMAT_VERSION,
+            snapshot_id: snapshot.id.stable_key(),
+            documents: term_documents
+                .into_iter()
+                .map(|document| TermDocument {
+                    id: document.id,
+                    name: document.name,
+                })
+                .collect(),
+            term_tokens: postings.keys().cloned().collect(),
+            term_postings: postings.into_values().collect(),
+        }
+    }
+
+    pub(crate) fn is_well_formed(&self) -> bool {
+        self.term_tokens.len() == self.term_postings.len()
+            && self.term_tokens.windows(2).all(|pair| pair[0] < pair[1])
+            && self.term_postings.iter().all(|posting| {
+                posting
+                    .windows(2)
+                    .all(|pair| pair[0].document_index < pair[1].document_index)
+                    && posting
+                        .last()
+                        .is_none_or(|entry| (entry.document_index as usize) < self.documents.len())
+            })
     }
 }
 
@@ -223,10 +345,17 @@ impl SymbolDict {
 /// | regex  | O(N) worst, early by limit*  | —               |
 ///
 /// \* regex still scans; at 1B use sharded dict + automata index (future).
-struct DictRuntime {
-    dict: SymbolDict,
-    /// length → indices for fuzzy pruning.
-    by_len: FxHashMap<u16, Vec<u32>>,
+enum DictRuntime {
+    Owned {
+        dict: SymbolDict,
+        /// length → indices for fuzzy pruning.
+        by_len: FxHashMap<u16, Vec<u32>>,
+    },
+    Packed {
+        reader: Arc<GenerationPackReader>,
+        key: String,
+        max_bytes: u64,
+    },
 }
 
 impl DictRuntime {
@@ -238,7 +367,7 @@ impl DictRuntime {
             let len = low.chars().count().min(u16::MAX as usize) as u16;
             by_len.entry(len).or_default().push(idx);
         }
-        Self { dict, by_len }
+        Self::Owned { dict, by_len }
     }
 
     fn search(
@@ -247,28 +376,47 @@ impl DictRuntime {
         kind: SearchKind,
         limit: usize,
     ) -> Result<Vec<SearchHit>, SearchError> {
+        if let Self::Packed {
+            reader,
+            key,
+            max_bytes,
+        } = self
+        {
+            let result = reader
+                .with_record_for_validation(key, *max_bytes, |bytes| {
+                    let dict = rkyv::access::<ArchivedSymbolDict, rkyv::rancor::Error>(bytes)
+                        .map_err(|error| SearchError::Backend(error.to_string()))?;
+                    search_archived_dict(dict, query, kind, limit)
+                })
+                .map_err(|error| SearchError::Backend(error.to_string()))?
+                .ok_or_else(|| SearchError::Backend("missing packed symbol dictionary".into()))?;
+            return result;
+        }
+        let Self::Owned { dict, by_len } = self else {
+            unreachable!()
+        };
         let normalized = query.to_lowercase();
         let mut hits = Vec::new();
         match kind {
             SearchKind::Exact => {
                 // `lower` is already sorted by (lower, original): binary-search the equal range
                 // instead of building an O(N) HashMap that cloned every lowercase name.
-                let lower = &self.dict.lower;
+                let lower = &dict.lower;
                 let start = lower.partition_point(|s| s.as_str() < normalized.as_str());
                 for (i, candidate) in lower.iter().enumerate().skip(start) {
                     if candidate != &normalized {
                         break;
                     }
                     hits.push(SearchHit {
-                        value: self.dict.names[i].clone(),
+                        value: dict.names[i].clone(),
                         definition_id: None,
-                        score_micros: if self.dict.names[i] == query {
+                        score_micros: if dict.names[i] == query {
                             SCORE_EXACT_CASE
                         } else {
                             SCORE_EXACT_CASE_INSENSITIVE
                         },
                         reason: Some(
-                            if self.dict.names[i] == query {
+                            if dict.names[i] == query {
                                 "exact-case"
                             } else {
                                 "exact-case-insensitive"
@@ -279,30 +427,30 @@ impl DictRuntime {
                 }
             }
             SearchKind::Prefix => {
-                let lower = &self.dict.lower;
+                let lower = &dict.lower;
                 let start = lower.partition_point(|s| s.as_str() < normalized.as_str());
                 for (i, cand) in lower.iter().enumerate().skip(start) {
                     if !cand.starts_with(&normalized) {
                         break;
                     }
                     hits.push(SearchHit {
-                        value: self.dict.names[i].clone(),
+                        value: dict.names[i].clone(),
                         definition_id: None,
-                        score_micros: if self.dict.names[i] == query {
+                        score_micros: if dict.names[i] == query {
                             SCORE_EXACT_CASE
-                        } else if self.dict.names[i].eq_ignore_ascii_case(query) {
+                        } else if dict.names[i].eq_ignore_ascii_case(query) {
                             SCORE_EXACT_CASE_INSENSITIVE
-                        } else if self.dict.names[i].starts_with(query) {
+                        } else if dict.names[i].starts_with(query) {
                             SCORE_PREFIX_CASE
                         } else {
                             SCORE_PREFIX
                         },
                         reason: Some(
-                            if self.dict.names[i] == query {
+                            if dict.names[i] == query {
                                 "exact-case"
-                            } else if self.dict.names[i].eq_ignore_ascii_case(query) {
+                            } else if dict.names[i].eq_ignore_ascii_case(query) {
                                 "exact-case-insensitive"
-                            } else if self.dict.names[i].starts_with(query) {
+                            } else if dict.names[i].starts_with(query) {
                                 "prefix-case"
                             } else {
                                 "prefix-case-insensitive"
@@ -323,13 +471,13 @@ impl DictRuntime {
                 // Only scan length buckets inside the accepted Levenshtein bound.
                 for len in lo..=hi {
                     let key = len as u16;
-                    if let Some(idxs) = self.by_len.get(&key) {
+                    if let Some(idxs) = by_len.get(&key) {
                         for &i in idxs {
-                            let low = &self.dict.lower[i as usize];
+                            let low = &dict.lower[i as usize];
                             if let Some(distance) = levenshtein_at_most(&q, low, FUZZY_MAX_DISTANCE)
                             {
                                 hits.push(SearchHit {
-                                    value: self.dict.names[i as usize].clone(),
+                                    value: dict.names[i as usize].clone(),
                                     definition_id: None,
                                     // Exact fuzzy matches outrank one- and two-edit matches.
                                     score_micros: SCORE_FUZZY_EXACT
@@ -352,7 +500,7 @@ impl DictRuntime {
                 // Full scan of the opened shard: O(N_shard). Deterministic: collect all
                 // matches, then sort + truncate to `limit`. No silent mid-universe cutoff —
                 // at multi-billion scale, open a name-hash **shard** instead of one giant dict.
-                for name in self.dict.names.iter() {
+                for name in dict.names.iter() {
                     if re.is_match(name) {
                         hits.push(SearchHit {
                             value: name.clone(),
@@ -373,24 +521,182 @@ impl DictRuntime {
     }
 }
 
-/// Hybrid search backend.
-pub struct SearchIndex {
-    dict: Option<DictRuntime>,
-    tantivy: Option<TantivyBackend>,
-    term_overlay: Option<SearchTermOverlay>,
-    /// Keeps on-disk generation files alive for the full Tantivy reader lifetime.
-    generation_guard: Option<crate::generation_gc::GenerationGuard>,
+fn search_archived_dict(
+    dict: &ArchivedSymbolDict,
+    query: &str,
+    kind: SearchKind,
+    limit: usize,
+) -> Result<Vec<SearchHit>, SearchError> {
+    if !matches!(kind, SearchKind::Exact | SearchKind::Prefix) {
+        let owned = rkyv::deserialize::<SymbolDict, rkyv::rancor::Error>(dict)
+            .map_err(|error| SearchError::Backend(error.to_string()))?;
+        return DictRuntime::build(owned).search(query, kind, limit);
+    }
+    let normalized = query.to_lowercase();
+    let mut low = 0usize;
+    let mut high = dict.lower.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if dict.lower[mid].as_str() < normalized.as_str() {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let mut hits = Vec::new();
+    for index in low..dict.lower.len() {
+        let candidate = dict.lower[index].as_str();
+        let matches = match kind {
+            SearchKind::Exact => candidate == normalized,
+            SearchKind::Prefix => candidate.starts_with(&normalized),
+            _ => unreachable!(),
+        };
+        if !matches {
+            break;
+        }
+        let name = dict.names[index].as_str();
+        let (score_micros, reason) = if name == query {
+            (SCORE_EXACT_CASE, "exact-case")
+        } else if name.eq_ignore_ascii_case(query) {
+            (SCORE_EXACT_CASE_INSENSITIVE, "exact-case-insensitive")
+        } else if name.starts_with(query) {
+            (SCORE_PREFIX_CASE, "prefix-case")
+        } else {
+            (SCORE_PREFIX, "prefix-case-insensitive")
+        };
+        hits.push(SearchHit {
+            value: name.to_owned(),
+            definition_id: None,
+            score_micros,
+            reason: Some(reason.into()),
+        });
+    }
+    finish_hits(hits, limit)
 }
 
-struct TantivyBackend {
-    reader: tantivy::IndexReader,
-    name: tantivy::schema::Field,
-    name_terms: tantivy::schema::Field,
-    qualified_terms: tantivy::schema::Field,
-    path_terms: tantivy::schema::Field,
-    kind_terms: tantivy::schema::Field,
-    stored: tantivy::schema::Field,
-    stored_id: tantivy::schema::Field,
+enum TermRuntime {
+    Owned(TermIndex),
+    Packed {
+        reader: Arc<GenerationPackReader>,
+        key: String,
+        max_bytes: u64,
+    },
+}
+
+impl TermRuntime {
+    fn search(
+        &self,
+        tokens: &[String],
+        excluded_ids: &BTreeSet<String>,
+    ) -> Result<Vec<SearchHit>, SearchError> {
+        match self {
+            Self::Owned(index) => Ok(search_owned_terms(index, tokens, excluded_ids)),
+            Self::Packed {
+                reader,
+                key,
+                max_bytes,
+            } => reader
+                .with_record_for_validation(key, *max_bytes, |bytes| {
+                    let archived = rkyv::access::<ArchivedTermIndex, rkyv::rancor::Error>(bytes)
+                        .map_err(|error| SearchError::Backend(error.to_string()))?;
+                    Ok(search_archived_terms(archived, tokens, excluded_ids))
+                })
+                .map_err(|error| SearchError::Backend(error.to_string()))?
+                .ok_or_else(|| SearchError::Backend("missing packed term index".into()))?,
+        }
+    }
+}
+
+fn search_owned_terms(
+    index: &TermIndex,
+    tokens: &[String],
+    excluded_ids: &BTreeSet<String>,
+) -> Vec<SearchHit> {
+    let mut candidates: FxHashMap<u32, [u64; 5]> = FxHashMap::default();
+    for token in tokens {
+        if let Ok(token_index) = index
+            .term_tokens
+            .binary_search_by(|candidate| candidate.as_str().cmp(token))
+        {
+            for posting in &index.term_postings[token_index] {
+                accumulate_posting(
+                    candidates.entry(posting.document_index).or_default(),
+                    posting.fields,
+                );
+            }
+        }
+    }
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (document_index, counts) in candidates {
+        // Postings are only guaranteed in-bounds when the index passed
+        // `is_well_formed`; skip a stale/corrupt posting rather than panic.
+        let Some(document) = index.documents.get(document_index as usize) else {
+            continue;
+        };
+        if excluded_ids.contains(&document.id) {
+            continue;
+        }
+        if let Some(score_micros) = score_term_counts(tokens.len(), counts) {
+            hits.push(SearchHit {
+                value: document.name.clone(),
+                definition_id: Some(document.id.clone()),
+                score_micros,
+                reason: Some("term-coverage".into()),
+            });
+        }
+    }
+    hits
+}
+
+fn search_archived_terms(
+    index: &ArchivedTermIndex,
+    tokens: &[String],
+    excluded_ids: &BTreeSet<String>,
+) -> Vec<SearchHit> {
+    let mut candidates: FxHashMap<u32, [u64; 5]> = FxHashMap::default();
+    for token in tokens {
+        if let Ok(token_index) = index
+            .term_tokens
+            .binary_search_by(|candidate| candidate.as_str().cmp(token))
+        {
+            for posting in index.term_postings[token_index].iter() {
+                accumulate_posting(
+                    candidates
+                        .entry(posting.document_index.to_native())
+                        .or_default(),
+                    posting.fields,
+                );
+            }
+        }
+    }
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (document_index, counts) in candidates {
+        // Archived postings skip the `is_well_formed` gate (only structural
+        // rkyv validation runs), so bound-check before indexing an mmap slice.
+        let Some(document) = index.documents.get(document_index as usize) else {
+            continue;
+        };
+        if excluded_ids.contains(document.id.as_str()) {
+            continue;
+        }
+        if let Some(score_micros) = score_term_counts(tokens.len(), counts) {
+            hits.push(SearchHit {
+                value: document.name.as_str().to_owned(),
+                definition_id: Some(document.id.as_str().to_owned()),
+                score_micros,
+                reason: Some("term-coverage".into()),
+            });
+        }
+    }
+    hits
+}
+/// Persistent dictionary plus a compact definition-level inverted term index.
+pub struct SearchIndex {
+    dict: Option<DictRuntime>,
+    terms: Option<TermRuntime>,
+    term_overlay: Option<SearchTermOverlay>,
+    /// Keeps on-disk generation files alive for the full reader lifetime.
+    generation_guard: Option<crate::generation_gc::GenerationGuard>,
 }
 
 impl std::fmt::Debug for SearchIndex {
@@ -398,9 +704,18 @@ impl std::fmt::Debug for SearchIndex {
         f.debug_struct("SearchIndex")
             .field(
                 "dict_names",
-                &self.dict.as_ref().map(|d| d.dict.names.len()),
+                &self.dict.as_ref().map(|dict| match dict {
+                    DictRuntime::Owned { dict, .. } => dict.names.len(),
+                    DictRuntime::Packed { .. } => 0,
+                }),
             )
-            .field("has_tantivy", &self.tantivy.is_some())
+            .field(
+                "term_documents",
+                &self.terms.as_ref().map(|terms| match terms {
+                    TermRuntime::Owned(index) => index.documents.len(),
+                    TermRuntime::Packed { .. } => 0,
+                }),
+            )
             .field("has_generation_guard", &self.generation_guard.is_some())
             .finish()
     }
@@ -410,68 +725,43 @@ impl SearchIndex {
     pub fn from_symbol_dict(dict: SymbolDict) -> Self {
         Self {
             dict: Some(DictRuntime::build(dict)),
-            tantivy: None,
+            terms: None,
+            term_overlay: None,
+            generation_guard: None,
+        }
+    }
+
+    pub(crate) fn from_packed_dict(
+        reader: Arc<GenerationPackReader>,
+        key: String,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            dict: Some(DictRuntime::Packed {
+                reader,
+                key,
+                max_bytes,
+            }),
+            terms: None,
             term_overlay: None,
             generation_guard: None,
         }
     }
 
     pub fn from_snapshot(snapshot: &IndexSnapshot) -> Result<Self, SearchError> {
-        let dict = SymbolDict::from_snapshot(snapshot);
-        // Build tantivy by borrowing the names, then hand the dict to the runtime — avoids
-        // cloning the entire Vec<String> of names at cold index build.
-        let tantivy = Some(TantivyBackend::from_dict(&dict)?);
-        Ok(Self {
-            dict: Some(DictRuntime::build(dict)),
-            tantivy,
-            term_overlay: None,
-            generation_guard: None,
-        })
+        Ok(Self::from_parts(
+            SymbolDict::from_snapshot(snapshot),
+            Some(TermIndex::from_snapshot(snapshot)),
+        ))
     }
 
-    pub fn open_tantivy_dir(path: &std::path::Path) -> Result<Self, SearchError> {
-        let index =
-            tantivy::Index::open_in_dir(path).map_err(|e| SearchError::Backend(e.to_string()))?;
-        let schema = index.schema();
-        let name = schema
-            .get_field("name")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let stored = schema
-            .get_field("stored")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let name_terms = schema
-            .get_field("name_terms")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let qualified_terms = schema
-            .get_field("qualified_terms")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let path_terms = schema
-            .get_field("path_terms")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let kind_terms = schema
-            .get_field("kind_terms")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let stored_id = schema
-            .get_field("stored_id")
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let reader = index
-            .reader()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        Ok(Self {
-            dict: None,
-            tantivy: Some(TantivyBackend {
-                reader,
-                name,
-                name_terms,
-                qualified_terms,
-                path_terms,
-                kind_terms,
-                stored,
-                stored_id,
-            }),
+    pub(crate) fn from_parts(dict: SymbolDict, terms: Option<TermIndex>) -> Self {
+        Self {
+            dict: Some(DictRuntime::build(dict)),
+            terms: terms.map(TermRuntime::Owned),
             term_overlay: None,
             generation_guard: None,
-        })
+        }
     }
 
     pub fn with_generation_guard(mut self, guard: crate::generation_gc::GenerationGuard) -> Self {
@@ -480,153 +770,8 @@ impl SearchIndex {
     }
 
     pub(crate) fn with_term_overlays(mut self, overlays: Vec<SearchTermOverlay>) -> Self {
-        let mut removed_ids = BTreeSet::new();
-        let mut documents = BTreeMap::new();
-        let mut snapshot_id = None;
-        for overlay in overlays {
-            removed_ids.extend(overlay.removed_ids.iter().cloned());
-            for id in overlay.removed_ids {
-                documents.remove(&id);
-            }
-            for document in overlay.documents {
-                removed_ids.insert(document.id.clone());
-                documents.insert(document.id.clone(), document);
-            }
-            snapshot_id = Some(overlay.snapshot_id);
-        }
-        self.term_overlay = snapshot_id.map(|snapshot_id| SearchTermOverlay {
-            snapshot_id,
-            removed_ids: removed_ids.into_iter().collect(),
-            added_names: Vec::new(),
-            removed_names: Vec::new(),
-            documents: documents.into_values().collect(),
-        });
+        self.term_overlay = SearchTermOverlay::compose(overlays);
         self
-    }
-
-    pub fn with_dict_and_tantivy_dir(
-        dict: SymbolDict,
-        path: &std::path::Path,
-    ) -> Result<Self, SearchError> {
-        let mut index = Self::open_tantivy_dir(path)?;
-        index.dict = Some(DictRuntime::build(dict));
-        Ok(index)
-    }
-
-    pub fn publish_tantivy_snapshot(
-        snapshot: &IndexSnapshot,
-        dir: &std::path::Path,
-    ) -> Result<(), SearchError> {
-        use rayon::prelude::*;
-        use tantivy::{
-            Index, IndexWriter, doc,
-            schema::{STORED, STRING, Schema, TEXT},
-        };
-        std::fs::create_dir_all(dir).map_err(|e| SearchError::Backend(e.to_string()))?;
-        let mut builder = Schema::builder();
-        let name = builder.add_text_field("name", TEXT);
-        let name_terms = builder.add_text_field("name_terms", TEXT | STORED);
-        let qualified_terms = builder.add_text_field("qualified_terms", TEXT | STORED);
-        let path_terms = builder.add_text_field("path_terms", TEXT | STORED);
-        let kind_terms = builder.add_text_field("kind_terms", TEXT | STORED);
-        let stored = builder.add_text_field("stored", STORED);
-        let stored_id = builder.add_text_field("stored_id", STRING | STORED);
-        let schema = builder.build();
-        let index =
-            Index::create_in_dir(dir, schema).map_err(|e| SearchError::Backend(e.to_string()))?;
-
-        let field_terms = |value: &str| {
-            let mut tokens = BTreeSet::new();
-            add_search_tokens(&mut tokens, value);
-            tokens.into_iter().collect::<Vec<_>>().join(" ")
-        };
-        // Tokenizing 5 fields per symbol over the whole corpus is the dominant index-time cost
-        // and is pure CPU, so prepare every document's field strings in parallel up front. The
-        // single-threaded writer producer loop below then only ships already-built strings.
-        let prep_start = std::time::Instant::now();
-        let prepared: Vec<PreparedSearchDoc> = snapshot
-            .files
-            .par_iter()
-            .flat_map_iter(|(path, artifact)| {
-                let path_terms_value = field_terms(path);
-                artifact
-                    .symbols
-                    .iter()
-                    .map(move |symbol| PreparedSearchDoc {
-                        name: symbol.name.to_lowercase(),
-                        name_terms: field_terms(&symbol.name),
-                        qualified_terms: field_terms(&symbol.qualified_name),
-                        path_terms: path_terms_value.clone(),
-                        kind_terms: field_terms(symbol.kind.as_ref()),
-                        stored: symbol.name.clone(),
-                        stored_id: symbol.id.clone(),
-                    })
-            })
-            .collect();
-        crate::timing::stage("search.prep", prep_start, || {
-            format!("docs={}", prepared.len())
-        });
-
-        // A 15 MB budget forces tantivy to a single indexing thread. Give it one thread per core
-        // (capped) with enough per-thread heap so indexing/merge keeps pace with the producer.
-        let threads = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-            .clamp(1, TANTIVY_MAX_WRITER_THREADS);
-        let mut writer: IndexWriter = index
-            .writer_with_num_threads(threads, TANTIVY_WRITER_HEAP_PER_THREAD * threads)
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        // Background auto-merge races the explicit final merge below: segment ids collected
-        // after commit can already be merged away ("segments ... could not be found in the
-        // SegmentManager"), failing the whole publish. Build with merging disabled and do one
-        // deterministic merge ourselves.
-        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
-        // The writer's worker threads (not the producer) are the throughput floor here, so a
-        // single producer loop is as fast as feeding from the whole pool and avoids the extra
-        // contention. Tokenization already happened in parallel above.
-        let add_start = std::time::Instant::now();
-        for prepared_doc in prepared {
-            writer
-                .add_document(doc!(
-                    name => prepared_doc.name,
-                    name_terms => prepared_doc.name_terms,
-                    qualified_terms => prepared_doc.qualified_terms,
-                    path_terms => prepared_doc.path_terms,
-                    kind_terms => prepared_doc.kind_terms,
-                    stored => prepared_doc.stored,
-                    stored_id => prepared_doc.stored_id
-                ))
-                .map_err(|e| SearchError::Backend(e.to_string()))?;
-        }
-        crate::timing::stage("search.add_docs", add_start, || {
-            format!("threads={threads}")
-        });
-        let commit_start = std::time::Instant::now();
-        writer
-            .commit()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        crate::timing::stage("search.commit", commit_start, String::new);
-        // Multi-threaded indexing leaves one segment per worker. Merge to a single segment at
-        // publish time: every cold CLI query re-opens this index, and per-query segment fan-out
-        // (plus tie-order drift across segment layouts) is paid far more often than this one
-        // merge.
-        let merge_start = std::time::Instant::now();
-        let segments = index
-            .searchable_segment_ids()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        if segments.len() > 1 {
-            writer
-                .merge(&segments)
-                .wait()
-                .map_err(|e| SearchError::Backend(e.to_string()))?;
-        }
-        writer
-            .wait_merging_threads()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        crate::timing::stage("search.merge", merge_start, || {
-            format!("segments={}", segments.len())
-        });
-        Ok(())
     }
 
     pub fn search(
@@ -641,13 +786,27 @@ impl SearchIndex {
         if kind == SearchKind::Terms {
             return self.search_terms(query, limit);
         }
-        if let Some(dict) = &self.dict {
+        let dict = self
+            .dict
+            .as_ref()
+            .ok_or_else(|| SearchError::Backend("no search backend available".into()))?;
+        let Some(overlay) = &self.term_overlay else {
             return dict.search(query, kind, limit);
+        };
+        let expanded_limit = limit
+            .saturating_add(overlay.removed_names.len())
+            .saturating_add(overlay.added_names.len());
+        let removed: BTreeSet<_> = overlay.removed_names.iter().map(String::as_str).collect();
+        let mut hits = dict.search(query, kind, expanded_limit)?;
+        hits.retain(|hit| !removed.contains(hit.value.as_str()));
+        if !overlay.added_names.is_empty() {
+            let added = DictRuntime::build(SymbolDict::from_names(
+                overlay.added_names.clone(),
+                overlay.snapshot_id.clone(),
+            ));
+            hits.extend(added.search(query, kind, expanded_limit)?);
         }
-        if let Some(tv) = &self.tantivy {
-            return tv.search(query, kind, limit);
-        }
-        Err(SearchError::Backend("no search backend available".into()))
+        finish_hits(hits, limit)
     }
 
     fn search_terms(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, SearchError> {
@@ -676,276 +835,33 @@ impl SearchIndex {
             }
             shadowed_ids.extend(overlay.removed_ids.iter().cloned());
         }
-        if let Some(tantivy) = &self.tantivy {
-            hits.extend(tantivy.search_excluding(
-                query,
-                SearchKind::Terms,
-                limit,
-                &shadowed_ids,
-            )?);
+        if let Some(terms) = &self.terms {
+            hits.extend(terms.search(&tokens, &shadowed_ids)?);
         }
         finish_hits(hits, limit)
     }
 
     pub fn backend_label(&self) -> &'static str {
-        match (&self.dict, &self.tantivy) {
-            (Some(_), Some(_)) => "hybrid",
-            (Some(_), None) => "dict",
-            (None, Some(_)) => "tantivy",
-            (None, None) => "none",
-        }
+        self.dict.as_ref().map_or("none", |_| "dict")
     }
-}
 
-impl TantivyBackend {
-    fn from_dict(dict: &SymbolDict) -> Result<Self, SearchError> {
-        use tantivy::{
-            Index, IndexWriter, doc,
-            schema::{STORED, STRING, Schema, TEXT},
-        };
-        let mut builder = Schema::builder();
-        let name = builder.add_text_field("name", TEXT);
-        let name_terms = builder.add_text_field("name_terms", TEXT | STORED);
-        let qualified_terms = builder.add_text_field("qualified_terms", TEXT | STORED);
-        let path_terms = builder.add_text_field("path_terms", TEXT | STORED);
-        let kind_terms = builder.add_text_field("kind_terms", TEXT | STORED);
-        let stored = builder.add_text_field("stored", STORED);
-        let stored_id = builder.add_text_field("stored_id", STRING | STORED);
-        let schema = builder.build();
-        let index = Index::create_in_ram(schema);
-        let mut writer: IndexWriter = index
-            .writer(TANTIVY_WRITER_HEAP_BYTES)
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        if dict.term_documents.is_empty() {
-            for (original, search_terms) in dict.names.iter().zip(&dict.terms) {
-                writer
-                    .add_document(doc!(
-                        name => original.to_lowercase(),
-                        name_terms => search_terms.to_owned(),
-                        qualified_terms => search_terms.to_owned(),
-                        path_terms => String::new(),
-                        kind_terms => String::new(),
-                        stored => original.to_owned(),
-                        stored_id => String::new()
-                    ))
-                    .map_err(|e| SearchError::Backend(e.to_string()))?;
-            }
-        } else {
-            for document in &dict.term_documents {
-                writer
-                    .add_document(doc!(
-                        name => document.name.to_lowercase(),
-                        name_terms => document.name_terms.to_owned(),
-                        qualified_terms => document.qualified_terms.to_owned(),
-                        path_terms => document.path_terms.to_owned(),
-                        kind_terms => document.kind_terms.to_owned(),
-                        stored => document.name.to_owned(),
-                        stored_id => document.id.to_owned()
-                    ))
-                    .map_err(|e| SearchError::Backend(e.to_string()))?;
-            }
-        }
-        writer
-            .commit()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let reader = index
-            .reader()
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        Ok(Self {
+    pub fn has_terms(&self) -> bool {
+        self.terms.is_some()
+    }
+
+    pub(crate) fn with_packed_terms(
+        mut self,
+        reader: Arc<GenerationPackReader>,
+        key: String,
+        max_bytes: u64,
+    ) -> Self {
+        self.terms = Some(TermRuntime::Packed {
             reader,
-            name,
-            name_terms,
-            qualified_terms,
-            path_terms,
-            kind_terms,
-            stored,
-            stored_id,
-        })
+            key,
+            max_bytes,
+        });
+        self
     }
-
-    fn search(
-        &self,
-        query: &str,
-        kind: SearchKind,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>, SearchError> {
-        self.search_excluding(query, kind, limit, &BTreeSet::new())
-    }
-
-    fn search_excluding(
-        &self,
-        query: &str,
-        kind: SearchKind,
-        limit: usize,
-        excluded_ids: &BTreeSet<String>,
-    ) -> Result<Vec<SearchHit>, SearchError> {
-        use tantivy::{
-            Term, collector::TopDocs, query::BooleanQuery, query::BoostQuery,
-            query::FuzzyTermQuery, query::Occur, query::Query, query::RegexQuery, query::TermQuery,
-            schema::IndexRecordOption, schema::Value,
-        };
-        let searcher = self.reader.searcher();
-        let normalized = query.to_lowercase();
-        let term_query_tokens = if kind == SearchKind::Terms {
-            query_tokens(query)
-        } else {
-            Vec::new()
-        };
-        let boxed: Box<dyn Query> = match kind {
-            SearchKind::Exact => Box::new(TermQuery::new(
-                Term::from_field_text(self.name, &normalized),
-                IndexRecordOption::Basic,
-            )),
-            SearchKind::Prefix => Box::new(FuzzyTermQuery::new_prefix(
-                Term::from_field_text(self.name, &normalized),
-                0,
-                true,
-            )),
-            SearchKind::Fuzzy => Box::new(FuzzyTermQuery::new(
-                Term::from_field_text(self.name, &normalized),
-                2,
-                true,
-            )),
-            SearchKind::Regex => Box::new(
-                // Case-insensitive via inline flag on the ORIGINAL pattern; lowercasing the
-                // pattern text would corrupt metacharacter classes (`\D` → `\d`).
-                RegexQuery::from_pattern(&format!("(?i){query}"), self.name)
-                    .map_err(|e| SearchError::Invalid(e.to_string()))?,
-            ),
-            SearchKind::Terms => {
-                if term_query_tokens.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let fields = [
-                    (self.name_terms, 4.0),
-                    (self.qualified_terms, 3.0),
-                    (self.path_terms, 1.5),
-                    (self.kind_terms, 1.0),
-                ];
-                let mut clauses: Vec<(Occur, Box<dyn Query>)> = term_query_tokens
-                    .iter()
-                    .flat_map(|token| {
-                        fields.into_iter().map(move |(field, boost)| {
-                            let query = TermQuery::new(
-                                Term::from_field_text(field, token),
-                                IndexRecordOption::WithFreqs,
-                            );
-                            (
-                                Occur::Should,
-                                Box::new(BoostQuery::new(Box::new(query), boost)) as Box<dyn Query>,
-                            )
-                        })
-                    })
-                    .collect();
-                clauses.extend(excluded_ids.iter().map(|id| {
-                    (
-                        Occur::MustNot,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(self.stored_id, id),
-                            IndexRecordOption::Basic,
-                        )) as Box<dyn Query>,
-                    )
-                }));
-                Box::new(BooleanQuery::new(clauses))
-            }
-        };
-        let collect_limit = if kind == SearchKind::Terms {
-            limit
-                .max(1)
-                .saturating_mul(TERM_CANDIDATE_MULTIPLIER)
-                .max(TERM_CANDIDATE_FLOOR)
-        } else {
-            limit
-                .max(1)
-                .saturating_mul(NAME_CANDIDATE_MULTIPLIER)
-                .max(NAME_CANDIDATE_FLOOR)
-        };
-        let docs: Vec<(f32, tantivy::DocAddress)> = searcher
-            .search(&boxed, &TopDocs::with_limit(collect_limit).order_by_score())
-            .map_err(|e| SearchError::Backend(e.to_string()))?;
-        let mut hits = Vec::with_capacity(docs.len());
-        for (score, address) in docs {
-            let document: tantivy::TantivyDocument = searcher
-                .doc(address)
-                .map_err(|e| SearchError::Backend(e.to_string()))?;
-            if let Some(value) = document
-                .get_first(self.stored)
-                .and_then(|value| value.as_str())
-            {
-                let definition_id = (kind == SearchKind::Terms)
-                    .then(|| {
-                        document
-                            .get_first(self.stored_id)
-                            .and_then(|value| value.as_str())
-                            .filter(|value| !value.is_empty())
-                            .map(ToOwned::to_owned)
-                    })
-                    .flatten();
-                let term_score = if kind == SearchKind::Terms {
-                    let field_text = |field| {
-                        document
-                            .get_first(field)
-                            .and_then(|value| value.as_str())
-                            .unwrap_or_default()
-                    };
-                    let Some(score) = score_term_fields(
-                        &term_query_tokens,
-                        field_text(self.name_terms),
-                        field_text(self.qualified_terms),
-                        field_text(self.path_terms),
-                        field_text(self.kind_terms),
-                    ) else {
-                        continue;
-                    };
-                    score
-                } else {
-                    0
-                };
-                hits.push(SearchHit {
-                    value: value.to_owned(),
-                    definition_id,
-                    score_micros: match kind {
-                        SearchKind::Exact if value == query => SCORE_EXACT_CASE,
-                        SearchKind::Exact => SCORE_EXACT_CASE_INSENSITIVE,
-                        SearchKind::Prefix if value == query => SCORE_EXACT_CASE,
-                        SearchKind::Prefix if value.eq_ignore_ascii_case(query) => {
-                            SCORE_EXACT_CASE_INSENSITIVE
-                        }
-                        SearchKind::Prefix if value.starts_with(query) => SCORE_PREFIX_CASE,
-                        SearchKind::Prefix => SCORE_PREFIX,
-                        SearchKind::Terms => term_score,
-                        _ => (score.max(0.0) * 1_000_000.0) as u64,
-                    },
-                    reason: Some(match kind {
-                        SearchKind::Exact if value == query => "exact-case".into(),
-                        SearchKind::Exact => "exact-case-insensitive".into(),
-                        SearchKind::Prefix if value == query => "exact-case".into(),
-                        SearchKind::Prefix if value.eq_ignore_ascii_case(query) => {
-                            "exact-case-insensitive".into()
-                        }
-                        SearchKind::Prefix if value.starts_with(query) => "prefix-case".into(),
-                        SearchKind::Prefix => "prefix-case-insensitive".into(),
-                        SearchKind::Fuzzy => "fuzzy".into(),
-                        SearchKind::Regex => "regex".into(),
-                        SearchKind::Terms => "term-coverage".into(),
-                    }),
-                });
-            }
-        }
-        finish_hits(hits, limit)
-    }
-}
-
-/// Field strings for one search document, tokenized off the writer thread so the producer loop
-/// only ships owned strings into tantivy.
-struct PreparedSearchDoc {
-    name: String,
-    name_terms: String,
-    qualified_terms: String,
-    path_terms: String,
-    kind_terms: String,
-    stored: String,
-    stored_id: String,
 }
 
 fn add_search_tokens(tokens: &mut BTreeSet<String>, text: &str) {
@@ -1010,37 +926,55 @@ fn score_term_fields(
     path_terms: &str,
     kind_terms: &str,
 ) -> Option<u64> {
-    fn field_tokens(value: &str) -> BTreeSet<&str> {
-        value.split_whitespace().collect()
-    }
-    let name_tokens = field_tokens(name_terms);
-    let qualified_tokens = field_tokens(qualified_terms);
-    let path_tokens = field_tokens(path_terms);
-    let kind_tokens = field_tokens(kind_terms);
-    let count_matches = |available: &BTreeSet<&str>| {
-        query
-            .iter()
-            .filter(|token| available.contains(String::as_str(token)))
-            .count() as u64
-    };
-    let name_matches = count_matches(&name_tokens);
-    let qualified_matches = count_matches(&qualified_tokens);
-    let path_matches = count_matches(&path_tokens);
-    let kind_matches = count_matches(&kind_tokens);
+    let contains = |field: &str, token: &str| field.split_whitespace().any(|item| item == token);
+    let count_matches =
+        |field: &str| query.iter().filter(|token| contains(field, token)).count() as u64;
+    let name_matches = count_matches(name_terms);
+    let qualified_matches = count_matches(qualified_terms);
+    let path_matches = count_matches(path_terms);
+    let kind_matches = count_matches(kind_terms);
     let matched = query
         .iter()
         .filter(|token| {
             let token = String::as_str(token);
-            name_tokens.contains(token)
-                || qualified_tokens.contains(token)
-                || path_tokens.contains(token)
-                || kind_tokens.contains(token)
+            contains(name_terms, token)
+                || contains(qualified_terms, token)
+                || contains(path_terms, token)
+                || contains(kind_terms, token)
         })
         .count() as u64;
+    score_term_counts(
+        query.len(),
+        [
+            matched,
+            name_matches,
+            qualified_matches,
+            path_matches,
+            kind_matches,
+        ],
+    )
+}
+
+fn accumulate_posting(counts: &mut [u64; 5], fields: u8) {
+    counts[0] += 1;
+    counts[1] += u64::from(fields & 1 != 0);
+    counts[2] += u64::from(fields & 2 != 0);
+    counts[3] += u64::from(fields & 4 != 0);
+    counts[4] += u64::from(fields & 8 != 0);
+}
+
+fn score_term_counts(query_len: usize, counts: [u64; 5]) -> Option<u64> {
+    let [
+        matched,
+        name_matches,
+        qualified_matches,
+        path_matches,
+        kind_matches,
+    ] = counts;
     if matched == 0 {
         return None;
     }
-    let full_coverage = (matched as usize == query.len()) as u64;
+    let full_coverage = (matched as usize == query_len) as u64;
     Some(
         (600_000
             + matched.min(6) * 35_000

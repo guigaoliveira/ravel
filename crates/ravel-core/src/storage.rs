@@ -2,20 +2,21 @@ use crate::durable_io::{atomic_replace, sync_parent_directory};
 use crate::{
     analysis::{self, HubEntry},
     generation_pack::{GenerationPackReader, StreamingGenerationPackWriter},
-    graph::{CompactGraph, GraphIndex},
+    graph::{CompactGraph, FlatCompactGraph, GraphIndex},
     incremental_graph::{
         GraphAdjShard, GraphEdgeShard, GraphFileShard, IncrementalGraphOverlay,
         IncrementalGraphState, OwnedEdge, digest_shard_id, graph_shard_id, owned_edge_digest,
     },
     model::{
-        FileArtifact, FileHashIndex, FileList, IndexSnapshot, IndexStats, SnapshotId,
-        SymbolMetaDict, SymbolMetaOverlay,
+        FileArtifact, FileHashIndex, FileList, IndexSnapshot, IndexStats, SnapshotId, SymbolMeta,
+        SymbolMetaDict, SymbolMetaIdShard, SymbolMetaLocation, SymbolMetaLookupShard,
+        SymbolMetaOverlay, SymbolMetaShardIndex,
     },
     resolver::{
         LookupSlice, ModuleExport, ResolutionLookup, ResolutionUniverse, ResolutionUniverseOverlay,
         ResolutionUniverseShard, ResolverConfig, SymbolDefinition, resolution_shard_id,
     },
-    search::{SearchIndex, SearchTermOverlay, SymbolDict},
+    search::{SearchIndex, SearchTermOverlay, SymbolDict, TermIndex},
     structural::FileContribution,
     structural_reverse::{
         ReverseOverlaySet, ReverseShard, ReverseShardOverlay, ReverseShardSet,
@@ -29,13 +30,19 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 15;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
+const SYMBOL_META_SHARD_BITS: u8 = 8;
+const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
+
+fn symbol_meta_shard_id(key: &str) -> usize {
+    (blake3::hash(key.as_bytes()).as_bytes()[0] as usize) & (SYMBOL_META_SHARD_COUNT - 1)
+}
 // Graph base pack sections shard independently. 12 bits (4096 buckets) keeps each shard small
 // enough that a single-file cold sync decodes only a thin slice of the ~785MB graph section.
 const GRAPH_FILE_BITS: u8 = 12;
@@ -48,7 +55,6 @@ const MAX_DELTA_COMPONENT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMPACT_GRAPH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_STATS_BYTES: u64 = 16 * 1024 * 1024;
 static STRUCTURAL_PUBLISH_FAILPOINT: AtomicU8 = AtomicU8::new(0);
-static SEARCH_PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static STRUCTURAL_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -101,6 +107,9 @@ pub struct Manifest {
     /// Optional relative path to stats sidecar (JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<String>,
+    /// Small hot-path copy so `status` does not open a multi-gigabyte generation pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_inline: Option<IndexStats>,
     /// Optional relative path to symbol dictionary (bincode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbols: Option<String>,
@@ -110,6 +119,9 @@ pub struct Manifest {
     /// Optional relative path to on-disk Tantivy directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_dir: Option<String>,
+    /// Optional compact definition-level term index. Loaded only for `SearchKind::Terms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_terms: Option<String>,
     /// Ordered small search deltas layered over the immutable Tantivy/name base.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search_overlays: Vec<String>,
@@ -181,6 +193,88 @@ pub(crate) struct StructuralPackStager {
 }
 
 impl StructuralPackStager {
+    fn stage_symbol_meta(&mut self, snapshot: &IndexSnapshot) -> Result<(), StorageError> {
+        let index = SymbolMetaShardIndex {
+            format_version: SymbolMetaShardIndex::FORMAT_VERSION,
+            snapshot_id: snapshot.id.stable_key(),
+            shard_bits: SYMBOL_META_SHARD_BITS,
+        };
+        self.add_meta("query/symbol-meta/index", &index)?;
+        let mut ids = vec![Vec::<SymbolMeta>::new(); SYMBOL_META_SHARD_COUNT];
+        for (path, artifact) in &snapshot.files {
+            for symbol in &artifact.symbols {
+                let meta = SymbolMeta {
+                    id: symbol.id.clone(),
+                    name: symbol.name.clone(),
+                    qualified_name: symbol.qualified_name.clone(),
+                    kind: Arc::clone(&symbol.kind),
+                    path: path.clone(),
+                    span: symbol.span,
+                    exported: symbol.exported,
+                    complexity: symbol.complexity.clone(),
+                };
+                let id_shard = symbol_meta_shard_id(&meta.id);
+                ids[id_shard].push(meta);
+            }
+        }
+        let mut names = vec![
+            BTreeMap::<String, BTreeMap<[u8; 32], SymbolMetaLocation>>::new();
+            SYMBOL_META_SHARD_COUNT
+        ];
+        let mut qualified = vec![
+            BTreeMap::<String, BTreeMap<[u8; 32], SymbolMetaLocation>>::new();
+            SYMBOL_META_SHARD_COUNT
+        ];
+        for (shard, shard_ids) in ids.iter_mut().enumerate() {
+            shard_ids.sort_by(|left, right| {
+                (&left.id, left.span, &left.path).cmp(&(&right.id, right.span, &right.path))
+            });
+            for (position, meta) in shard_ids.iter().enumerate() {
+                let id_digest = *blake3::hash(meta.id.as_bytes()).as_bytes();
+                let location = SymbolMetaLocation {
+                    shard: shard as u8,
+                    index: position as u32,
+                    id_digest,
+                };
+                names[symbol_meta_shard_id(&meta.name)]
+                    .entry(meta.name.clone())
+                    .or_default()
+                    .insert(id_digest, location);
+                qualified[symbol_meta_shard_id(&meta.qualified_name)]
+                    .entry(meta.qualified_name.clone())
+                    .or_default()
+                    .insert(id_digest, location);
+            }
+        }
+        for shard in 0..SYMBOL_META_SHARD_COUNT {
+            self.add_meta(
+                &format!("query/symbol-meta/id/{shard:02x}"),
+                &SymbolMetaIdShard {
+                    entries: std::mem::take(&mut ids[shard]),
+                },
+            )?;
+            self.add_meta(
+                &format!("query/symbol-meta/name/{shard:02x}"),
+                &SymbolMetaLookupShard {
+                    entries: std::mem::take(&mut names[shard])
+                        .into_iter()
+                        .map(|(key, values)| (key, values.into_values().collect()))
+                        .collect(),
+                },
+            )?;
+            self.add_meta(
+                &format!("query/symbol-meta/qualified/{shard:02x}"),
+                &SymbolMetaLookupShard {
+                    entries: std::mem::take(&mut qualified[shard])
+                        .into_iter()
+                        .map(|(key, values)| (key, values.into_values().collect()))
+                        .collect(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn add_meta<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result<(), StorageError> {
         let bytes = bincode::serialize(value).map_err(|source| StorageError::Bincode {
             path: self.path.clone(),
@@ -192,6 +286,116 @@ impl StructuralPackStager {
                 path: self.path.clone(),
                 message: error.to_string(),
             })
+    }
+
+    fn add_bytes(&mut self, key: String, bytes: impl AsRef<[u8]>) -> Result<(), StorageError> {
+        self.writer
+            .add(key, bytes)
+            .map_err(|error| StorageError::Invalid {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })
+    }
+
+    /// Stage the canonical snapshot and every cold-query projection in the same unpublished
+    /// pack. Artifacts are individual records so incremental readers can fetch one file without
+    /// hydrating the complete snapshot.
+    pub(crate) fn stage_snapshot(&mut self, snapshot: &IndexSnapshot) -> Result<(), StorageError> {
+        self.add_meta("snapshot/edges", &snapshot.edges)?;
+        let mut artifact_index = ArtifactIndex {
+            store: "#artifact/".into(),
+            entries: BTreeMap::new(),
+            overrides: BTreeSet::new(),
+            tombstones: BTreeSet::new(),
+            state: [0; 32],
+        };
+        for (path, artifact) in &snapshot.files {
+            let bytes = bincode::serialize(artifact).map_err(|source| StorageError::Bincode {
+                path: self.path.clone(),
+                source,
+            })?;
+            FileSnapshotStorage::xor_state(
+                &mut artifact_index.state,
+                FileSnapshotStorage::artifact_digest(path, &artifact.source_hash),
+            );
+            artifact_index.entries.insert(
+                path.clone(),
+                ArtifactLocation {
+                    store: None,
+                    offset: 0,
+                    len: bytes.len() as u64,
+                    source_hash: artifact.source_hash.clone(),
+                    bytes_read: artifact.bytes_read,
+                    parse_error: !artifact.diagnostics.is_empty(),
+                },
+            );
+            self.add_bytes(format!("artifact/{path}"), bytes)?;
+        }
+        self.add_meta("artifact/index", &artifact_index)?;
+
+        let graph = GraphIndex::from_snapshot(snapshot);
+        let flat_graph = FlatCompactGraph::from_compact(graph.to_compact());
+        let graph_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat_graph).map_err(|error| {
+            StorageError::Invalid {
+                path: self.path.clone(),
+                message: format!("archive query graph: {error}"),
+            }
+        })?;
+        drop(flat_graph);
+        self.add_bytes("query/graph".into(), &graph_bytes)?;
+        drop(graph_bytes);
+        let hubs = analysis::precompute_hubs(&graph, 1_000);
+        self.add_bytes(
+            "query/hubs".into(),
+            serde_json::to_vec(&hubs).map_err(|source| StorageError::Json {
+                path: self.path.clone(),
+                source,
+            })?,
+        )?;
+        drop(graph);
+        let symbols = SymbolDict::from_snapshot_names_only(snapshot);
+        let symbol_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&symbols).map_err(|error| {
+            StorageError::Invalid {
+                path: self.path.clone(),
+                message: format!("archive symbol dictionary: {error}"),
+            }
+        })?;
+        self.add_bytes("query/symbols".into(), &symbol_bytes)?;
+        drop(symbol_bytes);
+        drop(symbols);
+        let term_index = TermIndex::from_snapshot(snapshot);
+        let term_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).map_err(|error| {
+            StorageError::Invalid {
+                path: self.path.clone(),
+                message: format!("archive term index: {error}"),
+            }
+        })?;
+        self.add_bytes("query/terms".into(), &term_bytes)?;
+        drop(term_bytes);
+        drop(term_index);
+        self.stage_symbol_meta(snapshot)?;
+        let stats = IndexStats {
+            files: snapshot.files.len(),
+            edges: snapshot.edges.len(),
+            bytes: snapshot
+                .files
+                .values()
+                .map(|artifact| artifact.bytes_read)
+                .sum(),
+            parse_errors: snapshot
+                .files
+                .values()
+                .filter(|artifact| !artifact.diagnostics.is_empty())
+                .count(),
+            snapshot_id: snapshot.id.stable_key(),
+        };
+        self.add_bytes(
+            "query/stats".into(),
+            serde_json::to_vec(&stats).map_err(|source| StorageError::Json {
+                path: self.path.clone(),
+                source,
+            })?,
+        )
     }
 
     pub(crate) fn stage_universe(
@@ -1543,6 +1747,8 @@ fn apply_universe_overlay_to_shard(
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct ArtifactLocation {
+    #[serde(default)]
+    store: Option<String>,
     offset: u64,
     len: u64,
     source_hash: String,
@@ -1571,6 +1777,13 @@ pub struct FileSnapshotStorage {
     root: PathBuf,
     retention: usize,
     manifest_cache: Mutex<Option<(std::time::SystemTime, Manifest)>>,
+}
+
+pub(crate) struct PackedSymbolMeta {
+    pub(crate) reader: GenerationPackReader,
+    pub(crate) index: SymbolMetaShardIndex,
+    pub(crate) overlays: Vec<SymbolMetaOverlay>,
+    pub(crate) generation_guard: crate::generation_gc::GenerationGuard,
 }
 
 impl Clone for FileSnapshotStorage {
@@ -1726,6 +1939,7 @@ impl FileSnapshotStorage {
             manifest.stats.as_deref(),
             manifest.symbols.as_deref(),
             manifest.search_dir.as_deref(),
+            manifest.search_terms.as_deref(),
             manifest.symbol_meta.as_deref(),
             manifest.files.as_deref(),
             manifest.file_hashes.as_deref(),
@@ -1757,38 +1971,6 @@ impl FileSnapshotStorage {
         paths
     }
 
-    fn publish_or_reuse_search_snapshot(
-        &self,
-        desired_name: &str,
-        snapshot: &IndexSnapshot,
-    ) -> Result<String, StorageError> {
-        let desired_path = self.root.join(desired_name);
-        if desired_path.is_dir() && SearchIndex::open_tantivy_dir(&desired_path).is_ok() {
-            return Ok(desired_name.to_owned());
-        }
-        let sequence = SEARCH_PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let actual_name = if desired_path.exists() {
-            format!("{desired_name}.recovered-{}-{sequence}", std::process::id())
-        } else {
-            desired_name.to_owned()
-        };
-        let search_path = self.root.join(&actual_name);
-        let search_tmp = self.root.join(format!(
-            "{actual_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        SearchIndex::publish_tantivy_snapshot(snapshot, &search_tmp).map_err(|error| {
-            StorageError::Search {
-                path: search_tmp.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        atomic_replace(&search_tmp, &search_path)
-            .map_err(|source| self.io(source, search_path.clone()))?;
-        sync_parent_directory(&search_path)
-            .map_err(|source| self.io(source, search_path.clone()))?;
-        Ok(actual_name)
-    }
     fn current_path(&self) -> PathBuf {
         self.root.join("CURRENT")
     }
@@ -1971,6 +2153,7 @@ impl FileSnapshotStorage {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn attach_structural_pack_base(
         &self,
         staged: StagedStructuralPack,
@@ -2005,6 +2188,102 @@ impl FileSnapshotStorage {
             source,
         })?;
         atomic_write(&manifest_path, &bytes).map_err(|source| self.io(source, manifest_path))
+    }
+
+    /// Atomically promote a fully staged base pack and publish a manifest that references only
+    /// records inside it. No large sidecar is rewritten during this commit.
+    pub(crate) fn publish_packed_snapshot(
+        &self,
+        snapshot: &IndexSnapshot,
+        staged: StagedStructuralPack,
+    ) -> Result<(), StorageError> {
+        let _generation_guard = self.acquire_generation_read_guard()?;
+        let id = snapshot.id.stable_key();
+        if staged.generation != id {
+            return Err(StorageError::Invalid {
+                path: self.current_path(),
+                message: "staged pack snapshot does not match publication".into(),
+            });
+        }
+        let final_name = format!("snapshot-{id}.pack");
+        let staged_path = self.root.join(staged.name);
+        let final_path = self.root.join(&final_name);
+        atomic_replace(&staged_path, &final_path)
+            .map_err(|source| self.io(source, final_path.clone()))?;
+        sync_parent_directory(&final_path).map_err(|source| self.io(source, self.root.clone()))?;
+
+        let mut artifact_state = [0; 32];
+        let mut artifact_live_bytes = 0u64;
+        for (path, artifact) in &snapshot.files {
+            Self::xor_state(
+                &mut artifact_state,
+                Self::artifact_digest(path, &artifact.source_hash),
+            );
+            artifact_live_bytes =
+                artifact_live_bytes.saturating_add(bincode::serialized_size(artifact).unwrap_or(0));
+        }
+        let reference = |key: &str| format!("{final_name}#{key}");
+        let stats_inline = IndexStats {
+            files: snapshot.files.len(),
+            edges: snapshot.edges.len(),
+            bytes: snapshot
+                .files
+                .values()
+                .map(|artifact| artifact.bytes_read)
+                .sum(),
+            parse_errors: snapshot
+                .files
+                .values()
+                .filter(|artifact| !artifact.diagnostics.is_empty())
+                .count(),
+            snapshot_id: snapshot.id.stable_key(),
+        };
+        let manifest = Manifest {
+            snapshot_id: snapshot.id.clone(),
+            payload_snapshot_id: None,
+            base_snapshot_id: None,
+            schema_version: SCHEMA_VERSION,
+            checksum: snapshot.id.stable_key(),
+            payload: reference("snapshot/edges"),
+            graph: Some(reference("query/graph")),
+            stats: Some(reference("query/stats")),
+            stats_inline: Some(stats_inline),
+            symbols: Some(reference("query/symbols")),
+            symbols_checksum: None,
+            search_dir: Some(reference("query/symbols")),
+            search_terms: Some(reference("query/terms")),
+            search_overlays: Vec::new(),
+            symbol_meta: Some(reference("query/symbol-meta/index")),
+            symbol_meta_overlays: Vec::new(),
+            files: None,
+            file_hashes: None,
+            hubs: Some(reference("query/hubs")),
+            artifact_index: Some(reference("artifact/index")),
+            artifact_deltas: Vec::new(),
+            artifact_delta_weights: Vec::new(),
+            artifact_store: Some(reference("artifact/")),
+            artifact_locator: None,
+            artifact_state: Some(artifact_state),
+            artifact_live_bytes: Some(artifact_live_bytes),
+            structural_packs: Some(StructuralPackChain {
+                base: final_name,
+                current_snapshot: id.clone(),
+                overlays: Vec::new(),
+            }),
+        };
+        let manifest_name = format!("snapshot-{id}.manifest.json");
+        let manifest_path = self.root.join(&manifest_name);
+        let bytes = serde_json::to_vec(&manifest).map_err(|source| StorageError::Json {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        atomic_write(&manifest_path, &bytes)
+            .map_err(|source| self.io(source, manifest_path.clone()))?;
+        atomic_write(&self.current_path(), manifest_name.as_bytes())
+            .map_err(|source| self.io(source, self.current_path()))?;
+        drop(_generation_guard);
+        self.gc_generations()?;
+        Ok(())
     }
 
     pub(crate) fn open_structural_reader(
@@ -2527,6 +2806,9 @@ impl FileSnapshotStorage {
         manifest: &Manifest,
     ) -> Result<Option<IndexStats>, StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
+        if let Some(stats) = &manifest.stats_inline {
+            return Ok(Some(stats.clone()));
+        }
         let Some(stats_name) = manifest.stats.as_ref() else {
             return Ok(None);
         };
@@ -2585,8 +2867,8 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.artifact_index.as_ref() else {
             return Ok(None);
         };
-        let path = self.root.join(name);
-        let bytes = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        let path = self.root.join(self.component_ref_path(name));
+        let bytes = self.read_component_ref(name, MAX_COMPONENT_BYTES)?;
         let mut index: ArtifactIndex = bincode::deserialize(&bytes)
             .map_err(|source| StorageError::Bincode { path, source })?;
         for delta_name in &manifest.artifact_deltas {
@@ -2616,7 +2898,9 @@ impl FileSnapshotStorage {
         index: &ArtifactIndex,
         location: &ArtifactLocation,
     ) -> Result<FileArtifact, StorageError> {
-        let path = self.root.join(&index.store);
+        let path = self
+            .root
+            .join(location.store.as_deref().unwrap_or(&index.store));
         let mut file = fs::File::open(&path).map_err(|source| self.io(source, path.clone()))?;
         file.seek(SeekFrom::Start(location.offset))
             .map_err(|source| self.io(source, path.clone()))?;
@@ -2632,7 +2916,9 @@ impl FileSnapshotStorage {
         artifact_path: &str,
     ) -> Result<Option<ArtifactLocation>, StorageError> {
         let Some(locator_name) = manifest.artifact_locator.as_ref() else {
-            return Ok(None);
+            return Ok(self
+                .read_artifact_index(manifest)?
+                .and_then(|index| index.entries.get(artifact_path).cloned()));
         };
         let path = self.root.join(locator_name);
         let mut file = fs::File::open(&path).map_err(|source| self.io(source, path.clone()))?;
@@ -2658,6 +2944,7 @@ impl FileSnapshotStorage {
                         u64::from_le_bytes(record[start..start + 8].try_into().unwrap())
                     };
                     return Ok(Some(ArtifactLocation {
+                        store: None,
                         offset: u64_at(32),
                         len: u64_at(40),
                         bytes_read: u64_at(48),
@@ -2703,6 +2990,37 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
+        if let Some(location) = self.current_artifact_location(&manifest, path)?
+            && location.store.is_some()
+        {
+            let index = ArtifactIndex {
+                store: String::new(),
+                entries: BTreeMap::new(),
+                overrides: BTreeSet::new(),
+                tombstones: BTreeSet::new(),
+                state: [0; 32],
+            };
+            return self.read_artifact_at(&index, &location).map(Some);
+        }
+        if let Some(store) = manifest.artifact_store.as_deref()
+            && let Some((pack, prefix)) = store.split_once('#')
+        {
+            let Some(index) = self.read_artifact_index(&manifest)? else {
+                return Ok(None);
+            };
+            if !index.entries.contains_key(path) || index.tombstones.contains(path) {
+                return Ok(None);
+            }
+            let reference = format!("{pack}#{prefix}{path}");
+            let record_path = self.root.join(pack);
+            let bytes = self.read_component_ref(&reference, MAX_COMPONENT_BYTES)?;
+            return bincode::deserialize(&bytes).map(Some).map_err(|source| {
+                StorageError::Bincode {
+                    path: record_path,
+                    source,
+                }
+            });
+        }
         let Some(location) = self.current_artifact_location(&manifest, path)? else {
             return Ok(None);
         };
@@ -2761,6 +3079,7 @@ impl FileSnapshotStorage {
                 Self::artifact_digest(path, &artifact.source_hash),
             );
             let location = ArtifactLocation {
+                store: None,
                 offset,
                 len: bytes.len() as u64,
                 source_hash: artifact.source_hash.clone(),
@@ -2852,8 +3171,15 @@ impl FileSnapshotStorage {
                     path: self.current_path(),
                     message: "artifact delta requires stats".into(),
                 })?;
-        let store_path = self.root.join(&store_name);
+        let packed_store = store_name.contains('#');
+        let write_store_name = if packed_store {
+            "artifacts.overlay.store".to_owned()
+        } else {
+            store_name.clone()
+        };
+        let store_path = self.root.join(&write_store_name);
         let mut store = fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(&store_path)
             .map_err(|source| self.io(source, store_path.clone()))?;
@@ -2900,6 +3226,7 @@ impl FileSnapshotStorage {
             parse_errors = parse_errors - usize::from(previous.parse_error)
                 + usize::from(!artifact.diagnostics.is_empty());
             let location = ArtifactLocation {
+                store: packed_store.then(|| write_store_name.clone()),
                 offset,
                 len: payload.len() as u64,
                 source_hash: artifact.source_hash.clone(),
@@ -2925,7 +3252,7 @@ impl FileSnapshotStorage {
             return Ok(None);
         }
         let mut delta = ArtifactIndex {
-            store: store_name,
+            store: write_store_name.clone(),
             entries: delta_entries,
             overrides: delta_overrides,
             tombstones: BTreeSet::new(),
@@ -2987,6 +3314,10 @@ impl FileSnapshotStorage {
         manifest.snapshot_id = snapshot_id;
         manifest.base_snapshot_id = Some(component_id);
         manifest.stats = Some(stats_name);
+        manifest.stats_inline = Some(stats.clone());
+        if let Some(chain) = &mut manifest.structural_packs {
+            chain.current_snapshot = generation.clone();
+        }
         manifest.artifact_deltas.push(delta_name);
         manifest.artifact_delta_weights.push(delta_weight);
         manifest.artifact_state = Some(artifact_state);
@@ -3084,8 +3415,15 @@ impl FileSnapshotStorage {
             return Ok(false);
         };
         let payload_id = self.payload_snapshot_id(&manifest).clone();
-        let store_path = self.root.join(&store_name);
+        let packed_store = store_name.contains('#');
+        let write_store_name = if packed_store {
+            "artifacts.overlay.store".to_owned()
+        } else {
+            store_name.clone()
+        };
+        let store_path = self.root.join(&write_store_name);
         let mut store = fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(&store_path)
             .map_err(|source| self.io(source, store_path.clone()))?;
@@ -3094,7 +3432,7 @@ impl FileSnapshotStorage {
             .map_err(|source| self.io(source, store_path.clone()))?;
         let mut live_bytes = manifest.artifact_live_bytes.unwrap_or(0);
         let mut delta = ArtifactIndex {
-            store: store_name,
+            store: write_store_name.clone(),
             entries: BTreeMap::new(),
             overrides: changed_paths.clone(),
             tombstones: BTreeSet::new(),
@@ -3131,6 +3469,7 @@ impl FileSnapshotStorage {
             delta.entries.insert(
                 path.clone(),
                 ArtifactLocation {
+                    store: packed_store.then(|| write_store_name.clone()),
                     offset,
                     len: payload.len() as u64,
                     source_hash: artifact.source_hash.clone(),
@@ -3191,7 +3530,6 @@ impl FileSnapshotStorage {
         }
 
         let stats_name = format!("snapshot-{id}.stats.json");
-        let new_search_name = format!("snapshot-{id}.search");
         let symbol_meta_name = format!("snapshot-{id}.symbol_meta.bin");
 
         let graph_sidecars = if structural_overlay.is_none() {
@@ -3211,27 +3549,21 @@ impl FileSnapshotStorage {
             None
         };
 
-        let (symbols_name, symbols_checksum, search_name) = if structural_overlay.is_some()
+        let (symbols_name, symbols_checksum) = if structural_overlay.is_some()
             && !search_terms_changed
             && manifest.symbols.is_some()
             && manifest.symbols_checksum.is_some()
-            && manifest
-                .search_dir
-                .as_ref()
-                .is_some_and(|name| self.root.join(name).is_dir())
         {
             (
                 manifest.symbols.clone().unwrap(),
                 manifest.symbols_checksum.clone().unwrap(),
-                manifest.search_dir.clone().unwrap(),
             )
         } else {
             let symbols_name = format!("snapshot-{id}.symbols.bin");
-            let dict = SymbolDict::from_snapshot_names_only(snapshot);
-            let search_name = self.publish_or_reuse_search_snapshot(&new_search_name, snapshot)?;
+            let dict = SymbolDict::from_snapshot(snapshot);
             let symbols_checksum =
                 self.atomic_write_bincode(&self.root.join(&symbols_name), &dict)?;
-            (symbols_name, symbols_checksum, search_name)
+            (symbols_name, symbols_checksum)
         };
         // Stable symbol ids are graph node identities. A structural overlay may shift a
         // declaration span, add a homonym, or move a file even when the unique spelling set is
@@ -3305,7 +3637,8 @@ impl FileSnapshotStorage {
                 .as_ref()
                 .map_or(stats_name, |name| format!("{name}#stats/json")),
         );
-        manifest.search_dir = Some(search_name);
+        manifest.stats_inline = Some(stats);
+        // Preserve the base search reference; name/term overlays are applied independently.
         manifest.search_overlays.clear();
         manifest.artifact_deltas.push(
             packed_generation
@@ -3363,6 +3696,35 @@ impl FileSnapshotStorage {
         if manifest.schema_version != SCHEMA_VERSION || manifest.structural_packs.is_none() {
             return Ok(false);
         }
+        let mut symbol_meta_overlays = manifest
+            .symbol_meta_overlays
+            .iter()
+            .map(|reference| {
+                let path = self.root.join(self.component_ref_path(reference));
+                let bytes = self.read_component_ref(reference, MAX_DELTA_COMPONENT_BYTES)?;
+                bincode::deserialize(&bytes)
+                    .map_err(|source| StorageError::Bincode { path, source })
+            })
+            .collect::<Result<Vec<SymbolMetaOverlay>, StorageError>>()?;
+        symbol_meta_overlays.push(symbol_meta_overlay.clone());
+        let symbol_meta_overlay = SymbolMetaOverlay::compose(symbol_meta_overlays)
+            .expect("current symbol metadata overlay is always present");
+        let search_overlay = if let Some(current) = search_overlay {
+            let mut overlays = manifest
+                .search_overlays
+                .iter()
+                .map(|reference| {
+                    let path = self.root.join(self.component_ref_path(reference));
+                    let bytes = self.read_component_ref(reference, MAX_DELTA_COMPONENT_BYTES)?;
+                    bincode::deserialize(&bytes)
+                        .map_err(|source| StorageError::Bincode { path, source })
+                })
+                .collect::<Result<Vec<SearchTermOverlay>, StorageError>>()?;
+            overlays.push(current.clone());
+            SearchTermOverlay::compose(overlays)
+        } else {
+            None
+        };
         let Some(store_name) = manifest.artifact_store.clone() else {
             return Ok(false);
         };
@@ -3371,8 +3733,15 @@ impl FileSnapshotStorage {
         };
         let component_id = self.component_snapshot_id(&manifest).clone();
         let payload_id = self.payload_snapshot_id(&manifest).clone();
-        let store_path = self.root.join(&store_name);
+        let packed_store = store_name.contains('#');
+        let write_store_name = if packed_store {
+            "artifacts.overlay.store".to_owned()
+        } else {
+            store_name.clone()
+        };
+        let store_path = self.root.join(&write_store_name);
         let mut store = fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(&store_path)
             .map_err(|source| self.io(source, store_path.clone()))?;
@@ -3381,7 +3750,7 @@ impl FileSnapshotStorage {
             .map_err(|source| self.io(source, store_path.clone()))?;
         let mut live_bytes = manifest.artifact_live_bytes.unwrap_or(0);
         let mut delta = ArtifactIndex {
-            store: store_name,
+            store: write_store_name.clone(),
             entries: BTreeMap::new(),
             overrides: BTreeSet::new(),
             tombstones: BTreeSet::new(),
@@ -3425,6 +3794,7 @@ impl FileSnapshotStorage {
             delta.entries.insert(
                 path.clone(),
                 ArtifactLocation {
+                    store: packed_store.then(|| write_store_name.clone()),
                     offset,
                     len: payload.len() as u64,
                     source_hash: artifact.source_hash.clone(),
@@ -3483,6 +3853,15 @@ impl FileSnapshotStorage {
             path: self.root.join(format!("snapshot-{id}.stats.json")),
             source,
         })?;
+        let symbol_meta_name = format!("snapshot-{id}.symbol-meta-overlay.bin");
+        self.atomic_write_bincode(&self.root.join(&symbol_meta_name), &symbol_meta_overlay)?;
+        let search_name = if let Some(overlay) = &search_overlay {
+            let name = format!("snapshot-{id}.search-overlay.bin");
+            self.atomic_write_bincode(&self.root.join(&name), overlay)?;
+            Some(name)
+        } else {
+            None
+        };
         structural_publish_failpoint(1, &self.current_path())?;
         let pack_name = self.stage_structural_overlay_pack(
             &mut manifest,
@@ -3492,8 +3871,8 @@ impl FileSnapshotStorage {
             reverse_overlay,
             &delta_bytes,
             &stats_bytes,
-            Some(symbol_meta_overlay),
-            search_overlay,
+            None,
+            None,
         )?;
         structural_publish_failpoint(2, &self.current_path())?;
 
@@ -3502,17 +3881,16 @@ impl FileSnapshotStorage {
         manifest.base_snapshot_id = Some(component_id);
         manifest.hubs = None;
         manifest.stats = Some(format!("{pack_name}#stats/json"));
+        manifest.stats_inline = Some(stats.clone());
         manifest
             .artifact_deltas
             .push(format!("{pack_name}#artifact/delta"));
         manifest.artifact_delta_weights.push(delta_weight);
-        manifest
-            .symbol_meta_overlays
-            .push(format!("{pack_name}#symbol-meta/overlay"));
-        if search_overlay.is_some() {
-            manifest
-                .search_overlays
-                .push(format!("{pack_name}#search/overlay"));
+        manifest.symbol_meta_overlays.clear();
+        manifest.symbol_meta_overlays.push(symbol_meta_name);
+        if let Some(search_name) = search_name {
+            manifest.search_overlays.clear();
+            manifest.search_overlays.push(search_name);
         }
         manifest.artifact_state = Some(artifact_state);
         manifest.artifact_live_bytes = Some(live_bytes);
@@ -3549,6 +3927,9 @@ impl FileSnapshotStorage {
         let Some(preliminary_store) = preliminary.artifact_store.as_ref() else {
             return Ok(false);
         };
+        if preliminary_store.contains('#') {
+            return Ok(false);
+        }
         let Some(preliminary_live) = preliminary.artifact_live_bytes else {
             return Ok(false);
         };
@@ -3586,6 +3967,9 @@ impl FileSnapshotStorage {
         let Some(old_store) = manifest.artifact_store.clone() else {
             return Ok(false);
         };
+        if old_store.contains('#') {
+            return Ok(false);
+        }
         let physical = fs::metadata(self.root.join(&old_store))
             .map_err(|source| self.io(source, self.root.join(&old_store)))?
             .len();
@@ -3738,12 +4122,49 @@ impl FileSnapshotStorage {
             .filter(|chain| chain.current_snapshot == manifest.snapshot_id.stable_key())
         {
             if let Some(graph_name) = manifest.graph.as_ref() {
+                let open_started = std::time::Instant::now();
                 let path = self.root.join(self.component_ref_path(graph_name));
-                let payload = self.read_component_ref(graph_name, MAX_COMPACT_GRAPH_BYTES)?;
-                let compact: CompactGraph = bincode::deserialize(&payload)
-                    .map_err(|source| StorageError::Bincode { path, source })?;
+                let graph_record = graph_name
+                    .split_once('#')
+                    .map_or(graph_name.as_str(), |(_, record)| record);
+                let reader =
+                    GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?;
+                let compact = reader
+                    .with_record_for_validation(graph_record, MAX_COMPACT_GRAPH_BYTES, |bytes| {
+                        let archived = rkyv::access::<
+                            crate::graph::ArchivedFlatCompactGraph,
+                            rkyv::rancor::Error,
+                        >(bytes)
+                        .map_err(|error| error.to_string())?;
+                        rkyv::deserialize::<FlatCompactGraph, rkyv::rancor::Error>(archived)
+                            .map(FlatCompactGraph::into_compact)
+                            .map_err(|error| error.to_string())
+                    })
+                    .map_err(|error| StorageError::Invalid {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?
+                    .transpose()
+                    .map_err(|message| StorageError::Invalid {
+                        path: path.clone(),
+                        message,
+                    })?
+                    .ok_or_else(|| StorageError::Invalid {
+                        path: path.clone(),
+                        message: format!("missing pack record {graph_record}"),
+                    })?;
+                crate::timing::stage("graph.open.archive", open_started, String::new);
                 if compact.snapshot_id == self.component_snapshot_id(&manifest).stable_key() {
+                    let materialize_started = std::time::Instant::now();
                     let mut graph = GraphIndex::from_compact(compact);
+                    crate::timing::stage(
+                        "graph.open.materialize",
+                        materialize_started,
+                        String::new,
+                    );
                     let edge_count = self
                         .open_stats_from_manifest(&manifest)?
                         .map_or_else(|| graph.edge_count(), |stats| stats.edges);
@@ -3816,19 +4237,31 @@ impl FileSnapshotStorage {
         let Some(symbols_name) = manifest.symbols.as_ref() else {
             return Ok(None);
         };
-        let path = self.root.join(symbols_name);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let payload = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        let path = self.root.join(self.component_ref_path(symbols_name));
+        let payload = self.read_component_ref(symbols_name, MAX_COMPONENT_BYTES)?;
         // Hot cold-search path: skip the full-payload blake3 (consistent with `open_graph` /
         // `open_current`, which also skip it). `validate` still verifies the checksum.
-        let dict = bincode::deserialize::<SymbolDict>(&payload).map_err(|source| {
-            StorageError::Bincode {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let dict = if symbols_name.contains('#') {
+            let archived =
+                rkyv::access::<crate::search::ArchivedSymbolDict, rkyv::rancor::Error>(&payload)
+                    .map_err(|error| StorageError::Invalid {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?;
+            rkyv::deserialize::<SymbolDict, rkyv::rancor::Error>(archived).map_err(|error| {
+                StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?
+        } else {
+            bincode::deserialize::<SymbolDict>(&payload).map_err(|source| {
+                StorageError::Bincode {
+                    path: path.clone(),
+                    source,
+                }
+            })?
+        };
         if dict.snapshot_id != self.component_snapshot_id(&manifest).stable_key() {
             return Err(StorageError::Invalid {
                 path: self.current_path(),
@@ -3844,29 +4277,23 @@ impl FileSnapshotStorage {
         Ok(Some(dict))
     }
 
-    /// Optional on-disk Tantivy directory for fuzzy/regex hybrid path.
+    /// Legacy search-directory accessor. Schema 8 stores all search data in `symbols`.
     pub fn open_search_dir(&self) -> Result<Option<PathBuf>, StorageError> {
-        let _generation_guard = self.acquire_generation_read_guard()?;
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
         self.ensure_supported_schema(&manifest)?;
-        let Some(name) = manifest.search_dir.as_ref() else {
-            return Ok(None);
-        };
-        let path = self.root.join(name);
-        if path.is_dir() {
-            Ok(Some(path))
-        } else {
-            Ok(None)
-        }
+        Ok(manifest
+            .search_dir
+            .or(manifest.symbols)
+            .map(|path| self.root.join(self.component_ref_path(&path))))
     }
 
-    /// Open dictionary and optional Tantivy reader from one manifest while retaining the
-    /// generation lease for the entire on-disk reader lifetime.
+    /// Open the persistent dictionary and compact term postings while retaining the generation
+    /// lease for the entire reader lifetime.
     pub fn open_search_index(
         &self,
-        needs_tantivy: bool,
+        needs_terms: bool,
     ) -> Result<Option<SearchIndex>, StorageError> {
         let generation_guard = self.acquire_generation_read_guard()?;
         let Some(manifest) = self.read_manifest()? else {
@@ -3884,25 +4311,69 @@ impl FileSnapshotStorage {
                 Ok(overlay)
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
-        let mut dict = self.symbols_from_manifest(&manifest)?;
-        if let Some(dict) = dict.as_mut() {
-            dict.apply_name_overlays(&overlays);
+        if let Some(symbol_reference) = manifest.symbols.as_deref()
+            && let Some((pack, symbol_key)) = symbol_reference.split_once('#')
+        {
+            let path = self.root.join(pack);
+            let reader = Arc::new(GenerationPackReader::open(&path).map_err(|error| {
+                StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?);
+            let mut index = SearchIndex::from_packed_dict(
+                Arc::clone(&reader),
+                symbol_key.to_owned(),
+                MAX_COMPONENT_BYTES,
+            );
+            if needs_terms
+                && let Some(term_reference) = manifest.search_terms.as_deref()
+                && let Some((term_pack, term_key)) = term_reference.split_once('#')
+            {
+                let term_reader = if term_pack == pack {
+                    Arc::clone(&reader)
+                } else {
+                    Arc::new(
+                        GenerationPackReader::open(self.root.join(term_pack)).map_err(|error| {
+                            StorageError::Invalid {
+                                path: self.root.join(term_pack),
+                                message: error.to_string(),
+                            }
+                        })?,
+                    )
+                };
+                index =
+                    index.with_packed_terms(term_reader, term_key.to_owned(), MAX_COMPONENT_BYTES);
+            }
+            return Ok(Some(
+                index
+                    .with_term_overlays(overlays)
+                    .with_generation_guard(generation_guard),
+            ));
         }
-        let search_path = manifest
-            .search_dir
-            .as_ref()
-            .map(|name| self.root.join(name))
-            .filter(|path| path.is_dir());
-        let index = match (dict, needs_tantivy, search_path) {
-            (Some(dict), true, Some(path)) => SearchIndex::with_dict_and_tantivy_dir(dict, &path),
-            (Some(dict), _, _) => Ok(SearchIndex::from_symbol_dict(dict)),
-            (None, true, Some(path)) => SearchIndex::open_tantivy_dir(&path),
-            (None, _, _) => return Ok(None),
+        let dict = self.symbols_from_manifest(&manifest)?;
+        let Some(dict) = dict else {
+            return Ok(None);
+        };
+        let packed_terms = needs_terms
+            .then_some(manifest.search_terms.as_deref())
+            .flatten()
+            .and_then(|reference| reference.split_once('#'));
+        let terms = if needs_terms && packed_terms.is_none() {
+            self.terms_from_manifest(&manifest)?
+        } else {
+            None
+        };
+        let mut index = SearchIndex::from_parts(dict, terms);
+        if let Some((pack, key)) = packed_terms {
+            let path = self.root.join(pack);
+            let reader =
+                GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+            index = index.with_packed_terms(Arc::new(reader), key.to_owned(), MAX_COMPONENT_BYTES);
         }
-        .map_err(|error| StorageError::Search {
-            path: self.root.clone(),
-            message: error.to_string(),
-        })?;
         Ok(Some(
             index
                 .with_term_overlays(overlays)
@@ -3917,17 +4388,29 @@ impl FileSnapshotStorage {
         let Some(symbols_name) = manifest.symbols.as_ref() else {
             return Ok(None);
         };
-        let path = self.root.join(symbols_name);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let payload = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
-        let dict = bincode::deserialize::<SymbolDict>(&payload).map_err(|source| {
-            StorageError::Bincode {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let path = self.root.join(self.component_ref_path(symbols_name));
+        let payload = self.read_component_ref(symbols_name, MAX_COMPONENT_BYTES)?;
+        let dict = if symbols_name.contains('#') {
+            let archived =
+                rkyv::access::<crate::search::ArchivedSymbolDict, rkyv::rancor::Error>(&payload)
+                    .map_err(|error| StorageError::Invalid {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    })?;
+            rkyv::deserialize::<SymbolDict, rkyv::rancor::Error>(archived).map_err(|error| {
+                StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?
+        } else {
+            bincode::deserialize::<SymbolDict>(&payload).map_err(|source| {
+                StorageError::Bincode {
+                    path: path.clone(),
+                    source,
+                }
+            })?
+        };
         if dict.snapshot_id != self.component_snapshot_id(manifest).stable_key()
             || dict.format_version != SymbolDict::FORMAT_VERSION
             || !dict.is_well_formed()
@@ -3935,6 +4418,34 @@ impl FileSnapshotStorage {
             return Ok(None);
         }
         Ok(Some(dict))
+    }
+
+    fn terms_from_manifest(&self, manifest: &Manifest) -> Result<Option<TermIndex>, StorageError> {
+        let Some(reference) = manifest.search_terms.as_ref() else {
+            return Ok(None);
+        };
+        let path = self.root.join(self.component_ref_path(reference));
+        let payload = self.read_component_ref(reference, MAX_COMPONENT_BYTES)?;
+        let archived =
+            rkyv::access::<crate::search::ArchivedTermIndex, rkyv::rancor::Error>(&payload)
+                .map_err(|error| StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+        let terms =
+            rkyv::deserialize::<TermIndex, rkyv::rancor::Error>(archived).map_err(|error| {
+                StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+        if terms.snapshot_id != self.component_snapshot_id(manifest).stable_key()
+            || terms.format_version != TermIndex::FORMAT_VERSION
+            || !terms.is_well_formed()
+        {
+            return Ok(None);
+        }
+        Ok(Some(terms))
     }
 
     pub fn open_symbol_meta(&self) -> Result<Option<SymbolMetaDict>, StorageError> {
@@ -3946,10 +4457,42 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.symbol_meta.as_ref() else {
             return Ok(None);
         };
-        let payload = self.read_component_ref(name, MAX_COMPONENT_BYTES)?;
-        // Stale sidecars (schema drift) → treat as missing; caller falls back or reindexes.
-        let Ok(mut meta) = bincode::deserialize::<SymbolMetaDict>(&payload) else {
-            return Ok(None);
+        let path = self.root.join(self.component_ref_path(name));
+        let mut meta = if let Some((_, record)) = name.split_once('#') {
+            let reader =
+                GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+            let Some(result) = reader
+                .with_record_for_validation(record, MAX_COMPONENT_BYTES, |bytes| {
+                    let archived = rkyv::access::<
+                        crate::model::ArchivedSymbolMetaDict,
+                        rkyv::rancor::Error,
+                    >(bytes)
+                    .map_err(|error| error.to_string())?;
+                    rkyv::deserialize::<SymbolMetaDict, rkyv::rancor::Error>(archived)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| StorageError::Invalid {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?
+            else {
+                return Ok(None);
+            };
+            let Ok(meta) = result else {
+                return Ok(None);
+            };
+            meta
+        } else {
+            let payload = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+            bincode::deserialize::<SymbolMetaDict>(&payload).map_err(|source| {
+                StorageError::Bincode {
+                    path: path.clone(),
+                    source,
+                }
+            })?
         };
         if meta.format_version != SymbolMetaDict::FORMAT_VERSION {
             return Ok(None);
@@ -3981,6 +4524,64 @@ impl FileSnapshotStorage {
             return Ok(None);
         }
         Ok(Some(meta))
+    }
+
+    pub(crate) fn open_packed_symbol_meta(&self) -> Result<Option<PackedSymbolMeta>, StorageError> {
+        let generation_guard = self.acquire_generation_read_guard()?;
+        let Some(manifest) = self.read_manifest()? else {
+            return Ok(None);
+        };
+        self.ensure_supported_schema(&manifest)?;
+        let Some(reference) = manifest.symbol_meta.as_ref() else {
+            return Ok(None);
+        };
+        let Some((pack_name, record)) = reference.split_once('#') else {
+            return Ok(None);
+        };
+        let path = self.root.join(pack_name);
+        let reader = GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        let index = reader
+            .with_record(record, MAX_COMPONENT_BYTES, |bytes| {
+                bincode::deserialize::<SymbolMetaShardIndex>(bytes)
+            })
+            .map_err(|error| StorageError::Invalid {
+                path: path.clone(),
+                message: error.to_string(),
+            })?
+            .transpose()
+            .map_err(|source| StorageError::Bincode {
+                path: path.clone(),
+                source,
+            })?;
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        if index.format_version != SymbolMetaShardIndex::FORMAT_VERSION
+            || index.shard_bits != SYMBOL_META_SHARD_BITS
+            || index.snapshot_id != self.component_snapshot_id(&manifest).stable_key()
+        {
+            return Ok(None);
+        }
+        let mut overlays = Vec::with_capacity(manifest.symbol_meta_overlays.len());
+        for overlay_name in &manifest.symbol_meta_overlays {
+            let overlay_path = self.root.join(self.component_ref_path(overlay_name));
+            let bytes = self.read_component_ref(overlay_name, MAX_DELTA_COMPONENT_BYTES)?;
+            overlays.push(bincode::deserialize(&bytes).map_err(|source| {
+                StorageError::Bincode {
+                    path: overlay_path,
+                    source,
+                }
+            })?);
+        }
+        Ok(Some(PackedSymbolMeta {
+            reader,
+            index,
+            overlays,
+            generation_guard,
+        }))
     }
 
     pub fn open_file_list(&self) -> Result<Option<FileList>, StorageError> {
@@ -4105,11 +4706,8 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.hubs.as_ref() else {
             return Ok(None);
         };
-        let path = self.root.join(name);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let bytes = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        let path = self.root.join(self.component_ref_path(name));
+        let bytes = self.read_component_ref(name, MAX_COMPONENT_BYTES)?;
         let hubs: Vec<HubEntry> =
             serde_json::from_slice(&bytes).map_err(|source| StorageError::Json { path, source })?;
         Ok(Some(hubs))
@@ -4187,19 +4785,14 @@ impl SnapshotStorage for FileSnapshotStorage {
         let graph_name = format!("snapshot-{id}.graph.bin");
         let stats_name = format!("snapshot-{id}.stats.json");
         let symbols_name = format!("snapshot-{id}.symbols.bin");
-        let new_search_name = format!("snapshot-{id}.search");
         let symbol_meta_name = format!("snapshot-{id}.symbol_meta.bin");
         let files_name = format!("snapshot-{id}.files.bin");
         let file_hashes_name = format!("snapshot-{id}.file_hashes.bin");
         let hubs_name = format!("snapshot-{id}.hubs.json");
         let manifest_name = format!("snapshot-{id}.manifest.json");
 
-        // Every large sidecar derives independently from `snapshot` and writes to a distinct
-        // atomic temp path (temp names are per-final-path), so they publish concurrently instead
-        // of serially. Wall time collapses from the serial sum (payload+graph+search+symbols+
-        // artifacts, ~30s on the real corpus) toward the slowest single sidecar (Tantivy search).
-        // Each closure streams straight to its temp file, so the RSS win of not buffering every
-        // serialized Vec is preserved. Manifest assembly below joins their results.
+        // Large components stream to distinct atomic temp paths. The payload lane overlaps the
+        // derived-sidecar lane without retaining duplicate serialized buffers in memory.
         let payload_task = || -> Result<String, StorageError> {
             let t = std::time::Instant::now();
             let checksum = self.atomic_write_bincode(&self.payload_path(&id), snapshot)?;
@@ -4231,14 +4824,12 @@ impl SnapshotStorage for FileSnapshotStorage {
             crate::timing::stage("publish.hubs", t, String::new);
             Ok(())
         };
-        let search_task = || -> Result<String, StorageError> {
-            let t = std::time::Instant::now();
-            let name = self.publish_or_reuse_search_snapshot(&new_search_name, snapshot)?;
-            crate::timing::stage("publish.search", t, String::new);
-            Ok(name)
-        };
         let symbols_task = || -> Result<String, StorageError> {
-            let dict = SymbolDict::from_snapshot_names_only(snapshot);
+            let t = std::time::Instant::now();
+            let dict = SymbolDict::from_snapshot(snapshot);
+            crate::timing::stage("publish.search_terms", t, || {
+                format!("names={}", dict.names.len())
+            });
             self.atomic_write_bincode(&self.symbols_path(&id), &dict)
         };
         let symbol_meta_task = || -> Result<(), StorageError> {
@@ -4263,14 +4854,8 @@ impl SnapshotStorage for FileSnapshotStorage {
             out
         };
 
-        // Three lanes, not a full fan-out. Measured on the real corpus: with tokenization
-        // parallelized the search build drops to a few seconds, so the serial heavy-sidecar
-        // chain (~10s) is the wall-clock ceiling either way — an 8-way fan-out was no faster
-        // than this shape but held GraphIndex, SymbolDict, SymbolMetaDict, and the search prep
-        // buffers live simultaneously (+1.8 GB peak RSS). The chain keeps the original
-        // build→write→drop discipline so at most one heavy sidecar is resident at a time;
-        // payload and search stream to their own files and add little residency. Errors
-        // surface after the join so every started write finishes before we bail.
+        // The chain keeps build→write→drop discipline so at most one derived heavy sidecar is
+        // resident at a time. Errors surface after the join so every started write finishes.
         // (index name, store name, locator name, state) as returned by write_initial_artifact_store.
         type ArtifactStoreParts = (String, String, String, [u8; 32]);
         let chain_task = || -> Result<(String, ArtifactStoreParts), StorageError> {
@@ -4282,10 +4867,8 @@ impl SnapshotStorage for FileSnapshotStorage {
             let artifact_out = artifact_task()?;
             Ok((symbols_checksum, artifact_out))
         };
-        let (checksum, (search_name, chain_out)) =
-            rayon::join(payload_task, || rayon::join(search_task, chain_task));
+        let (checksum, chain_out) = rayon::join(payload_task, chain_task);
         let checksum = checksum?;
-        let search_name = search_name?;
         let (
             symbols_checksum,
             (artifact_index_name, artifact_store, artifact_locator, artifact_state),
@@ -4322,9 +4905,11 @@ impl SnapshotStorage for FileSnapshotStorage {
             payload: payload_name,
             graph: Some(graph_name),
             stats: Some(stats_name),
+            stats_inline: Some(stats),
             symbols: Some(symbols_name),
             symbols_checksum: Some(symbols_checksum),
-            search_dir: Some(search_name),
+            search_dir: None,
+            search_terms: None,
             search_overlays: Vec::new(),
             symbol_meta: Some(symbol_meta_name),
             symbol_meta_overlays: Vec::new(),
@@ -4368,6 +4953,82 @@ impl SnapshotStorage for FileSnapshotStorage {
                     manifest.schema_version
                 ),
             });
+        }
+        if manifest.payload.contains('#') {
+            let base_name = manifest
+                .structural_packs
+                .as_ref()
+                .map(|chain| chain.base.as_str())
+                .ok_or_else(|| StorageError::Invalid {
+                    path: self.current_path(),
+                    message: "packed payload is missing its base pack".into(),
+                })?;
+            let base_path = self.root.join(base_name);
+            let mut reader =
+                GenerationPackReader::open(&base_path).map_err(|error| StorageError::Invalid {
+                    path: base_path.clone(),
+                    message: error.to_string(),
+                })?;
+            let edge_bytes = reader
+                .read("snapshot/edges", MAX_COMPONENT_BYTES)
+                .map_err(|error| StorageError::Invalid {
+                    path: base_path.clone(),
+                    message: error.to_string(),
+                })?
+                .ok_or_else(|| StorageError::Invalid {
+                    path: base_path.clone(),
+                    message: "packed snapshot has no edge record".into(),
+                })?;
+            let mut edges =
+                bincode::deserialize(&edge_bytes).map_err(|source| StorageError::Bincode {
+                    path: base_path.clone(),
+                    source,
+                })?;
+            let index =
+                self.read_artifact_index(&manifest)?
+                    .ok_or_else(|| StorageError::Invalid {
+                        path: base_path.clone(),
+                        message: "packed snapshot has no artifact index".into(),
+                    })?;
+            let mut files = BTreeMap::new();
+            for path in index.entries.keys() {
+                let artifact = if index.overrides.contains(path) {
+                    self.open_artifact(path)?
+                        .ok_or_else(|| StorageError::Invalid {
+                            path: base_path.clone(),
+                            message: format!("missing overlaid artifact {path}"),
+                        })?
+                } else {
+                    let key = format!("artifact/{path}");
+                    let bytes = reader
+                        .read(&key, MAX_COMPONENT_BYTES)
+                        .map_err(|error| StorageError::Invalid {
+                            path: base_path.clone(),
+                            message: error.to_string(),
+                        })?
+                        .ok_or_else(|| StorageError::Invalid {
+                            path: base_path.clone(),
+                            message: format!("missing packed artifact {path}"),
+                        })?;
+                    bincode::deserialize(&bytes).map_err(|source| StorageError::Bincode {
+                        path: base_path.clone(),
+                        source,
+                    })?
+                };
+                files.insert(path.clone(), artifact);
+            }
+            if manifest.structural_packs.as_ref().is_some_and(|chain| {
+                !chain.overlays.is_empty()
+                    && chain.current_snapshot == manifest.snapshot_id.stable_key()
+            }) && let Some(graph) = self.open_structural_graph_base()?
+            {
+                edges = graph.edges();
+            }
+            return Ok(Some(IndexSnapshot {
+                id: manifest.snapshot_id,
+                files,
+                edges,
+            }));
         }
         let path = self.root.join(&manifest.payload);
         // Hot path: skip full blake3 of the payload (validate still checks).
@@ -4425,6 +5086,111 @@ impl SnapshotStorage for FileSnapshotStorage {
                     manifest.schema_version
                 ),
             });
+        }
+        if manifest.payload.contains('#') {
+            let mut pack_names = BTreeSet::new();
+            if let Some(chain) = &manifest.structural_packs {
+                pack_names.insert(chain.base.clone());
+                pack_names.extend(chain.overlays.iter().cloned());
+            }
+            for reference in [
+                Some(manifest.payload.as_str()),
+                manifest.graph.as_deref(),
+                manifest.symbols.as_deref(),
+                manifest.search_terms.as_deref(),
+                manifest.symbol_meta.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(manifest.artifact_deltas.iter().map(String::as_str))
+            .chain(manifest.search_overlays.iter().map(String::as_str))
+            .chain(manifest.symbol_meta_overlays.iter().map(String::as_str))
+            {
+                if let Some((pack, _)) = reference.split_once('#') {
+                    pack_names.insert(pack.to_owned());
+                }
+            }
+            for pack_name in pack_names {
+                let pack_path = self.root.join(&pack_name);
+                let mut reader = GenerationPackReader::open(&pack_path).map_err(|error| {
+                    StorageError::Invalid {
+                        path: pack_path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let keys = reader.keys().map(str::to_owned).collect::<Vec<_>>();
+                for key in keys {
+                    let bytes = reader
+                        .read(&key, MAX_COMPONENT_BYTES)
+                        .map_err(|error| StorageError::Invalid {
+                            path: pack_path.clone(),
+                            message: error.to_string(),
+                        })?
+                        .ok_or_else(|| StorageError::Invalid {
+                            path: pack_path.clone(),
+                            message: format!("missing pack record {key}"),
+                        })?;
+                    let bincode_valid = if key == "query/symbol-meta/index" {
+                        bincode::deserialize::<SymbolMetaShardIndex>(&bytes).is_ok()
+                    } else if key.starts_with("query/symbol-meta/id/") {
+                        bincode::deserialize::<SymbolMetaIdShard>(&bytes).is_ok()
+                    } else if key.starts_with("query/symbol-meta/name/")
+                        || key.starts_with("query/symbol-meta/qualified/")
+                    {
+                        bincode::deserialize::<SymbolMetaLookupShard>(&bytes).is_ok()
+                    } else if key == "symbol-meta/overlay" {
+                        bincode::deserialize::<SymbolMetaOverlay>(&bytes).is_ok()
+                    } else {
+                        true
+                    };
+                    if !bincode_valid {
+                        return Err(StorageError::Invalid {
+                            path: pack_path.clone(),
+                            message: format!("invalid bincode record {key}"),
+                        });
+                    }
+                }
+                for key in ["query/graph", "query/symbols", "query/terms"] {
+                    if !reader.keys().any(|candidate| candidate == key) {
+                        continue;
+                    }
+                    let valid = reader
+                        .with_record_for_validation(key, MAX_COMPONENT_BYTES, |bytes| match key {
+                            "query/graph" => rkyv::access::<
+                                crate::graph::ArchivedFlatCompactGraph,
+                                rkyv::rancor::Error,
+                            >(bytes)
+                            .is_ok(),
+                            "query/symbols" => rkyv::access::<
+                                crate::search::ArchivedSymbolDict,
+                                rkyv::rancor::Error,
+                            >(bytes)
+                            .is_ok(),
+                            "query/terms" => rkyv::access::<
+                                crate::search::ArchivedTermIndex,
+                                rkyv::rancor::Error,
+                            >(bytes)
+                            .is_ok(),
+                            _ => true,
+                        })
+                        .map_err(|error| StorageError::Invalid {
+                            path: pack_path.clone(),
+                            message: error.to_string(),
+                        })?
+                        .unwrap_or(false);
+                    if !valid {
+                        return Err(StorageError::Invalid {
+                            path: pack_path.clone(),
+                            message: format!("invalid archived record {key}"),
+                        });
+                    }
+                }
+            }
+            self.open_current()?.ok_or_else(|| StorageError::Invalid {
+                path: self.current_path(),
+                message: "packed snapshot is missing".into(),
+            })?;
+            return Ok(());
         }
         let path = self.root.join(&manifest.payload);
         let payload = self.open_payload(path.clone(), true, &manifest.checksum)?;
@@ -5203,9 +5969,11 @@ mod tests {
             payload: "snapshot-base.bin".into(),
             graph: None,
             stats: Some("snapshot-overlay.pack#stats/json".into()),
+            stats_inline: None,
             symbols: None,
             symbols_checksum: None,
             search_dir: None,
+            search_terms: None,
             search_overlays: Vec::new(),
             symbol_meta: None,
             symbol_meta_overlays: Vec::new(),

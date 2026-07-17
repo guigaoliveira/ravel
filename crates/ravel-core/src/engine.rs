@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub use crate::model::IndexStats;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
@@ -99,26 +99,303 @@ struct EngineInner {
 
 #[derive(Debug)]
 struct SymbolMetaRuntime {
-    dict: Arc<crate::model::SymbolMetaDict>,
+    backend: SymbolMetaBackend,
+}
+
+#[derive(Debug)]
+enum SymbolMetaBackend {
+    Owned(Arc<crate::model::SymbolMetaDict>),
+    Packed(Box<PackedSymbolMetaBackend>),
+}
+
+#[derive(Debug)]
+struct PackedSymbolMetaBackend {
+    reader: crate::generation_pack::GenerationPackReader,
+    index: crate::model::SymbolMetaShardIndex,
+    removed_ids: BTreeSet<String>,
+    removed_digests: BTreeSet<[u8; 32]>,
+    upserts: FxHashMap<String, crate::model::SymbolMeta>,
+    id_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaIdShard>>>,
+    name_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaLookupShard>>>,
+    qualified_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaLookupShard>>>,
+    _generation_guard: crate::generation_gc::GenerationGuard,
 }
 
 impl SymbolMetaRuntime {
     fn new(dict: crate::model::SymbolMetaDict) -> Self {
         debug_assert!(dict.is_well_formed());
         Self {
-            dict: Arc::new(dict),
+            backend: SymbolMetaBackend::Owned(Arc::new(dict)),
         }
     }
 
-    fn get_by_id(&self, id: &str) -> Option<&crate::model::SymbolMeta> {
-        self.dict.get_by_id(id)
+    fn packed(packed: crate::storage::PackedSymbolMeta) -> Self {
+        let crate::storage::PackedSymbolMeta {
+            reader,
+            index,
+            overlays,
+            generation_guard,
+        } = packed;
+        let mut removed_ids = BTreeSet::new();
+        let mut upserts = FxHashMap::default();
+        for overlay in overlays {
+            for id in overlay.removed_ids {
+                removed_ids.insert(id.clone());
+                upserts.remove(&id);
+            }
+            for entry in overlay.upserts {
+                removed_ids.insert(entry.id.clone());
+                upserts.insert(entry.id.clone(), entry);
+            }
+        }
+        let removed_digests = removed_ids
+            .iter()
+            .map(|id| *blake3::hash(id.as_bytes()).as_bytes())
+            .collect();
+        Self {
+            backend: SymbolMetaBackend::Packed(Box::new(PackedSymbolMetaBackend {
+                reader,
+                index,
+                removed_ids,
+                removed_digests,
+                upserts,
+                id_cache: Mutex::new(FxHashMap::default()),
+                name_cache: Mutex::new(FxHashMap::default()),
+                qualified_cache: Mutex::new(FxHashMap::default()),
+                _generation_guard: generation_guard,
+            })),
+        }
     }
 
-    fn exact_id_or_qualified(&self, query: &str) -> Vec<&crate::model::SymbolMeta> {
+    fn shard_id(key: &str, shard_bits: u8) -> u8 {
+        let mask = if shard_bits == 8 {
+            u8::MAX
+        } else {
+            (1u8 << shard_bits) - 1
+        };
+        blake3::hash(key.as_bytes()).as_bytes()[0] & mask
+    }
+
+    fn load_id_shard(&self, shard: u8) -> Option<Arc<crate::model::SymbolMetaIdShard>> {
+        let SymbolMetaBackend::Packed(packed) = &self.backend else {
+            return None;
+        };
+        if let Some(cached) = packed.id_cache.lock().unwrap().get(&shard).cloned() {
+            return Some(cached);
+        }
+        let key = format!("query/symbol-meta/id/{shard:02x}");
+        let decoded = packed
+            .reader
+            .with_record(&key, 64 * 1024 * 1024, |bytes| {
+                bincode::deserialize::<crate::model::SymbolMetaIdShard>(bytes).ok()
+            })
+            .ok()
+            .flatten()
+            .flatten()
+            .map(Arc::new)?;
+        packed
+            .id_cache
+            .lock()
+            .unwrap()
+            .insert(shard, Arc::clone(&decoded));
+        Some(decoded)
+    }
+
+    fn lookup_locations(
+        &self,
+        qualified: bool,
+        key: &str,
+    ) -> Vec<crate::model::SymbolMetaLocation> {
+        let SymbolMetaBackend::Packed(packed) = &self.backend else {
+            return Vec::new();
+        };
+        let shard = Self::shard_id(key, packed.index.shard_bits);
+        let cache = if qualified {
+            &packed.qualified_cache
+        } else {
+            &packed.name_cache
+        };
+        let cached = cache.lock().unwrap().get(&shard).cloned();
+        let shard_data = cached.or_else(|| {
+            let kind = if qualified { "qualified" } else { "name" };
+            let record = format!("query/symbol-meta/{kind}/{shard:02x}");
+            let decoded = packed
+                .reader
+                .with_record(&record, 64 * 1024 * 1024, |bytes| {
+                    bincode::deserialize::<crate::model::SymbolMetaLookupShard>(bytes).ok()
+                })
+                .ok()
+                .flatten()
+                .flatten()
+                .map(Arc::new)?;
+            cache.lock().unwrap().insert(shard, Arc::clone(&decoded));
+            Some(decoded)
+        });
+        let Some(shard_data) = shard_data else {
+            return Vec::new();
+        };
+        shard_data
+            .entries
+            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(key))
+            .ok()
+            .map(|position| shard_data.entries[position].1.clone())
+            .unwrap_or_default()
+    }
+
+    fn get_by_location(
+        &self,
+        location: crate::model::SymbolMetaLocation,
+    ) -> Option<crate::model::SymbolMeta> {
+        let shard = self.load_id_shard(location.shard)?;
+        let entry = shard.entries.get(location.index as usize)?;
+        if blake3::hash(entry.id.as_bytes()).as_bytes() != &location.id_digest {
+            return None;
+        }
+        self.get_by_id(&entry.id)
+    }
+
+    fn get_by_id(&self, id: &str) -> Option<crate::model::SymbolMeta> {
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => dict.get_by_id(id).cloned(),
+            SymbolMetaBackend::Packed(packed) => {
+                if let Some(entry) = packed.upserts.get(id) {
+                    return Some(entry.clone());
+                }
+                if packed.removed_ids.contains(id) {
+                    return None;
+                }
+                let shard = self.load_id_shard(Self::shard_id(id, packed.index.shard_bits))?;
+                let start = shard
+                    .entries
+                    .partition_point(|entry| entry.id.as_str() < id);
+                shard.entries[start..]
+                    .iter()
+                    .take_while(|entry| entry.id == id)
+                    .last()
+                    .cloned()
+            }
+        }
+    }
+
+    fn entries_for(&self, name: &str, limit: usize) -> (Vec<crate::model::SymbolMeta>, usize) {
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => {
+                let entries = dict.entries_for(name).collect::<Vec<_>>();
+                let total = entries.len();
+                (entries.into_iter().take(limit).cloned().collect(), total)
+            }
+            SymbolMetaBackend::Packed(packed) => {
+                let mut locations = self.lookup_locations(false, name);
+                locations.retain(|location| {
+                    !packed.removed_digests.contains(&location.id_digest)
+                        || packed.upserts.values().any(|entry| {
+                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
+                        })
+                });
+                let location_digests = locations
+                    .iter()
+                    .map(|location| location.id_digest)
+                    .collect::<BTreeSet<_>>();
+                let additions = packed
+                    .upserts
+                    .values()
+                    .filter(|entry| entry.name == name)
+                    .filter(|entry| {
+                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let total = locations.len() + additions.len();
+                let mut result = locations
+                    .into_iter()
+                    .filter_map(|location| self.get_by_location(location))
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                result.extend(
+                    additions
+                        .into_iter()
+                        .take(limit.saturating_sub(result.len())),
+                );
+                result.sort_by(|left, right| {
+                    (&left.name, &left.path, left.span).cmp(&(&right.name, &right.path, right.span))
+                });
+                (result, total)
+            }
+        }
+    }
+
+    fn exact_id_or_qualified(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<crate::model::SymbolMeta>, usize) {
         if let Some(entry) = self.get_by_id(query) {
-            return vec![entry];
+            return (vec![entry], 1);
         }
-        self.dict.entries_for_qualified(query)
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => {
+                let entries = dict.entries_for_qualified(query);
+                let total = entries.len();
+                (entries.into_iter().take(limit).cloned().collect(), total)
+            }
+            SymbolMetaBackend::Packed(packed) => {
+                let mut locations = self.lookup_locations(true, query);
+                locations.retain(|location| {
+                    !packed.removed_digests.contains(&location.id_digest)
+                        || packed.upserts.values().any(|entry| {
+                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
+                        })
+                });
+                let location_digests = locations
+                    .iter()
+                    .map(|location| location.id_digest)
+                    .collect::<BTreeSet<_>>();
+                let additions = packed
+                    .upserts
+                    .values()
+                    .filter(|entry| entry.qualified_name == query)
+                    .filter(|entry| {
+                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let total = locations.len() + additions.len();
+                let mut result = locations
+                    .into_iter()
+                    .filter_map(|location| self.get_by_location(location))
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                result.extend(
+                    additions
+                        .into_iter()
+                        .take(limit.saturating_sub(result.len())),
+                );
+                (result, total)
+            }
+        }
+    }
+
+    fn materialize(&self) -> Option<Arc<crate::model::SymbolMetaDict>> {
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => Some(Arc::clone(dict)),
+            SymbolMetaBackend::Packed(packed) => {
+                let mut entries = Vec::new();
+                for shard in 0..(1u16 << packed.index.shard_bits) {
+                    entries.extend(
+                        self.load_id_shard(shard as u8)?
+                            .entries
+                            .iter()
+                            .filter(|entry| !packed.removed_ids.contains(&entry.id))
+                            .cloned(),
+                    );
+                }
+                entries.extend(packed.upserts.values().cloned());
+                Some(Arc::new(crate::model::SymbolMetaDict::from_all_entries(
+                    packed.index.snapshot_id.clone(),
+                    entries,
+                )))
+            }
+        }
     }
 }
 
@@ -816,19 +1093,8 @@ impl WorkspaceEngine {
                 return Ok(stats);
             }
         }
-        if let Some(stats) = self.try_artifact_only_sync(&prepared)? {
-            *self.inner.snapshot_cache.lock().unwrap() = None;
-            *self.inner.symbol_meta_cache.lock().unwrap() = None;
-            *self.inner.dirty_cache.lock().unwrap() = None;
-            self.remember_published_generation();
-            return Ok(stats);
-        }
-
-        let hydrate_start = std::time::Instant::now();
-        self.hydrate_structural_cache()?;
-        crate::timing::stage("sync.hydrate_structural_cache", hydrate_start, String::new);
         let delta_start = std::time::Instant::now();
-        if let Some(stats) = self.try_resident_structural_delta(&prepared)? {
+        if let Some(stats) = self.try_incremental_delta(&prepared)? {
             crate::timing::stage("sync.structural_delta.total", delta_start, String::new);
             return Ok(stats);
         }
@@ -1062,63 +1328,9 @@ impl WorkspaceEngine {
         )
     }
 
-    fn try_artifact_only_sync(
-        &self,
-        prepared: &[PreparedPath],
-    ) -> Result<Option<IndexStats>, EngineError> {
-        let storage = self.storage();
-        let mut deltas = Vec::new();
-        for prepared in prepared {
-            if prepared.unchanged {
-                continue;
-            }
-            let Some(bytes) = prepared.bytes.as_ref() else {
-                return Ok(None);
-            };
-            let Some(previous) = storage.open_artifact(&prepared.relative)? else {
-                return Ok(None);
-            };
-            let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
-            artifact.path = prepared.relative.clone();
-            // These fields feed global graph/search/detail sidecars. If any changes, the
-            // current format must use the full correctness path until those indexes are sharded.
-            let symbol_shape_changed = previous.symbols.len() != artifact.symbols.len()
-                || previous
-                    .symbols
-                    .iter()
-                    .zip(&artifact.symbols)
-                    .any(|(old, new)| {
-                        old.id != new.id
-                            || old.name != new.name
-                            || old.qualified_name != new.qualified_name
-                            || old.kind != new.kind
-                            || old.exported != new.exported
-                    });
-            if previous.language != artifact.language
-                || symbol_shape_changed
-                || previous.imports != artifact.imports
-                || previous.exports != artifact.exports
-                || previous.symbol_refs != artifact.symbol_refs
-            {
-                return Ok(None);
-            }
-            deltas.push((prepared.relative.clone(), artifact));
-        }
-        if deltas.is_empty() {
-            return Ok(None);
-        }
-        let stats = storage.publish_artifact_deltas_deferred_gc(&deltas)?;
-        self.schedule_generation_maintenance();
-        storage.compact_artifacts_if_amplified(
-            self.config.storage.artifact_store_max_amplification,
-            self.config.storage.retention,
-        )?;
-        Ok(stats)
-    }
-
     /// Fast structural path for in-place edits. It loads only changed/affected artifacts and
     /// publishes component overlays; the full snapshot is reconstructed only on explicit demand.
-    fn try_resident_structural_delta(
+    fn try_incremental_delta(
         &self,
         prepared: &[PreparedPath],
     ) -> Result<Option<IndexStats>, EngineError> {
@@ -1146,6 +1358,49 @@ impl WorkspaceEngine {
         if changes.is_empty() {
             return Ok(None);
         }
+
+        // Content-only edits update artifacts and stats without touching graph/search sidecars.
+        // Classify from the artifacts already parsed above so a structural edit is never parsed
+        // and loaded twice before entering the structural delta path.
+        let artifact_deltas = changes
+            .iter()
+            .map(|(path, old, new)| {
+                let (Some(old), Some(new)) = (old, new) else {
+                    return None;
+                };
+                let symbol_shape_changed = old.symbols.len() != new.symbols.len()
+                    || old.symbols.iter().zip(&new.symbols).any(|(old, new)| {
+                        old.id != new.id
+                            || old.name != new.name
+                            || old.qualified_name != new.qualified_name
+                            || old.kind != new.kind
+                            || old.exported != new.exported
+                    });
+                (old.language == new.language
+                    && !symbol_shape_changed
+                    && old.imports == new.imports
+                    && old.exports == new.exports
+                    && old.symbol_refs == new.symbol_refs)
+                    .then(|| (path.clone(), new.clone()))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(deltas) = artifact_deltas {
+            let stats = storage.publish_artifact_deltas_deferred_gc(&deltas)?;
+            self.schedule_generation_maintenance();
+            storage.compact_artifacts_if_amplified(
+                self.config.storage.artifact_store_max_amplification,
+                self.config.storage.retention,
+            )?;
+            *self.inner.snapshot_cache.lock().unwrap() = None;
+            *self.inner.symbol_meta_cache.lock().unwrap() = None;
+            *self.inner.dirty_cache.lock().unwrap() = None;
+            self.remember_published_generation();
+            return Ok(stats);
+        }
+
+        let hydrate_start = std::time::Instant::now();
+        self.hydrate_structural_cache()?;
+        crate::timing::stage("sync.hydrate_structural_cache", hydrate_start, String::new);
 
         let Some(current_generation) = storage.current_generation()? else {
             return Ok(None);
@@ -1412,7 +1667,7 @@ impl WorkspaceEngine {
                 .flat_map(|(path, _, new)| {
                     new.iter()
                         .flat_map(|artifact| artifact.symbols.iter())
-                        .map(|symbol| SymbolTermDocument::from_symbol(path, symbol))
+                        .map(|symbol| SymbolTermDocument::from_symbol(path, symbol, 0))
                 })
                 .collect();
             SearchTermOverlay {
@@ -1629,9 +1884,17 @@ impl WorkspaceEngine {
             let graph_staged = stager.stage_graph(graph);
             crate::timing::stage("index.stage_graph", stage_start, String::new);
             graph_staged?;
-            (resolved_edges, Some(stager.finish()?))
+            (resolved_edges, Some(stager))
         };
         let snapshot = IndexSnapshot { id, files, edges };
+        let staged_pack = staged_pack
+            .map(|mut stager| {
+                let stage_start = std::time::Instant::now();
+                stager.stage_snapshot(&snapshot)?;
+                crate::timing::stage("index.stage_snapshot", stage_start, String::new);
+                stager.finish()
+            })
+            .transpose()?;
         let staged_overlay = structural_overlay.as_ref().map(
             |(universe_overlay, reverse_overlay, graph_overlay)| {
                 (graph_overlay, universe_overlay, reverse_overlay)
@@ -1658,13 +1921,12 @@ impl WorkspaceEngine {
         }
         if !published_overlay {
             let publish_start = std::time::Instant::now();
-            storage.publish(&snapshot)?;
-            crate::timing::stage("index.publish", publish_start, String::new);
             if let Some(staged_pack) = staged_pack {
-                let attach_start = std::time::Instant::now();
-                storage.attach_structural_pack_base(staged_pack)?;
-                crate::timing::stage("index.attach_pack", attach_start, String::new);
+                storage.publish_packed_snapshot(&snapshot, staged_pack)?;
+            } else {
+                storage.publish(&snapshot)?;
             }
+            crate::timing::stage("index.publish", publish_start, String::new);
         }
         let stats = IndexStats {
             files: snapshot.files.len(),
@@ -1732,20 +1994,40 @@ impl WorkspaceEngine {
     /// One-shot agent context: search + callers + impact in a single call (fewer tool hops).
     /// Auto-syncs dirty git sources **once** (nested search/query skip a second pass).
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
+        let context_started = std::time::Instant::now();
         let synced = self.auto_sync_if_dirty()?;
+        let after_sync = std::time::Instant::now();
+        crate::timing::stage("context.sync", context_started, String::new);
         let limit = limit.clamp(1, 50);
         // Use raw paths — auto_sync already ran. Context combines deterministic spelling
         // lookup with definition-level term evidence: a one-word concept may occur in a path or
         // qualified name, while prose intent words must not turn the query into a hard AND.
-        let mut hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
-        let mut term_hits =
-            self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
-        if !term_hits.is_empty() {
-            let ranking_graph = self.graph()?;
+        let (searches, eager_graph, eager_symbol_runtime) = std::thread::scope(|scope| {
+            let graph = scope.spawn(|| self.graph());
+            let symbol_runtime = scope.spawn(|| self.symbol_meta_runtime());
+            let searches = (|| {
+                let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+                let term_hits =
+                    self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+                Ok::<_, EngineError>((hits, term_hits))
+            })();
+            let graph = graph
+                .join()
+                .map_err(|_| EngineError::Search("context graph worker panicked".into()))
+                .and_then(|result| result);
+            let symbol_runtime = symbol_runtime
+                .join()
+                .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
+                .and_then(|result| result);
+            (searches, graph, symbol_runtime)
+        });
+        let (mut hits, term_hits) = searches?;
+        let mut term_hits = term_hits;
+        if let Ok(graph) = &eager_graph {
             for hit in &mut term_hits {
                 if let Some(id) = hit.definition_id.as_deref() {
-                    let degree = ranking_graph.direct_relations_limit(id, true, 0).1
-                        + ranking_graph.direct_relations_limit(id, false, 0).1;
+                    let degree = graph.direct_relations_limit(id, true, 0).1
+                        + graph.direct_relations_limit(id, false, 0).1;
                     hit.score_micros = hit
                         .score_micros
                         .saturating_add((degree as u64).min(40) * 500)
@@ -1753,6 +2035,10 @@ impl WorkspaceEngine {
                 }
             }
         }
+        let after_prefix = std::time::Instant::now();
+        crate::timing::stage("context.prefix", after_sync, String::new);
+        let after_terms = std::time::Instant::now();
+        crate::timing::stage("context.terms", after_prefix, String::new);
         hits.extend(term_hits);
         hits.sort_by(|left, right| {
             right
@@ -1777,7 +2063,7 @@ impl WorkspaceEngine {
                 hit.reason.as_deref() != Some("term-coverage") || hit.score_micros >= floor
             });
         }
-        let symbol_runtime = self.symbol_meta_runtime()?.unwrap_or_else(|| {
+        let symbol_runtime = eager_symbol_runtime?.unwrap_or_else(|| {
             Arc::new(SymbolMetaRuntime::new(crate::model::SymbolMetaDict {
                 format_version: crate::model::SymbolMetaDict::FORMAT_VERSION,
                 snapshot_id: String::new(),
@@ -1787,9 +2073,11 @@ impl WorkspaceEngine {
                 qualified_order: Vec::new(),
             }))
         });
-        let symbol_meta = Arc::clone(&symbol_runtime.dict);
-        let exact_identity = symbol_runtime.exact_id_or_qualified(query);
-        let exact_primary = (exact_identity.len() == 1).then(|| exact_identity[0]);
+        crate::timing::stage("context.graph_rank_meta", after_terms, String::new);
+        let candidates_started = std::time::Instant::now();
+        let (exact_identity, exact_identity_total) =
+            symbol_runtime.exact_id_or_qualified(query, limit);
+        let exact_primary = (exact_identity_total == 1).then(|| exact_identity[0].clone());
         let required_terms = crate::search::query_tokens(query);
         let mut candidates = Vec::new();
         let mut candidate_entries = Vec::new();
@@ -1819,43 +2107,70 @@ impl WorkspaceEngine {
                 }));
             }
         }
-        let mut add_candidate = |entry: &crate::model::SymbolMeta, hit: &SearchHit| {
-            if seen_ids.insert(entry.id.clone()) {
-                *candidate_counts.entry(entry.name.clone()).or_default() += 1;
-                candidate_total += 1;
-                if candidates.len() < limit {
-                    candidate_entries.push(entry.clone());
-                    candidate_scores.push(hit.score_micros);
-                    candidate_reasons.push(hit.reason.clone().unwrap_or_default());
-                    candidates.push(serde_json::json!({
-                        "id": entry.id,
-                        "name": entry.name,
-                        "qualified": entry.qualified_name,
-                        "kind": entry.kind,
-                        "path": entry.path,
-                        "line": entry.span.start_line + 1,
-                        "end_line": entry.span.end_line + 1,
-                        "score": hit.score_micros,
-                        "why": hit.reason,
-                    }));
-                }
+        if exact_identity_total > exact_identity.len() {
+            let omitted = exact_identity_total - exact_identity.len();
+            candidate_total += omitted;
+            if let Some(first) = exact_identity.first() {
+                *candidate_counts.entry(first.name.clone()).or_default() += omitted;
             }
-        };
+        }
+        macro_rules! add_candidate {
+            ($entry:expr, $hit:expr) => {{
+                let entry = $entry;
+                let hit = $hit;
+                if seen_ids.insert(entry.id.clone()) {
+                    *candidate_counts.entry(entry.name.clone()).or_default() += 1;
+                    candidate_total += 1;
+                    if candidates.len() < limit {
+                        candidate_entries.push(entry.clone());
+                        candidate_scores.push(hit.score_micros);
+                        candidate_reasons.push(hit.reason.clone().unwrap_or_default());
+                        candidates.push(serde_json::json!({
+                            "id": entry.id,
+                            "name": entry.name,
+                            "qualified": entry.qualified_name,
+                            "kind": entry.kind,
+                            "path": entry.path,
+                            "line": entry.span.start_line + 1,
+                            "end_line": entry.span.end_line + 1,
+                            "score": hit.score_micros,
+                            "why": hit.reason,
+                        }));
+                    }
+                }
+            }};
+        }
         for hit in &hits {
             if let Some(id) = hit.definition_id.as_deref() {
+                if candidates.len() >= limit {
+                    if seen_ids.insert(id.to_owned()) {
+                        *candidate_counts.entry(hit.value.clone()).or_default() += 1;
+                        candidate_total += 1;
+                    }
+                    continue;
+                }
                 if let Some(entry) = symbol_runtime.get_by_id(id) {
-                    add_candidate(entry, hit);
+                    add_candidate!(&entry, hit);
                 }
                 continue;
             }
-            for entry in symbol_meta.entries_for(&hit.value) {
+            let remaining = limit.saturating_sub(candidates.len());
+            let (entries, total) = symbol_runtime.entries_for(&hit.value, remaining);
+            if total > entries.len() {
+                let omitted = total - entries.len();
+                candidate_total += omitted;
+                *candidate_counts.entry(hit.value.clone()).or_default() += omitted;
+            }
+            for entry in entries {
                 if hit.reason.as_deref() != Some("term-coverage")
-                    || crate::search::symbol_meta_matches_query_tokens(&required_terms, entry)
+                    || crate::search::symbol_meta_matches_query_tokens(&required_terms, &entry)
                 {
-                    add_candidate(entry, hit);
+                    add_candidate!(&entry, hit);
                 }
             }
         }
+        let after_candidates = std::time::Instant::now();
+        crate::timing::stage("context.candidates", candidates_started, String::new);
 
         let primary = exact_identity
             .first()
@@ -1878,7 +2193,7 @@ impl WorkspaceEngine {
 
         // A simple spelling can name hundreds of methods. Choosing the first path would create a
         // convincing but false context. Resolve only a unique definition or an exact qualified id.
-        let primary_meta = exact_primary.or_else(|| {
+        let primary_meta = exact_primary.as_ref().or_else(|| {
             let first = candidate_entries.first()?;
             if candidate_reasons
                 .first()
@@ -1891,10 +2206,11 @@ impl WorkspaceEngine {
             }
             (candidate_counts.get(&primary) == Some(&1)).then_some(first)
         });
-        let ambiguous = primary_meta.is_none()
-            && candidate_counts
-                .get(&primary)
-                .is_some_and(|count| *count > 1);
+        let ambiguous = exact_identity_total > 1
+            || (primary_meta.is_none()
+                && candidate_counts
+                    .get(&primary)
+                    .is_some_and(|count| *count > 1));
         let graph_primary = primary_meta.map(|entry| entry.id.as_str());
         let impact_limits = QueryLimits {
             depth: 2,
@@ -1906,10 +2222,14 @@ impl WorkspaceEngine {
         let display_node = |node: &str| {
             symbol_runtime
                 .get_by_id(node)
-                .map(|entry| entry.qualified_name.clone())
+                .map(|entry| entry.qualified_name)
                 .unwrap_or_else(|| node.to_owned())
         };
-        let graph = graph_primary.map(|_| self.graph()).transpose()?;
+        let graph = if graph_primary.is_some() {
+            Some(eager_graph?)
+        } else {
+            None
+        };
         let impact = graph_primary.and_then(|node| {
             graph
                 .as_deref()
@@ -1970,9 +2290,9 @@ impl WorkspaceEngine {
                     let related = symbol_runtime.get_by_id(&relation.node);
                     serde_json::json!({
                         "id": relation.node,
-                        "name": related.map(|entry| entry.qualified_name.as_str()).unwrap_or(&relation.node),
+                        "name": related.as_ref().map(|entry| entry.qualified_name.clone()).unwrap_or_else(|| relation.node.clone()),
                         "kind": relation.kind.as_str(),
-                        "path": related.map(|entry| entry.path.as_str()),
+                        "path": related.as_ref().map(|entry| entry.path.clone()),
                         "site": {
                             "path": relation.source_path,
                             "line": relation.span.map(|span| span.start_line + 1),
@@ -1987,6 +2307,7 @@ impl WorkspaceEngine {
         };
         let incoming_relations = relation_json(incoming_sites);
         let outgoing_relations = relation_json(outgoing_sites);
+        crate::timing::stage("context.graph_enrichment", after_candidates, String::new);
         let caller_count = callers_names.len();
         let source = primary_meta.and_then(|symbol| symbol_source_excerpt(&self.root, symbol));
         let candidates_truncated = candidate_total > candidates.len();
@@ -2069,26 +2390,20 @@ impl WorkspaceEngine {
         self.search_index_for(SearchKind::Exact)
     }
 
-    /// Materialize search backend for `kind` without loading the full snapshot when sidecars exist.
-    /// Exact/prefix open **dict only** (cheapest). Fuzzy/regex open Hybrid (dict + on-disk Tantivy).
+    /// Materialize search backend for `kind` without loading the full snapshot. Ordinary name
+    /// search opens only the compact dictionary; term documents/postings are loaded lazily.
     fn search_index_for(&self, kind: SearchKind) -> Result<Arc<SearchIndex>, EngineError> {
         self.refresh_external_generation()?;
         let mut cache = self.inner.search_cache.lock().unwrap();
         if let Some(index) = cache.as_ref() {
-            // Upgrade path: cached dict-only but fuzzy/regex needs Tantivy.
-            let needs_tantivy = matches!(
-                kind,
-                SearchKind::Fuzzy | SearchKind::Regex | SearchKind::Terms
-            );
-            if !needs_tantivy || index.backend_label() != "dict" {
+            if kind != SearchKind::Terms || index.has_terms() {
                 return Ok(Arc::clone(index));
             }
         }
-        let needs_tantivy = matches!(
-            kind,
-            SearchKind::Fuzzy | SearchKind::Regex | SearchKind::Terms
-        );
-        let index = if let Some(index) = self.storage().open_search_index(needs_tantivy)? {
+        let index = if let Some(index) = self
+            .storage()
+            .open_search_index(kind == SearchKind::Terms)?
+        {
             Arc::new(index)
         } else {
             let snapshot = self.snapshot_after_refresh()?;
@@ -2126,7 +2441,7 @@ impl WorkspaceEngine {
     fn symbol_meta(&self) -> Result<Option<Arc<crate::model::SymbolMetaDict>>, EngineError> {
         Ok(self
             .symbol_meta_runtime()?
-            .map(|runtime| Arc::clone(&runtime.dict)))
+            .and_then(|runtime| runtime.materialize()))
     }
 
     fn symbol_meta_runtime(&self) -> Result<Option<Arc<SymbolMetaRuntime>>, EngineError> {
@@ -2135,10 +2450,13 @@ impl WorkspaceEngine {
         if let Some(meta) = cache.as_ref() {
             return Ok(Some(Arc::clone(meta)));
         }
-        let Some(meta) = self.storage().open_symbol_meta()? else {
+        let meta = if let Some(packed) = self.storage().open_packed_symbol_meta()? {
+            Arc::new(SymbolMetaRuntime::packed(packed))
+        } else if let Some(meta) = self.storage().open_symbol_meta()? {
+            Arc::new(SymbolMetaRuntime::new(meta))
+        } else {
             return Ok(None);
         };
-        let meta = Arc::new(SymbolMetaRuntime::new(meta));
         *cache = Some(Arc::clone(&meta));
         Ok(Some(meta))
     }
@@ -2151,13 +2469,12 @@ impl WorkspaceEngine {
             .ok()
             .flatten()
             .and_then(|runtime| {
-                let qualified = runtime.exact_id_or_qualified(node);
-                if qualified.len() == 1 {
+                let (qualified, total) = runtime.exact_id_or_qualified(node, 2);
+                if total == 1 {
                     return Some(qualified[0].id.clone());
                 }
-                let mut by_name = runtime.dict.entries_for(node);
-                let first = by_name.next()?;
-                by_name.next().is_none().then(|| first.id.clone())
+                let (by_name, total) = runtime.entries_for(node, 2);
+                (total == 1).then(|| by_name[0].id.clone())
             })
             .unwrap_or_else(|| node.to_owned())
     }
@@ -2290,10 +2607,10 @@ impl WorkspaceEngine {
     pub fn node_detail(&self, symbol: &str) -> Result<Option<crate::model::Symbol>, EngineError> {
         // Prefer compact symbol_meta sidecar (no full snapshot / MCP snapshot_cache).
         if let Some(runtime) = self.symbol_meta_runtime()? {
-            return match runtime
+            let meta = runtime
                 .get_by_id(symbol)
-                .or_else(|| runtime.dict.get(symbol))
-            {
+                .or_else(|| runtime.entries_for(symbol, 1).0.into_iter().next());
+            return match meta {
                 Some(m) => {
                     // Delta generations keep the global name→path sidecar when symbol shape is
                     // unchanged, then read current span/complexity from the artifact overlay.
@@ -2700,6 +3017,43 @@ mod resident_sync_tests {
     }
 
     #[test]
+    fn cold_structural_sync_after_content_only_sync_keeps_the_incremental_pack() {
+        let (root, engine, service) = fixture();
+        let base = engine
+            .storage()
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .structural_packs
+            .unwrap()
+            .base;
+
+        std::fs::write(&service, "export const answer = () => 43;\n").unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+        let content_manifest = engine.storage().read_manifest().unwrap().unwrap();
+        assert_eq!(
+            content_manifest
+                .structural_packs
+                .as_ref()
+                .unwrap()
+                .current_snapshot,
+            content_manifest.snapshot_id.stable_key()
+        );
+
+        std::fs::write(&service, "export const renamed = () => 43;\n").unwrap();
+        let cold = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        cold.sync(Some(std::slice::from_ref(&service))).unwrap();
+
+        let current = cold.storage().read_manifest().unwrap().unwrap();
+        let chain = current.structural_packs.unwrap();
+        assert_eq!(chain.base, base);
+        assert_eq!(chain.overlays.len(), 1);
+        assert_eq!(chain.current_snapshot, current.snapshot_id.stable_key());
+    }
+
+    #[test]
     fn resident_rename_is_visible_to_cold_search_without_rebuilding_the_base() {
         let (root, engine, service) = fixture();
         let before = engine.storage().read_manifest().unwrap().unwrap();
@@ -2740,6 +3094,9 @@ mod resident_sync_tests {
         engine
             .sync_resident(Some(std::slice::from_ref(&service)))
             .unwrap();
+        let second_manifest = engine.storage().read_manifest().unwrap().unwrap();
+        assert_eq!(second_manifest.search_overlays.len(), 1);
+        assert_eq!(second_manifest.symbol_meta_overlays.len(), 1);
         let second_reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
         assert!(
             second_reader

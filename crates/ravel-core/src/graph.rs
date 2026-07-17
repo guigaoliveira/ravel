@@ -60,7 +60,17 @@ pub enum QueryError {
 
 /// Compact on-disk adjacency (node strings + u32 neighbor lists).
 /// Much smaller/faster than re-deserializing full `Edge` rows + rebuilding maps.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct CompactGraph {
     pub snapshot_id: String,
     pub nodes: Vec<String>,
@@ -72,7 +82,96 @@ pub struct CompactGraph {
     pub reverse_relation_ids: Vec<Vec<u32>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct FlatCompactGraph {
+    pub(crate) snapshot_id: String,
+    pub(crate) nodes: Vec<String>,
+    pub(crate) forward_offsets: Vec<u32>,
+    pub(crate) forward_values: Vec<u32>,
+    pub(crate) reverse_offsets: Vec<u32>,
+    pub(crate) reverse_values: Vec<u32>,
+    pub(crate) edge_count: u32,
+    pub(crate) relations: Vec<CompactRelation>,
+    pub(crate) forward_relation_offsets: Vec<u32>,
+    pub(crate) forward_relation_values: Vec<u32>,
+    pub(crate) reverse_relation_offsets: Vec<u32>,
+    pub(crate) reverse_relation_values: Vec<u32>,
+}
+
+impl FlatCompactGraph {
+    fn flatten(rows: Vec<Vec<u32>>) -> (Vec<u32>, Vec<u32>) {
+        let total = rows.iter().map(Vec::len).sum();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut values = Vec::with_capacity(total);
+        offsets.push(0);
+        for row in rows {
+            values.extend(row);
+            offsets.push(values.len() as u32);
+        }
+        (offsets, values)
+    }
+
+    fn expand(offsets: &[u32], values: &[u32]) -> Vec<Vec<u32>> {
+        offsets
+            .windows(2)
+            .map(|window| values[window[0] as usize..window[1] as usize].to_vec())
+            .collect()
+    }
+
+    pub(crate) fn from_compact(compact: CompactGraph) -> Self {
+        let (forward_offsets, forward_values) = Self::flatten(compact.forward);
+        let (reverse_offsets, reverse_values) = Self::flatten(compact.reverse);
+        let (forward_relation_offsets, forward_relation_values) =
+            Self::flatten(compact.forward_relation_ids);
+        let (reverse_relation_offsets, reverse_relation_values) =
+            Self::flatten(compact.reverse_relation_ids);
+        Self {
+            snapshot_id: compact.snapshot_id,
+            nodes: compact.nodes,
+            forward_offsets,
+            forward_values,
+            reverse_offsets,
+            reverse_values,
+            edge_count: compact.edge_count,
+            relations: compact.relations,
+            forward_relation_offsets,
+            forward_relation_values,
+            reverse_relation_offsets,
+            reverse_relation_values,
+        }
+    }
+
+    pub(crate) fn into_compact(self) -> CompactGraph {
+        CompactGraph {
+            snapshot_id: self.snapshot_id,
+            nodes: self.nodes,
+            forward: Self::expand(&self.forward_offsets, &self.forward_values),
+            reverse: Self::expand(&self.reverse_offsets, &self.reverse_values),
+            edge_count: self.edge_count,
+            relations: self.relations,
+            forward_relation_ids: Self::expand(
+                &self.forward_relation_offsets,
+                &self.forward_relation_values,
+            ),
+            reverse_relation_ids: Self::expand(
+                &self.reverse_relation_offsets,
+                &self.reverse_relation_values,
+            ),
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct CompactRelation {
     pub from: u32,
     pub to: u32,

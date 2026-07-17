@@ -4,10 +4,11 @@
 //! authenticates the directory; every directory entry authenticates its record. This module is
 //! used by snapshot storage for independently readable generation components.
 
+use memmap2::Mmap;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -17,7 +18,7 @@ const HEADER_MAGIC: &[u8; 8] = b"RAVELPK\0";
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAVLDIR\0";
 const FOOTER_MAGIC: &[u8; 8] = b"RAVLFTR\0";
 const VERSION: u32 = 1;
-const ALIGNMENT: u32 = 8;
+const ALIGNMENT: u32 = 16;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 56;
 const MAX_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
@@ -58,6 +59,7 @@ pub(crate) struct StreamingGenerationPackWriter {
     writer: BufWriter<fs::File>,
     position: u64,
     entries: BTreeMap<String, Entry>,
+    replace_on_publish: bool,
 }
 
 impl StreamingGenerationPackWriter {
@@ -93,6 +95,7 @@ impl StreamingGenerationPackWriter {
             writer,
             position: HEADER_LEN,
             entries: BTreeMap::new(),
+            replace_on_publish: true,
         })
     }
 
@@ -171,12 +174,14 @@ impl StreamingGenerationPackWriter {
                 source,
             })?;
         drop(self.writer);
-        crate::durable_io::atomic_replace(&self.tmp, &self.path).map_err(|source| {
-            PackError::Io {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
+        if self.replace_on_publish {
+            crate::durable_io::atomic_replace(&self.tmp, &self.path).map_err(|source| {
+                PackError::Io {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+        }
         crate::durable_io::sync_parent_directory(&self.path).map_err(|source| PackError::Io {
             path: self.parent,
             source,
@@ -187,7 +192,7 @@ impl StreamingGenerationPackWriter {
 #[derive(Debug)]
 pub struct GenerationPackReader {
     path: PathBuf,
-    file: fs::File,
+    mmap: Mmap,
     entries: BTreeMap<String, Entry>,
     directory_offset: u64,
 }
@@ -195,7 +200,7 @@ pub struct GenerationPackReader {
 impl GenerationPackReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PackError> {
         let path = path.as_ref().to_path_buf();
-        let mut file = fs::File::open(&path).map_err(|source| PackError::Io {
+        let file = fs::File::open(&path).map_err(|source| PackError::Io {
             path: path.clone(),
             source,
         })?;
@@ -209,57 +214,48 @@ impl GenerationPackReader {
         if file_len < HEADER_LEN + FOOTER_LEN {
             return invalid(&path, "truncated header/footer");
         }
-        let mut header = [0u8; HEADER_LEN as usize];
-        file.read_exact(&mut header)
-            .map_err(|source| PackError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        // SAFETY: the immutable generation file is protected by a generation lease while any
+        // reader is alive. Writers publish a new path and never modify a referenced pack.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|source| PackError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let header = &mmap[..HEADER_LEN as usize];
         if &header[..8] != HEADER_MAGIC
-            || u32_at(&header, 8) != VERSION
-            || u32_at(&header, 12) != ALIGNMENT
+            || u32_at(header, 8) != VERSION
+            || u32_at(header, 12) != ALIGNMENT
         {
             return invalid(&path, "unsupported header");
         }
-        file.seek(SeekFrom::Start(file_len - FOOTER_LEN))
-            .and_then(|_| {
-                let mut footer = [0u8; FOOTER_LEN as usize];
-                file.read_exact(&mut footer).map(|_| footer)
+        let footer: [u8; FOOTER_LEN as usize] = mmap
+            [(file_len - FOOTER_LEN) as usize..file_len as usize]
+            .try_into()
+            .expect("footer length was checked");
+        (|| {
+            if &footer[..8] != FOOTER_MAGIC {
+                return invalid(&path, "missing footer magic");
+            }
+            let directory_offset = u64_at(&footer, 8);
+            let directory_len = u64_at(&footer, 16);
+            if directory_len > MAX_DIRECTORY_BYTES
+                || directory_offset < HEADER_LEN
+                || directory_offset.checked_add(directory_len) != Some(file_len - FOOTER_LEN)
+            {
+                return invalid(&path, "directory bounds are invalid");
+            }
+            let directory =
+                &mmap[directory_offset as usize..(directory_offset + directory_len) as usize];
+            if blake3::hash(directory).as_bytes() != &footer[24..56] {
+                return invalid(&path, "directory checksum mismatch");
+            }
+            let entries = decode_directory(directory, directory_offset, &path)?;
+            Ok(Self {
+                path,
+                mmap,
+                entries,
+                directory_offset,
             })
-            .map_err(|source| PackError::Io {
-                path: path.clone(),
-                source,
-            })
-            .and_then(|footer| {
-                if &footer[..8] != FOOTER_MAGIC {
-                    return invalid(&path, "missing footer magic");
-                }
-                let directory_offset = u64_at(&footer, 8);
-                let directory_len = u64_at(&footer, 16);
-                if directory_len > MAX_DIRECTORY_BYTES
-                    || directory_offset < HEADER_LEN
-                    || directory_offset.checked_add(directory_len) != Some(file_len - FOOTER_LEN)
-                {
-                    return invalid(&path, "directory bounds are invalid");
-                }
-                let mut directory = vec![0; directory_len as usize];
-                file.seek(SeekFrom::Start(directory_offset))
-                    .and_then(|_| file.read_exact(&mut directory))
-                    .map_err(|source| PackError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                if blake3::hash(&directory).as_bytes() != &footer[24..56] {
-                    return invalid(&path, "directory checksum mismatch");
-                }
-                let entries = decode_directory(&directory, directory_offset, &path)?;
-                Ok(Self {
-                    path,
-                    file,
-                    entries,
-                    directory_offset,
-                })
-            })
+        })()
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -284,18 +280,85 @@ impl GenerationPackReader {
         {
             return invalid(&self.path, "record bounds are invalid");
         }
-        let mut bytes = vec![0; entry.len as usize];
-        self.file
-            .seek(SeekFrom::Start(entry.offset))
-            .and_then(|_| self.file.read_exact(&mut bytes))
-            .map_err(|source| PackError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        if blake3::hash(&bytes).as_bytes() != &entry.checksum {
+        let bytes = &self.mmap[entry.offset as usize..(entry.offset + entry.len) as usize];
+        let checksum = if bytes.len() >= 1024 * 1024 {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_rayon(bytes);
+            hasher.finalize()
+        } else {
+            blake3::hash(bytes)
+        };
+        if checksum.as_bytes() != &entry.checksum {
             return invalid(&self.path, "record checksum mismatch");
         }
-        Ok(Some(bytes))
+        Ok(Some(bytes.to_vec()))
+    }
+
+    pub fn with_record<T>(
+        &self,
+        key: &str,
+        max_bytes: u64,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, PackError> {
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(None);
+        };
+        if entry.len > max_bytes || entry.len > usize::MAX as u64 {
+            return Err(PackError::RecordTooLarge {
+                key: key.into(),
+                actual: entry.len,
+                limit: max_bytes,
+            });
+        }
+        let end = entry
+            .offset
+            .checked_add(entry.len)
+            .ok_or_else(|| PackError::Invalid {
+                path: self.path.clone(),
+                message: "record bounds overflow".into(),
+            })?;
+        if end > self.directory_offset {
+            return invalid(&self.path, "record bounds are invalid");
+        }
+        let bytes = &self.mmap[entry.offset as usize..end as usize];
+        if blake3::hash(bytes).as_bytes() != &entry.checksum {
+            return invalid(&self.path, "record checksum mismatch");
+        }
+        Ok(Some(read(bytes)))
+    }
+
+    /// Borrow a bounded record without recomputing its blake3 checksum. The consumer must fully
+    /// validate the record format before interpreting it; this is intended for bytecheck/rkyv
+    /// hot paths. `ravel validate` still verifies the stored checksum separately.
+    pub(crate) fn with_record_for_validation<T>(
+        &self,
+        key: &str,
+        max_bytes: u64,
+        validate: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, PackError> {
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(None);
+        };
+        if entry.len > max_bytes || entry.len > usize::MAX as u64 {
+            return Err(PackError::RecordTooLarge {
+                key: key.into(),
+                actual: entry.len,
+                limit: max_bytes,
+            });
+        }
+        let end = entry
+            .offset
+            .checked_add(entry.len)
+            .ok_or_else(|| PackError::Invalid {
+                path: self.path.clone(),
+                message: "record bounds overflow".into(),
+            })?;
+        if end > self.directory_offset {
+            return invalid(&self.path, "record bounds are invalid");
+        }
+        Ok(Some(validate(
+            &self.mmap[entry.offset as usize..end as usize],
+        )))
     }
 }
 

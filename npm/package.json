@@ -1,6 +1,6 @@
 {
   "name": "@guigaoliveira/ravel-cli",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Ravel — local TypeScript/JavaScript code graph for coding agents.",
   "keywords": ["mcp", "code-graph", "typescript", "ai-agents", "claude", "codex", "cursor"],
   "bin": {

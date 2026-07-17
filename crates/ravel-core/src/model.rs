@@ -12,7 +12,21 @@ pub struct Diagnostic {
     pub span: Option<Span>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct Span {
     pub start_byte: u32,
     pub end_byte: u32,
@@ -22,7 +36,17 @@ pub struct Span {
     pub end_column: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct Complexity {
     /// McCabe: 1 + branch points (if/for/while/case/catch/ternary/logical).
     pub cyclomatic: u32,
@@ -153,7 +177,20 @@ pub struct FileArtifact {
     pub bytes_read: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum EdgeKind {
     Import,
     ReExport,
@@ -207,7 +244,20 @@ pub enum EdgeConfidence {
     Unresolved { score: f32, reason: Arc<str> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum EdgeProvenance {
     Ast,
     Resolution,
@@ -290,7 +340,17 @@ impl SchemaSummary {
 }
 
 /// First-seen symbol metadata for cold `node_detail` without full snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SymbolMeta {
     pub id: String,
     pub name: String,
@@ -302,7 +362,17 @@ pub struct SymbolMeta {
     pub complexity: Option<Complexity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct SymbolMetaDict {
     pub format_version: u32,
     pub snapshot_id: String,
@@ -322,7 +392,57 @@ pub(crate) struct SymbolMetaOverlay {
     pub(crate) upserts: Vec<SymbolMeta>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SymbolMetaShardIndex {
+    pub(crate) format_version: u32,
+    pub(crate) snapshot_id: String,
+    pub(crate) shard_bits: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SymbolMetaIdShard {
+    pub(crate) entries: Vec<SymbolMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SymbolMetaLookupShard {
+    pub(crate) entries: Vec<(String, Vec<SymbolMetaLocation>)>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SymbolMetaLocation {
+    pub(crate) shard: u8,
+    pub(crate) index: u32,
+    pub(crate) id_digest: [u8; 32],
+}
+
+impl SymbolMetaShardIndex {
+    pub(crate) const FORMAT_VERSION: u32 = 1;
+}
+
 impl SymbolMetaOverlay {
+    pub(crate) fn compose(overlays: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut removed_ids = std::collections::BTreeSet::new();
+        let mut upserts = BTreeMap::new();
+        let mut snapshot_id = None;
+        for overlay in overlays {
+            for id in overlay.removed_ids {
+                removed_ids.insert(id.clone());
+                upserts.remove(&id);
+            }
+            for entry in overlay.upserts {
+                removed_ids.insert(entry.id.clone());
+                upserts.insert(entry.id.clone(), entry);
+            }
+            snapshot_id = Some(overlay.snapshot_id);
+        }
+        snapshot_id.map(|snapshot_id| Self {
+            snapshot_id,
+            removed_ids: removed_ids.into_iter().collect(),
+            upserts: upserts.into_values().collect(),
+        })
+    }
+
     pub(crate) fn from_artifact_changes(
         snapshot_id: String,
         changes: &[(Option<&FileArtifact>, Option<&FileArtifact>)],
@@ -395,6 +515,36 @@ impl SymbolMetaDict {
             id_order: Vec::new(),
             qualified_order: Vec::new(),
         };
+        result.rebuild_orders();
+        result
+    }
+
+    pub(crate) fn from_all_entries(snapshot_id: String, mut all: Vec<SymbolMeta>) -> Self {
+        all.sort_by(|left, right| {
+            (&left.name, &left.path, left.span, &left.id).cmp(&(
+                &right.name,
+                &right.path,
+                right.span,
+                &right.id,
+            ))
+        });
+        let mut result = Self {
+            format_version: Self::FORMAT_VERSION,
+            snapshot_id,
+            entries: Vec::new(),
+            duplicates: Vec::new(),
+            id_order: Vec::new(),
+            qualified_order: Vec::new(),
+        };
+        let mut last_name: Option<String> = None;
+        for entry in all {
+            if last_name.as_deref() == Some(entry.name.as_str()) {
+                result.duplicates.push(entry);
+            } else {
+                last_name = Some(entry.name.clone());
+                result.entries.push(entry);
+            }
+        }
         result.rebuild_orders();
         result
     }
