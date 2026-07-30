@@ -7,9 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-30
+
+**The index is rebuilt once on first use after upgrading.** Symbol metadata
+changed on-disk layout, so `SCHEMA_VERSION` moves 15 -> 16 and auto-sync
+rebuilds the index the first time a command runs. Nothing to do by hand.
+Running an older binary against a 1.5.0 index also rebuilds, in its own
+format — see the note under Changed for why that is deliberate.
+
 ### Changed
-- Full index is a further 13% faster on a 20.4k-file / 744k-edge corpus
-  (9124ms in 1.4.1 -> 7949-8071ms), snapshot id unchanged:
+- Symbol lookups no longer decode a shard to reach one entry. Metadata shards
+  are rkyv archives read in place, binary-searched in the mmap, and only the
+  matching entry is owned. Validation is proportional to a record's size, so it
+  runs once per shard per process; packs are immutable once published, and a new
+  generation builds a new runtime. Isolated A/B over MCP on a 20.4k-file /
+  744k-edge corpus: `context.candidates` 6.87ms -> 1.93ms (-72%), warm
+  `explore` 17.25ms -> 7.97ms (-54%). Explore output is identical for 9 queries
+  with each binary reading the format it writes.
+
+  Two honest consequences. rkyv's relative pointers and alignment padding make
+  these records slightly *larger*, not smaller — 182.3MB -> 188.2MB, +0.3% of
+  the pack; the change earns its place on the read path, not on size. And the
+  schema bump is not cosmetic: a binary predating this layout would otherwise
+  reject only the shard index and then answer from an empty symbol-meta
+  backend, which is indistinguishable from a genuine "nothing found". With the
+  bump both directions report an unsupported schema and rebuild, so a downgrade
+  is loud instead of silently empty.
+- Full index is a further 13% faster on that corpus (9124ms in 1.4.1 ->
+  7949-8071ms), snapshot id unchanged:
   - Resolution's two remaining sequential steps now fan out — building the
     resolution universe and ordering the resulting edges.
     `resolve.sort_edges` 281.4ms -> 54.7ms, `index.resolve_edges` 1240.0ms ->
@@ -19,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sequential merge.
 - `RAVEL_TIMING=1` reports resolution's phases: universe build,
   imports/exports, symbol refs, merge/dedup, and the edge sort.
+
+### Notes for the next round
+Two measured findings are recorded in the code rather than acted on, so they
+are not rediscovered from scratch:
+- `snapshot/edges` (293MB, 16% of the pack) is derivable from the graph's file
+  section and is read only when hydrating a full snapshot, never by a query.
+- `graph_from_edges` (1050ms) is dominated by ordered-map traversals over
+  string keys, not by allocation — two attempts to cut its clones measured
+  22% and 7% *slower*. Interning node ids is the structural fix, and it would
+  also cut ~500MB from the pack.
 
 ## [1.4.1] - 2026-07-29
 
@@ -195,7 +230,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.1
 [1.3.0]: https://github.com/guigaoliveira/ravel/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/guigaoliveira/ravel/compare/v1.1.0...v1.2.0
