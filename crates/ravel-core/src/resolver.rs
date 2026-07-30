@@ -758,7 +758,16 @@ fn select_visible_local_definition(
 /// match, so first insert wins; the owner scan took `max_by_key` on qualified-name
 /// length, whose ties resolve to the last candidate, so owners let later inserts win.
 struct ArtifactLookups<'a> {
+    artifact: &'a FileArtifact,
+    /// Every reference needs its source symbol, so this one always pays off.
     by_id: FxHashMap<&'a str, &'a crate::model::Symbol>,
+    /// The remaining three serve `this.<field>.<member>` only. Most files have no
+    /// such reference, and building maps they never consult cost more than it
+    /// saved, so they are filled on first use.
+    member_maps: std::cell::OnceCell<MemberLookups<'a>>,
+}
+
+struct MemberLookups<'a> {
     by_qualified: FxHashMap<&'a str, &'a crate::model::Symbol>,
     owners_by_qualified: FxHashMap<&'a str, &'a crate::model::Symbol>,
     declared_type_by_symbol: FxHashMap<&'a str, &'a str>,
@@ -766,45 +775,56 @@ struct ArtifactLookups<'a> {
 
 impl<'a> ArtifactLookups<'a> {
     fn build(artifact: &'a FileArtifact) -> Self {
-        let mut lookups = Self {
-            by_id: FxHashMap::default(),
-            by_qualified: FxHashMap::default(),
-            owners_by_qualified: FxHashMap::default(),
-            declared_type_by_symbol: FxHashMap::default(),
-        };
+        let mut by_id =
+            FxHashMap::with_capacity_and_hasher(artifact.symbols.len(), rustc_hash::FxBuildHasher);
         for symbol in &artifact.symbols {
-            lookups.by_id.entry(symbol.id.as_str()).or_insert(symbol);
-            lookups
-                .by_qualified
-                .entry(symbol.qualified_name.as_str())
-                .or_insert(symbol);
-            if matches!(
-                symbol.kind.as_ref(),
-                "class_declaration" | "interface_declaration"
-            ) {
-                lookups
-                    .owners_by_qualified
-                    .insert(symbol.qualified_name.as_str(), symbol);
-            }
+            by_id.entry(symbol.id.as_str()).or_insert(symbol);
         }
-        for reference in &artifact.symbol_refs {
-            if reference.kind == EdgeKind::TypeOf {
-                lookups
-                    .declared_type_by_symbol
-                    .entry(reference.from_id.as_str())
-                    .or_insert(reference.to.as_str());
-            }
+        Self {
+            artifact,
+            by_id,
+            member_maps: std::cell::OnceCell::new(),
         }
-        lookups
+    }
+
+    fn member_maps(&self) -> &MemberLookups<'a> {
+        self.member_maps.get_or_init(|| {
+            let mut maps = MemberLookups {
+                by_qualified: FxHashMap::default(),
+                owners_by_qualified: FxHashMap::default(),
+                declared_type_by_symbol: FxHashMap::default(),
+            };
+            for symbol in &self.artifact.symbols {
+                maps.by_qualified
+                    .entry(symbol.qualified_name.as_str())
+                    .or_insert(symbol);
+                if matches!(
+                    symbol.kind.as_ref(),
+                    "class_declaration" | "interface_declaration"
+                ) {
+                    maps.owners_by_qualified
+                        .insert(symbol.qualified_name.as_str(), symbol);
+                }
+            }
+            for reference in &self.artifact.symbol_refs {
+                if reference.kind == EdgeKind::TypeOf {
+                    maps.declared_type_by_symbol
+                        .entry(reference.from_id.as_str())
+                        .or_insert(reference.to.as_str());
+                }
+            }
+            maps
+        })
     }
 
     /// Nearest class/interface ancestor of `qualified_name`, itself included.
     /// Walking the dotted prefixes longest-first is what the old scan achieved by
     /// filtering every symbol and taking the longest qualified-name match.
     fn enclosing_owner(&self, qualified_name: &str) -> Option<&'a crate::model::Symbol> {
+        let owners = &self.member_maps().owners_by_qualified;
         let mut candidate = qualified_name;
         loop {
-            if let Some(owner) = self.owners_by_qualified.get(candidate) {
+            if let Some(owner) = owners.get(candidate) {
                 return Some(owner);
             }
             candidate = candidate.rsplit_once('.')?.0;
@@ -863,11 +883,12 @@ fn resolve_symbol_reference(
         // services, typed properties) and resolve the member on that type.
         let (field, rest) = member.split_once('.')?;
         let field_qualified = format!("{}.{}", owner.qualified_name, field);
-        let field_symbol = lookups
+        let member_maps = lookups.member_maps();
+        let field_symbol = member_maps
             .by_qualified
             .get(field_qualified.as_str())
             .copied()?;
-        let declared_type = *lookups
+        let declared_type = *member_maps
             .declared_type_by_symbol
             .get(field_symbol.id.as_str())?;
         let type_reference = SymbolRef {
