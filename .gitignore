@@ -1,6 +1,8 @@
 /target/
 **/target/
 /.ravel/
+# Tests run the engine from crate directories, which leaves index state behind.
+**/.ravel/
 *.profraw
 *.pstat
 /reports/*.local.json
