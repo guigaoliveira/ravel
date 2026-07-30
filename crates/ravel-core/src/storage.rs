@@ -209,77 +209,143 @@ impl StructuralPackStager {
             shard_bits: SYMBOL_META_SHARD_BITS,
         };
         self.add_meta("query/symbol-meta/index", &index)?;
+        use rayon::prelude::*;
+        /// Files per worker when bucketing symbols into id shards. Bounds the number
+        /// of partial shard sets that have to be merged afterwards.
+        const META_FILE_CHUNK: usize = 512;
+
+        // Bucket every symbol into its id shard. Chunks are merged in file order,
+        // so the order the sort below sees — and therefore where it leaves records
+        // whose (id, span, path) tie — is what the sequential build produced.
+        let files: Vec<_> = snapshot.files.iter().collect();
+        let chunked: Vec<Vec<Vec<SymbolMeta>>> = files
+            .par_chunks(META_FILE_CHUNK)
+            .map(|chunk| {
+                let mut shards = vec![Vec::<SymbolMeta>::new(); SYMBOL_META_SHARD_COUNT];
+                for (path, artifact) in chunk {
+                    for symbol in &artifact.symbols {
+                        let meta = SymbolMeta {
+                            id: symbol.id.clone(),
+                            name: symbol.name.clone(),
+                            qualified_name: symbol.qualified_name.clone(),
+                            kind: Arc::clone(&symbol.kind),
+                            path: (*path).clone(),
+                            span: symbol.span,
+                            exported: symbol.exported,
+                            complexity: symbol.complexity.clone(),
+                        };
+                        shards[symbol_meta_shard_id(&meta.id)].push(meta);
+                    }
+                }
+                shards
+            })
+            .collect();
         let mut ids = vec![Vec::<SymbolMeta>::new(); SYMBOL_META_SHARD_COUNT];
-        for (path, artifact) in &snapshot.files {
-            for symbol in &artifact.symbols {
-                let meta = SymbolMeta {
-                    id: symbol.id.clone(),
-                    name: symbol.name.clone(),
-                    qualified_name: symbol.qualified_name.clone(),
-                    kind: Arc::clone(&symbol.kind),
-                    path: path.clone(),
-                    span: symbol.span,
-                    exported: symbol.exported,
-                    complexity: symbol.complexity.clone(),
-                };
-                let id_shard = symbol_meta_shard_id(&meta.id);
-                ids[id_shard].push(meta);
+        for chunk in chunked {
+            for (shard, entries) in chunk.into_iter().enumerate() {
+                ids[shard].extend(entries);
             }
         }
-        let mut names = vec![
-            BTreeMap::<String, BTreeMap<[u8; 32], SymbolMetaLocation>>::new();
-            SYMBOL_META_SHARD_COUNT
-        ];
-        let mut qualified = vec![
-            BTreeMap::<String, BTreeMap<[u8; 32], SymbolMetaLocation>>::new();
-            SYMBOL_META_SHARD_COUNT
-        ];
-        for (shard, shard_ids) in ids.iter_mut().enumerate() {
-            shard_ids.sort_by(|left, right| {
-                (&left.id, left.span, &left.path).cmp(&(&right.id, right.span, &right.path))
-            });
-            for (position, meta) in shard_ids.iter().enumerate() {
-                let id_digest = *blake3::hash(meta.id.as_bytes()).as_bytes();
-                let location = SymbolMetaLocation {
-                    shard: shard as u8,
-                    index: position as u32,
-                    id_digest,
-                };
-                names[symbol_meta_shard_id(&meta.name)]
-                    .entry(meta.name.clone())
-                    .or_default()
-                    .insert(id_digest, location);
-                qualified[symbol_meta_shard_id(&meta.qualified_name)]
-                    .entry(meta.qualified_name.clone())
-                    .or_default()
-                    .insert(id_digest, location);
+
+        // Sort each id shard and hash its ids in parallel, emitting the lookup
+        // entries already bucketed by the shard that will store them. Name and
+        // qualified lookups live in shards derived from the name, not the id, so
+        // without this bucketing the writes would cross shards.
+        type LookupBuckets = Vec<Vec<(String, [u8; 32], SymbolMetaLocation)>>;
+        let (name_buckets, qualified_buckets): (Vec<LookupBuckets>, Vec<LookupBuckets>) = ids
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard, shard_ids)| {
+                shard_ids.sort_by(|left, right| {
+                    (&left.id, left.span, &left.path).cmp(&(&right.id, right.span, &right.path))
+                });
+                let mut names: LookupBuckets = vec![Vec::new(); SYMBOL_META_SHARD_COUNT];
+                let mut qualified: LookupBuckets = vec![Vec::new(); SYMBOL_META_SHARD_COUNT];
+                for (position, meta) in shard_ids.iter().enumerate() {
+                    let id_digest = *blake3::hash(meta.id.as_bytes()).as_bytes();
+                    let location = SymbolMetaLocation {
+                        shard: shard as u8,
+                        index: position as u32,
+                        id_digest,
+                    };
+                    names[symbol_meta_shard_id(&meta.name)].push((
+                        meta.name.clone(),
+                        id_digest,
+                        location,
+                    ));
+                    qualified[symbol_meta_shard_id(&meta.qualified_name)].push((
+                        meta.qualified_name.clone(),
+                        id_digest,
+                        location,
+                    ));
+                }
+                (names, qualified)
+            })
+            .unzip();
+
+        // Assemble each target shard's map from the buckets aimed at it. The inner
+        // map is keyed by id digest, which is unique per symbol, so the result does
+        // not depend on the order contributions arrive in.
+        let collect_lookups = |buckets: Vec<LookupBuckets>| -> Vec<SymbolMetaLookupShard> {
+            (0..SYMBOL_META_SHARD_COUNT)
+                .into_par_iter()
+                .map(|target| {
+                    let mut map: BTreeMap<String, BTreeMap<[u8; 32], SymbolMetaLocation>> =
+                        BTreeMap::new();
+                    for source in &buckets {
+                        for (key, digest, location) in &source[target] {
+                            map.entry(key.clone())
+                                .or_default()
+                                .insert(*digest, *location);
+                        }
+                    }
+                    SymbolMetaLookupShard {
+                        entries: map
+                            .into_iter()
+                            .map(|(key, values)| (key, values.into_values().collect()))
+                            .collect(),
+                    }
+                })
+                .collect()
+        };
+        let (names, qualified) = rayon::join(
+            || collect_lookups(name_buckets),
+            || collect_lookups(qualified_buckets),
+        );
+
+        // Serialize all three record families in parallel, then write them in the
+        // original key order so the pack layout is unchanged.
+        let id_shards: Vec<SymbolMetaIdShard> = ids
+            .into_iter()
+            .map(|entries| SymbolMetaIdShard { entries })
+            .collect();
+        let serialized: Vec<[(String, Vec<u8>); 3]> = (0..SYMBOL_META_SHARD_COUNT)
+            .into_par_iter()
+            .map(|shard| {
+                Ok([
+                    (
+                        format!("query/symbol-meta/id/{shard:02x}"),
+                        bincode::serialize(&id_shards[shard])?,
+                    ),
+                    (
+                        format!("query/symbol-meta/name/{shard:02x}"),
+                        bincode::serialize(&names[shard])?,
+                    ),
+                    (
+                        format!("query/symbol-meta/qualified/{shard:02x}"),
+                        bincode::serialize(&qualified[shard])?,
+                    ),
+                ])
+            })
+            .collect::<Result<Vec<_>, bincode::Error>>()
+            .map_err(|source| StorageError::Bincode {
+                path: self.path.clone(),
+                source,
+            })?;
+        for records in serialized {
+            for (key, bytes) in records {
+                self.add_bytes(key, bytes)?;
             }
-        }
-        for shard in 0..SYMBOL_META_SHARD_COUNT {
-            self.add_meta(
-                &format!("query/symbol-meta/id/{shard:02x}"),
-                &SymbolMetaIdShard {
-                    entries: std::mem::take(&mut ids[shard]),
-                },
-            )?;
-            self.add_meta(
-                &format!("query/symbol-meta/name/{shard:02x}"),
-                &SymbolMetaLookupShard {
-                    entries: std::mem::take(&mut names[shard])
-                        .into_iter()
-                        .map(|(key, values)| (key, values.into_values().collect()))
-                        .collect(),
-                },
-            )?;
-            self.add_meta(
-                &format!("query/symbol-meta/qualified/{shard:02x}"),
-                &SymbolMetaLookupShard {
-                    entries: std::mem::take(&mut qualified[shard])
-                        .into_iter()
-                        .map(|(key, values)| (key, values.into_values().collect()))
-                        .collect(),
-                },
-            )?;
         }
         Ok(())
     }
@@ -321,11 +387,27 @@ impl StructuralPackStager {
             tombstones: BTreeSet::new(),
             state: [0; 32],
         };
-        for (path, artifact) in &snapshot.files {
-            let bytes = bincode::serialize(artifact).map_err(|source| StorageError::Bincode {
-                path: self.path.clone(),
-                source,
-            })?;
+        // Encoding 20k artifacts is per-file CPU work; only the pack write has to
+        // stay ordered. `collect` on an indexed parallel iterator preserves order,
+        // so records land in the same sequence as before.
+        let encoded: Vec<(&String, &crate::model::FileArtifact, Vec<u8>)> = {
+            use rayon::prelude::*;
+            snapshot
+                .files
+                .iter()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(path, artifact)| {
+                    bincode::serialize(artifact)
+                        .map(|bytes| (path, artifact, bytes))
+                        .map_err(|source| StorageError::Bincode {
+                            path: self.path.clone(),
+                            source,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (path, artifact, bytes) in encoded {
             FileSnapshotStorage::xor_state(
                 &mut artifact_index.state,
                 FileSnapshotStorage::artifact_digest(path, &artifact.source_hash),
@@ -1806,7 +1888,15 @@ pub struct FileSnapshotStorage {
     root: PathBuf,
     retention: usize,
     manifest_cache: Mutex<Option<(std::time::SystemTime, Manifest)>>,
+    /// Decoded artifact index, keyed by the component refs it was decoded from.
+    /// Those refs are content-addressed, so a matching key means identical bytes.
+    /// Per-path lookups used to decode the whole index — tens of thousands of
+    /// entries — once for every path asked about.
+    artifact_index_cache: Mutex<Option<CachedArtifactIndex>>,
 }
+
+/// Index component ref, the delta refs applied over it, and the decoded result.
+type CachedArtifactIndex = (String, Vec<String>, Option<Arc<ArtifactIndex>>);
 
 pub(crate) struct PackedSymbolMeta {
     pub(crate) reader: GenerationPackReader,
@@ -1821,6 +1911,7 @@ impl Clone for FileSnapshotStorage {
             root: self.root.clone(),
             retention: self.retention,
             manifest_cache: Mutex::new(None),
+            artifact_index_cache: Mutex::new(None),
         }
     }
 }
@@ -1842,6 +1933,7 @@ impl FileSnapshotStorage {
         Self {
             root: root.as_ref().to_path_buf(),
             retention: retention.max(1),
+            artifact_index_cache: Mutex::new(None),
             manifest_cache: Mutex::new(None),
         }
     }
@@ -2889,6 +2981,35 @@ impl FileSnapshotStorage {
         Some(blake3::Hash::from_bytes(state).to_hex().to_string())
     }
 
+    /// `read_artifact_index` memoized for the generation it describes.
+    ///
+    /// Callers that resolve one path at a time (artifact loads, source-hash
+    /// probes) otherwise decode the entire index per path. The key is the index
+    /// component ref plus the delta refs applied on top; all are content-addressed,
+    /// so an equal key guarantees equal bytes and a new generation misses.
+    fn cached_artifact_index(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Option<Arc<ArtifactIndex>>, StorageError> {
+        let Some(name) = manifest.artifact_index.as_ref() else {
+            return Ok(None);
+        };
+        if let Some((cached_name, cached_deltas, cached)) =
+            self.artifact_index_cache.lock().unwrap().as_ref()
+            && cached_name == name
+            && *cached_deltas == manifest.artifact_deltas
+        {
+            return Ok(cached.clone());
+        }
+        let index = self.read_artifact_index(manifest)?.map(Arc::new);
+        *self.artifact_index_cache.lock().unwrap() = Some((
+            name.clone(),
+            manifest.artifact_deltas.clone(),
+            index.clone(),
+        ));
+        Ok(index)
+    }
+
     fn read_artifact_index(
         &self,
         manifest: &Manifest,
@@ -2946,7 +3067,7 @@ impl FileSnapshotStorage {
     ) -> Result<Option<ArtifactLocation>, StorageError> {
         let Some(locator_name) = manifest.artifact_locator.as_ref() else {
             return Ok(self
-                .read_artifact_index(manifest)?
+                .cached_artifact_index(manifest)?
                 .and_then(|index| index.entries.get(artifact_path).cloned()));
         };
         let path = self.root.join(locator_name);
@@ -3034,7 +3155,7 @@ impl FileSnapshotStorage {
         if let Some(store) = manifest.artifact_store.as_deref()
             && let Some((pack, prefix)) = store.split_once('#')
         {
-            let Some(index) = self.read_artifact_index(&manifest)? else {
+            let Some(index) = self.cached_artifact_index(&manifest)? else {
                 return Ok(None);
             };
             if !index.entries.contains_key(path) || index.tombstones.contains(path) {
