@@ -2,7 +2,7 @@ use crate::model::{
     Edge, EdgeConfidence, EdgeKind, EdgeProvenance, ExportBindingKind, FileArtifact,
     ImportBindingKind, Span, SymbolRef,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -753,29 +753,85 @@ fn select_visible_local_definition(
     one_logical_definition_for(closest, required)
 }
 
-fn source_definition_is_type_only(artifact: &FileArtifact, id: &str) -> bool {
-    artifact.symbols.iter().any(|symbol| {
-        symbol.id == id
-            && matches!(
+/// Node-local lookups built once per artifact instead of re-scanned per reference.
+/// Every map preserves the selection the linear scans made: `find` kept the first
+/// match, so first insert wins; the owner scan took `max_by_key` on qualified-name
+/// length, whose ties resolve to the last candidate, so owners let later inserts win.
+struct ArtifactLookups<'a> {
+    by_id: FxHashMap<&'a str, &'a crate::model::Symbol>,
+    by_qualified: FxHashMap<&'a str, &'a crate::model::Symbol>,
+    owners_by_qualified: FxHashMap<&'a str, &'a crate::model::Symbol>,
+    declared_type_by_symbol: FxHashMap<&'a str, &'a str>,
+}
+
+impl<'a> ArtifactLookups<'a> {
+    fn build(artifact: &'a FileArtifact) -> Self {
+        let mut lookups = Self {
+            by_id: FxHashMap::default(),
+            by_qualified: FxHashMap::default(),
+            owners_by_qualified: FxHashMap::default(),
+            declared_type_by_symbol: FxHashMap::default(),
+        };
+        for symbol in &artifact.symbols {
+            lookups.by_id.entry(symbol.id.as_str()).or_insert(symbol);
+            lookups
+                .by_qualified
+                .entry(symbol.qualified_name.as_str())
+                .or_insert(symbol);
+            if matches!(
                 symbol.kind.as_ref(),
-                "interface_declaration" | "type_alias_declaration"
-            )
+                "class_declaration" | "interface_declaration"
+            ) {
+                lookups
+                    .owners_by_qualified
+                    .insert(symbol.qualified_name.as_str(), symbol);
+            }
+        }
+        for reference in &artifact.symbol_refs {
+            if reference.kind == EdgeKind::TypeOf {
+                lookups
+                    .declared_type_by_symbol
+                    .entry(reference.from_id.as_str())
+                    .or_insert(reference.to.as_str());
+            }
+        }
+        lookups
+    }
+
+    /// Nearest class/interface ancestor of `qualified_name`, itself included.
+    /// Walking the dotted prefixes longest-first is what the old scan achieved by
+    /// filtering every symbol and taking the longest qualified-name match.
+    fn enclosing_owner(&self, qualified_name: &str) -> Option<&'a crate::model::Symbol> {
+        let mut candidate = qualified_name;
+        loop {
+            if let Some(owner) = self.owners_by_qualified.get(candidate) {
+                return Some(owner);
+            }
+            candidate = candidate.rsplit_once('.')?.0;
+        }
+    }
+}
+
+fn source_definition_is_type_only(lookups: &ArtifactLookups<'_>, id: &str) -> bool {
+    lookups.by_id.get(id).is_some_and(|symbol| {
+        matches!(
+            symbol.kind.as_ref(),
+            "interface_declaration" | "type_alias_declaration"
+        )
     })
 }
 
 fn resolve_symbol_reference(
     root: &Path,
     artifact: &FileArtifact,
+    lookups: &ArtifactLookups<'_>,
     reference: &SymbolRef,
     imports: Option<&ResolvedImports>,
     universe: &dyn ResolutionLookup,
     config: &ResolverConfig,
 ) -> Option<SymbolDefinition> {
     let raw = reference.to.as_str();
-    let source_definition = artifact
-        .symbols
-        .iter()
-        .find(|symbol| symbol.id == reference.from_id);
+    let source_definition = lookups.by_id.get(reference.from_id.as_str()).copied();
     let required = match reference.kind {
         EdgeKind::TypeOf | EdgeKind::Implements => RequiredNamespace::Type,
         EdgeKind::Extends
@@ -793,24 +849,44 @@ fn resolve_symbol_reference(
 
     if let Some(member) = raw.strip_prefix("this.") {
         let source = source_definition?;
-        let owner = artifact
-            .symbols
-            .iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.kind.as_ref(),
-                    "class_declaration" | "interface_declaration"
-                ) && (source.qualified_name == candidate.qualified_name
-                    || source
-                        .qualified_name
-                        .starts_with(&format!("{}.", candidate.qualified_name)))
-            })
-            .max_by_key(|candidate| candidate.qualified_name.len())?;
-        return find_qualified_definition_for(
+        let owner = lookups.enclosing_owner(&source.qualified_name)?;
+        if let Some(definition) = find_qualified_definition_for(
             universe,
             &artifact.path,
             &format!("{}.{}", owner.qualified_name, member),
             required,
+        ) {
+            return Some(definition);
+        }
+        // `this.<field>.<member>` where the member is not declared on the owner:
+        // hop through the field's declared type annotation (constructor-injected
+        // services, typed properties) and resolve the member on that type.
+        let (field, rest) = member.split_once('.')?;
+        let field_qualified = format!("{}.{}", owner.qualified_name, field);
+        let field_symbol = lookups.by_qualified.get(field_qualified.as_str()).copied()?;
+        let declared_type = *lookups
+            .declared_type_by_symbol
+            .get(field_symbol.id.as_str())?;
+        let type_reference = SymbolRef {
+            from_id: field_symbol.id.clone(),
+            to: declared_type.into(),
+            kind: EdgeKind::TypeOf,
+            span: reference.span,
+        };
+        let type_definition = resolve_symbol_reference(
+            root,
+            artifact,
+            lookups,
+            &type_reference,
+            imports,
+            universe,
+            config,
+        )?;
+        return find_qualified_definition_for(
+            universe,
+            &type_definition.path,
+            &format!("{}.{}", type_definition.qualified_name, rest),
+            RequiredNamespace::Value,
         );
     }
 
@@ -1307,10 +1383,13 @@ fn resolve_artifacts_impl(
         .into_par_iter()
         .map(|artifact| {
             let imports = imported_bindings.get(&artifact.path);
+            // One pass over the artifact's symbols and refs, then O(1) lookups per
+            // reference: the scans this replaces were O(refs × symbols) per file.
+            let lookups = ArtifactLookups::build(artifact);
             let mut out = Vec::new();
             for r in &artifact.symbol_refs {
                 let Some(target) =
-                    resolve_symbol_reference(root, artifact, r, imports, universe, config)
+                    resolve_symbol_reference(root, artifact, &lookups, r, imports, universe, config)
                 else {
                     continue;
                 };
@@ -1324,7 +1403,7 @@ fn resolve_artifacts_impl(
                 };
                 let type_only = matches!(r.kind, EdgeKind::TypeOf | EdgeKind::Implements)
                     || (r.kind == EdgeKind::Extends
-                        && source_definition_is_type_only(artifact, &from));
+                        && source_definition_is_type_only(&lookups, &from));
                 let edge = Edge {
                     from: from.clone(),
                     to: target.id.clone(),
@@ -1783,6 +1862,90 @@ mod tests {
         assert_eq!(parsed["compilerOptions"]["baseUrl"], "src,}");
         assert_eq!(parsed["compilerOptions"]["paths"]["@x/*"][0], "lib,]/*");
     }
+    #[test]
+    fn resolves_call_through_constructor_injected_field_type() {
+        let root = tempdir().unwrap();
+        let service = "export class FooService { run(): void {} }";
+        let controller = "import { FooService } from './foo.service';\n\
+            export class FooController {\n\
+              constructor(private readonly svc: FooService) {}\n\
+              handle() { this.svc.run(); }\n\
+            }";
+        let a = write_artifact(root.path(), "src/controller.ts", controller);
+        let b = write_artifact(root.path(), "src/foo.service.ts", service);
+        let map: BTreeMap<String, FileArtifact> = [(a.path.clone(), a), (b.path.clone(), b)].into();
+        let edges = resolve_edges(root.path(), &map, &ResolverConfig::default());
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls
+                    && edge.to.contains("foo.service.ts")
+                    && edge.to.ends_with("FooService.run")
+            }),
+            "expected Calls edge to FooService.run via declared field type, got: {:#?}",
+            edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resolves_call_through_class_property_with_aliased_import_type() {
+        // Mirrors the NestJS controller shape: class-body property typed by an
+        // aliased import, assigned in the constructor, invoked via `this.<field>`.
+        let root = tempdir().unwrap();
+        let usecase = "export class GetAllUseCase { execute(): number { return 1; } }";
+        let controller = "import { GetAllUseCase as UseCase } from './usecase';\n\
+            export class Controller {\n\
+              private readonly usecase: UseCase;\n\
+              constructor() { this.usecase = new UseCase(); }\n\
+              handle() { return this.usecase.execute(); }\n\
+            }";
+        let a = write_artifact(root.path(), "src/controller.ts", controller);
+        let b = write_artifact(root.path(), "src/usecase.ts", usecase);
+        let map: BTreeMap<String, FileArtifact> = [(a.path.clone(), a), (b.path.clone(), b)].into();
+        let edges = resolve_edges(root.path(), &map, &ResolverConfig::default());
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls
+                    && edge.to.contains("usecase.ts")
+                    && edge.to.ends_with("GetAllUseCase.execute")
+            }),
+            "expected Calls edge to GetAllUseCase.execute via aliased declared type, got: {:#?}",
+            edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resolves_call_through_interface_typed_field_to_interface_member() {
+        let root = tempdir().unwrap();
+        let contract = "export interface IUseCase { execute(): Promise<void>; }";
+        let controller = "import { IUseCase } from './contract';\n\
+            export class Controller {\n\
+              constructor(private readonly usecase: IUseCase) {}\n\
+              handle() { return this.usecase.execute(); }\n\
+            }";
+        let a = write_artifact(root.path(), "src/controller.ts", controller);
+        let b = write_artifact(root.path(), "src/contract.ts", contract);
+        let map: BTreeMap<String, FileArtifact> = [(a.path.clone(), a), (b.path.clone(), b)].into();
+        let edges = resolve_edges(root.path(), &map, &ResolverConfig::default());
+        assert!(
+            edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Calls
+                    && edge.to.contains("contract.ts")
+                    && edge.to.ends_with("IUseCase.execute")
+            }),
+            "expected Calls edge to IUseCase.execute via declared field type, got: {:#?}",
+            edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn resolves_relative_import_and_keeps_unresolved_visible() {
         let root = tempdir().unwrap();
