@@ -433,8 +433,20 @@ impl IncrementalGraphState {
                 .by_file
                 .insert(key, value);
         }
-        for (key, value) in self.edge_refcounts {
-            let digest = owned_edge_digest(&key)?;
+        // Digesting an edge means serializing it and hashing the bytes — the only
+        // per-item work here that is not a move, and it runs for every edge in the
+        // workspace. The placement itself stays sequential: its keys are 128-bit
+        // digests, so the inserts are cheap next to the hashing.
+        let digested: Option<Vec<(u128, u32)>> = {
+            use rayon::prelude::*;
+            self.edge_refcounts
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(key, value)| Some((owned_edge_digest(&key)?, value)))
+                .collect()
+        };
+        for (digest, value) in digested? {
             out.edges
                 .entry(digest_shard_id(digest, edge_bits))
                 .or_default()
