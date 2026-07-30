@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-07-30
+
+### Changed
+- `explore` relations use the same site shape `callers_of` returns. 1.7.0 trimmed
+  one and left the other emitting the old form for the same data: `id` beside both
+  of its own parts, `provenance`, a `resolved` confidence on every entry, and
+  `path` repeated inside a nested `site` object. Relations were 6203 of the 12828
+  bytes of a concise explore — 48% of the response, half of it repetition.
+
+  Both now return `path`, `line`, `symbol`, `kind`, plus `type_only` and
+  `confidence` only when they say something. One shape to learn, and a site read
+  the same way whichever tool produced it.
+
+  Explore on a symbol with 20 reference sites: 12828 -> 8690 bytes (-32%), and
+  19789 -> 8690 (-56%) counting the concise default from 1.6.0.
+
+### Migration
+Items in `relations.incoming` / `relations.outgoing` are flat: `site.path` and
+`site.line` moved to `path` and `line`, `name` became `symbol`, and `id` /
+`provenance` are gone. `symbol` is accepted as input by `callers_of` and
+`calls_from`, so it replaces `id` for chaining.
+
 ## [1.7.0] - 2026-07-30
 
 1.6.0 made the graph tool reachable and cheap. It did not make its answer
@@ -310,7 +332,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/guigaoliveira/ravel/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...v1.5.0
