@@ -275,37 +275,72 @@ impl TermIndex {
     pub(crate) const FORMAT_VERSION: u32 = 3;
 
     pub(crate) fn from_snapshot(snapshot: &IndexSnapshot) -> Self {
-        let mut term_documents = Vec::new();
-        for (path, artifact) in &snapshot.files {
-            for symbol in &artifact.symbols {
-                let document = SymbolTermDocument::from_symbol(path, symbol, 0);
-                term_documents.push(document);
-            }
-        }
-        term_documents.sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
-        let mut postings: BTreeMap<String, Vec<TermPosting>> = BTreeMap::new();
-        for (document_index, document) in term_documents.iter().enumerate() {
-            let mut document_tokens = BTreeMap::<&str, u8>::new();
-            for (terms, field) in [
-                (&document.name_terms, 1),
-                (&document.qualified_terms, 2),
-                (&document.path_terms, 4),
-                (&document.kind_terms, 8),
-            ] {
-                for token in terms.split_whitespace() {
-                    *document_tokens.entry(token).or_default() |= field;
+        use rayon::prelude::*;
+        /// Documents per parallel chunk when inverting the postings. Small enough to
+        /// keep every worker's temporary map cheap, large enough to amortize the merge.
+        const POSTING_CHUNK: usize = 4_096;
+
+        // Per-file document construction is independent; collecting per file and
+        // flattening in BTreeMap order reproduces the sequential order exactly.
+        let mut term_documents: Vec<SymbolTermDocument> = snapshot
+            .files
+            .iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(path, artifact)| {
+                artifact
+                    .symbols
+                    .iter()
+                    .map(|symbol| SymbolTermDocument::from_symbol(path, symbol, 0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        // Stable sort, same comparator: ties keep insertion order as before.
+        term_documents.par_sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+
+        // Invert in document-index order per chunk, then merge chunks in order. Each
+        // token's postings therefore stay ascending by document_index, which
+        // `is_well_formed` requires and the binary-search readers rely on.
+        let chunks: Vec<BTreeMap<&str, Vec<TermPosting>>> = term_documents
+            .par_chunks(POSTING_CHUNK)
+            .enumerate()
+            .map(|(chunk_index, documents)| {
+                let base = chunk_index * POSTING_CHUNK;
+                let mut chunk_postings: BTreeMap<&str, Vec<TermPosting>> = BTreeMap::new();
+                for (offset, document) in documents.iter().enumerate() {
+                    let mut document_tokens = BTreeMap::<&str, u8>::new();
+                    for (terms, field) in [
+                        (&document.name_terms, 1),
+                        (&document.qualified_terms, 2),
+                        (&document.path_terms, 4),
+                        (&document.kind_terms, 8),
+                    ] {
+                        for token in terms.split_whitespace() {
+                            *document_tokens.entry(token).or_default() |= field;
+                        }
+                    }
+                    for (token, fields) in document_tokens {
+                        chunk_postings.entry(token).or_default().push(TermPosting {
+                            document_index: (base + offset) as u32,
+                            fields,
+                        });
+                    }
                 }
-            }
-            for (token, fields) in document_tokens {
-                postings
-                    .entry(token.to_owned())
-                    .or_default()
-                    .push(TermPosting {
-                        document_index: document_index as u32,
-                        fields,
-                    });
+                chunk_postings
+            })
+            .collect();
+        let mut postings: BTreeMap<&str, Vec<TermPosting>> = BTreeMap::new();
+        for chunk_postings in chunks {
+            for (token, entries) in chunk_postings {
+                postings.entry(token).or_default().extend(entries);
             }
         }
+        let term_tokens: Vec<String> = postings.keys().map(|token| (*token).to_owned()).collect();
+        let term_postings: Vec<Vec<TermPosting>> = postings.into_values().collect();
+
         Self {
             format_version: Self::FORMAT_VERSION,
             snapshot_id: snapshot.id.stable_key(),
@@ -316,8 +351,8 @@ impl TermIndex {
                     name: document.name,
                 })
                 .collect(),
-            term_tokens: postings.keys().cloned().collect(),
-            term_postings: postings.into_values().collect(),
+            term_tokens,
+            term_postings,
         }
     }
 

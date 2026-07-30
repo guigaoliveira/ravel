@@ -310,7 +310,10 @@ impl StructuralPackStager {
     /// pack. Artifacts are individual records so incremental readers can fetch one file without
     /// hydrating the complete snapshot.
     pub(crate) fn stage_snapshot(&mut self, snapshot: &IndexSnapshot) -> Result<(), StorageError> {
+        let mut mark = std::time::Instant::now();
         self.add_meta("snapshot/edges", &snapshot.edges)?;
+        crate::timing::stage("stage_snapshot.edges", mark, String::new);
+        mark = std::time::Instant::now();
         let mut artifact_index = ArtifactIndex {
             store: "#artifact/".into(),
             entries: BTreeMap::new(),
@@ -341,8 +344,14 @@ impl StructuralPackStager {
             self.add_bytes(format!("artifact/{path}"), bytes)?;
         }
         self.add_meta("artifact/index", &artifact_index)?;
+        crate::timing::stage("stage_snapshot.artifacts", mark, || {
+            format!("n={}", snapshot.files.len())
+        });
+        mark = std::time::Instant::now();
 
         let graph = GraphIndex::from_snapshot(snapshot);
+        crate::timing::stage("stage_snapshot.graph_from_snapshot", mark, String::new);
+        mark = std::time::Instant::now();
         let flat_graph = FlatCompactGraph::from_compact(graph.to_compact());
         let graph_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat_graph).map_err(|error| {
             StorageError::Invalid {
@@ -353,6 +362,8 @@ impl StructuralPackStager {
         drop(flat_graph);
         self.add_bytes("query/graph".into(), &graph_bytes)?;
         drop(graph_bytes);
+        crate::timing::stage("stage_snapshot.query_graph", mark, String::new);
+        mark = std::time::Instant::now();
         let hubs = analysis::precompute_hubs(&graph, 1_000);
         self.add_bytes(
             "query/hubs".into(),
@@ -362,6 +373,8 @@ impl StructuralPackStager {
             })?,
         )?;
         drop(graph);
+        crate::timing::stage("stage_snapshot.hubs", mark, String::new);
+        mark = std::time::Instant::now();
         let symbols = SymbolDict::from_snapshot_names_only(snapshot);
         let symbol_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&symbols).map_err(|error| {
             StorageError::Invalid {
@@ -372,6 +385,8 @@ impl StructuralPackStager {
         self.add_bytes("query/symbols".into(), &symbol_bytes)?;
         drop(symbol_bytes);
         drop(symbols);
+        crate::timing::stage("stage_snapshot.symbol_dict", mark, String::new);
+        mark = std::time::Instant::now();
         let term_index = TermIndex::from_snapshot(snapshot);
         let term_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).map_err(|error| {
             StorageError::Invalid {
@@ -382,7 +397,10 @@ impl StructuralPackStager {
         self.add_bytes("query/terms".into(), &term_bytes)?;
         drop(term_bytes);
         drop(term_index);
+        crate::timing::stage("stage_snapshot.term_index", mark, String::new);
+        mark = std::time::Instant::now();
         self.stage_symbol_meta(snapshot)?;
+        crate::timing::stage("stage_snapshot.symbol_meta", mark, String::new);
         let stats = IndexStats {
             files: snapshot.files.len(),
             edges: snapshot.edges.len(),
@@ -469,12 +487,14 @@ impl StructuralPackStager {
     }
 
     pub(crate) fn stage_graph(&mut self, graph: IncrementalGraphState) -> Result<(), StorageError> {
+        let mark = std::time::Instant::now();
         let graph = graph
             .into_section_shards(GRAPH_FILE_BITS, GRAPH_EDGE_BITS, GRAPH_ADJ_BITS)
             .ok_or_else(|| StorageError::Invalid {
                 path: self.path.clone(),
                 message: "invalid graph shard layout".into(),
             })?;
+        crate::timing::stage("stage_graph.section_shards", mark, String::new);
         self.add_meta(
             "meta/graph2",
             &(
