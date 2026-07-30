@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Full index is a further 13% faster on a 20.4k-file / 744k-edge corpus
+  (9124ms in 1.4.1 -> 7949-8071ms), snapshot id unchanged:
+  - Resolution's two remaining sequential steps now fan out — building the
+    resolution universe and ordering the resulting edges.
+    `resolve.sort_edges` 281.4ms -> 54.7ms, `index.resolve_edges` 1240.0ms ->
+    910.8ms.
+  - Structural contributions are built per file in parallel: 475.8ms ->
+    411.4ms. The small share confirms that stage is dominated by its
+    sequential merge.
+- `RAVEL_TIMING=1` reports resolution's phases: universe build,
+  imports/exports, symbol refs, merge/dedup, and the edge sort.
+
 ## [1.4.1] - 2026-07-29
 
 Released as 1.4.1: the 1.4.0 tag failed its own validation job (`cargo fmt
