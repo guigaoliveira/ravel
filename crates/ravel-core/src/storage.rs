@@ -35,7 +35,12 @@ use std::{
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 15;
+/// 16: symbol-meta shards moved to rkyv archives read in place. Without this bump
+/// a binary that predates the layout rejects only the shard index and then answers
+/// queries from an empty symbol-meta backend, which is indistinguishable from a
+/// genuine "nothing found". The bump makes the mismatch loud in both directions:
+/// each side reports an unsupported schema and rebuilds.
+const SCHEMA_VERSION: u32 = 16;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -319,28 +324,39 @@ impl StructuralPackStager {
             .into_iter()
             .map(|entries| SymbolMetaIdShard { entries })
             .collect();
+        // rkyv rather than bincode: a lookup reads one entry out of thousands, and
+        // decoding a whole shard to reach it was the dominant per-query cost the
+        // first time each shard was touched. Written under `symbol-meta2/` so an
+        // index produced by an older binary keeps its readable `symbol-meta/`
+        // records and a reader that predates this layout simply does not see it.
         let serialized: Vec<[(String, Vec<u8>); 3]> = (0..SYMBOL_META_SHARD_COUNT)
             .into_par_iter()
             .map(|shard| {
+                let id_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&id_shards[shard])
+                    .map_err(|error| error.to_string())?;
+                let name_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&names[shard])
+                    .map_err(|error| error.to_string())?;
+                let qualified_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&qualified[shard])
+                    .map_err(|error| error.to_string())?;
                 Ok([
                     (
-                        format!("query/symbol-meta/id/{shard:02x}"),
-                        bincode::serialize(&id_shards[shard])?,
+                        format!("query/symbol-meta2/id/{shard:02x}"),
+                        id_bytes.into_vec(),
                     ),
                     (
-                        format!("query/symbol-meta/name/{shard:02x}"),
-                        bincode::serialize(&names[shard])?,
+                        format!("query/symbol-meta2/name/{shard:02x}"),
+                        name_bytes.into_vec(),
                     ),
                     (
-                        format!("query/symbol-meta/qualified/{shard:02x}"),
-                        bincode::serialize(&qualified[shard])?,
+                        format!("query/symbol-meta2/qualified/{shard:02x}"),
+                        qualified_bytes.into_vec(),
                     ),
                 ])
             })
-            .collect::<Result<Vec<_>, bincode::Error>>()
-            .map_err(|source| StorageError::Bincode {
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|message| StorageError::Invalid {
                 path: self.path.clone(),
-                source,
+                message: format!("archive symbol meta shard: {message}"),
             })?;
         for records in serialized {
             for (key, bytes) in records {

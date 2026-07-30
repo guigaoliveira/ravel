@@ -119,9 +119,12 @@ struct PackedSymbolMetaBackend {
     removed_ids: BTreeSet<String>,
     removed_digests: BTreeSet<[u8; 32]>,
     upserts: FxHashMap<String, crate::model::SymbolMeta>,
-    id_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaIdShard>>>,
-    name_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaLookupShard>>>,
-    qualified_cache: Mutex<FxHashMap<u8, Arc<crate::model::SymbolMetaLookupShard>>>,
+    /// Shards whose archive has already been validated in this process. Entries are
+    /// borrowed from the mmap, so nothing decoded needs caching — only the fact that
+    /// the bytes were checked once.
+    validated_id_shards: Mutex<FxHashMap<u8, ()>>,
+    validated_name_shards: Mutex<FxHashMap<u8, ()>>,
+    validated_qualified_shards: Mutex<FxHashMap<u8, ()>>,
     _generation_guard: crate::generation_gc::GenerationGuard,
 }
 
@@ -163,9 +166,9 @@ impl SymbolMetaRuntime {
                 removed_ids,
                 removed_digests,
                 upserts,
-                id_cache: Mutex::new(FxHashMap::default()),
-                name_cache: Mutex::new(FxHashMap::default()),
-                qualified_cache: Mutex::new(FxHashMap::default()),
+                validated_id_shards: Mutex::new(FxHashMap::default()),
+                validated_name_shards: Mutex::new(FxHashMap::default()),
+                validated_qualified_shards: Mutex::new(FxHashMap::default()),
                 _generation_guard: generation_guard,
             })),
         }
@@ -180,29 +183,65 @@ impl SymbolMetaRuntime {
         blake3::hash(key.as_bytes()).as_bytes()[0] & mask
     }
 
-    fn load_id_shard(&self, shard: u8) -> Option<Arc<crate::model::SymbolMetaIdShard>> {
-        let SymbolMetaBackend::Packed(packed) = &self.backend else {
-            return None;
-        };
-        if let Some(cached) = packed.id_cache.lock().unwrap().get(&shard).cloned() {
-            return Some(cached);
-        }
-        let key = format!("query/symbol-meta/id/{shard:02x}");
-        let decoded = packed
+    /// Ceiling for one symbol-meta shard record, matching the bound the previous
+    /// decoding reader applied.
+    const SHARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Borrow one archived shard record straight out of the mmap.
+    ///
+    /// Shards hold thousands of entries and a lookup wants one, so decoding the
+    /// record was the whole cost of first touching a shard. `rkyv::access`
+    /// validates it, which is proportional to the record, so that happens once per
+    /// shard per process — generation packs are immutable once published, and a new
+    /// generation builds a new runtime with an empty set.
+    fn with_archived_shard<T, A>(
+        packed: &PackedSymbolMetaBackend,
+        validated: &Mutex<FxHashMap<u8, ()>>,
+        key: &str,
+        shard: u8,
+        use_archive: impl FnOnce(&A) -> T,
+    ) -> Option<T>
+    where
+        A: rkyv::Portable
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        let already_validated = validated.lock().unwrap().contains_key(&shard);
+        packed
             .reader
-            .with_record(&key, 64 * 1024 * 1024, |bytes| {
-                bincode::deserialize::<crate::model::SymbolMetaIdShard>(bytes).ok()
+            .with_record_for_validation(key, Self::SHARD_MAX_BYTES, |bytes| {
+                let archived = if already_validated {
+                    // SAFETY: these bytes passed `rkyv::access` earlier in this
+                    // process and the record is immutable for this runtime's life.
+                    unsafe { rkyv::access_unchecked::<A>(bytes) }
+                } else {
+                    let archived = rkyv::access::<A, rkyv::rancor::Error>(bytes).ok()?;
+                    validated.lock().unwrap().insert(shard, ());
+                    archived
+                };
+                Some(use_archive(archived))
             })
             .ok()
             .flatten()
             .flatten()
-            .map(Arc::new)?;
-        packed
-            .id_cache
-            .lock()
-            .unwrap()
-            .insert(shard, Arc::clone(&decoded));
-        Some(decoded)
+    }
+
+    fn with_id_shard<T>(
+        &self,
+        shard: u8,
+        use_archive: impl FnOnce(&crate::model::ArchivedSymbolMetaIdShard) -> T,
+    ) -> Option<T> {
+        let SymbolMetaBackend::Packed(packed) = &self.backend else {
+            return None;
+        };
+        Self::with_archived_shard(
+            packed,
+            &packed.validated_id_shards,
+            &format!("query/symbol-meta2/id/{shard:02x}"),
+            shard,
+            use_archive,
+        )
     }
 
     fn lookup_locations(
@@ -214,48 +253,48 @@ impl SymbolMetaRuntime {
             return Vec::new();
         };
         let shard = Self::shard_id(key, packed.index.shard_bits);
-        let cache = if qualified {
-            &packed.qualified_cache
+        let (kind, validated) = if qualified {
+            ("qualified", &packed.validated_qualified_shards)
         } else {
-            &packed.name_cache
+            ("name", &packed.validated_name_shards)
         };
-        let cached = cache.lock().unwrap().get(&shard).cloned();
-        let shard_data = cached.or_else(|| {
-            let kind = if qualified { "qualified" } else { "name" };
-            let record = format!("query/symbol-meta/{kind}/{shard:02x}");
-            let decoded = packed
-                .reader
-                .with_record(&record, 64 * 1024 * 1024, |bytes| {
-                    bincode::deserialize::<crate::model::SymbolMetaLookupShard>(bytes).ok()
-                })
-                .ok()
-                .flatten()
-                .flatten()
-                .map(Arc::new)?;
-            cache.lock().unwrap().insert(shard, Arc::clone(&decoded));
-            Some(decoded)
-        });
-        let Some(shard_data) = shard_data else {
-            return Vec::new();
-        };
-        shard_data
-            .entries
-            .binary_search_by(|(candidate, _)| candidate.as_str().cmp(key))
-            .ok()
-            .map(|position| shard_data.entries[position].1.clone())
-            .unwrap_or_default()
+        Self::with_archived_shard::<_, crate::model::ArchivedSymbolMetaLookupShard>(
+            packed,
+            validated,
+            &format!("query/symbol-meta2/{kind}/{shard:02x}"),
+            shard,
+            |archived| {
+                archived
+                    .entries
+                    .binary_search_by(|entry| entry.0.as_str().cmp(key))
+                    .ok()
+                    .map(|position| {
+                        archived.entries[position]
+                            .1
+                            .iter()
+                            .map(|location| crate::model::SymbolMetaLocation {
+                                shard: location.shard,
+                                index: location.index.to_native(),
+                                id_digest: location.id_digest,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            },
+        )
+        .unwrap_or_default()
     }
 
     fn get_by_location(
         &self,
         location: crate::model::SymbolMetaLocation,
     ) -> Option<crate::model::SymbolMeta> {
-        let shard = self.load_id_shard(location.shard)?;
-        let entry = shard.entries.get(location.index as usize)?;
-        if blake3::hash(entry.id.as_bytes()).as_bytes() != &location.id_digest {
-            return None;
-        }
-        self.get_by_id(&entry.id)
+        let id = self.with_id_shard(location.shard, |archived| {
+            let entry = archived.entries.get(location.index as usize)?;
+            (blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest)
+                .then(|| entry.id.as_str().to_owned())
+        })??;
+        self.get_by_id(&id)
     }
 
     fn get_by_id(&self, id: &str) -> Option<crate::model::SymbolMeta> {
@@ -268,15 +307,23 @@ impl SymbolMetaRuntime {
                 if packed.removed_ids.contains(id) {
                     return None;
                 }
-                let shard = self.load_id_shard(Self::shard_id(id, packed.index.shard_bits))?;
-                let start = shard
-                    .entries
-                    .partition_point(|entry| entry.id.as_str() < id);
-                shard.entries[start..]
-                    .iter()
-                    .take_while(|entry| entry.id == id)
-                    .last()
-                    .cloned()
+                // Binary search inside the archive and own only the entry that
+                // matched, instead of decoding every entry in the shard to reach it.
+                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |archived| {
+                    let start = archived
+                        .entries
+                        .partition_point(|entry| entry.id.as_str() < id);
+                    archived.entries[start..]
+                        .iter()
+                        .take_while(|entry| entry.id.as_str() == id)
+                        .last()
+                        .and_then(|entry| {
+                            rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(
+                                entry,
+                            )
+                            .ok()
+                        })
+                })?
             }
         }
     }
@@ -385,13 +432,22 @@ impl SymbolMetaRuntime {
             SymbolMetaBackend::Packed(packed) => {
                 let mut entries = Vec::new();
                 for shard in 0..(1u16 << packed.index.shard_bits) {
-                    entries.extend(
-                        self.load_id_shard(shard as u8)?
+                    // Materializing is the one caller that does want every entry, so
+                    // it deserializes the whole shard on purpose.
+                    let shard_entries = self.with_id_shard(shard as u8, |archived| {
+                        archived
                             .entries
                             .iter()
+                            .filter_map(|entry| {
+                                rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(
+                                    entry,
+                                )
+                                .ok()
+                            })
                             .filter(|entry| !packed.removed_ids.contains(&entry.id))
-                            .cloned(),
-                    );
+                            .collect::<Vec<_>>()
+                    })?;
+                    entries.extend(shard_entries);
                 }
                 entries.extend(packed.upserts.values().cloned());
                 Some(Arc::new(crate::model::SymbolMetaDict::from_all_entries(

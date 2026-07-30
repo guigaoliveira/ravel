@@ -399,17 +399,50 @@ pub(crate) struct SymbolMetaShardIndex {
     pub(crate) shard_bits: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SymbolMetaIdShard {
     pub(crate) entries: Vec<SymbolMeta>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SymbolMetaLookupShard {
     pub(crate) entries: Vec<(String, Vec<SymbolMetaLocation>)>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SymbolMetaLocation {
     pub(crate) shard: u8,
     pub(crate) index: u32,
@@ -417,7 +450,10 @@ pub(crate) struct SymbolMetaLocation {
 }
 
 impl SymbolMetaShardIndex {
-    pub(crate) const FORMAT_VERSION: u32 = 1;
+    /// 2: shard records are rkyv archives under `symbol-meta2/`, read in place.
+    /// A reader that predates this rejects the mismatch and falls back rather than
+    /// looking for records that are no longer written.
+    pub(crate) const FORMAT_VERSION: u32 = 2;
 }
 
 impl SymbolMetaOverlay {
