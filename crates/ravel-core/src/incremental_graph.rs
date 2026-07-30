@@ -334,6 +334,11 @@ impl IncrementalGraphState {
     }
 
     fn add_edge(&mut self, edge: &OwnedEdge) {
+        // Probing before inserting is a measured loss here: resolution hands over
+        // deduplicated edges and each (from, to) pair is almost always new, so the
+        // probe misses and `entry` repeats a traversal whose every comparison walks
+        // the keys' strings. Cost is dominated by those traversals, not by the
+        // clones — interning node names would be the structural fix.
         let count = self.edge_refcounts.entry(edge.clone()).or_default();
         *count += 1;
         if *count == 1 {
