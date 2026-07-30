@@ -2484,25 +2484,31 @@ impl WorkspaceEngine {
                     .collect()
             })
             .unwrap_or_default();
+        // Same site shape `callers_of` returns, for the same reasons: one shape to
+        // learn, and nothing repeated. `id` was "symbol://" + path + kind + qualified
+        // name emitted beside both of its own parts; `provenance` and a `resolved`
+        // confidence change no decision.
         let relation_json = |relations: Vec<crate::graph::RelationView>| {
             relations
                 .into_iter()
                 .map(|relation| {
                     let related = symbol_runtime.get_by_id(&relation.node);
-                    serde_json::json!({
-                        "id": relation.node,
-                        "name": related.as_ref().map(|entry| entry.qualified_name.clone()).unwrap_or_else(|| relation.node.clone()),
+                    let mut site = serde_json::json!({
+                        "path": relation.source_path,
+                        "line": relation.span.map(|span| span.start_line + 1),
+                        "symbol": related
+                            .as_ref()
+                            .map(|entry| entry.qualified_name.clone())
+                            .unwrap_or_else(|| relation.node.clone()),
                         "kind": relation.kind.as_str(),
-                        "path": related.as_ref().map(|entry| entry.path.clone()),
-                        "site": {
-                            "path": relation.source_path,
-                            "line": relation.span.map(|span| span.start_line + 1),
-                            "end_line": relation.span.map(|span| span.end_line + 1),
-                        },
-                        "confidence": relation.confidence,
-                        "provenance": relation.provenance,
-                        "type_only": relation.type_only,
-                    })
+                    });
+                    if relation.type_only {
+                        site["type_only"] = serde_json::Value::Bool(true);
+                    }
+                    if relation.confidence != "resolved" {
+                        site["confidence"] = serde_json::json!(relation.confidence);
+                    }
+                    site
                 })
                 .collect::<Vec<_>>()
         };
@@ -3774,10 +3780,11 @@ mod agent_context_tests {
                 .contains("getPendingLegalPersonOnboarding")
         );
         let incoming = exact["relations"]["incoming"].as_array().unwrap();
+        // Flat site shape, shared with `callers_of`: path and line at the top level.
         assert!(incoming.iter().any(|relation| {
             relation["kind"] == "Calls"
-                && relation["site"]["path"] == "consumer.ts"
-                && relation["site"]["line"] == 3
+                && relation["path"] == "consumer.ts"
+                && relation["line"] == 3
         }));
         let impact = engine
             .impact_risk(
