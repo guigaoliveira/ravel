@@ -468,7 +468,7 @@ skip_sibling_emit = true
             cursor,
         }) => {
             emit_json(
-                &relation_page(&root, &node, true, page_size, cursor)?,
+                &reference_sites(&root, &node, true, page_size, cursor)?,
                 pretty,
             )?;
         }
@@ -478,7 +478,7 @@ skip_sibling_emit = true
             cursor,
         }) => {
             emit_json(
-                &relation_page(&root, &node, false, page_size, cursor)?,
+                &reference_sites(&root, &node, false, page_size, cursor)?,
                 pretty,
             )?;
         }
@@ -688,24 +688,19 @@ fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
         .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
 }
 
-/// One page of a symbol's resolved edges, in one direction.
+/// One page of a symbol's reference sites, in one direction.
 ///
-/// Named commands for the two directions people actually ask about, so the common
-/// question does not require knowing that it is `query --reverse`.
-fn relation_page(
+/// Named commands for the two questions people actually ask, answered with the
+/// line of each site rather than just the file that contains it.
+fn reference_sites(
     root: &std::path::Path,
     node: &str,
     reverse: bool,
     page_size: usize,
     cursor: usize,
-) -> anyhow::Result<ravel_core::graph::QueryPage> {
+) -> anyhow::Result<serde_json::Value> {
     let engine = WorkspaceEngine::load(root, &Flags::default())?;
-    let limits = QueryLimits {
-        page_size,
-        cursor,
-        ..Default::default()
-    };
-    Ok(engine.query(node, reverse, &limits, None)?)
+    Ok(engine.reference_sites(node, reverse, page_size, cursor)?)
 }
 
 fn daemon_call_if_running(

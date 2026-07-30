@@ -70,9 +70,21 @@ pub struct SyncRequest {
     pub paths: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ReferenceSitesRequest {
+    pub root: Option<String>,
+    /// Symbol name, qualified name, or id. A bare name is resolved.
+    pub node: String,
+    /// Sites per page (default 50).
+    pub limit: Option<usize>,
+    /// Resume offset: pass the previous page's next_cursor.
+    pub cursor: Option<usize>,
+}
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
     pub root: Option<String>,
     pub node: String,
+    /// Follow dependents instead of dependencies.
+    pub reverse: Option<bool>,
     pub depth: Option<usize>,
     pub nodes: Option<usize>,
 }
@@ -533,23 +545,26 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "PRIMARY. Who depends on this symbol — resolved reverse edges, so no matches \
-                       inside comments or strings and no same-named symbol from another file. \
-                       Prefer this over grepping a name when the question is \"what breaks if I \
-                       change this\": it answers in a fraction of the tokens a grep-then-read \
-                       sweep costs, and it reflects uncommitted edits. Takes a symbol id or \
-                       qualified name (`explore` returns ids). Page with page_size/cursor."
+        description = "PRIMARY. Every place that references this symbol, with the file and line \
+                       of each one, the referring symbol, the edge kind, and whether the \
+                       reference is type-only. Resolved edges: never a match inside a comment or \
+                       string, never a same-named symbol from an unrelated file. This is the \
+                       \"what breaks if I change this\" answer, and it is enough to judge each \
+                       site without opening the files first — which is what makes it cheaper \
+                       than grepping a name and reading every hit. Accepts a bare name, a \
+                       qualified name, or an id. Reflects uncommitted edits. Page with \
+                       limit/cursor; `total` and `by_kind` are exact."
     )]
-    async fn callers_of(&self, Parameters(request): Parameters<QueryRequest>) -> String {
-        query_tool(self, request, true).await
+    async fn callers_of(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+        reference_sites_tool(self, request, true).await
     }
 
     #[tool(
-        description = "PRIMARY. What this symbol calls or imports — resolved forward edges. \
-                       Same cost and precision argument as callers_of, in the other direction."
+        description = "PRIMARY. What this symbol references — same shape and guarantees as \
+                       callers_of, in the other direction."
     )]
-    async fn calls_from(&self, Parameters(request): Parameters<QueryRequest>) -> String {
-        query_tool(self, request, false).await
+    async fn calls_from(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+        reference_sites_tool(self, request, false).await
     }
 
     #[tool(
@@ -608,6 +623,14 @@ impl RavelMcp {
             },
             Err(error) => error_json(error.to_string()),
         }
+    }
+
+    #[tool(
+        description = "Transitive reach: every file that can be reached from this symbol by                        following edges, or that can reach it with reverse=true. This is a walk                        over the whole graph and answers \"how far does this spread\" — for the                        places that actually reference the symbol, with lines, use callers_of."
+    )]
+    async fn reachable(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+        let reverse = request.reverse.unwrap_or(false);
+        query_tool(self, request, reverse).await
     }
 
     #[tool(description = "Blast radius + risk scores for a symbol")]
@@ -832,6 +855,22 @@ impl RavelMcp {
     }
 }
 
+async fn reference_sites_tool(
+    mcp: &RavelMcp,
+    request: ReferenceSitesRequest,
+    reverse: bool,
+) -> String {
+    let limit = request.limit.unwrap_or(50).max(1);
+    let cursor = request.cursor.unwrap_or(0);
+    match mcp.engine(request.root) {
+        Ok(engine) => match engine.reference_sites(&request.node, reverse, limit, cursor) {
+            Ok(value) => value.to_string(),
+            Err(error) => error_json(error.to_string()),
+        },
+        Err(error) => error_json(error.to_string()),
+    }
+}
+
 async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> String {
     let mut limits = QueryLimits::default();
     if let Some(depth) = request.depth {
@@ -866,9 +905,9 @@ impl ServerHandler for RavelMcp {
                  \n\
                  Pick by the question:\n\
                  - \"who calls / uses / depends on X\" or \"what breaks if I change X\" → \
-                 callers_of. Resolved edges: no hits inside comments or strings, no same-named \
-                 symbol from an unrelated file. Costs a fraction of grepping a name and then \
-                 reading each file to check it.\n\
+                 callers_of. Returns each site with its file and line, so the answer is \
+                 actionable without opening the files. Resolved edges: no hits inside comments \
+                 or strings, no same-named symbol from an unrelated file.\n\
                  - \"what does X call / import\" → calls_from.\n\
                  - \"what is X, and what is around it\" → explore. One call: resolves the name, \
                  disambiguates, and returns typed relation pages with totals. Ask detail=true \

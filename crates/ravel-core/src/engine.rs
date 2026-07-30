@@ -2748,6 +2748,72 @@ impl WorkspaceEngine {
         self.query_raw(node, reverse, limits, cancel)
     }
 
+    /// The reference sites of one symbol, one hop out, with where each one is.
+    ///
+    /// This is the "what breaks if I change this" answer. The transitive walk in
+    /// `query` reports which files are reachable, which is a different question and
+    /// leaves the caller to open each one to find out where and how; blast radius
+    /// across the whole graph is `impact_risk`. Sites carry the line, the referring
+    /// symbol, the edge kind, and whether the reference is type-only — enough to
+    /// judge each one without reading the file first.
+    pub fn reference_sites(
+        &self,
+        node: &str,
+        reverse: bool,
+        limit: usize,
+        cursor: usize,
+    ) -> Result<serde_json::Value, EngineError> {
+        let _ = self.auto_sync_if_dirty()?;
+        let graph = self.graph()?;
+        let resolved = self.resolve_graph_node(&graph, node);
+        let symbols = self.symbol_meta_runtime()?;
+        // Ask for the page plus everything before it, then slice: relation order is
+        // deterministic, so a cursor is an offset into the same sequence.
+        let end = cursor.saturating_add(limit);
+        let (relations, total) = graph.direct_relations_limit(&resolved, reverse, end);
+        let by_kind = graph.direct_relation_kind_counts(&resolved, reverse);
+        let sites: Vec<_> = relations
+            .into_iter()
+            .skip(cursor)
+            .map(|relation| {
+                let related = symbols
+                    .as_ref()
+                    .and_then(|symbols| symbols.get_by_id(&relation.node));
+                // No `id` field: it is "symbol://" + path + "#" + kind + qualified
+                // name, so emitting it alongside `path` and `symbol` triples the cost
+                // of every site. `symbol` is the chaining key — these tools accept a
+                // qualified name directly. `confidence` appears only when it is not
+                // `resolved`, since that is the only value worth reacting to.
+                let mut site = serde_json::json!({
+                    "path": relation.source_path,
+                    "line": relation.span.map(|span| span.start_line + 1),
+                    "symbol": related
+                        .as_ref()
+                        .map(|entry| entry.qualified_name.clone())
+                        .unwrap_or_else(|| relation.node.clone()),
+                    "kind": relation.kind.as_str(),
+                });
+                if relation.type_only {
+                    site["type_only"] = serde_json::Value::Bool(true);
+                }
+                if relation.confidence != "resolved" {
+                    site["confidence"] = serde_json::json!(relation.confidence);
+                }
+                site
+            })
+            .collect();
+        let next_cursor =
+            (cursor + sites.len() < total).then(|| (cursor + sites.len()).to_string());
+        Ok(serde_json::json!({
+            "node": resolved,
+            "direction": if reverse { "incoming" } else { "outgoing" },
+            "sites": sites,
+            "total": total,
+            "by_kind": by_kind,
+            "next_cursor": next_cursor,
+        }))
+    }
+
     /// Query without auto-sync (for compound tools that already synced once).
     pub fn query_raw(
         &self,

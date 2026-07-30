@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-30
+
+1.6.0 made the graph tool reachable and cheap. It did not make its answer
+*sufficient*: `callers_of` returned the files that reach a symbol, so acting on
+the answer still meant opening each one — the grep-then-read loop it was supposed
+to replace. This release fixes that.
+
+### Changed
+- `callers_of` / `calls_from` (and `ravel callers-of` / `calls-from`) return the
+  reference **sites**: file, line, the referring symbol's qualified name, the edge
+  kind, and `type_only` when the reference cannot break at runtime — plus an exact
+  `total` and a complete `by_kind`. Each site can be judged without opening the
+  file, which is the whole point.
+
+  They also switched from a transitive walk to the direct edges, matching what the
+  names claim. "How far does this spread" is a different question, answered by
+  `impact` or the new `reachable`.
+
+  Measured on a 20.4k-file corpus, for a symbol with 20 real reference sites:
+  4992 bytes for the complete, exact answer. `grep -rn` on the same name returns
+  **820** textual hits — imports, comments, and same-named fields on unrelated
+  classes — so the comparable grep sweep is ~115KB and still needs every hit
+  triaged by hand. The 2801-byte grep quoted in 1.6.0 was 20 of those 820, which
+  made it look cheaper than a complete answer by comparing it to none.
+- Sites omit what does not change a decision: no `id` (it is `symbol://` + path +
+  kind + qualified name, so emitting it beside `path` and `symbol` tripled the
+  cost of every site, and `symbol` is already accepted as input), and
+  `confidence` only when it is not `resolved`.
+- `visited_nodes` / `visited_edges` are gone from these responses. They were
+  traversal counters — cost on every call, no bearing on any decision.
+
+### Added
+- `reachable` (extended surface) keeps the transitive walk that `callers_of` used
+  to perform, with a `reverse` flag, so the capability is not lost.
+
+### Migration
+`callers_of` / `calls_from` responses changed shape: `items` (file paths from a
+transitive walk) became `sites` (direct references with lines), alongside `total`,
+`by_kind` and `next_cursor`. For the previous transitive behaviour use
+`reachable`, or `ravel query --reverse` on the CLI.
+
 ## [1.6.0] - 2026-07-30
 
 This release is about whether an agent *reaches for* the graph, not how fast the
@@ -269,7 +310,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.1
