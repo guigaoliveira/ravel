@@ -3,6 +3,7 @@ use crate::model::IndexSnapshot;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const SCORE_EXACT_CASE: u64 = 1_300_000;
@@ -391,6 +392,8 @@ enum DictRuntime {
         reader: Arc<GenerationPackReader>,
         key: String,
         max_bytes: u64,
+        /// Set once `rkyv::access` has validated this record in this process.
+        validated: AtomicBool,
     },
 }
 
@@ -416,12 +419,12 @@ impl DictRuntime {
             reader,
             key,
             max_bytes,
+            validated,
         } = self
         {
             let result = reader
                 .with_record_for_validation(key, *max_bytes, |bytes| {
-                    let dict = rkyv::access::<ArchivedSymbolDict, rkyv::rancor::Error>(bytes)
-                        .map_err(|error| SearchError::Backend(error.to_string()))?;
+                    let dict = access_validated_once::<ArchivedSymbolDict>(bytes, validated)?;
                     search_archived_dict(dict, query, kind, limit)
                 })
                 .map_err(|error| SearchError::Backend(error.to_string()))?
@@ -616,6 +619,8 @@ enum TermRuntime {
         reader: Arc<GenerationPackReader>,
         key: String,
         max_bytes: u64,
+        /// Set once `rkyv::access` has validated this record in this process.
+        validated: AtomicBool,
     },
 }
 
@@ -624,18 +629,19 @@ impl TermRuntime {
         &self,
         tokens: &[String],
         excluded_ids: &BTreeSet<String>,
+        limit: usize,
     ) -> Result<Vec<SearchHit>, SearchError> {
         match self {
-            Self::Owned(index) => Ok(search_owned_terms(index, tokens, excluded_ids)),
+            Self::Owned(index) => Ok(search_owned_terms(index, tokens, excluded_ids, limit)),
             Self::Packed {
                 reader,
                 key,
                 max_bytes,
+                validated,
             } => reader
                 .with_record_for_validation(key, *max_bytes, |bytes| {
-                    let archived = rkyv::access::<ArchivedTermIndex, rkyv::rancor::Error>(bytes)
-                        .map_err(|error| SearchError::Backend(error.to_string()))?;
-                    Ok(search_archived_terms(archived, tokens, excluded_ids))
+                    let archived = access_validated_once::<ArchivedTermIndex>(bytes, validated)?;
+                    Ok(search_archived_terms(archived, tokens, excluded_ids, limit))
                 })
                 .map_err(|error| SearchError::Backend(error.to_string()))?
                 .ok_or_else(|| SearchError::Backend("missing packed term index".into()))?,
@@ -643,26 +649,64 @@ impl TermRuntime {
     }
 }
 
+/// Validate a packed archive on first access, then borrow it directly.
+///
+/// `rkyv::access` walks the whole archive to check it, which costs time
+/// proportional to the record — over 100MB for the term index on a large
+/// workspace, paid on every single query. The bytes cannot change underneath
+/// us: generation packs are immutable once published, a new generation is a
+/// new file, and observing one drops the runtime holding this flag. So the
+/// check is worth exactly as much the first time as the thousandth.
+fn access_validated_once<'bytes, T>(
+    bytes: &'bytes [u8],
+    validated: &AtomicBool,
+) -> Result<&'bytes T, SearchError>
+where
+    T: rkyv::Portable
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    if validated.load(Ordering::Acquire) {
+        // SAFETY: these exact bytes passed `rkyv::access` earlier in this
+        // process, and the record they come from is immutable for the lifetime
+        // of this runtime (see above).
+        return Ok(unsafe { rkyv::access_unchecked::<T>(bytes) });
+    }
+    let archived = rkyv::access::<T, rkyv::rancor::Error>(bytes)
+        .map_err(|error| SearchError::Backend(error.to_string()))?;
+    validated.store(true, Ordering::Release);
+    Ok(archived)
+}
+
 fn search_owned_terms(
     index: &TermIndex,
     tokens: &[String],
     excluded_ids: &BTreeSet<String>,
+    limit: usize,
 ) -> Vec<SearchHit> {
-    let mut candidates: FxHashMap<u32, [u64; 5]> = FxHashMap::default();
-    for token in tokens {
-        if let Ok(token_index) = index
-            .term_tokens
-            .binary_search_by(|candidate| candidate.as_str().cmp(token))
-        {
-            for posting in &index.term_postings[token_index] {
-                accumulate_posting(
-                    candidates.entry(posting.document_index).or_default(),
-                    posting.fields,
-                );
-            }
+    let lists: Vec<usize> = tokens
+        .iter()
+        .filter_map(|token| {
+            index
+                .term_tokens
+                .binary_search_by(|candidate| candidate.as_str().cmp(token))
+                .ok()
+        })
+        .collect();
+    let scanned: usize = lists
+        .iter()
+        .map(|&token_index| index.term_postings[token_index].len())
+        .sum();
+    let mut candidates: FxHashMap<u32, [u64; 5]> =
+        FxHashMap::with_capacity_and_hasher(scanned, rustc_hash::FxBuildHasher);
+    for token_index in lists {
+        for posting in &index.term_postings[token_index] {
+            accumulate_posting(
+                candidates.entry(posting.document_index).or_default(),
+                posting.fields,
+            );
         }
     }
-    let mut hits = Vec::with_capacity(candidates.len());
+    let mut scored: Vec<ScoredTerm<'_>> = Vec::with_capacity(candidates.len());
     for (document_index, counts) in candidates {
         // Postings are only guaranteed in-bounds when the index passed
         // `is_well_formed`; skip a stale/corrupt posting rather than panic.
@@ -673,39 +717,53 @@ fn search_owned_terms(
             continue;
         }
         if let Some(score_micros) = score_term_counts(tokens.len(), counts) {
-            hits.push(SearchHit {
-                value: document.name.clone(),
-                definition_id: Some(document.id.clone()),
+            scored.push(ScoredTerm {
                 score_micros,
-                reason: Some("term-coverage".into()),
+                name: document.name.as_str(),
+                id: document.id.as_str(),
             });
         }
     }
-    hits
+    top_term_hits(scored, limit)
 }
 
 fn search_archived_terms(
     index: &ArchivedTermIndex,
     tokens: &[String],
     excluded_ids: &BTreeSet<String>,
+    limit: usize,
 ) -> Vec<SearchHit> {
-    let mut candidates: FxHashMap<u32, [u64; 5]> = FxHashMap::default();
-    for token in tokens {
-        if let Ok(token_index) = index
-            .term_tokens
-            .binary_search_by(|candidate| candidate.as_str().cmp(token))
-        {
-            for posting in index.term_postings[token_index].iter() {
-                accumulate_posting(
-                    candidates
-                        .entry(posting.document_index.to_native())
-                        .or_default(),
-                    posting.fields,
-                );
-            }
+    let lists: Vec<usize> = tokens
+        .iter()
+        .filter_map(|token| {
+            index
+                .term_tokens
+                .binary_search_by(|candidate| candidate.as_str().cmp(token))
+                .ok()
+        })
+        .collect();
+    let scanned: usize = lists
+        .iter()
+        .map(|&token_index| index.term_postings[token_index].len())
+        .sum();
+    // One allocation instead of ~18 doubling rehashes: the posting totals are
+    // known before accumulating.
+    let mut candidates: FxHashMap<u32, [u64; 5]> =
+        FxHashMap::with_capacity_and_hasher(scanned, rustc_hash::FxBuildHasher);
+    for token_index in lists {
+        for posting in index.term_postings[token_index].iter() {
+            accumulate_posting(
+                candidates
+                    .entry(posting.document_index.to_native())
+                    .or_default(),
+                posting.fields,
+            );
         }
     }
-    let mut hits = Vec::with_capacity(candidates.len());
+    // Score into borrowed keys: a common token like "service" matches six
+    // figures of definitions, and all but `limit` of them are discarded. Owning
+    // their names up front was three heap allocations per discarded candidate.
+    let mut scored: Vec<ScoredTerm<'_>> = Vec::with_capacity(candidates.len());
     for (document_index, counts) in candidates {
         // Archived postings skip the `is_well_formed` gate (only structural
         // rkyv validation runs), so bound-check before indexing an mmap slice.
@@ -716,15 +774,56 @@ fn search_archived_terms(
             continue;
         }
         if let Some(score_micros) = score_term_counts(tokens.len(), counts) {
-            hits.push(SearchHit {
-                value: document.name.as_str().to_owned(),
-                definition_id: Some(document.id.as_str().to_owned()),
+            scored.push(ScoredTerm {
                 score_micros,
-                reason: Some("term-coverage".into()),
+                name: document.name.as_str(),
+                id: document.id.as_str(),
             });
         }
     }
-    hits
+    crate::timing::note("terms.postings", || {
+        format!(
+            "tokens={} scanned={scanned} scored={} limit={limit}",
+            tokens.len(),
+            scored.len()
+        )
+    });
+    top_term_hits(scored, limit)
+}
+
+/// A scored candidate that still borrows its name and id from the index.
+struct ScoredTerm<'index> {
+    score_micros: u64,
+    name: &'index str,
+    id: &'index str,
+}
+
+/// Select the best `limit` candidates, then own only those.
+///
+/// The order matches `finish_hits` exactly — score descending, then name, then
+/// id — and ids are unique, so the comparator is a total order and the selected
+/// set is identical to scoring everything and truncating afterwards.
+fn top_term_hits(mut scored: Vec<ScoredTerm<'_>>, limit: usize) -> Vec<SearchHit> {
+    let cmp = |left: &ScoredTerm<'_>, right: &ScoredTerm<'_>| {
+        right
+            .score_micros
+            .cmp(&left.score_micros)
+            .then_with(|| left.name.cmp(right.name))
+            .then_with(|| left.id.cmp(right.id))
+    };
+    if limit < scored.len() {
+        scored.select_nth_unstable_by(limit, cmp);
+        scored.truncate(limit);
+    }
+    scored
+        .into_iter()
+        .map(|candidate| SearchHit {
+            value: candidate.name.to_owned(),
+            definition_id: Some(candidate.id.to_owned()),
+            score_micros: candidate.score_micros,
+            reason: Some("term-coverage".into()),
+        })
+        .collect()
 }
 /// Persistent dictionary plus a compact definition-level inverted term index.
 pub struct SearchIndex {
@@ -777,6 +876,7 @@ impl SearchIndex {
                 reader,
                 key,
                 max_bytes,
+                validated: AtomicBool::new(false),
             }),
             terms: None,
             term_overlay: None,
@@ -872,7 +972,10 @@ impl SearchIndex {
             shadowed_ids.extend(overlay.removed_ids.iter().cloned());
         }
         if let Some(terms) = &self.terms {
-            hits.extend(terms.search(&tokens, &shadowed_ids)?);
+            // Pre-selecting the index's own best `limit` is safe: anything it
+            // drops already has `limit` better candidates ahead of it, so it
+            // could not survive the merge with the overlay either.
+            hits.extend(terms.search(&tokens, &shadowed_ids, limit)?);
         }
         finish_hits(hits, limit)
     }
@@ -895,6 +998,7 @@ impl SearchIndex {
             reader,
             key,
             max_bytes,
+            validated: AtomicBool::new(false),
         });
         self
     }
