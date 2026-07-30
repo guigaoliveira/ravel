@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-07-29
+## [1.4.1] - 2026-07-29
+
+Released as 1.4.1: the 1.4.0 tag failed its own validation job (`cargo fmt
+--check`) before publishing anything, and a tag that exists is not moved.
+No 1.4.0 artifact was ever published, so this is the first release of the
+work below.
 
 ### Added
 - `this.<field>.<member>` calls resolve through the field's declared type.
@@ -177,8 +182,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.4.0...HEAD
-[1.4.0]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.0
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.1
 [1.3.0]: https://github.com/guigaoliveira/ravel/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/guigaoliveira/ravel/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/guigaoliveira/ravel/compare/v1.0.0...v1.1.0
