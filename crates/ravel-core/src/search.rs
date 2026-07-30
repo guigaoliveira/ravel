@@ -742,6 +742,11 @@ fn search_archived_terms(
                 .ok()
         })
         .collect();
+    // Try to answer from the documents carrying the rarest token alone. When that
+    // succeeds it is provably the same answer for a fraction of the work.
+    if let Some(hits) = intersection_top_hits(index, tokens.len(), &lists, excluded_ids, limit) {
+        return hits;
+    }
     let scanned: usize = lists
         .iter()
         .map(|&token_index| index.term_postings[token_index].len())
@@ -789,6 +794,109 @@ fn search_archived_terms(
         )
     });
     top_term_hits(scored, limit)
+}
+
+/// Highest score any document matching exactly `matched` of the query's tokens can
+/// reach. Mirrors `score_term_counts`, using the fact that a token contributes at
+/// most one match to each field: with `matched` tokens, no field count can exceed
+/// `matched`. `terms_upper_bound_dominates_scores` pins the two together.
+fn terms_upper_bound(query_len: usize, matched: usize) -> u64 {
+    let matched = matched as u64;
+    let full_coverage = (matched as usize == query_len) as u64;
+    (600_000
+        + matched.min(6) * 35_000
+        + matched.min(4) * 25_000
+        + matched.min(4) * 10_000
+        + matched.min(4) * 3_000
+        + matched.min(2) * 1_000
+        + full_coverage * 20_000)
+        .min(950_000)
+}
+
+/// Answer a multi-token query from the documents containing its rarest token.
+///
+/// Every posting list is ascending by document index, so one forward pass with a
+/// cursor per list scores those documents exactly, without the hash map the full
+/// scan needs. A document missing the rarest token can match at most
+/// `present - 1` tokens, so once `limit` candidates score strictly above that
+/// ceiling, no skipped document could have entered the result and the answer is
+/// the same set the full scan would produce.
+///
+/// Returns `None` when that cannot be shown — a single-token query, too few
+/// candidates to establish the k-th score, or a ceiling the candidates do not
+/// clear — and the caller falls back to the full scan.
+fn intersection_top_hits<'index>(
+    index: &'index ArchivedTermIndex,
+    query_len: usize,
+    lists: &[usize],
+    excluded_ids: &BTreeSet<String>,
+    limit: usize,
+) -> Option<Vec<SearchHit>> {
+    if lists.len() < 2 || limit == 0 {
+        return None;
+    }
+    let ceiling = terms_upper_bound(query_len, lists.len() - 1);
+    let driver_at = lists
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &token_index)| index.term_postings[token_index].len())?
+        .0;
+    let driver = &index.term_postings[lists[driver_at]];
+    let others: Vec<_> = lists
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != driver_at)
+        .map(|(_, &token_index)| &index.term_postings[token_index])
+        .collect();
+    let mut cursors = vec![0usize; others.len()];
+    let mut scored: Vec<ScoredTerm<'index>> = Vec::new();
+    for posting in driver.iter() {
+        let document_index = posting.document_index.to_native();
+        let mut counts = [0u64; 5];
+        accumulate_posting(&mut counts, posting.fields);
+        for (other, cursor) in others.iter().zip(cursors.iter_mut()) {
+            while *cursor < other.len()
+                && other[*cursor].document_index.to_native() < document_index
+            {
+                *cursor += 1;
+            }
+            if *cursor < other.len() && other[*cursor].document_index.to_native() == document_index
+            {
+                accumulate_posting(&mut counts, other[*cursor].fields);
+            }
+        }
+        // Archived postings skip the `is_well_formed` gate, so bound-check before
+        // indexing an mmap slice.
+        let Some(document) = index.documents.get(document_index as usize) else {
+            continue;
+        };
+        if excluded_ids.contains(document.id.as_str()) {
+            continue;
+        }
+        if let Some(score_micros) = score_term_counts(query_len, counts) {
+            scored.push(ScoredTerm {
+                score_micros,
+                name: document.name.as_str(),
+                id: document.id.as_str(),
+            });
+        }
+    }
+    if scored.len() < limit {
+        return None;
+    }
+    let scanned = driver.len() + others.iter().map(|other| other.len()).sum::<usize>();
+    let candidates = scored.len();
+    let hits = top_term_hits(scored, limit);
+    // Strictly above the ceiling: an equal score could still outrank the k-th by
+    // the name/id tie-break that `finish_hits` applies.
+    let kth = hits.iter().map(|hit| hit.score_micros).min()?;
+    if kth <= ceiling {
+        return None;
+    }
+    crate::timing::note("terms.pruned", || {
+        format!("scanned={scanned} candidates={candidates} kth={kth} ceiling={ceiling}")
+    });
+    Some(hits)
 }
 
 /// A scored candidate that still borrows its name and id from the index.
@@ -1612,5 +1720,52 @@ mod tests {
             result_partial, result_full,
             "partial and full sort must produce identical results"
         );
+    }
+
+    /// The rarest-token pruning is only exact while `terms_upper_bound` really is an
+    /// upper bound on `score_term_counts`. Brute-force every reachable field-count
+    /// combination so a change to the scorer that breaks the bound fails here rather
+    /// than silently dropping results from term search.
+    #[test]
+    fn terms_upper_bound_dominates_scores() {
+        for query_len in 1..=6usize {
+            for matched in 1..=query_len {
+                let bound = terms_upper_bound(query_len, matched);
+                let matched64 = matched as u64;
+                // A token contributes at most one match per field, so each field
+                // count ranges over 0..=matched independently.
+                for name in 0..=matched64 {
+                    for qualified in 0..=matched64 {
+                        for path in 0..=matched64 {
+                            for kind in 0..=matched64 {
+                                let counts = [matched64, name, qualified, path, kind];
+                                let score = score_term_counts(query_len, counts)
+                                    .expect("matched >= 1 always scores");
+                                assert!(
+                                    score <= bound,
+                                    "score {score} exceeds bound {bound} for \
+                                     query_len={query_len} counts={counts:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ceiling must separate coverage levels, otherwise the pruning can never
+    /// fire: a fully-covering document has to be able to outscore the best possible
+    /// partially-covering one.
+    #[test]
+    fn full_coverage_can_outscore_the_partial_ceiling() {
+        for query_len in 2..=6usize {
+            let partial_ceiling = terms_upper_bound(query_len, query_len - 1);
+            let full = terms_upper_bound(query_len, query_len);
+            assert!(
+                full > partial_ceiling,
+                "query_len={query_len}: full {full} must exceed partial {partial_ceiling}"
+            );
+        }
     }
 }
