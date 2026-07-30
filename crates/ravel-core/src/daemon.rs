@@ -123,6 +123,11 @@ impl RuntimeLayout {
         let short = root.as_str().get(..32).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid daemon root identity")
         })?;
+        // Version-scoped endpoint: an upgraded binary must never route queries
+        // to a daemon from an older install (same protocol, stale semantics).
+        // Each version binds its own socket; old daemons expire on their own.
+        let short = format!("{short}-{}", crate::VERSION);
+        let short = short.as_str();
         #[cfg(unix)]
         let directory = {
             use std::os::unix::ffi::OsStrExt;
@@ -951,6 +956,33 @@ mod tests {
         assert!(DaemonLease::try_acquire(&lock).unwrap().is_none());
         drop(first);
         assert!(DaemonLease::try_acquire(&lock).unwrap().is_some());
+    }
+
+    #[test]
+    fn runtime_layout_is_version_scoped_so_upgrades_never_reach_stale_daemons() {
+        // A new binary must never route queries to a daemon from an older
+        // install (same protocol, older semantics). Scoping the endpoint by
+        // binary version means upgrades bind a fresh socket immediately.
+        let runtime = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let root = RootIdentity::discover(root.path()).unwrap();
+        let layout = RuntimeLayout::in_directory(runtime.path().into(), &root).unwrap();
+        #[cfg(unix)]
+        {
+            let LocalEndpoint::Unix(path) = &layout.endpoint;
+            assert!(
+                path.to_string_lossy().contains(crate::VERSION),
+                "socket path must embed the binary version, got {path:?}"
+            );
+        }
+        assert!(
+            layout
+                .singleton_lock
+                .to_string_lossy()
+                .contains(crate::VERSION),
+            "singleton lock must embed the binary version, got {:?}",
+            layout.singleton_lock
+        );
     }
 
     #[test]

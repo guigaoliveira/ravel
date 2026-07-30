@@ -343,8 +343,7 @@ impl RavelMcp {
             .ok_or_else(|| "shared daemon could not be started".to_owned())?;
         match client.client.call(operation.clone()) {
             Ok(value) => Ok(value),
-            Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
-            Err(crate::daemon::DaemonCallError::Transport(_)) => {
+            Err(error) if should_respawn_after(&error) => {
                 self.forget_daemon(root);
                 let retry = self
                     .daemon_client(root)
@@ -354,7 +353,19 @@ impl RavelMcp {
                     .call(operation)
                     .map_err(|error| error.to_string())
             }
+            Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+/// A dying daemon answers politely instead of dropping the connection; treat
+/// that reply like a transport failure so the client respawns instead of
+/// surfacing "daemon is shutting down" to the agent.
+fn should_respawn_after(error: &crate::daemon::DaemonCallError) -> bool {
+    match error {
+        crate::daemon::DaemonCallError::Transport(_) => true,
+        crate::daemon::DaemonCallError::Remote(message) => message.contains("shutting down"),
     }
 }
 
@@ -745,7 +756,10 @@ impl RavelMcp {
     async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
             Ok(engine) => match engine.validate() {
-                Ok(f) => serde_json::to_string(&f).unwrap_or_else(|_| "[]".into()),
+                // Bounded page + complete per-code counts: raw findings run to
+                // megabytes on big monorepos.
+                Ok(f) => serde_json::to_string(&crate::analysis::policy_report(f, 100))
+                    .unwrap_or_else(|_| "[]".into()),
                 Err(error) => error_json(error.to_string()),
             },
             Err(error) => error_json(error.to_string()),
@@ -966,5 +980,19 @@ mod tests {
             .expect("follower did not take over after leader exit");
         drop(replacement);
         follower.join().unwrap();
+    }
+
+    #[test]
+    fn shutting_down_daemon_reply_triggers_respawn_like_a_transport_failure() {
+        use crate::daemon::DaemonCallError;
+        assert!(should_respawn_after(&DaemonCallError::Transport(
+            std::io::Error::other("gone")
+        )));
+        assert!(should_respawn_after(&DaemonCallError::Remote(
+            "daemon is shutting down".into()
+        )));
+        assert!(!should_respawn_after(&DaemonCallError::Remote(
+            "no such symbol".into()
+        )));
     }
 }
