@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-29
+
+### Added
+- `this.<field>.<member>` calls resolve through the field's declared type.
+  NestJS controllers and use-case classes are built almost entirely from
+  constructor-injected services, so their call graph was largely invisible:
+  the member lookup stopped at the owning class. Covers constructor
+  injection, aliased imports, and interface-typed fields.
+- Cursor pagination on the graph walk (`QueryLimits.cursor`, `ravel query
+  --page-size N --cursor N`). Every page previously restarted at offset 0,
+  which made the returned `next_cursor` unusable and hubs impossible to
+  enumerate completely.
+- Complete per-kind edge counts on explore (`incoming_by_kind` /
+  `outgoing_by_kind`). Bounded by the number of edge kinds, so a hub reports
+  its true shape even when the relation page truncates.
+- File-level cycles (`ravel cycles --files`). Package-level SCCs collapse a
+  monorepo whose top-level buckets all reach each other into one giant
+  component, hiding the actionable cycles between files.
+- `related-tests` also probes `src/` -> `test/` mirrors (NestJS/Jest layout).
+
+### Changed
+- `ImpactReport.exact` marks a budget-saturated `total_affected` as a lower
+  bound instead of presenting it as the real total.
+- Truncation warnings only promise a re-query limit the explore page can
+  actually serve, and point at the paginated walk beyond that.
+- `validate` returns a bounded findings page plus complete per-code counts
+  (`--limit`); the raw list reaches megabytes on large monorepos.
+- `context` builds the index when no snapshot exists instead of failing and
+  telling the agent to run `ravel index` by hand.
+- Term index construction is parallel (per-file documents, parallel stable
+  sort, per-chunk posting inversion merged in chunk order). On a 20.4k-file
+  / 744k-edge corpus, measured on tmpfs to isolate CPU from disk:
+  2308ms -> 1306ms. Snapshot id unchanged, so the built index is identical.
+- Reference resolution uses per-artifact lookups instead of scanning the
+  artifact's symbols once per reference: O(refs x symbols) -> O(1) per
+  reference. Performance-neutral on the corpus above (its files are small);
+  it bounds the cost for generated files with thousands of symbols.
+- `RAVEL_TIMING=1` breaks down `stage_snapshot` and `stage_graph`, which
+  together are ~40% of a full index and were previously opaque.
+
+### Fixed
+- `diff-impact` mapped nothing: git returns absolute paths while graph nodes
+  are workspace-relative, so every changed file was skipped.
+- An upgraded binary could route queries to a daemon from an older install
+  (same wire protocol, older semantics). The runtime endpoint and singleton
+  lock now embed the binary version.
+- A daemon that is shutting down answers politely instead of dropping the
+  connection; that reply surfaced "daemon is shutting down" to the agent
+  rather than respawning.
+
 ## [1.3.0] - 2026-07-17
 
 ### Changed
@@ -88,7 +138,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/guigaoliveira/ravel/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/guigaoliveira/ravel/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/guigaoliveira/ravel/compare/v1.0.0...v1.1.0
