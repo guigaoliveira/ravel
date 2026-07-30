@@ -74,6 +74,10 @@ struct EngineInner {
     graph_cache: Mutex<Option<Arc<GraphIndex>>>,
     search_cache: Mutex<Option<Arc<SearchIndex>>>,
     symbol_meta_cache: Mutex<Option<Arc<SymbolMetaRuntime>>>,
+    /// Auto-sync reads the hash sidecar on every tool call to decide whether the
+    /// index is stale. Rebuilding it means unzipping the artifact index into
+    /// 20k+ owned paths, so cache it for the generation it describes.
+    file_hashes_cache: Mutex<Option<Arc<crate::model::FileHashIndex>>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -560,6 +564,7 @@ impl WorkspaceEngine {
                 graph_cache: Mutex::new(None),
                 search_cache: Mutex::new(None),
                 symbol_meta_cache: Mutex::new(None),
+                file_hashes_cache: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 worktree_identity: Mutex::new(None),
                 config_hash,
@@ -1393,6 +1398,7 @@ impl WorkspaceEngine {
             )?;
             *self.inner.snapshot_cache.lock().unwrap() = None;
             *self.inner.symbol_meta_cache.lock().unwrap() = None;
+            *self.inner.file_hashes_cache.lock().unwrap() = None;
             *self.inner.dirty_cache.lock().unwrap() = None;
             self.remember_published_generation();
             return Ok(stats);
@@ -1724,6 +1730,7 @@ impl WorkspaceEngine {
         *self.inner.snapshot_cache.lock().unwrap() = None;
         *self.inner.graph_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
+        *self.inner.file_hashes_cache.lock().unwrap() = None;
         if search_overlay.is_some() {
             *self.inner.search_cache.lock().unwrap() = None;
         }
@@ -1939,6 +1946,7 @@ impl WorkspaceEngine {
         *self.inner.graph_cache.lock().unwrap() = None;
         *self.inner.search_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
+        *self.inner.file_hashes_cache.lock().unwrap() = None;
         // Cache state and the generation marker become visible in that order; readers that race
         // before this point invalidate/reload from CURRENT instead of accepting stale entries.
         self.remember_published_generation();
@@ -2006,12 +2014,28 @@ impl WorkspaceEngine {
         // lookup with definition-level term evidence: a one-word concept may occur in a path or
         // qualified name, while prose intent words must not turn the query into a hard AND.
         let (searches, eager_graph, eager_symbol_runtime) = std::thread::scope(|scope| {
-            let graph = scope.spawn(|| self.graph());
-            let symbol_runtime = scope.spawn(|| self.symbol_meta_runtime());
+            let graph = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let opened = self.graph();
+                crate::timing::stage("context.worker_graph", started, String::new);
+                opened
+            });
+            let symbol_runtime = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let runtime = self.symbol_meta_runtime();
+                crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                runtime
+            });
             let searches = (|| {
+                let prefix_started = std::time::Instant::now();
                 let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+                crate::timing::stage("context.search_prefix", prefix_started, String::new);
+                let terms_started = std::time::Instant::now();
                 let term_hits =
                     self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+                crate::timing::stage("context.search_terms", terms_started, || {
+                    format!("hits={}", term_hits.len())
+                });
                 Ok::<_, EngineError>((hits, term_hits))
             })();
             let graph = graph
@@ -2475,6 +2499,24 @@ impl WorkspaceEngine {
         *self.inner.graph_cache.lock().unwrap() = None;
         *self.inner.search_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
+        *self.inner.file_hashes_cache.lock().unwrap() = None;
+    }
+
+    /// Hash sidecar for the current generation. Cached because auto-sync consults
+    /// it on every tool call, and it is immutable for the generation it describes:
+    /// `clear_cache` drops it as soon as a new generation is observed.
+    fn file_hashes_cached(&self) -> Result<Option<Arc<crate::model::FileHashIndex>>, EngineError> {
+        self.refresh_external_generation()?;
+        let mut cache = self.inner.file_hashes_cache.lock().unwrap();
+        if let Some(hashes) = cache.as_ref() {
+            return Ok(Some(Arc::clone(hashes)));
+        }
+        let Some(hashes) = self.storage().open_file_hashes().ok().flatten() else {
+            return Ok(None);
+        };
+        let hashes = Arc::new(hashes);
+        *cache = Some(Arc::clone(&hashes));
+        Ok(Some(hashes))
     }
 
     fn symbol_meta(&self) -> Result<Option<Arc<crate::model::SymbolMetaDict>>, EngineError> {
@@ -2799,7 +2841,10 @@ impl WorkspaceEngine {
         if !self.config.sync.auto {
             return Ok(None);
         }
-        if self.storage().open_stats().ok().flatten().is_none() {
+        let stats_started = std::time::Instant::now();
+        let has_snapshot = self.storage().open_stats().ok().flatten().is_some();
+        crate::timing::stage("autosync.open_stats", stats_started, String::new);
+        if !has_snapshot {
             // No snapshot yet: first use after install. Build it instead of
             // sending the agent off to run `ravel index` by hand.
             return self.index().map(Some);
@@ -2809,10 +2854,16 @@ impl WorkspaceEngine {
         }
         // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
         // Prevents accidental full-snapshot open on every search.
-        let Some(hashes) = self.storage().open_file_hashes().ok().flatten() else {
+        let hashes_started = std::time::Instant::now();
+        let Some(hashes) = self.file_hashes_cached()? else {
             return Ok(None);
         };
+        crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
+        let dirty_started = std::time::Instant::now();
         let dirty = self.discover_dirty_sources();
+        crate::timing::stage("autosync.discover_dirty", dirty_started, || {
+            format!("paths={}", dirty.len())
+        });
         if dirty.is_empty() {
             return Ok(None);
         }
