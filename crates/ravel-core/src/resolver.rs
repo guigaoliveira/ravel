@@ -293,33 +293,67 @@ impl ResolutionUniverse {
     pub const FORMAT_VERSION: u32 = 6;
 
     pub fn build(artifacts: &BTreeMap<String, FileArtifact>, config: &ResolverConfig) -> Self {
+        use rayon::prelude::*;
+        /// Artifacts per worker when collecting definitions. Bounds how many partial
+        /// maps the merge below has to fold together.
+        const BUILD_CHUNK: usize = 512;
+
         let mut universe = Self {
             format_version: Self::FORMAT_VERSION,
             resolver_fingerprint: resolver_fingerprint(config),
             ..Self::default()
         };
-        for artifact in artifacts.values() {
-            universe.files.insert(artifact.path.clone());
-            for symbol in &artifact.symbols {
+        let ordered: Vec<&FileArtifact> = artifacts.values().collect();
+        // Collect per chunk, then fold in artifact order. That keeps each name's
+        // pre-sort order identical to the sequential build, so the stable sort below
+        // resolves ties the same way.
+        type Collected = (
+            Vec<String>,
+            BTreeMap<String, Vec<SymbolDefinition>>,
+            Vec<(String, Vec<ModuleExport>)>,
+        );
+        let collected: Vec<Collected> = ordered
+            .par_chunks(BUILD_CHUNK)
+            .map(|chunk| {
+                let mut files = Vec::with_capacity(chunk.len());
+                let mut definitions: BTreeMap<String, Vec<SymbolDefinition>> = BTreeMap::new();
+                let mut exports = Vec::with_capacity(chunk.len());
+                for artifact in chunk {
+                    files.push(artifact.path.clone());
+                    for symbol in &artifact.symbols {
+                        definitions
+                            .entry(symbol.name.clone())
+                            .or_default()
+                            .push(SymbolDefinition::from_symbol(artifact, symbol));
+                    }
+                    exports.push((artifact.path.clone(), module_exports(artifact)));
+                }
+                (files, definitions, exports)
+            })
+            .collect();
+        for (files, definitions, exports) in collected {
+            universe.files.extend(files);
+            for (name, entries) in definitions {
                 universe
                     .symbol_definitions
-                    .entry(symbol.name.clone())
+                    .entry(name)
                     .or_default()
-                    .push(SymbolDefinition::from_symbol(artifact, symbol));
+                    .extend(entries);
             }
-            universe
-                .module_exports
-                .insert(artifact.path.clone(), module_exports(artifact));
+            universe.module_exports.extend(exports);
         }
-        for definitions in universe.symbol_definitions.values_mut() {
-            definitions.sort_by(|left, right| {
-                (&left.path, left.span, &left.qualified_name).cmp(&(
-                    &right.path,
-                    right.span,
-                    &right.qualified_name,
-                ))
+        universe
+            .symbol_definitions
+            .par_iter_mut()
+            .for_each(|(_, definitions)| {
+                definitions.sort_by(|left, right| {
+                    (&left.path, left.span, &left.qualified_name).cmp(&(
+                        &right.path,
+                        right.span,
+                        &right.qualified_name,
+                    ))
+                });
             });
-        }
         universe
     }
 
@@ -1140,13 +1174,16 @@ fn resolve_artifacts_impl(
     let universe: &dyn ResolutionLookup = if let Some(universe) = persisted_universe {
         universe
     } else {
+        let universe_started = std::time::Instant::now();
         built_universe = ResolutionUniverse::build(artifacts, config);
+        crate::timing::stage("resolve.universe_build", universe_started, String::new);
         &built_universe
     };
     use rayon::prelude::*;
     // Per-artifact resolution only reads the shared universe, so fan it out across cores.
     // Results are merged in BTreeMap order below, which keeps edge/trace/contribution
     // ordering identical to the sequential implementation.
+    let imports_started = std::time::Instant::now();
     let per_artifact: Vec<_> = artifacts
         .values()
         .collect::<Vec<_>>()
@@ -1407,6 +1444,8 @@ fn resolve_artifacts_impl(
     // References resolve independently per artifact; the cross-file dedup happens on the ordered
     // merge below, so results match the sequential implementation exactly.
     type RefEdgeKey = (String, String, EdgeKind, Span);
+    crate::timing::stage("resolve.imports_exports", imports_started, String::new);
+    let refs_started = std::time::Instant::now();
     let ref_edges: Vec<Vec<(RefEdgeKey, Edge)>> = artifacts
         .values()
         .collect::<Vec<_>>()
@@ -1449,6 +1488,8 @@ fn resolve_artifacts_impl(
             out
         })
         .collect();
+    crate::timing::stage("resolve.symbol_refs", refs_started, String::new);
+    let merge_started = std::time::Instant::now();
     let mut seen: FxHashSet<(String, String, EdgeKind, Span)> = FxHashSet::default();
     for (artifact, file_refs) in artifacts.values().zip(ref_edges) {
         for (key, edge) in file_refs {
@@ -1464,7 +1505,13 @@ fn resolve_artifacts_impl(
         }
     }
 
-    edges.sort_by(|a, b| (&a.from, &a.to, &a.kind).cmp(&(&b.from, &b.to, &b.kind)));
+    crate::timing::stage("resolve.merge_dedup", merge_started, String::new);
+    let sort_started = std::time::Instant::now();
+    // Same comparator, same stability: rayon's `par_sort_by` is a stable sort, and
+    // ordering three quarters of a million edges by their string endpoints is the
+    // last sequential step of resolution.
+    edges.par_sort_by(|a, b| (&a.from, &a.to, &a.kind).cmp(&(&b.from, &b.to, &b.kind)));
+    crate::timing::stage("resolve.sort_edges", sort_started, String::new);
     let mut reverse = ReverseIndex::default();
     if collect_auxiliary {
         reverse.rebuild(&edges);
