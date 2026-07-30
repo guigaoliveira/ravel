@@ -2066,6 +2066,34 @@ impl WorkspaceEngine {
         Ok(stats)
     }
 
+    /// Bytes the index occupies and how many generations are retained.
+    ///
+    /// A flat read of the storage directory — dozens of entries, not a tree walk — so
+    /// `status` stays cheap.
+    fn index_footprint(home: &std::path::Path) -> (u64, usize) {
+        let Ok(entries) = std::fs::read_dir(home) else {
+            return (0, 0);
+        };
+        let mut bytes = 0u64;
+        let mut generations = 0usize;
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_file() {
+                bytes += metadata.len();
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".manifest.json"))
+                {
+                    generations += 1;
+                }
+            }
+        }
+        (bytes, generations)
+    }
+
     /// Index health for agents. Cheap: does not spawn git status.
     pub fn status(&self) -> Result<serde_json::Value, EngineError> {
         let store = self.storage();
@@ -2091,10 +2119,20 @@ impl WorkspaceEngine {
             .iter()
             .max_by_key(|(_, count)| **count)
             .map(|(extension, count)| (extension.clone(), *count));
+        // What the index costs on disk, and why. Retention keeps whole generations
+        // so an in-flight reader never has its mmap pulled out from under it, which
+        // means the footprint is a multiple of one index — surprising enough to be
+        // worth stating rather than leaving to be discovered by a full disk.
+        let (disk_bytes, generations) = Self::index_footprint(&home);
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,
             "storage": home,
+            "disk": {
+                "bytes": disk_bytes,
+                "generations": generations,
+                "retention": self.config.storage.retention,
+            },
             "stats": stats,
             "git_repo": git,
             "auto_sync": self.config.sync.auto && self.config.sync_allows_git(),

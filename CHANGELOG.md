@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-30
+
+Disk footprint, after a 13GB `.ravel` turned up on a workspace whose index is
+1.7GB.
+
+### Added
+- `status` reports `disk`: bytes on disk, generations retained, and the
+  configured `retention`. Retention keeps whole generations so a reader's mmap is
+  never pulled out from under it, which makes the footprint a multiple of one
+  index — 4.86GB across 3 generations on the workspace above. That is working as
+  configured, and it was invisible until a disk filled up.
+- `ravel gc` runs generation collection now instead of waiting for the deferred
+  background pass, and reports bytes reclaimed. `--aggressive` collects down to
+  the live generation for that run only, leaving the configured retention alone:
+  2.48GB -> 2.08GB on a 20.4k-file corpus, after which explore, callers_of and
+  validate return identical results.
+
+### Notes
+The 13GB observation is not reproduced and not explained. Retention is respected
+in every path measured — content-only deltas share one base pack across
+generations (1.7GB total for 4 generations), and structural edits grow it slowly
+(1.8GB -> 2.4GB over six syncs), both capped at three generations. The directory
+had self-collected to 4.86GB by the time it was investigated. Recorded here
+rather than fixed by guesswork; `status` now makes the footprint visible and `gc`
+makes it reclaimable, which is what the symptom actually called for.
+
 ## [1.8.0] - 2026-07-30
 
 ### Changed
@@ -332,7 +358,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/guigaoliveira/ravel/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/guigaoliveira/ravel/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...v1.6.0

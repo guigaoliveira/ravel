@@ -201,6 +201,16 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Reclaim disk: drop retained index generations beyond `storage.retention`
+    ///
+    /// Retention keeps whole generations so a reader's mmap is never pulled out from
+    /// under it, which makes the footprint a multiple of one index. Collection is
+    /// normally deferred to a background pass; this runs it now.
+    Gc {
+        /// Keep only the current generation for this run (default: storage.retention)
+        #[arg(long)]
+        aggressive: bool,
+    },
     /// Architecture boundary violations (ravel.boundaries.toml)
     Boundaries,
     /// Schema summary: counts by node/edge kind
@@ -585,6 +595,33 @@ skip_sibling_emit = true
             if total > 0 {
                 anyhow::bail!("index validation failed with {total} finding(s)");
             }
+        }
+        Some(Command::Gc { aggressive }) => {
+            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let status = engine.status()?;
+            let before = status["disk"]["bytes"].as_u64().unwrap_or(0);
+            // `--aggressive` collects down to the live generation for this run only;
+            // the configured retention is untouched.
+            let report = if aggressive {
+                let home = PathBuf::from(status["storage"].as_str().unwrap_or_default());
+                ravel_core::storage::FileSnapshotStorage::with_retention(&home, 1)
+                    .gc_generations()?
+            } else {
+                engine.storage().gc_generations()?
+            };
+            let after = engine.status()?["disk"]["bytes"].as_u64().unwrap_or(0);
+            emit_json(
+                &serde_json::json!({
+                    "removed_files": report.removed_files,
+                    "removed_dirs": report.removed_dirs,
+                    "retained_manifests": report.retained_manifests,
+                    "deferred_for_readers": report.deferred_for_readers,
+                    "bytes_before": before,
+                    "bytes_after": after,
+                    "bytes_reclaimed": before.saturating_sub(after),
+                }),
+                pretty,
+            )?;
         }
         Some(Command::Boundaries) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
