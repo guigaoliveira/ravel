@@ -71,8 +71,9 @@ impl StructuralReverseIndex {
         };
         // Resolver traces are emitted in the same path order as `artifacts`. Walk the contiguous
         // ranges directly instead of allocating a workspace-wide map of per-file Vecs.
+        let mut ranges = Vec::with_capacity(artifacts.len());
         let mut trace_cursor = 0usize;
-        for (path, artifact) in artifacts {
+        for path in artifacts.keys() {
             let trace_start = trace_cursor;
             while traces
                 .get(trace_cursor)
@@ -80,8 +81,27 @@ impl StructuralReverseIndex {
             {
                 trace_cursor += 1;
             }
-            let contribution =
-                FileContribution::from_artifact(artifact, traces[trace_start..trace_cursor].iter());
+            ranges.push(trace_start..trace_cursor);
+        }
+        // Each file's contribution is independent, and it is retained in `files`
+        // either way, so building them in parallel costs no extra memory. Merging
+        // into the workspace-wide maps stays sequential and in artifact order.
+        let contributions: Vec<(&String, FileContribution)> = {
+            use rayon::prelude::*;
+            artifacts
+                .iter()
+                .zip(ranges)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|((path, artifact), range)| {
+                    (
+                        path,
+                        FileContribution::from_artifact(artifact, traces[range].iter()),
+                    )
+                })
+                .collect()
+        };
+        for (path, contribution) in contributions {
             for candidate in &contribution.module_candidates {
                 index
                     .module_importers
