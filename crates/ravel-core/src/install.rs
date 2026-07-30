@@ -402,20 +402,33 @@ args = ["serve", "--mcp"]
 fn agent_instruction_block() -> String {
     format!(
         r#"{MARKER_BEGIN}
-## Ravel (code graph — prefer over grep/Read for structural queries)
+## Ravel — relational questions about TypeScript/JavaScript code
 
-Local TS/JS graph. Index once; query cheaply; sync after edits.
+Pick the tool by the question, not by habit:
+
+| Question | Use | Why |
+|---|---|---|
+| who calls / uses / depends on X; what breaks if I change X | `ravel callers-of X` | resolved edges: no hits in comments or strings, no same-named symbol from another file. Costs a fraction of grepping the name and then reading each file to check it. |
+| what does X call or import | `ravel calls-from X` | same, other direction |
+| what is X and what surrounds it | `ravel explore X` | one call: resolves the name, disambiguates, typed relation pages with exact totals |
+| where does this literal text appear | `grep` / `rg` | not a graph question; Ravel has no advantage |
 
 ```bash
-ravel status                   # session start
-ravel explore SYMBOL           # ONE call → search + callers + callees + impact
-ravel sync                     # after edits (auto on explore too)
-ravel serve --mcp              # persistent MCP (stays fresh, auto-sync)
+ravel status                   # session start — reports how much of this repo is actually indexed
+ravel callers-of SYMBOL        # the cheap, precise "what breaks" answer
+ravel explore SYMBOL           # broader context in one call (add --detail for the long tail)
+ravel sync path/to/edited.ts   # after a write, for immediate certainty
 ```
 
-3 primary MCP tools (`explore`, `status`, `sync`) — low schema overhead.
-Set `RAVEL_MCP_TOOLS=all` for full surface (search, impact, cycles, hubs, …).
-Edit with the agent's editor — ravel does not write source files.
+Answers reflect **uncommitted edits**: every call auto-syncs Git-dirty files against a
+content-hash sidecar first, so results match the working tree rather than the last commit.
+
+Relation and impact results are pages carrying exact totals — follow `next_cursor` instead
+of treating one page as the whole answer.
+
+`status` tells you when Ravel does not apply: a repo whose sources it cannot parse reports
+its real coverage instead of looking healthy. Ravel never writes source files — edit with
+your own editor.
 {MARKER_END}
 "#
     )

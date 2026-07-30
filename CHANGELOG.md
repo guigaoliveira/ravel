@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-30
+
+This release is about whether an agent *reaches for* the graph, not how fast the
+graph is. The trigger was measuring a session where an agent had Ravel connected
+and used `grep` throughout: the cheap precise tool was not exposed, and the tool
+that was exposed cost 7× a grep for the same question.
+
+### Added
+- `callers_of` and `calls_from` are primary MCP tools, and `ravel callers-of` /
+  `ravel calls-from` are named CLI commands. "Who depends on this" was previously
+  reachable only as `query --reverse` behind `RAVEL_MCP_TOOLS=all`, so the common
+  question required knowing an uncommon spelling. Measured on a 20.4k-file corpus:
+  answering it costs 2006 bytes this way, against 19769 for `explore` and 2801 for
+  a bare `grep` that still leaves every hit to verify by reading.
+- `status` reports coverage: `indexed_files`, `unsupported_source_files`, and the
+  count per extension, from a bounded walk. In Ravel's own repository the previous
+  answer was `"indexed": true, "hint": "Index ready"` while 3 files of 40 were
+  indexed and 37 Rust files were invisible — a graph that answers nothing looks
+  identical to a symbol that has no callers. It now says which is which.
+- `explore` takes `detail` (CLI: `--detail`) for the full payload.
+
+### Changed
+- `explore` is concise by default: similar spellings are capped at 10 with
+  `matches_total` alongside, and the blast-radius sample is omitted while
+  `n_affected` keeps the count a decision turns on. Response size on that corpus:
+  19789 -> 12327, 9827 -> 4118, 6111 -> 4507 bytes (-26% to -58%). Anything
+  dropped is still available via `detail=true`, `callers_of`, or `impact`.
+- MCP server instructions and the `AGENTS.md` / `CLAUDE.md` block now state which
+  question each tool answers, including the one it should *not* be used for:
+  literal text search belongs to grep, where a resolved graph has no advantage.
+  They also state that answers include uncommitted edits — the standard objection
+  to any code index is staleness, and auto-sync against the hash sidecar already
+  removes it.
+
+### Migration
+`explore` responses no longer carry the full `matches` list or a populated
+`impact` array unless `detail` is set. Consumers that read either should pass
+`detail: true` or move to `callers_of` / `impact`.
+
 ## [1.5.0] - 2026-07-30
 
 **The index is rebuilt once on first use after upgrading.** Symbol metadata
@@ -230,7 +269,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/guigaoliveira/ravel/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/guigaoliveira/ravel/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/guigaoliveira/ravel/compare/v1.3.0...v1.4.1
 [1.3.0]: https://github.com/guigaoliveira/ravel/compare/v1.2.0...v1.3.0

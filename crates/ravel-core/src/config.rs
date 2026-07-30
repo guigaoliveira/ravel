@@ -651,6 +651,54 @@ fn parse_num<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, Config
         .map_err(|_| invalid(field, value, "expected a non-negative integer"))
 }
 
+/// Source files present that this indexer cannot parse, as `extension -> count`.
+///
+/// An agent that asks whether a workspace is indexed needs to know when the answer
+/// is "yes, and it covers almost nothing" — a Rust repo with three stray `.js`
+/// files reports as healthy otherwise, which reads as "the graph is empty" rather
+/// than "the graph does not apply here". The walk stops after `budget` entries so
+/// status stays cheap; the counts are a signal, not a census.
+pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<String, usize> {
+    /// Extensions worth naming. Anything else is not obviously project source.
+    const KNOWN_SOURCE: &[&str] = &[
+        "rs", "py", "go", "java", "kt", "rb", "php", "cs", "swift", "c", "cc", "cpp", "h", "hpp",
+        "scala", "ex", "exs", "dart", "lua", "zig",
+    ];
+    let root = &config.project.root;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(config.ignore.gitignore)
+        .git_global(false)
+        .git_exclude(config.ignore.gitignore)
+        .follow_links(false);
+    let custom = root.join(".ravelignore");
+    if custom.is_file() {
+        builder.add_ignore(custom);
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen = 0usize;
+    for entry in builder.build().flatten() {
+        seen += 1;
+        if seen > budget {
+            break;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if config.is_noise(&path) {
+            continue;
+        }
+        if let Some(extension) = path.extension().and_then(|value| value.to_str())
+            && KNOWN_SOURCE.contains(&extension)
+        {
+            *counts.entry(extension.to_owned()).or_default() += 1;
+        }
+    }
+    counts
+}
+
 pub fn discover_files(config: &Config) -> Result<Vec<PathBuf>, ConfigError> {
     let root = &config.project.root;
     let mut builder = ignore::WalkBuilder::new(root);

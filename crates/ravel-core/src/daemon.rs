@@ -294,8 +294,17 @@ pub enum HandshakeError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonOperation {
     Status,
-    Context { query: String, limit: usize },
-    Sync { paths: Vec<PathBuf> },
+    Context {
+        query: String,
+        limit: usize,
+        /// Full payload instead of the concise default. `serde(default)` keeps the
+        /// wire shape readable by a peer that predates the field.
+        #[serde(default)]
+        detail: bool,
+    },
+    Sync {
+        paths: Vec<PathBuf>,
+    },
     Lease,
     PromotePersistent,
     Shutdown,
@@ -831,8 +840,12 @@ fn handle_connection(
     let request_guard = RequestGuard::new(state);
     let response: Result<Value, String> = match operation {
         DaemonOperation::Status => engine.status().map_err(|error| error.to_string()),
-        DaemonOperation::Context { query, limit } => engine
-            .context(&query, limit)
+        DaemonOperation::Context {
+            query,
+            limit,
+            detail,
+        } => engine
+            .context_with_detail(&query, limit, detail)
             .map_err(|error| error.to_string()),
         DaemonOperation::Sync { paths } => engine
             .sync_resident((!paths.is_empty()).then_some(paths.as_slice()))

@@ -2082,6 +2082,15 @@ impl WorkspaceEngine {
         let has = stats_present || graph_present;
         let home = self.root.join(&self.config.storage.home);
         let git = self.is_git_repo_cached();
+        // Bounded walk: enough to tell "indexed and covers this workspace" from
+        // "indexed and covers three files of it".
+        let unsupported = crate::config::unsupported_source_counts(&self.config, 20_000);
+        let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
+        let unsupported_total: usize = unsupported.values().sum();
+        let dominant_unsupported = unsupported
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(extension, count)| (extension.clone(), *count));
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,
@@ -2100,21 +2109,51 @@ impl WorkspaceEngine {
                 "hubs": manifest.as_ref().is_some_and(|m| store.referenced_path_exists(m.hubs.as_deref())),
                 "file_hashes": manifest.as_ref().is_some_and(|m| store.referenced_path_exists(m.file_hashes.as_deref())),
             },
+            "coverage": {
+                "indexed_files": indexed_files,
+                "unsupported_source_files": unsupported_total,
+                "unsupported_by_extension": unsupported,
+            },
             "hint": if !has {
-                "Run `ravel index` first."
+                "Run `ravel index` first.".to_owned()
+            } else if let Some((extension, count)) = dominant_unsupported
+                .filter(|(_, count)| *count > indexed_files)
+            {
+                // Say this before anything about freshness: an agent that trusts
+                // "index ready" here will read an almost-empty graph as "no callers".
+                format!(
+                    "Indexed {indexed_files} file(s), but {count} .{extension} file(s) here are not parsed (Ravel covers TypeScript/JavaScript). Graph answers apply only to the indexed part — use text search for the rest."
+                )
             } else if !self.config.sync.auto {
-                "Index ready. Auto-sync off. Use `ravel sync <paths>` or `watch`."
+                "Index ready. Auto-sync off. Use `ravel sync <paths>` or `watch`.".to_owned()
             } else if !git {
-                "Index ready (no git). Freshness: `ravel watch` or `ravel sync <paths>`."
+                "Index ready (no git). Freshness: `ravel watch` or `ravel sync <paths>`.".to_owned()
             } else {
-                "Index ready. Auto-sync: tracked dirty + hash sidecar."
+                "Index ready. Auto-sync: tracked dirty + hash sidecar.".to_owned()
             },
         }))
     }
 
     /// One-shot agent context: search + callers + impact in a single call (fewer tool hops).
     /// Auto-syncs dirty git sources **once** (nested search/query skip a second pass).
+    ///
+    /// Concise by default.
+    ///
+    /// Concise trims what an agent rarely acts on — the long tail of similar
+    /// spellings and the impact preview — while keeping everything a decision
+    /// needs: the resolved symbol, candidates to disambiguate, the typed
+    /// relation pages, and every total. `detail = true` restores the full
+    /// payload for a human reading the CLI output.
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
+        self.context_with_detail(query, limit, false)
+    }
+
+    pub fn context_with_detail(
+        &self,
+        query: &str,
+        limit: usize,
+        detail: bool,
+    ) -> Result<serde_json::Value, EngineError> {
         /// Hard cap on the relation page: keeps one-shot output bounded for
         /// agents. Totals beyond this must route to the paginated walk.
         const CONTEXT_RELATION_LIMIT_MAX: usize = 50;
@@ -2331,6 +2370,10 @@ impl WorkspaceEngine {
             .map(|entry| entry.name.clone())
             .or_else(|| candidate_entries.first().map(|entry| entry.name.clone()))
             .unwrap_or_else(|| query.to_owned());
+        /// Similar spellings kept when concise. A common word names hundreds of
+        /// definitions and the tail past the first handful never changes a decision,
+        /// but it was the single largest part of the response.
+        const CONCISE_MATCH_LIMIT: usize = 10;
         let mut matches = Vec::new();
         let mut matched_names: FxHashSet<&str> = FxHashSet::default();
         for entry in &exact_identity {
@@ -2343,6 +2386,10 @@ impl WorkspaceEngine {
             {
                 matches.push(hit.value.clone());
             }
+        }
+        let matches_total = matches.len();
+        if !detail {
+            matches.truncate(CONCISE_MATCH_LIMIT);
         }
 
         // A simple spelling can name hundreds of methods. Choosing the first path would create a
@@ -2505,6 +2552,7 @@ impl WorkspaceEngine {
             "q": query,
             "primary": primary,
             "matches": matches,
+            "matches_total": matches_total,
             "candidates": candidates,
             "ambiguous": ambiguous,
             "detail": primary_meta.map(|d| serde_json::json!({
@@ -2525,7 +2573,10 @@ impl WorkspaceEngine {
                 "incoming_by_kind": incoming_by_kind,
                 "outgoing_by_kind": outgoing_by_kind,
             },
-            "impact": impact_top,
+            // The blast-radius preview is a sample, and `n_affected` already carries
+            // the number a decision turns on. `impact` / `callers_of` give the list
+            // when it is actually wanted.
+            "impact": if detail { impact_top } else { Vec::new() },
             "n_callers": caller_count,
             "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
             "n_affected_exact": impact.as_ref().map(|r| r.exact).unwrap_or(true),

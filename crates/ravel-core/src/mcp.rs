@@ -88,6 +88,10 @@ pub struct ExploreRequest {
     pub root: Option<String>,
     pub query: String,
     pub limit: Option<usize>,
+    /// Ask for the full payload — every similar spelling and the blast-radius
+    /// sample. Off by default: the concise response carries the resolved symbol,
+    /// the candidates, the relation pages and every total.
+    pub detail: Option<bool>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SymbolDetailRequest {
@@ -520,6 +524,7 @@ impl RavelMcp {
             crate::daemon::DaemonOperation::Context {
                 query: request.query.clone(),
                 limit,
+                detail: request.detail.unwrap_or(false),
             },
         ) {
             Ok(value) => value.to_string(),
@@ -528,7 +533,29 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "PRIMARY: Index status (indexed?, files/edges/snapshot_id). Session start."
+        description = "PRIMARY. Who depends on this symbol — resolved reverse edges, so no matches \
+                       inside comments or strings and no same-named symbol from another file. \
+                       Prefer this over grepping a name when the question is \"what breaks if I \
+                       change this\": it answers in a fraction of the tokens a grep-then-read \
+                       sweep costs, and it reflects uncommitted edits. Takes a symbol id or \
+                       qualified name (`explore` returns ids). Page with page_size/cursor."
+    )]
+    async fn callers_of(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+        query_tool(self, request, true).await
+    }
+
+    #[tool(
+        description = "PRIMARY. What this symbol calls or imports — resolved forward edges. \
+                       Same cost and precision argument as callers_of, in the other direction."
+    )]
+    async fn calls_from(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+        query_tool(self, request, false).await
+    }
+
+    #[tool(
+        description = "PRIMARY: Index status — is this workspace indexed, how much of it is \
+                       covered, and are there source files the indexer does not support. Check \
+                       at session start before relying on the other tools."
     )]
     async fn status(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.call_daemon(
@@ -601,11 +628,6 @@ impl RavelMcp {
         }
     }
 
-    #[tool(description = "Who depends on this symbol (reverse edges)")]
-    async fn callers_of(&self, Parameters(request): Parameters<QueryRequest>) -> String {
-        query_tool(self, request, true).await
-    }
-
     #[tool(description = "Graph stats (files/edges/snapshot_id)")]
     async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
@@ -636,11 +658,6 @@ impl RavelMcp {
             },
             Err(error) => error_json(error.to_string()),
         }
-    }
-
-    #[tool(description = "Forward traversal: what a symbol calls/imports")]
-    async fn calls_from(&self, Parameters(request): Parameters<QueryRequest>) -> String {
-        query_tool(self, request, false).await
     }
 
     #[tool(description = "Get detailed information about a symbol")]
@@ -837,19 +854,39 @@ impl ServerHandler for RavelMcp {
     fn get_info(&self) -> ServerInfo {
         let mode = match self.mode {
             McpToolMode::Primary => {
-                "primary (3 tools: explore, status, sync; set RAVEL_MCP_TOOLS=all for full)"
+                "primary (explore, callers_of, calls_from, status, sync; \
+                 set RAVEL_MCP_TOOLS=all for search/impact/cycles/hubs/orphans/…)"
             }
             McpToolMode::All => "all tools",
         };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             format!(
-                "Ravel = token-efficient code graph (TS/JS). Mode: {mode}. \
-                 Prefer: explore | status | sync. \
-                 Explore accepts a symbol/qualified name or natural terms and returns bounded evidence. \
-                 Do NOT read whole files to find callers — use tools. \
-                 Editing: use agent editor; ravel maps blast radius. \
-                 Each requested root is watched unless sync.mode=none; use sync for explicit paths. \
-                 CLI: `ravel explore X` / `ravel impact X --risk`."
+                "Ravel answers relational questions about TypeScript/JavaScript code from a \
+                 resolved graph. Mode: {mode}.\n\
+                 \n\
+                 Pick by the question:\n\
+                 - \"who calls / uses / depends on X\" or \"what breaks if I change X\" → \
+                 callers_of. Resolved edges: no hits inside comments or strings, no same-named \
+                 symbol from an unrelated file. Costs a fraction of grepping a name and then \
+                 reading each file to check it.\n\
+                 - \"what does X call / import\" → calls_from.\n\
+                 - \"what is X, and what is around it\" → explore. One call: resolves the name, \
+                 disambiguates, and returns typed relation pages with totals. Ask detail=true \
+                 only when the long tail of similar names matters.\n\
+                 - \"where does this literal text appear\" → grep/ripgrep. That is not a graph \
+                 question and Ravel has no advantage there.\n\
+                 \n\
+                 Answers include uncommitted edits: each call auto-syncs Git-dirty files against \
+                 a content-hash sidecar first, so results match the working tree, not the last \
+                 commit. Pass edited paths to sync for immediate certainty after a write.\n\
+                 \n\
+                 Call status once at session start. It reports how much of the workspace is \
+                 actually indexed — a repo whose sources Ravel does not parse can be \"indexed\" \
+                 and still answer nothing, and status says so rather than looking healthy.\n\
+                 \n\
+                 Relation and impact results are pages with exact totals; follow next_cursor \
+                 rather than assuming a page is the whole answer.\n\
+                 CLI equivalents: `ravel callers-of X`, `ravel explore X`, `ravel impact X --risk`."
             ),
         )
     }

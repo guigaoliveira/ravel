@@ -46,6 +46,9 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Full payload: every similar spelling and the blast-radius sample
+        #[arg(long)]
+        detail: bool,
     },
     /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
     /// Prefer `ravel install` for multi-agent MCP wiring.
@@ -97,6 +100,24 @@ enum Command {
     /// Guess related test files for a source path
     RelatedTests {
         path: String,
+    },
+    /// Who depends on this symbol — resolved reverse edges, paged with exact totals
+    #[command(name = "callers-of")]
+    CallersOf {
+        node: String,
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
+    },
+    /// What this symbol calls or imports — resolved forward edges
+    #[command(name = "calls-from")]
+    CallsFrom {
+        node: String,
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
     },
     Query {
         node: String,
@@ -344,19 +365,24 @@ skip_sibling_emit = true
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.status()?, pretty)?;
         }
-        Some(Command::Context { query, limit }) => {
+        Some(Command::Context {
+            query,
+            limit,
+            detail,
+        }) => {
             if let Some(value) = daemon_call_if_running(
                 &root,
                 ravel_core::daemon::DaemonOperation::Context {
                     query: query.clone(),
                     limit,
+                    detail,
                 },
             )? {
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.context(&query, limit)?, pretty)?;
+            emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
         }
         Some(Command::Setup { claude, force }) => {
             write_agent_setup(&root, claude, force)?;
@@ -435,6 +461,26 @@ skip_sibling_emit = true
         Some(Command::RelatedTests { path }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.related_tests(&path)?, pretty)?;
+        }
+        Some(Command::CallersOf {
+            node,
+            page_size,
+            cursor,
+        }) => {
+            emit_json(
+                &relation_page(&root, &node, true, page_size, cursor)?,
+                pretty,
+            )?;
+        }
+        Some(Command::CallsFrom {
+            node,
+            page_size,
+            cursor,
+        }) => {
+            emit_json(
+                &relation_page(&root, &node, false, page_size, cursor)?,
+                pretty,
+            )?;
         }
         Some(Command::Query {
             node,
@@ -640,6 +686,26 @@ fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
+}
+
+/// One page of a symbol's resolved edges, in one direction.
+///
+/// Named commands for the two directions people actually ask about, so the common
+/// question does not require knowing that it is `query --reverse`.
+fn relation_page(
+    root: &std::path::Path,
+    node: &str,
+    reverse: bool,
+    page_size: usize,
+    cursor: usize,
+) -> anyhow::Result<ravel_core::graph::QueryPage> {
+    let engine = WorkspaceEngine::load(root, &Flags::default())?;
+    let limits = QueryLimits {
+        page_size,
+        cursor,
+        ..Default::default()
+    };
+    Ok(engine.query(node, reverse, &limits, None)?)
 }
 
 fn daemon_call_if_running(
