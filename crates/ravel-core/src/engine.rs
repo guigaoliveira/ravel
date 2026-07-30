@@ -1084,7 +1084,14 @@ impl WorkspaceEngine {
                 })
                 .cloned()
                 .collect(),
-            _ => self.discover_dirty_sources(),
+            _ => {
+                let discover_started = std::time::Instant::now();
+                let discovered = self.discover_dirty_sources();
+                crate::timing::stage("sync.discover", discover_started, || {
+                    format!("paths={}", discovered.len())
+                });
+                discovered
+            }
         };
 
         // Read/hash each path once. The prepared bytes are reused below if publication is needed.

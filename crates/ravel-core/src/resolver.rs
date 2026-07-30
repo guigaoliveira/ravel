@@ -344,18 +344,24 @@ impl ResolutionUniverse {
         if let Some(new) = new {
             self.files.insert(new.path.clone());
             for symbol in &new.symbols {
+                let definition = SymbolDefinition::from_symbol(new, symbol);
                 let definitions = self
                     .symbol_definitions
                     .entry(symbol.name.clone())
                     .or_default();
-                definitions.push(SymbolDefinition::from_symbol(new, symbol));
-                definitions.sort_by(|left, right| {
-                    (&left.path, left.span, &left.qualified_name).cmp(&(
-                        &right.path,
-                        right.span,
-                        &right.qualified_name,
-                    ))
+                // The vector is already sorted, so insert at its place instead of
+                // re-sorting it per symbol. A name shared across a large monorepo
+                // has thousands of definitions, and a file declaring S symbols
+                // re-sorted all of them S times.
+                let key = (
+                    &definition.path,
+                    definition.span,
+                    &definition.qualified_name,
+                );
+                let at = definitions.partition_point(|existing| {
+                    (&existing.path, existing.span, &existing.qualified_name) <= key
                 });
+                definitions.insert(at, definition);
             }
             self.module_exports
                 .insert(new.path.clone(), module_exports(new));

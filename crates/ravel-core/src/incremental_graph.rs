@@ -154,11 +154,20 @@ impl IncrementalGraphState {
             let path = edge.source_path.as_deref().unwrap_or(&edge.from);
             let owned = OwnedEdge::from(edge);
             state.add_edge(&owned);
-            state
-                .by_file
-                .entry(path.to_owned())
-                .or_default()
-                .insert(owned);
+            // Own the path only when the file is new to the map. `entry` would
+            // allocate a String per edge, and edges outnumber files ~36 to 1.
+            match state.by_file.get_mut(path) {
+                Some(edges) => {
+                    edges.insert(owned);
+                }
+                None => {
+                    state
+                        .by_file
+                        .entry(path.to_owned())
+                        .or_default()
+                        .insert(owned);
+                }
+            }
         }
         state
     }
