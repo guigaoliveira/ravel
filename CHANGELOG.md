@@ -36,16 +36,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--limit`); the raw list reaches megabytes on large monorepos.
 - `context` builds the index when no snapshot exists instead of failing and
   telling the agent to run `ravel index` by hand.
+- Warm query latency roughly halved. Measured over MCP against a live
+  server on a 20.4k-file / 744k-edge corpus, 3 alternating rounds against
+  the previous binary: mean warm `explore` 72.0ms -> 37.8ms. Three causes,
+  all in the read path:
+  - Packed archives were re-validated on every query. `rkyv::access` walks
+    the whole archive, and the term record is ~117MB on that corpus.
+    Validation now happens once per runtime; generation packs are immutable
+    once published, and a new generation drops the runtime.
+  - Term search owned every candidate before ranking. Query
+    "PixPaymentService" covers 190671 postings over 156022 distinct
+    definitions, and the old path allocated three Strings for each, sorted
+    all of them, and returned 160. Candidates are now ranked while still
+    borrowing from the index and only the selected ones are owned.
+    Explore output is byte-identical for 16 queries, including bare
+    "service" / "pix" / "payment".
+  - Auto-sync rebuilt the hash sidecar (20k+ owned paths) on every call to
+    check index freshness: 14-21ms per call, now cached per generation.
 - Term index construction is parallel (per-file documents, parallel stable
-  sort, per-chunk posting inversion merged in chunk order). On a 20.4k-file
-  / 744k-edge corpus, measured on tmpfs to isolate CPU from disk:
-  2308ms -> 1306ms. Snapshot id unchanged, so the built index is identical.
+  sort, per-chunk posting inversion merged in chunk order). On the corpus
+  above, measured on tmpfs to isolate CPU from disk: 2308ms -> 1306ms.
+  Snapshot id unchanged, so the built index is identical. Full index total,
+  3 alternating rounds vs 1.3.0: 11.41s -> 9.67s (-15%).
 - Reference resolution uses per-artifact lookups instead of scanning the
   artifact's symbols once per reference: O(refs x symbols) -> O(1) per
   reference. Performance-neutral on the corpus above (its files are small);
-  it bounds the cost for generated files with thousands of symbols.
-- `RAVEL_TIMING=1` breaks down `stage_snapshot` and `stage_graph`, which
-  together are ~40% of a full index and were previously opaque.
+  it bounds the cost for generated files with thousands of symbols. The
+  lookups only needed for `this.<field>.<member>` are built on first use,
+  since most files never contain such a reference.
+- `RAVEL_TIMING=1` breaks down `stage_snapshot` and `stage_graph` (together
+  ~40% of a full index), the context workers, and the auto-sync steps. All
+  were previously opaque, and `context.prefix` in particular measured a
+  whole parallel scope rather than search.
 
 ### Fixed
 - `diff-impact` mapped nothing: git returns absolute paths while graph nodes
