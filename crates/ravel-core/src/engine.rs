@@ -1347,14 +1347,27 @@ impl WorkspaceEngine {
         prepared: &[PreparedPath],
     ) -> Result<Option<IndexStats>, EngineError> {
         let storage = self.storage();
-        let mut changes = Vec::new();
-        for prepared in prepared.iter().filter(|prepared| !prepared.unchanged) {
-            let old = storage.open_artifact(&prepared.relative)?;
-            let new = prepared.bytes.as_ref().map(|bytes| {
-                let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
-                artifact.path = prepared.relative.clone();
-                artifact
-            });
+        // Loading the previous artifact and re-parsing the new bytes are both
+        // per-file work with no shared state; a burst of edits (or a pull) used
+        // to parse them one at a time on a single core.
+        let loaded: Vec<_> = {
+            use rayon::prelude::*;
+            prepared
+                .par_iter()
+                .filter(|prepared| !prepared.unchanged)
+                .map(|prepared| {
+                    let old = storage.open_artifact(&prepared.relative)?;
+                    let new = prepared.bytes.as_ref().map(|bytes| {
+                        let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
+                        artifact.path = prepared.relative.clone();
+                        artifact
+                    });
+                    Ok((prepared.relative.clone(), old, new))
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?
+        };
+        let mut changes = Vec::with_capacity(loaded.len());
+        for (relative, old, new) in loaded {
             if old.is_none() && new.is_none() {
                 continue;
             }
@@ -1365,7 +1378,7 @@ impl WorkspaceEngine {
             {
                 return Ok(None);
             }
-            changes.push((prepared.relative.clone(), old, new));
+            changes.push((relative, old, new));
         }
         if changes.is_empty() {
             return Ok(None);
@@ -1397,12 +1410,16 @@ impl WorkspaceEngine {
             })
             .collect::<Option<Vec<_>>>();
         if let Some(deltas) = artifact_deltas {
+            let publish_started = std::time::Instant::now();
             let stats = storage.publish_artifact_deltas_deferred_gc(&deltas)?;
+            crate::timing::stage("delta.publish_artifacts", publish_started, String::new);
             self.schedule_generation_maintenance();
+            let compact_started = std::time::Instant::now();
             storage.compact_artifacts_if_amplified(
                 self.config.storage.artifact_store_max_amplification,
                 self.config.storage.retention,
             )?;
+            crate::timing::stage("delta.compact_artifacts", compact_started, String::new);
             *self.inner.snapshot_cache.lock().unwrap() = None;
             *self.inner.symbol_meta_cache.lock().unwrap() = None;
             *self.inner.file_hashes_cache.lock().unwrap() = None;
@@ -1755,60 +1772,82 @@ impl WorkspaceEngine {
         let root_str = self.root.to_string_lossy().replace('\\', "/");
         let root_str = root_str.replace("/./", "/");
         let root_str = root_str.trim_end_matches('/').to_owned();
-        let mut candidates = Vec::with_capacity(paths.len());
-        for path in paths {
-            let path = if path.is_absolute() {
-                path.clone()
-            } else {
-                self.root.join(path)
-            };
-            let path_str = path.to_string_lossy().replace('\\', "/");
-            let Some(rel) = path_str.strip_prefix(&root_str).and_then(|relative| {
-                let relative = relative.trim_start_matches('/');
-                (!relative.starts_with("../") && relative != "..").then_some(relative.to_owned())
-            }) else {
-                return Err(EngineError::PathOutsideWorkspace {
-                    root: self.root.clone(),
-                    path,
-                });
-            };
-            let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
-            let bytes = path
-                .is_file()
-                .then(|| {
-                    std::fs::metadata(&path)
-                        .ok()
-                        .filter(|metadata| metadata.len() <= max_bytes)
-                        .and_then(|_| std::fs::read(&path).ok())
+        let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
+        // Reading a batch of edited files is independent per path. `collect` on an
+        // indexed parallel iterator keeps input order, so the prepared list stays
+        // deterministic.
+        let candidates: Vec<(PathBuf, String, Option<Vec<u8>>)> = {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|path| {
+                    let path = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        self.root.join(path)
+                    };
+                    let path_str = path.to_string_lossy().replace('\\', "/");
+                    let Some(rel) = path_str.strip_prefix(&root_str).and_then(|relative| {
+                        let relative = relative.trim_start_matches('/');
+                        (!relative.starts_with("../") && relative != "..")
+                            .then_some(relative.to_owned())
+                    }) else {
+                        return Err(EngineError::PathOutsideWorkspace {
+                            root: self.root.clone(),
+                            path,
+                        });
+                    };
+                    let bytes = path
+                        .is_file()
+                        .then(|| {
+                            std::fs::metadata(&path)
+                                .ok()
+                                .filter(|metadata| metadata.len() <= max_bytes)
+                                .and_then(|_| std::fs::read(&path).ok())
+                        })
+                        .flatten();
+                    Ok((path, rel, bytes))
                 })
-                .flatten();
-            candidates.push((path, rel, bytes));
-        }
+                .collect::<Result<Vec<_>, EngineError>>()?
+        };
         let storage = self.storage();
+        let generation_started = std::time::Instant::now();
         let has_generation = storage.current_generation()?.is_some();
+        crate::timing::stage(
+            "prepare.current_generation",
+            generation_started,
+            String::new,
+        );
         let requested: Vec<_> = candidates
             .iter()
             .map(|(_, relative, _)| relative.clone())
             .collect();
+        let hashes_started = std::time::Instant::now();
         let hashes = storage.source_hashes_for_paths(&requested)?;
-        let mut all_unchanged = has_generation;
-        let mut prepared = Vec::with_capacity(candidates.len());
-        for (path, rel, bytes) in candidates {
-            let unchanged = bytes.as_ref().is_some_and(|bytes| {
-                hashes
-                    .get(&rel)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|old| blake3::hash(bytes).to_hex().as_str() == old)
-            }) || (bytes.is_none()
-                && hashes.get(&rel).is_some_and(Option::is_none));
-            all_unchanged &= unchanged;
-            prepared.push(PreparedPath {
-                path,
-                relative: rel,
-                bytes,
-                unchanged,
-            });
-        }
+        crate::timing::stage("prepare.source_hashes", hashes_started, String::new);
+        // blake3 over each file's contents is the cost here, not the map lookup.
+        let prepared: Vec<PreparedPath> = {
+            use rayon::prelude::*;
+            candidates
+                .into_par_iter()
+                .map(|(path, rel, bytes)| {
+                    let unchanged = bytes.as_ref().is_some_and(|bytes| {
+                        hashes
+                            .get(&rel)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|old| blake3::hash(bytes).to_hex().as_str() == old)
+                    }) || (bytes.is_none()
+                        && hashes.get(&rel).is_some_and(Option::is_none));
+                    PreparedPath {
+                        path,
+                        relative: rel,
+                        bytes,
+                        unchanged,
+                    }
+                })
+                .collect()
+        };
+        let all_unchanged = has_generation && prepared.iter().all(|prepared| prepared.unchanged);
         Ok((all_unchanged, prepared))
     }
 
@@ -1834,16 +1873,27 @@ impl WorkspaceEngine {
         // Works without git — identity falls back to path + "nogit".
         let identity = self.worktree_identity_cached();
         let content_state = content_state_override.unwrap_or_else(|| {
-            let mut state = [0u8; 32];
-            for (path, artifact) in &files {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&(path.len() as u64).to_le_bytes());
-                hasher.update(path.as_bytes());
-                hasher.update(artifact.source_hash.as_bytes());
-                for (slot, byte) in state.iter_mut().zip(hasher.finalize().as_bytes()) {
-                    *slot ^= byte;
-                }
-            }
+            // Per-file digests combine by XOR, which is associative and
+            // commutative, so the fold parallelizes without changing the result.
+            use rayon::prelude::*;
+            let state = files
+                .par_iter()
+                .map(|(path, artifact)| {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&(path.len() as u64).to_le_bytes());
+                    hasher.update(path.as_bytes());
+                    hasher.update(artifact.source_hash.as_bytes());
+                    *hasher.finalize().as_bytes()
+                })
+                .reduce(
+                    || [0u8; 32],
+                    |mut left, right| {
+                        for (slot, byte) in left.iter_mut().zip(right) {
+                            *slot ^= byte;
+                        }
+                        left
+                    },
+                );
             blake3::Hash::from_bytes(state).to_hex().to_string()
         });
         let id = SnapshotId {
@@ -2120,6 +2170,8 @@ impl WorkspaceEngine {
         let mut candidate_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut seen_ids = BTreeSet::new();
         let mut candidate_total = 0usize;
+        let (mut probe_by_id, mut probe_entries_for, mut probe_entries, mut probe_token_checks) =
+            (0usize, 0usize, 0usize, 0usize);
         for entry in &exact_identity {
             *candidate_counts.entry(entry.name.clone()).or_default() += 1;
             candidate_total += 1;
@@ -2183,28 +2235,40 @@ impl WorkspaceEngine {
                     }
                     continue;
                 }
+                probe_by_id += 1;
                 if let Some(entry) = symbol_runtime.get_by_id(id) {
                     add_candidate!(&entry, hit);
                 }
                 continue;
             }
             let remaining = limit.saturating_sub(candidates.len());
+            probe_entries_for += 1;
             let (entries, total) = symbol_runtime.entries_for(&hit.value, remaining);
             if total > entries.len() {
                 let omitted = total - entries.len();
                 candidate_total += omitted;
                 *candidate_counts.entry(hit.value.clone()).or_default() += omitted;
             }
+            probe_entries += entries.len();
             for entry in entries {
-                if hit.reason.as_deref() != Some("term-coverage")
-                    || crate::search::symbol_meta_matches_query_tokens(&required_terms, &entry)
-                {
+                if hit.reason.as_deref() != Some("term-coverage") {
+                    add_candidate!(&entry, hit);
+                    continue;
+                }
+                probe_token_checks += 1;
+                if crate::search::symbol_meta_matches_query_tokens(&required_terms, &entry) {
                     add_candidate!(&entry, hit);
                 }
             }
         }
         let after_candidates = std::time::Instant::now();
-        crate::timing::stage("context.candidates", candidates_started, String::new);
+        crate::timing::stage("context.candidates", candidates_started, || {
+            format!(
+                "hits={} by_id={probe_by_id} entries_for={probe_entries_for} \
+                 entries={probe_entries} token_checks={probe_token_checks}",
+                hits.len()
+            )
+        });
 
         let primary = exact_identity
             .first()
