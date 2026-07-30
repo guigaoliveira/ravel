@@ -664,11 +664,7 @@ mod tests {
                 config_hash: "h".into(),
             },
             files: BTreeMap::new(),
-            edges: vec![
-                edge("a", "root"),
-                edge("b", "root"),
-                edge("c", "root"),
-            ],
+            edges: vec![edge("a", "root"), edge("b", "root"), edge("c", "root")],
         };
         let graph = GraphIndex::from_snapshot(&snap);
 

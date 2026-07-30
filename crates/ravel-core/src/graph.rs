@@ -1240,18 +1240,9 @@ mod tests {
         // package-level SCC sees a single package (no cycle), file-level must
         // report exactly the {a.ts, b.ts} component.
         let edges = vec![
-            edge(
-                "symbol://src/a.ts#value:A",
-                "symbol://src/b.ts#value:B",
-            ),
-            edge(
-                "symbol://src/b.ts#value:B",
-                "symbol://src/a.ts#value:A",
-            ),
-            edge(
-                "symbol://src/c.ts#value:C",
-                "symbol://src/a.ts#value:A",
-            ),
+            edge("symbol://src/a.ts#value:A", "symbol://src/b.ts#value:B"),
+            edge("symbol://src/b.ts#value:B", "symbol://src/a.ts#value:A"),
+            edge("symbol://src/c.ts#value:C", "symbol://src/a.ts#value:A"),
         ];
         let graph = GraphIndex::from_edges(&edges, "snapshot".into());
         assert_eq!(graph.package_cycles().len(), 0);

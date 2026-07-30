@@ -863,7 +863,10 @@ fn resolve_symbol_reference(
         // services, typed properties) and resolve the member on that type.
         let (field, rest) = member.split_once('.')?;
         let field_qualified = format!("{}.{}", owner.qualified_name, field);
-        let field_symbol = lookups.by_qualified.get(field_qualified.as_str()).copied()?;
+        let field_symbol = lookups
+            .by_qualified
+            .get(field_qualified.as_str())
+            .copied()?;
         let declared_type = *lookups
             .declared_type_by_symbol
             .get(field_symbol.id.as_str())?;
@@ -1388,9 +1391,9 @@ fn resolve_artifacts_impl(
             let lookups = ArtifactLookups::build(artifact);
             let mut out = Vec::new();
             for r in &artifact.symbol_refs {
-                let Some(target) =
-                    resolve_symbol_reference(root, artifact, &lookups, r, imports, universe, config)
-                else {
+                let Some(target) = resolve_symbol_reference(
+                    root, artifact, &lookups, r, imports, universe, config,
+                ) else {
                     continue;
                 };
                 let from = r.from_id.clone();

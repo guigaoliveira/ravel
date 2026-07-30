@@ -3417,7 +3417,10 @@ mod agent_context_tests {
 
         let ctx = engine.context("hub", 10).unwrap();
         let incoming_total = ctx["relations"]["incoming_total"].as_u64().unwrap();
-        assert!(incoming_total > 50, "need cap overflow, got {incoming_total}");
+        assert!(
+            incoming_total > 50,
+            "need cap overflow, got {incoming_total}"
+        );
         let warnings = ctx["warnings"].as_array().unwrap();
         let hint = warnings
             .iter()

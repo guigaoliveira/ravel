@@ -299,7 +299,8 @@ impl TermIndex {
             .flatten()
             .collect();
         // Stable sort, same comparator: ties keep insertion order as before.
-        term_documents.par_sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        term_documents
+            .par_sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
 
         // Invert in document-index order per chunk, then merge chunks in order. Each
         // token's postings therefore stay ascending by document_index, which
