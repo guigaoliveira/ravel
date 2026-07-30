@@ -1994,11 +1994,14 @@ impl WorkspaceEngine {
     /// One-shot agent context: search + callers + impact in a single call (fewer tool hops).
     /// Auto-syncs dirty git sources **once** (nested search/query skip a second pass).
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
+        /// Hard cap on the relation page: keeps one-shot output bounded for
+        /// agents. Totals beyond this must route to the paginated walk.
+        const CONTEXT_RELATION_LIMIT_MAX: usize = 50;
         let context_started = std::time::Instant::now();
         let synced = self.auto_sync_if_dirty()?;
         let after_sync = std::time::Instant::now();
         crate::timing::stage("context.sync", context_started, String::new);
-        let limit = limit.clamp(1, 50);
+        let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
         // Use raw paths — auto_sync already ran. Context combines deterministic spelling
         // lookup with definition-level term evidence: a one-word concept may occur in a path or
         // qualified name, while prose intent words must not turn the query into a hard AND.
@@ -2312,6 +2315,41 @@ impl WorkspaceEngine {
         let source = primary_meta.and_then(|symbol| symbol_source_excerpt(&self.root, symbol));
         let candidates_truncated = candidate_total > candidates.len();
         let no_result = candidate_total == 0;
+        let (incoming_by_kind, outgoing_by_kind) = graph_primary
+            .and_then(|node| {
+                graph.as_deref().map(|graph| {
+                    (
+                        graph.direct_relation_kind_counts(node, true),
+                        graph.direct_relation_kind_counts(node, false),
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let mut warnings = Vec::<String>::new();
+        if ambiguous {
+            warnings.push("ambiguous symbol name; select a candidate id or qualified name".into());
+        } else if no_result {
+            warnings.push("no definition matched search evidence".into());
+        }
+        // The explore page caps at CONTEXT_RELATION_LIMIT_MAX; never promise a
+        // re-query beyond what it can actually return.
+        let mut truncation_hint = |direction: &str, total: usize| {
+            if total <= CONTEXT_RELATION_LIMIT_MAX {
+                warnings.push(format!(
+                    "{direction} edges truncated: showing {limit} of {total}; re-query with limit={total} for the full list"
+                ));
+            } else {
+                warnings.push(format!(
+                    "{direction} edges truncated: showing {limit} of {total}; re-query with limit={CONTEXT_RELATION_LIMIT_MAX} for the top {CONTEXT_RELATION_LIMIT_MAX} sites, `ravel query <id> --reverse --page-size N [--cursor N]` for complete enumeration, or read *_by_kind for the complete shape"
+                ));
+            }
+        };
+        if incoming_total > limit {
+            truncation_hint("incoming", incoming_total);
+        }
+        if outgoing_total > limit {
+            truncation_hint("outgoing", outgoing_total);
+        }
         Ok(serde_json::json!({
             "q": query,
             "primary": primary,
@@ -2329,19 +2367,20 @@ impl WorkspaceEngine {
             "relations": {
                 "incoming": incoming_relations,
                 "outgoing": outgoing_relations,
+                // Full edge counts (all kinds); the lists above are bounded pages.
+                "incoming_total": incoming_total,
+                "outgoing_total": outgoing_total,
+                // Complete per-kind aggregates — never truncated, even for hubs.
+                "incoming_by_kind": incoming_by_kind,
+                "outgoing_by_kind": outgoing_by_kind,
             },
             "impact": impact_top,
             "n_callers": caller_count,
             "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
+            "n_affected_exact": impact.as_ref().map(|r| r.exact).unwrap_or(true),
             "auto_synced": synced.is_some(),
             "sync_warning": self.last_update_error(),
-            "warnings": if ambiguous {
-                vec!["ambiguous symbol name; select a candidate id or qualified name"]
-            } else if no_result {
-                vec!["no definition matched search evidence"]
-            } else {
-                Vec::<&str>::new()
-            },
+            "warnings": warnings,
             "truncation": {
                 "candidates": candidates_truncated,
                 "incoming": incoming_total > limit,
@@ -2671,6 +2710,12 @@ impl WorkspaceEngine {
         Ok(analysis::package_cycles(&graph, package))
     }
 
+    /// File-level cycles: actionable SCCs between files, not path buckets.
+    pub fn file_cycles(&self, path_filter: Option<&str>) -> Result<Vec<CycleInfo>, EngineError> {
+        let graph = self.graph()?;
+        Ok(analysis::file_cycles(&graph, path_filter))
+    }
+
     pub fn impact_risk(
         &self,
         node: &str,
@@ -2755,7 +2800,9 @@ impl WorkspaceEngine {
             return Ok(None);
         }
         if self.storage().open_stats().ok().flatten().is_none() {
-            return Ok(None);
+            // No snapshot yet: first use after install. Build it instead of
+            // sending the agent off to run `ravel index` by hand.
+            return self.index().map(Some);
         }
         if !self.is_git_repo_cached() || !self.config.sync_allows_git() {
             return Ok(None);
@@ -2836,7 +2883,9 @@ impl WorkspaceEngine {
         let mut reason = None;
         let snapshot_id = graph.snapshot_id().to_owned();
         for path in paths {
-            let path_str = path.to_string_lossy().replace('\\', "/");
+            // Git returns absolute paths; graph nodes are workspace-relative.
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            let path_str = relative.to_string_lossy().replace('\\', "/");
             if !graph.contains_node(&path_str) {
                 continue;
             }
@@ -2862,6 +2911,7 @@ impl WorkspaceEngine {
             root: format!("diff:{from_ref}"),
             snapshot_id,
             total_affected: affected.len(),
+            exact: !truncated,
             affected,
             truncated,
             reason,
@@ -3230,6 +3280,166 @@ mod generation_cache_lock_tests {
 #[cfg(test)]
 mod agent_context_tests {
     use super::*;
+
+    #[test]
+    fn context_reports_relation_totals_when_truncated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("hub.ts"),
+            "export function hub() { return 1; }\n",
+        )
+        .unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                root.path().join(format!("consumer{i}.ts")),
+                format!(
+                    "import {{ hub }} from './hub';\n\
+                     export function use{i}() {{ return hub(); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let ctx = engine.context("hub", 2).unwrap();
+        // Totals must be visible even when the edge page is truncated, so a
+        // truncated page can never be mistaken for the full caller set.
+        let incoming_total = ctx["relations"]["incoming_total"].as_u64().unwrap();
+        assert!(incoming_total > 2, "expected total > limit, got {ctx:#}");
+        assert_eq!(ctx["truncation"]["incoming"], true);
+        // Complete per-kind aggregate: cheap (≤ #edge-kinds entries), never truncated.
+        let by_kind = &ctx["relations"]["incoming_by_kind"];
+        assert_eq!(by_kind["Calls"].as_u64(), Some(5), "got {ctx:#}");
+        assert_eq!(by_kind["Import"].as_u64(), Some(5), "got {ctx:#}");
+        // Total fits in one page (≤ 50): the hint must give the exact working limit.
+        let warnings = ctx["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| {
+                w.as_str()
+                    .is_some_and(|w| w.contains(&format!("limit={incoming_total}")))
+            }),
+            "expected re-query hint with exact limit, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn context_auto_indexes_on_first_use() {
+        // Plug-and-play: an agent's first explore on a freshly-installed repo
+        // must build the index instead of erroring with "run `ravel index`".
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("thing.ts"),
+            "export function thing() { return 1; }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        // No engine.index() here on purpose.
+        let ctx = engine.context("thing", 10).unwrap();
+        assert_eq!(ctx["detail"]["name"], "thing", "got {ctx:#}");
+    }
+
+    #[test]
+    fn diff_impact_maps_changed_files_to_graph_nodes() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(
+            root.path().join("base.ts"),
+            "export function base() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("dependent.ts"),
+            "import { base } from './base';\nexport function dep() { return base(); }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        std::fs::write(
+            root.path().join("base.ts"),
+            "export function base() { return 2; }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "change base"]);
+
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let report = engine
+            .diff_impact("HEAD~1", None, &QueryLimits::default())
+            .unwrap();
+        assert!(
+            report
+                .affected
+                .iter()
+                .any(|item| item.symbol.contains("dependent.ts")),
+            "changed base.ts must impact dependent.ts, got {report:?}"
+        );
+    }
+
+    #[test]
+    fn context_truncation_hint_never_promises_more_than_the_page_cap() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("hub.ts"),
+            "export function hub() { return 1; }\n",
+        )
+        .unwrap();
+        // 60 consumers → 120 incoming edges: beyond the explore page cap (50),
+        // so a "re-query with a higher limit" hint would promise the impossible.
+        for i in 0..60 {
+            std::fs::write(
+                root.path().join(format!("consumer{i}.ts")),
+                format!(
+                    "import {{ hub }} from './hub';\n\
+                     export function use{i}() {{ return hub(); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let ctx = engine.context("hub", 10).unwrap();
+        let incoming_total = ctx["relations"]["incoming_total"].as_u64().unwrap();
+        assert!(incoming_total > 50, "need cap overflow, got {incoming_total}");
+        let warnings = ctx["warnings"].as_array().unwrap();
+        let hint = warnings
+            .iter()
+            .filter_map(|w| w.as_str())
+            .find(|w| w.contains("incoming"))
+            .expect("missing incoming truncation warning");
+        // All three real escalations, none over-promised: top-50 page via
+        // re-query, complete enumeration via the (actually) paginated walk,
+        // complete shape via the by-kind aggregate.
+        assert!(
+            hint.contains("limit=50"),
+            "hint must offer the top-50 re-query, got: {hint}"
+        );
+        assert!(
+            hint.contains("--reverse") && hint.contains("--page-size"),
+            "hint must point to the paginated enumeration tool, got: {hint}"
+        );
+        assert!(
+            hint.contains("by_kind"),
+            "hint must mention the complete aggregate, got: {hint}"
+        );
+    }
 
     #[test]
     fn context_explains_ranked_definition_and_direct_relation_sites() {

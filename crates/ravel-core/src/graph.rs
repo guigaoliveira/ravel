@@ -25,6 +25,10 @@ pub struct QueryLimits {
     pub bytes: u64,
     pub timeout_ms: u64,
     pub page_size: usize,
+    /// Offset into the deterministic (sorted) item list where this page
+    /// starts. Feed a page's `next_cursor` back here to resume enumeration.
+    #[serde(default)]
+    pub cursor: usize,
 }
 impl Default for QueryLimits {
     fn default() -> Self {
@@ -35,6 +39,7 @@ impl Default for QueryLimits {
             bytes: 32 * 1024 * 1024,
             timeout_ms: 5_000,
             page_size: 100,
+            cursor: 0,
         }
     }
 }
@@ -514,6 +519,52 @@ impl GraphIndex {
         (items, total)
     }
 
+    /// Complete per-kind edge counts for one node. Bounded by the number of
+    /// edge kinds, so it stays cheap even for hubs where the relation page
+    /// itself must truncate.
+    pub fn direct_relation_kind_counts(
+        &self,
+        node: &str,
+        reverse: bool,
+    ) -> BTreeMap<&'static str, usize> {
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let Some(&node_id) = self.node_index.get(node) else {
+            return counts;
+        };
+        let relation_ids = if reverse {
+            self.reverse_relation_ids.get(node_id as usize)
+        } else {
+            self.forward_relation_ids.get(node_id as usize)
+        };
+        let overlaid = self.relation_overlay_nodes.contains(node);
+        for relation in relation_ids
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| self.relations.get(*relation_id as usize))
+        {
+            if overlaid
+                && relation
+                    .source_path
+                    .and_then(|id| self.nodes.get(id as usize))
+                    .is_some_and(|path| self.relation_file_overlays.contains_key(path.as_ref()))
+            {
+                continue;
+            }
+            *counts.entry(relation.kind.as_str()).or_default() += 1;
+        }
+        if overlaid {
+            let overlay_relations = if reverse {
+                self.overlay_reverse_relations.get(node)
+            } else {
+                self.overlay_forward_relations.get(node)
+            };
+            for edge in overlay_relations.into_iter().flatten() {
+                *counts.entry(edge.kind.as_str()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     fn relation_view(&self, relation: &CompactRelation, reverse: bool) -> RelationView {
         let related = if reverse { relation.from } else { relation.to };
         RelationView {
@@ -690,6 +741,61 @@ impl GraphIndex {
                 component
                     .into_iter()
                     .map(|index| graph[index].clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// SCCs of the file-collapsed graph. Finer than `package_cycles`: a
+    /// monorepo whose top-level buckets all reach each other collapses into
+    /// one giant package SCC, while the actionable cycles live between files.
+    pub fn file_cycles(&self) -> Vec<Vec<String>> {
+        let node_file: Vec<String> = self.nodes.iter().map(|n| file_name(n)).collect();
+        let mut file_graph: DiGraph<String, ()> = DiGraph::new();
+        let mut file_nodes: FxHashMap<&str, NodeIndex> = FxHashMap::default();
+        let mut seen_edges: rustc_hash::FxHashSet<(NodeIndex, NodeIndex)> =
+            rustc_hash::FxHashSet::default();
+
+        for (from_idx, neighbors) in self.forward.iter().enumerate() {
+            if self.inactive_nodes.contains(&(from_idx as u32)) {
+                continue;
+            }
+            let from_index = match file_nodes.get(node_file[from_idx].as_str()) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = file_graph.add_node(node_file[from_idx].clone());
+                    file_nodes.insert(node_file[from_idx].as_str(), idx);
+                    idx
+                }
+            };
+            for &to_idx in neighbors {
+                if self.inactive_nodes.contains(&to_idx) {
+                    continue;
+                }
+                let to_file = node_file[to_idx as usize].as_str();
+                if to_file == node_file[from_idx] {
+                    continue; // intra-file edges are not cycles between files
+                }
+                let to_index = match file_nodes.get(to_file) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = file_graph.add_node(node_file[to_idx as usize].clone());
+                        file_nodes.insert(node_file[to_idx as usize].as_str(), idx);
+                        idx
+                    }
+                };
+                if seen_edges.insert((from_index, to_index)) {
+                    file_graph.add_edge(from_index, to_index, ());
+                }
+            }
+        }
+        kosaraju_scc(&file_graph)
+            .into_iter()
+            .filter(|component| component.len() > 1)
+            .map(|component| {
+                component
+                    .into_iter()
+                    .map(|index| file_graph[index].clone())
                     .collect()
             })
             .collect()
@@ -981,12 +1087,12 @@ impl GraphIndex {
             }
         }
         item_ids.sort_by(|&a, &b| self.nodes[a as usize].cmp(&self.nodes[b as usize]));
-        let cursor = limits.page_size.min(item_ids.len());
-        let next_cursor = (cursor < item_ids.len()).then(|| cursor.to_string());
-        let page: Vec<String> = item_ids
-            .into_iter()
-            .take(cursor)
-            .map(|id| self.nodes[id as usize].to_string())
+        let start = limits.cursor.min(item_ids.len());
+        let end = start.saturating_add(limits.page_size).min(item_ids.len());
+        let next_cursor = (end < item_ids.len()).then(|| end.to_string());
+        let page: Vec<String> = item_ids[start..end]
+            .iter()
+            .map(|&id| self.nodes[id as usize].to_string())
             .collect();
         Ok((
             QueryPage {
@@ -1014,6 +1120,15 @@ fn relation_display_priority(kind: &EdgeKind) -> u8 {
         EdgeKind::Import => 6,
         EdgeKind::ReExport => 7,
     }
+}
+
+/// File path a graph node lives in: the path component of a `symbol://` id,
+/// or the node name itself for module/path nodes.
+fn file_name(node: &str) -> String {
+    node.strip_prefix("symbol://")
+        .and_then(|value| value.split_once('#').map(|(path, _)| path))
+        .unwrap_or(node)
+        .to_owned()
 }
 
 fn package_name(path: &str) -> String {
@@ -1094,6 +1209,57 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.visited_nodes, 1);
         assert_eq!(graph.package_cycles().len(), 1);
+    }
+
+    #[test]
+    fn walk_pages_resume_from_cursor_until_exhausted() {
+        // a ← b, a ← c, a ← d: three callers, page_size 1 → three pages
+        // chained by cursor, next_cursor None at the end.
+        let edges = vec![edge("b", "a"), edge("c", "a"), edge("d", "a")];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        let mut limits = QueryLimits {
+            page_size: 1,
+            ..Default::default()
+        };
+        let mut collected = Vec::new();
+        loop {
+            let page = graph.callers_of("a", &limits, None).unwrap();
+            collected.extend(page.items);
+            match page.next_cursor {
+                Some(cursor) => limits.cursor = cursor.parse().unwrap(),
+                None => break,
+            }
+        }
+        collected.sort();
+        assert_eq!(collected, vec!["b".to_owned(), "c".into(), "d".into()]);
+    }
+
+    #[test]
+    fn file_cycles_find_file_level_sccs_that_package_buckets_hide() {
+        // a.ts ↔ b.ts cycle plus an acyclic c.ts, all inside one path bucket:
+        // package-level SCC sees a single package (no cycle), file-level must
+        // report exactly the {a.ts, b.ts} component.
+        let edges = vec![
+            edge(
+                "symbol://src/a.ts#value:A",
+                "symbol://src/b.ts#value:B",
+            ),
+            edge(
+                "symbol://src/b.ts#value:B",
+                "symbol://src/a.ts#value:A",
+            ),
+            edge(
+                "symbol://src/c.ts#value:C",
+                "symbol://src/a.ts#value:A",
+            ),
+        ];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        assert_eq!(graph.package_cycles().len(), 0);
+        let cycles = graph.file_cycles();
+        assert_eq!(cycles.len(), 1);
+        let mut members = cycles[0].clone();
+        members.sort();
+        assert_eq!(members, vec!["src/a.ts".to_owned(), "src/b.ts".to_owned()]);
     }
 
     #[test]

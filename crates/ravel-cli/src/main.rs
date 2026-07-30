@@ -106,6 +106,12 @@ enum Command {
         depth: usize,
         #[arg(long, default_value_t = 10_000)]
         nodes: usize,
+        /// Items per page (raise for full enumeration in one call)
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        /// Resume offset: pass the previous page's next_cursor
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
     },
     Search {
         query: String,
@@ -125,6 +131,9 @@ enum Command {
     Cycles {
         #[arg(long)]
         package: Option<String>,
+        /// File-level SCCs instead of package buckets (finer, actionable)
+        #[arg(long)]
+        files: bool,
     },
     Hubs {
         #[arg(long, default_value_t = 20)]
@@ -166,7 +175,11 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         min_cooccurrence: u32,
     },
-    Validate,
+    Validate {
+        /// Max findings listed (complete per-code counts always included)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Architecture boundary violations (ravel.boundaries.toml)
     Boundaries,
     /// Schema summary: counts by node/edge kind
@@ -428,11 +441,15 @@ skip_sibling_emit = true
             reverse,
             depth,
             nodes,
+            page_size,
+            cursor,
         }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let limits = QueryLimits {
                 depth,
                 nodes,
+                page_size,
+                cursor,
                 ..Default::default()
             };
             emit_json(&engine.query(&node, reverse, &limits, None)?, pretty)?;
@@ -453,9 +470,13 @@ skip_sibling_emit = true
                 emit_json(&engine.query(&node, false, &limits, None)?, pretty)?;
             }
         }
-        Some(Command::Cycles { package }) => {
+        Some(Command::Cycles { package, files }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.cycles(package.as_deref())?, pretty)?;
+            if files {
+                emit_json(&engine.file_cycles(package.as_deref())?, pretty)?;
+            } else {
+                emit_json(&engine.cycles(package.as_deref())?, pretty)?;
+            }
         }
         Some(Command::Hubs { limit, kind }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -509,12 +530,14 @@ skip_sibling_emit = true
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.cochanged(&file, commits, min_cooccurrence)?, pretty)?;
         }
-        Some(Command::Validate) => {
+        Some(Command::Validate { limit }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let findings = engine.validate()?;
-            emit_json(&findings, pretty)?;
-            if !findings.is_empty() {
-                anyhow::bail!("index validation failed with {} finding(s)", findings.len());
+            let report = ravel_core::analysis::policy_report(findings, limit);
+            let total = report.total;
+            emit_json(&report, pretty)?;
+            if total > 0 {
+                anyhow::bail!("index validation failed with {total} finding(s)");
             }
         }
         Some(Command::Boundaries) => {

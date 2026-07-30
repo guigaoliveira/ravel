@@ -31,7 +31,12 @@ pub struct ImpactReport {
     pub root: String,
     pub snapshot_id: String,
     pub affected: Vec<ImpactItem>,
+    /// Nodes reached by the traversal. When `exact` is false this is a lower
+    /// bound (the walk hit a budget), not a real total.
     pub total_affected: usize,
+    /// True when the traversal completed within budgets, so `total_affected`
+    /// is the actual count rather than a saturated lower bound.
+    pub exact: bool,
     pub truncated: bool,
     pub reason: Option<String>,
 }
@@ -91,6 +96,53 @@ pub fn package_cycles(graph: &GraphIndex, package_filter: Option<&str>) -> Vec<C
     cycles
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyReport {
+    /// Real number of findings; `findings` below is a bounded page of them.
+    pub total: usize,
+    /// Complete per-code counts — never truncated.
+    pub by_code: BTreeMap<String, usize>,
+    pub findings: Vec<crate::policy::PolicyFinding>,
+    pub truncated: bool,
+}
+
+/// Bounded findings page + complete aggregate: keeps `validate` output usable
+/// by agents on repos where the raw list runs to megabytes.
+pub fn policy_report(findings: Vec<crate::policy::PolicyFinding>, limit: usize) -> PolicyReport {
+    let total = findings.len();
+    let mut by_code: BTreeMap<String, usize> = BTreeMap::new();
+    for finding in &findings {
+        *by_code.entry(finding.code.clone()).or_default() += 1;
+    }
+    let mut findings = findings;
+    findings.truncate(limit);
+    PolicyReport {
+        total,
+        by_code,
+        truncated: total > findings.len(),
+        findings,
+    }
+}
+
+/// File-level SCCs, largest first, optional filter by path substring. Finer
+/// than `package_cycles`, which collapses a monorepo into path buckets.
+pub fn file_cycles(graph: &GraphIndex, path_filter: Option<&str>) -> Vec<CycleInfo> {
+    let mut cycles: Vec<CycleInfo> = graph
+        .file_cycles()
+        .into_iter()
+        .map(|mut members| {
+            members.sort();
+            CycleInfo {
+                size: members.len(),
+                members,
+            }
+        })
+        .filter(|c| path_filter.is_none_or(|pf| c.members.iter().any(|m| m.contains(pf))))
+        .collect();
+    cycles.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
+    cycles
+}
+
 /// Impact with risk scoring from reverse BFS depths + reverse adjacency degree.
 pub fn impact_with_risk(
     graph: &GraphIndex,
@@ -125,6 +177,7 @@ pub fn impact_with_risk(
         // `items` is only the first bounded page; visited nodes describe the complete traversal
         // admitted by the configured budgets.
         total_affected: page.visited_nodes.saturating_sub(1),
+        exact: !page.truncated,
         affected,
         truncated: page.truncated,
         reason: page.reason,
@@ -488,6 +541,15 @@ pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
             out.push(format!("{stem}{pat}"));
             out.push(format!("{dir}/__tests__/{base_stem}{pat}"));
             out.push(format!("{dir}/{base_stem}{pat}"));
+            // src→test mirrors (NestJS/Jest monorepo layout): apps/X/src/**/f.ts
+            // → apps/X/test/**/f.spec.ts (and tests/).
+            if let Some((prefix, suffix)) = stem.split_once("/src/") {
+                out.push(format!("{prefix}/test/{suffix}{pat}"));
+                out.push(format!("{prefix}/tests/{suffix}{pat}"));
+            } else if let Some(suffix) = stem.strip_prefix("src/") {
+                out.push(format!("test/{suffix}{pat}"));
+                out.push(format!("tests/{suffix}{pat}"));
+            }
         }
     };
     if patterns.is_empty() {
@@ -590,6 +652,47 @@ mod tests {
     }
 
     #[test]
+    fn impact_reports_saturated_count_as_inexact_lower_bound() {
+        let snap = IndexSnapshot {
+            id: SnapshotId {
+                root: "r".into(),
+                worktree: "w".into(),
+                revision: "v".into(),
+                content_state: "c".into(),
+                schema_version: 1,
+                grammar_version: "g".into(),
+                config_hash: "h".into(),
+            },
+            files: BTreeMap::new(),
+            edges: vec![
+                edge("a", "root"),
+                edge("b", "root"),
+                edge("c", "root"),
+            ],
+        };
+        let graph = GraphIndex::from_snapshot(&snap);
+
+        // Node budget smaller than the caller set: the count is a lower bound, not a total.
+        let saturated = impact_with_risk(
+            &graph,
+            "root",
+            &QueryLimits {
+                nodes: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(saturated.truncated);
+        assert!(!saturated.exact);
+
+        // Full traversal within budget: the count is exact.
+        let complete = impact_with_risk(&graph, "root", &QueryLimits::default()).unwrap();
+        assert!(!complete.truncated);
+        assert!(complete.exact);
+        assert_eq!(complete.total_affected, 3);
+    }
+
+    #[test]
     fn impact_total_is_not_reduced_to_first_page_size() {
         let snap = IndexSnapshot {
             id: SnapshotId {
@@ -616,6 +719,48 @@ mod tests {
         .unwrap();
         assert_eq!(report.affected.len(), 1);
         assert_eq!(report.total_affected, 2);
+    }
+
+    #[test]
+    fn policy_report_bounds_findings_but_keeps_complete_counts() {
+        let finding = |code: &str, n: usize| crate::policy::PolicyFinding {
+            code: code.into(),
+            from: format!("from{n}.ts"),
+            to: format!("to{n}.ts"),
+            message: "m".into(),
+        };
+        let findings = vec![
+            finding("cross_package", 0),
+            finding("cross_package", 1),
+            finding("cross_package", 2),
+            finding("orphan_export", 3),
+            finding("orphan_export", 4),
+        ];
+        let report = policy_report(findings, 2);
+        assert_eq!(report.total, 5);
+        assert_eq!(report.findings.len(), 2);
+        assert!(report.truncated);
+        assert_eq!(report.by_code.get("cross_package"), Some(&3));
+        assert_eq!(report.by_code.get("orphan_export"), Some(&2));
+
+        let complete = policy_report(Vec::new(), 2);
+        assert_eq!(complete.total, 0);
+        assert!(!complete.truncated);
+    }
+
+    #[test]
+    fn related_tests_candidates_include_src_to_test_mirror() {
+        // NestJS/Jest monorepo convention: apps/X/src/**/f.ts → apps/X/test/**/f.spec.ts
+        let candidates = related_tests(
+            "apps/permissions/src/application/usecases/get_all.usecase.ts",
+            &[],
+        );
+        assert!(
+            candidates.contains(
+                &"apps/permissions/test/application/usecases/get_all.usecase.spec.ts".to_owned()
+            ),
+            "missing src→test mirror candidate, got {candidates:#?}"
+        );
     }
 
     #[test]
