@@ -17,13 +17,19 @@ use thiserror::Error;
 const HEADER_MAGIC: &[u8; 8] = b"RAVELPK\0";
 const DIRECTORY_MAGIC: &[u8; 8] = b"RAVLDIR\0";
 const FOOTER_MAGIC: &[u8; 8] = b"RAVLFTR\0";
-const VERSION: u32 = 1;
+/// 2: directory entries carry an uncompressed length, so a record can be stored
+/// zstd-compressed while readers still know how much it expands to. Records whose
+/// consumer borrows them zero-copy out of the mmap stay stored raw.
+const VERSION: u32 = 2;
 const ALIGNMENT: u32 = 16;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 56;
 const MAX_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RECORDS: u32 = 10_000_000;
 const MAX_KEY_BYTES: usize = 16 * 1024;
+/// zstd level 3. Measured on real payloads: 8.2x at 590 MB/s on one core, and the
+/// higher levels buy single-digit percent for several times the index-time cost.
+const COMPRESSION_LEVEL: i32 = 3;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -45,8 +51,18 @@ pub enum PackError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     offset: u64,
+    /// Bytes occupied in the pack — the compressed size when `plain_len` differs.
     len: u64,
+    /// Size after decompression, equal to `len` for a record stored raw.
+    plain_len: u64,
+    /// blake3 of the bytes as stored, so verifying never has to decompress.
     checksum: [u8; 32],
+}
+
+impl Entry {
+    fn compressed(&self) -> bool {
+        self.plain_len != self.len
+    }
 }
 
 /// Writes records immediately instead of retaining every serialized component until publish.
@@ -104,6 +120,64 @@ impl StreamingGenerationPackWriter {
         key: impl Into<String>,
         bytes: impl AsRef<[u8]>,
     ) -> Result<(), PackError> {
+        self.add_record(key, bytes.as_ref(), false)
+    }
+
+    /// Store a record zstd-compressed.
+    ///
+    /// For payloads whose reader deserializes them anyway — every bincode record —
+    /// this is close to free on read and cuts the pack severalfold: they are long
+    /// runs of repeated path and symbol strings. Records borrowed zero-copy out of
+    /// the mmap must not use this; `with_record_for_validation` refuses them rather
+    /// than hand over bytes the consumer would misread as its own format.
+    pub(crate) fn add_compressed(
+        &mut self,
+        key: impl Into<String>,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<(), PackError> {
+        self.add_record(key, bytes.as_ref(), true)
+    }
+
+    /// Store bytes the caller already compressed.
+    ///
+    /// Compression is CPU-bound and this write loop is sequential, so stages that
+    /// already fan out their serialization compress there and hand the result over.
+    pub(crate) fn add_precompressed(
+        &mut self,
+        key: impl Into<String>,
+        compressed: &[u8],
+        plain_len: u64,
+    ) -> Result<(), PackError> {
+        self.add_encoded(key, compressed, plain_len)
+    }
+
+    fn add_record(
+        &mut self,
+        key: impl Into<String>,
+        plain: &[u8],
+        compress: bool,
+    ) -> Result<(), PackError> {
+        let encoded = if compress {
+            Some(compress_record(plain, &self.tmp)?)
+        } else {
+            None
+        };
+        // A payload that does not shrink is stored raw: `plain_len == len` is exactly
+        // how a reader tells the two apart.
+        match encoded.as_deref() {
+            Some(encoded) if encoded.len() < plain.len() => {
+                self.add_encoded(key, encoded, plain.len() as u64)
+            }
+            _ => self.add_encoded(key, plain, plain.len() as u64),
+        }
+    }
+
+    fn add_encoded(
+        &mut self,
+        key: impl Into<String>,
+        bytes: &[u8],
+        plain_len: u64,
+    ) -> Result<(), PackError> {
         let key = key.into();
         if key.is_empty() || key.len() > MAX_KEY_BYTES {
             return Err(PackError::Invalid {
@@ -124,7 +198,12 @@ impl StreamingGenerationPackWriter {
                 })?;
             self.position += padding;
         }
-        let bytes = bytes.as_ref();
+        if plain_len < bytes.len() as u64 {
+            return Err(PackError::Invalid {
+                path: self.path.clone(),
+                message: "record expands to fewer bytes than it occupies".into(),
+            });
+        }
         let len = bytes.len() as u64;
         self.writer
             .write_all(bytes)
@@ -137,6 +216,7 @@ impl StreamingGenerationPackWriter {
             Entry {
                 offset: self.position,
                 len,
+                plain_len,
                 checksum: *blake3::hash(bytes).as_bytes(),
             },
         );
@@ -262,14 +342,17 @@ impl GenerationPackReader {
         self.entries.keys().map(String::as_str)
     }
 
-    pub fn read(&mut self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, PackError> {
+    /// Takes `&self`: reading only borrows the mmap and the decoded directory, so a
+    /// reader can be shared and opened once instead of per record.
+    pub fn read(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, PackError> {
         let Some(entry) = self.entries.get(key) else {
             return Ok(None);
         };
-        if entry.len > max_bytes || entry.len > usize::MAX as u64 {
+        // Bound the expanded size: that is what the caller ends up holding.
+        if entry.plain_len > max_bytes || entry.plain_len > usize::MAX as u64 {
             return Err(PackError::RecordTooLarge {
                 key: key.into(),
-                actual: entry.len,
+                actual: entry.plain_len,
                 limit: max_bytes,
             });
         }
@@ -291,7 +374,11 @@ impl GenerationPackReader {
         if checksum.as_bytes() != &entry.checksum {
             return invalid(&self.path, "record checksum mismatch");
         }
-        Ok(Some(bytes.to_vec()))
+        if !entry.compressed() {
+            return Ok(Some(bytes.to_vec()));
+        }
+        let plain = decompress_record(bytes, entry.plain_len, &self.path)?;
+        Ok(Some(plain))
     }
 
     pub fn with_record<T>(
@@ -303,10 +390,10 @@ impl GenerationPackReader {
         let Some(entry) = self.entries.get(key) else {
             return Ok(None);
         };
-        if entry.len > max_bytes || entry.len > usize::MAX as u64 {
+        if entry.plain_len > max_bytes || entry.plain_len > usize::MAX as u64 {
             return Err(PackError::RecordTooLarge {
                 key: key.into(),
-                actual: entry.len,
+                actual: entry.plain_len,
                 limit: max_bytes,
             });
         }
@@ -324,7 +411,11 @@ impl GenerationPackReader {
         if blake3::hash(bytes).as_bytes() != &entry.checksum {
             return invalid(&self.path, "record checksum mismatch");
         }
-        Ok(Some(read(bytes)))
+        if !entry.compressed() {
+            return Ok(Some(read(bytes)));
+        }
+        let plain = decompress_record(bytes, entry.plain_len, &self.path)?;
+        Ok(Some(read(&plain)))
     }
 
     /// Borrow a bounded record without recomputing its blake3 checksum. The consumer must fully
@@ -339,6 +430,15 @@ impl GenerationPackReader {
         let Some(entry) = self.entries.get(key) else {
             return Ok(None);
         };
+        // Refuse instead of handing back compressed bytes: this path exists so the
+        // consumer can borrow the record straight out of the mmap, and it would read
+        // the compressed form as its own format.
+        if entry.compressed() {
+            return invalid(
+                &self.path,
+                "record is stored compressed and cannot be borrowed for zero-copy access",
+            );
+        }
         if entry.len > max_bytes || entry.len > usize::MAX as u64 {
             return Err(PackError::RecordTooLarge {
                 key: key.into(),
@@ -374,6 +474,7 @@ fn encode_directory(entries: &BTreeMap<String, Entry>, path: &Path) -> Result<Ve
         bytes.extend_from_slice(key.as_bytes());
         bytes.extend_from_slice(&entry.offset.to_le_bytes());
         bytes.extend_from_slice(&entry.len.to_le_bytes());
+        bytes.extend_from_slice(&entry.plain_len.to_le_bytes());
         bytes.extend_from_slice(&entry.checksum);
         if bytes.len() as u64 > MAX_DIRECTORY_BYTES {
             return invalid(path, "directory exceeds size limit");
@@ -400,8 +501,9 @@ fn decode_directory(
         let key_len = take_u32(bytes, &mut cursor, path)? as usize;
         if key_len == 0
             || key_len > MAX_KEY_BYTES
+            // key + offset(8) + len(8) + plain_len(8) + checksum(32)
             || cursor
-                .checked_add(key_len + 48)
+                .checked_add(key_len + 56)
                 .is_none_or(|end| end > bytes.len())
         {
             return invalid(path, "directory entry bounds are invalid");
@@ -415,6 +517,7 @@ fn decode_directory(
         cursor += key_len;
         let offset = take_u64(bytes, &mut cursor, path)?;
         let len = take_u64(bytes, &mut cursor, path)?;
+        let plain_len = take_u64(bytes, &mut cursor, path)?;
         let checksum: [u8; 32] = bytes[cursor..cursor + 32].try_into().unwrap();
         cursor += 32;
         if offset % u64::from(ALIGNMENT) != 0
@@ -429,6 +532,7 @@ fn decode_directory(
                 Entry {
                     offset,
                     len,
+                    plain_len,
                     checksum,
                 },
             )
@@ -441,6 +545,30 @@ fn decode_directory(
         return invalid(path, "trailing directory bytes");
     }
     Ok(entries)
+}
+
+/// Expand a compressed record, rejecting a length that disagrees with the directory.
+fn decompress_record(bytes: &[u8], plain_len: u64, path: &Path) -> Result<Vec<u8>, PackError> {
+    let plain =
+        zstd::bulk::decompress(bytes, plain_len as usize).map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if plain.len() as u64 != plain_len {
+        return Err(PackError::Invalid {
+            path: path.to_path_buf(),
+            message: "record expanded to an unexpected length".into(),
+        });
+    }
+    Ok(plain)
+}
+
+/// zstd a record, reporting the pack path on failure.
+pub(crate) fn compress_record(plain: &[u8], path: &Path) -> Result<Vec<u8>, PackError> {
+    zstd::bulk::compress(plain, COMPRESSION_LEVEL).map_err(|source| PackError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn padding_for(position: u64, alignment: u64) -> u64 {
@@ -488,7 +616,7 @@ mod tests {
         writer.add("a", b"abc").unwrap();
         writer.add("large", vec![7; 100]).unwrap();
         writer.publish().unwrap();
-        let mut reader = GenerationPackReader::open(&path).unwrap();
+        let reader = GenerationPackReader::open(&path).unwrap();
         assert_eq!(reader.keys().collect::<Vec<_>>(), vec!["a", "large"]);
         assert_eq!(reader.read("a", 3).unwrap().unwrap(), b"abc");
         assert!(matches!(
@@ -496,6 +624,106 @@ mod tests {
             Err(PackError::RecordTooLarge { .. })
         ));
         assert!(reader.entries.values().all(|entry| entry.offset % 8 == 0));
+    }
+
+    /// A compressed record must read back byte-identical, and its bound must apply to
+    /// the expanded size — a caller asking for at most N bytes gets at most N bytes,
+    /// not N compressed bytes that expand past its limit.
+    #[test]
+    fn compressed_records_roundtrip_and_bound_the_expanded_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        // Long runs of a repeated string: the shape every bincode payload here has.
+        let compressible = "apps/banking/src/application/services/wallet.service.ts"
+            .repeat(400)
+            .into_bytes();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add_compressed("squashed", &compressible).unwrap();
+        writer.add("plain", b"kept raw").unwrap();
+        writer.publish().unwrap();
+
+        let reader = GenerationPackReader::open(&path).unwrap();
+        assert_eq!(
+            reader
+                .read("squashed", compressible.len() as u64)
+                .unwrap()
+                .unwrap(),
+            compressible,
+            "compressed record must expand to exactly what was written"
+        );
+        assert_eq!(reader.read("plain", 64).unwrap().unwrap(), b"kept raw");
+
+        let stored = reader.entries["squashed"].len;
+        assert!(
+            stored < compressible.len() as u64,
+            "payload should have shrunk: {stored} vs {}",
+            compressible.len()
+        );
+        assert!(reader.entries["squashed"].compressed());
+        assert!(!reader.entries["plain"].compressed());
+
+        // The limit is checked against the expanded length.
+        assert!(matches!(
+            reader.read("squashed", compressible.len() as u64 - 1),
+            Err(PackError::RecordTooLarge { .. })
+        ));
+        // And `with_record` sees the expanded bytes too.
+        let seen = reader
+            .with_record("squashed", compressible.len() as u64, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen, compressible);
+    }
+
+    /// Asking to compress something that does not shrink must store it raw, so a
+    /// reader never pays a decompression pass for nothing — and `plain_len == len`
+    /// stays the only signal distinguishing the two.
+    #[test]
+    fn incompressible_payload_is_stored_raw() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        // Shorter than a zstd frame header, so the "compressed" form cannot be
+        // smaller whatever the entropy — deterministic, unlike relying on data that
+        // merely looks random.
+        let tiny = b"xy";
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add_compressed("tiny", tiny).unwrap();
+        writer.publish().unwrap();
+        let reader = GenerationPackReader::open(&path).unwrap();
+        assert!(
+            !reader.entries["tiny"].compressed(),
+            "a payload that does not shrink must be stored raw"
+        );
+        assert_eq!(reader.read("tiny", 4096).unwrap().unwrap(), tiny);
+    }
+
+    /// The zero-copy borrow must refuse a compressed record rather than hand back
+    /// bytes the consumer would interpret as its own format. Silently returning the
+    /// compressed form is the failure this guards: rkyv would read it as a corrupt
+    /// archive, or worse, not notice.
+    #[test]
+    fn zero_copy_borrow_refuses_a_compressed_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        let payload = "symbol://x#value:Y".repeat(200).into_bytes();
+        let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
+        writer.add_compressed("squashed", &payload).unwrap();
+        writer.add("plain", &payload).unwrap();
+        writer.publish().unwrap();
+        let reader = GenerationPackReader::open(&path).unwrap();
+
+        assert!(
+            reader
+                .with_record_for_validation("squashed", 1 << 20, |_| ())
+                .is_err(),
+            "a compressed record must not be borrowed for zero-copy access"
+        );
+        // The raw twin is still borrowable, so the refusal is about compression only.
+        let borrowed = reader
+            .with_record_for_validation("plain", 1 << 20, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(borrowed, payload);
     }
 
     #[test]
@@ -519,7 +747,7 @@ mod tests {
         let mut corrupt = original;
         corrupt[offset] ^= 1;
         fs::write(&path, corrupt).unwrap();
-        let mut reader = GenerationPackReader::open(&path).unwrap();
+        let reader = GenerationPackReader::open(&path).unwrap();
         assert!(reader.read("a", 100).is_err());
     }
 
@@ -546,7 +774,7 @@ mod tests {
         writer.add("stable", b"ok").unwrap();
         writer.publish().unwrap();
         fs::write(path.with_extension("pack.tmp-crash"), b"crash").unwrap();
-        let mut reader = GenerationPackReader::open(path).unwrap();
+        let reader = GenerationPackReader::open(path).unwrap();
         assert_eq!(reader.read("stable", 2).unwrap().unwrap(), b"ok");
     }
 
@@ -558,7 +786,7 @@ mod tests {
             let mut writer = StreamingGenerationPackWriter::new(&path).unwrap();
             writer.add("value", payload).unwrap();
             writer.publish().unwrap();
-            let mut reader = GenerationPackReader::open(&path).unwrap();
+            let reader = GenerationPackReader::open(&path).unwrap();
             assert_eq!(reader.read("value", 1).unwrap().unwrap(), payload);
         }
     }

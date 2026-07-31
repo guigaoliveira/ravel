@@ -68,6 +68,9 @@ pub enum EngineError {
 
 static SYNC_TICKET: AtomicU64 = AtomicU64::new(0);
 
+/// When the coverage walk last ran, and what it found.
+type CoverageProbe = (std::time::Instant, Arc<BTreeMap<String, usize>>);
+
 #[derive(Debug)]
 struct EngineInner {
     snapshot_cache: Mutex<Option<Arc<IndexSnapshot>>>,
@@ -78,6 +81,13 @@ struct EngineInner {
     /// index is stale. Rebuilding it means unzipping the artifact index into
     /// 20k+ owned paths, so cache it for the generation it describes.
     file_hashes_cache: Mutex<Option<Arc<crate::model::FileHashIndex>>>,
+    /// Which source extensions this workspace has that the indexer cannot parse.
+    /// A bounded directory walk — cheap once, but `status` is called repeatedly in a
+    /// session and re-walking it cost more per call than every other primary tool.
+    /// Kept behind a TTL rather than the generation caches: coverage describes which
+    /// files exist on disk, which has nothing to do with which index generation is
+    /// published, so invalidating it on publish re-walked for no reason.
+    unsupported_sources: Mutex<Option<CoverageProbe>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -621,6 +631,7 @@ impl WorkspaceEngine {
                 search_cache: Mutex::new(None),
                 symbol_meta_cache: Mutex::new(None),
                 file_hashes_cache: Mutex::new(None),
+                unsupported_sources: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 worktree_identity: Mutex::new(None),
                 config_hash,
@@ -1488,6 +1499,7 @@ impl WorkspaceEngine {
         self.hydrate_structural_cache()?;
         crate::timing::stage("sync.hydrate_structural_cache", hydrate_start, String::new);
 
+        let reader_start = std::time::Instant::now();
         let Some(current_generation) = storage.current_generation()? else {
             return Ok(None);
         };
@@ -1502,7 +1514,10 @@ impl WorkspaceEngine {
         let Some(reader) = reader else {
             return Ok(None);
         };
+        crate::timing::stage("delta.open_reader", reader_start, String::new);
+        let tsconfig_start = std::time::Instant::now();
         let resolver_config = load_tsconfig(&self.root);
+        crate::timing::stage("delta.load_tsconfig", tsconfig_start, String::new);
         if !reader.matches(&resolver_config) {
             return Ok(None);
         }
@@ -1522,12 +1537,14 @@ impl WorkspaceEngine {
                 );
             }
         }
+        let overlay_start = std::time::Instant::now();
         let universe_overlay = ResolutionUniverseOverlay::from_artifact_changes(
             reader.as_ref(),
             changes
                 .iter()
                 .map(|(_, old, new)| (old.as_ref(), new.as_ref())),
         );
+        crate::timing::stage("delta.universe_overlay", overlay_start, String::new);
         let universe = OverlayResolutionLookup::new(reader.as_ref(), &universe_overlay);
         let affected_start = std::time::Instant::now();
         let mut affected = reader.affected_files(
@@ -1548,6 +1565,7 @@ impl WorkspaceEngine {
             .iter()
             .map(|(path, _, new)| (path.as_str(), new.as_ref()))
             .collect();
+        let subset_start = std::time::Instant::now();
         let mut subset = BTreeMap::new();
         for path in &affected {
             let artifact = if let Some(new) = changed_artifacts.get(path.as_str()) {
@@ -1562,6 +1580,12 @@ impl WorkspaceEngine {
             };
             subset.insert(path.clone(), artifact);
         }
+        crate::timing::stage("delta.build_subset", subset_start, || {
+            format!("artifacts={}", subset.len())
+        });
+        crate::timing::stage("delta.build_subset", subset_start, || {
+            format!("artifacts={}", subset.len())
+        });
         let resolve_start = std::time::Instant::now();
         let Some((traces, mut contributions)) =
             resolve_subset_with_structural_data(&self.root, &subset, &universe, &resolver_config)
@@ -2097,12 +2121,16 @@ impl WorkspaceEngine {
     /// Index health for agents. Cheap: does not spawn git status.
     pub fn status(&self) -> Result<serde_json::Value, EngineError> {
         let store = self.storage();
+        let mark = std::time::Instant::now();
         // Status reports presence, so read the manifest once and never deserialize graph/symbol
         // sidecars merely to answer whether their referenced paths exist.
         let manifest = store.read_manifest().ok().flatten();
+        crate::timing::stage("status.manifest", mark, String::new);
+        let mark = std::time::Instant::now();
         let stats = manifest
             .as_ref()
             .and_then(|m| store.open_stats_from_manifest(m).ok().flatten());
+        crate::timing::stage("status.stats", mark, String::new);
         let stats_present = stats.is_some();
         let graph_present = manifest
             .as_ref()
@@ -2110,9 +2138,11 @@ impl WorkspaceEngine {
         let has = stats_present || graph_present;
         let home = self.root.join(&self.config.storage.home);
         let git = self.is_git_repo_cached();
-        // Bounded walk: enough to tell "indexed and covers this workspace" from
-        // "indexed and covers three files of it".
-        let unsupported = crate::config::unsupported_source_counts(&self.config, 20_000);
+        // Bounded walk, cached: enough to tell "indexed and covers this workspace"
+        // from "indexed and covers three files of it".
+        let mark = std::time::Instant::now();
+        let unsupported = self.unsupported_sources_cached();
+        crate::timing::stage("status.coverage", mark, String::new);
         let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
         let unsupported_total: usize = unsupported.values().sum();
         let dominant_unsupported = unsupported
@@ -2123,7 +2153,9 @@ impl WorkspaceEngine {
         // so an in-flight reader never has its mmap pulled out from under it, which
         // means the footprint is a multiple of one index — surprising enough to be
         // worth stating rather than leaving to be discovered by a full disk.
+        let mark = std::time::Instant::now();
         let (disk_bytes, generations) = Self::index_footprint(&home);
+        crate::timing::stage("status.footprint", mark, String::new);
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,
@@ -2150,7 +2182,7 @@ impl WorkspaceEngine {
             "coverage": {
                 "indexed_files": indexed_files,
                 "unsupported_source_files": unsupported_total,
-                "unsupported_by_extension": unsupported,
+                "unsupported_by_extension": unsupported.as_ref(),
             },
             "hint": if !has {
                 "Run `ravel index` first.".to_owned()
@@ -2724,6 +2756,29 @@ impl WorkspaceEngine {
         *self.inner.file_hashes_cache.lock().unwrap() = None;
     }
 
+    /// Unsupported-source counts, re-walked at most once per TTL.
+    ///
+    /// Coverage is a signal, not a census: it answers "does this graph apply to this
+    /// workspace at all", and that answer does not change between two `status` calls
+    /// seconds apart. Bounded staleness beats walking the tree on every call.
+    fn unsupported_sources_cached(&self) -> Arc<BTreeMap<String, usize>> {
+        /// Long enough that a burst of tool calls walks once, short enough that a
+        /// workspace gaining a new language is noticed within the same session.
+        const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut cache = self.inner.unsupported_sources.lock().unwrap();
+        if let Some((walked_at, counts)) = cache.as_ref()
+            && walked_at.elapsed() < COVERAGE_TTL
+        {
+            return Arc::clone(counts);
+        }
+        let counts = Arc::new(crate::config::unsupported_source_counts(
+            &self.config,
+            20_000,
+        ));
+        *cache = Some((std::time::Instant::now(), Arc::clone(&counts)));
+        counts
+    }
+
     /// Hash sidecar for the current generation. Cached because auto-sync consults
     /// it on every tool call, and it is immutable for the generation it describes:
     /// `clear_cache` drops it as soon as a new generation is observed.
@@ -3140,13 +3195,10 @@ impl WorkspaceEngine {
         if !self.is_git_repo_cached() || !self.config.sync_allows_git() {
             return Ok(None);
         }
-        // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
-        // Prevents accidental full-snapshot open on every search.
-        let hashes_started = std::time::Instant::now();
-        let Some(hashes) = self.file_hashes_cached()? else {
-            return Ok(None);
-        };
-        crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
+        // Discover first, load the sidecar second. The sidecar unzips the artifact
+        // index into tens of thousands of owned paths and hashes, and on a clean tree
+        // there is nothing to compare it against — loading it before knowing whether
+        // any path is dirty charged every query for work no query needed.
         let dirty_started = std::time::Instant::now();
         let dirty = self.discover_dirty_sources();
         crate::timing::stage("autosync.discover_dirty", dirty_started, || {
@@ -3155,6 +3207,13 @@ impl WorkspaceEngine {
         if dirty.is_empty() {
             return Ok(None);
         }
+        // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
+        // Prevents accidental full-snapshot open on every search.
+        let hashes_started = std::time::Instant::now();
+        let Some(hashes) = self.file_hashes_cached()? else {
+            return Ok(None);
+        };
+        crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
         let mut need_sync = false;
         for path in &dirty {
@@ -3619,6 +3678,40 @@ mod generation_cache_lock_tests {
 #[cfg(test)]
 mod agent_context_tests {
     use super::*;
+
+    /// Auto-sync now discovers dirty paths before loading the hash sidecar, because
+    /// the sidecar costs tens of thousands of owned strings and there is nothing to
+    /// compare it against on a clean tree. Reordering a freshness check is exactly the
+    /// kind of change that can silently stop noticing edits, so pin both outcomes: a
+    /// clean tree reports nothing to do, and an edited file is still picked up.
+    #[test]
+    fn auto_sync_reports_nothing_on_a_clean_tree_and_still_catches_an_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let service = root.path().join("service.ts");
+        std::fs::write(&service, "export function alpha() { return 1; }\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // Nothing changed since the index: no work, and no error.
+        assert!(
+            engine.auto_sync_if_dirty().unwrap().is_none(),
+            "a clean tree must report nothing to sync"
+        );
+
+        // An edit must still be found and indexed, whichever order the check runs in.
+        std::fs::write(
+            &service,
+            "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
+        )
+        .unwrap();
+        engine.sync(Some(std::slice::from_ref(&service))).unwrap();
+        let found = engine
+            .search_raw("beta", SearchKind::Exact, 5)
+            .unwrap()
+            .into_iter()
+            .any(|hit| hit.value == "beta");
+        assert!(found, "symbol added after the index was not picked up");
+    }
 
     #[test]
     fn context_reports_relation_totals_when_truncated() {

@@ -1610,10 +1610,19 @@ mod tests {
     }
 
     /// Synthetic scale: exact/prefix must stay sub-linear in wall time vs N.
+    ///
+    /// Asserts growth ratios, never absolute milliseconds. An absolute budget here
+    /// encodes the speed of whichever machine and profile happened to run it — this
+    /// test previously carried release-calibrated budgets while `cargo test` runs a
+    /// debug build, so it failed on a loaded machine while the property it exists to
+    /// protect was intact. N grows 5x then 4x below, so a genuinely linear
+    /// implementation shows up as a matching multiple; the bounds leave room for
+    /// scheduler noise without leaving room for O(N).
     #[test]
     fn scale_exact_prefix_sublinear_wall() {
         let sizes = [10_000usize, 50_000, 200_000];
         let mut prev_exact = 0.0f64;
+        let mut prev_prefix = 0.0f64;
         for &n in &sizes {
             let names: Vec<String> = (0..n).map(|i| format!("Sym{i:08}")).collect();
             let dict = SymbolDict::from_names(names, "scale".into());
@@ -1639,9 +1648,16 @@ mod tests {
                 );
             }
             prev_exact = exact_ms;
-            // Absolute budgets on this host (warm, synthetic ASCII names).
-            assert!(exact_ms < 2.0, "exact too slow: {exact_ms}ms at N={n}");
-            assert!(prefix_ms < 15.0, "prefix too slow: {prefix_ms}ms at N={n}");
+            // Beyond the first size the prefix query matches the same 10k names — only
+            // where the binary search lands changes — so its cost must stay flat. A
+            // linear scan would track N and grow 4-5x per step.
+            if prev_prefix > 0.0 {
+                assert!(
+                    prefix_ms < prev_prefix * 3.0 + 0.5,
+                    "prefix grew with N: {prev_prefix} -> {prefix_ms} at N={n}"
+                );
+            }
+            prev_prefix = prefix_ms;
         }
     }
 

@@ -27,6 +27,8 @@ serde_json = "1.0.140"
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.2"
+zstd = { version = "0.13", default-features = false }
+mimalloc = { version = "0.1", default-features = false }
 tree-sitter = "0.26.10"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"

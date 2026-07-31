@@ -6,7 +6,7 @@ use petgraph::{
     algo::{kosaraju_scc, toposort},
     graph::{DiGraph, NodeIndex},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
@@ -116,13 +116,6 @@ impl FlatCompactGraph {
         (offsets, values)
     }
 
-    fn expand(offsets: &[u32], values: &[u32]) -> Vec<Vec<u32>> {
-        offsets
-            .windows(2)
-            .map(|window| values[window[0] as usize..window[1] as usize].to_vec())
-            .collect()
-    }
-
     pub(crate) fn from_compact(compact: CompactGraph) -> Self {
         let (forward_offsets, forward_values) = Self::flatten(compact.forward);
         let (reverse_offsets, reverse_values) = Self::flatten(compact.reverse);
@@ -143,25 +136,6 @@ impl FlatCompactGraph {
             forward_relation_values,
             reverse_relation_offsets,
             reverse_relation_values,
-        }
-    }
-
-    pub(crate) fn into_compact(self) -> CompactGraph {
-        CompactGraph {
-            snapshot_id: self.snapshot_id,
-            nodes: self.nodes,
-            forward: Self::expand(&self.forward_offsets, &self.forward_values),
-            reverse: Self::expand(&self.reverse_offsets, &self.reverse_values),
-            edge_count: self.edge_count,
-            relations: self.relations,
-            forward_relation_ids: Self::expand(
-                &self.forward_relation_offsets,
-                &self.forward_relation_values,
-            ),
-            reverse_relation_ids: Self::expand(
-                &self.reverse_relation_offsets,
-                &self.reverse_relation_values,
-            ),
         }
     }
 }
@@ -402,6 +376,69 @@ impl GraphIndex {
             overlay_reverse_relations: BTreeMap::new(),
             inactive_nodes: BTreeSet::new(),
             snapshot_id: compact.snapshot_id,
+            package_graph: OnceLock::new(),
+        }
+    }
+
+    /// Build straight from the archived flat form, skipping two owned copies.
+    ///
+    /// The previous cold load ran four passes over the record: validate it,
+    /// deserialize 90MB into an owned `FlatCompactGraph`, expand that into a
+    /// `CompactGraph` with one `Vec` per node, then move those into the index. Only
+    /// the last shape is used. Reading the archived offsets and values directly
+    /// keeps the expansion — the index traverses `Vec<Vec<u32>>` — and drops the two
+    /// intermediate copies.
+    pub(crate) fn from_archived_flat(archived: &ArchivedFlatCompactGraph) -> Self {
+        fn expand(offsets: &[rkyv::rend::u32_le], values: &[rkyv::rend::u32_le]) -> Vec<Vec<u32>> {
+            offsets
+                .windows(2)
+                .map(|window| {
+                    values[window[0].to_native() as usize..window[1].to_native() as usize]
+                        .iter()
+                        .map(|value| value.to_native())
+                        .collect()
+                })
+                .collect()
+        }
+        let node_count = archived.nodes.len();
+        let nodes: Vec<Arc<str>> = archived
+            .nodes
+            .iter()
+            .map(|name| Arc::from(name.as_str()))
+            .collect();
+        let mut node_index: FxHashMap<Arc<str>, u32> =
+            FxHashMap::with_capacity_and_hasher(node_count, Default::default());
+        for (index, name) in nodes.iter().enumerate() {
+            node_index.insert(Arc::clone(name), index as u32);
+        }
+        Self {
+            nodes,
+            node_index,
+            forward: expand(&archived.forward_offsets, &archived.forward_values),
+            reverse: expand(&archived.reverse_offsets, &archived.reverse_values),
+            edge_count: archived.edge_count.to_native() as usize,
+            relations: archived
+                .relations
+                .iter()
+                .map(|relation| {
+                    rkyv::deserialize::<CompactRelation, rkyv::rancor::Error>(relation)
+                        .expect("archived relation is validated")
+                })
+                .collect(),
+            forward_relation_ids: expand(
+                &archived.forward_relation_offsets,
+                &archived.forward_relation_values,
+            ),
+            reverse_relation_ids: expand(
+                &archived.reverse_relation_offsets,
+                &archived.reverse_relation_values,
+            ),
+            relation_file_overlays: BTreeMap::new(),
+            relation_overlay_nodes: BTreeSet::new(),
+            overlay_forward_relations: BTreeMap::new(),
+            overlay_reverse_relations: BTreeMap::new(),
+            inactive_nodes: BTreeSet::new(),
+            snapshot_id: archived.snapshot_id.to_string(),
             package_graph: OnceLock::new(),
         }
     }
@@ -649,13 +686,24 @@ impl GraphIndex {
                 } else {
                     &mut self.reverse[id as usize]
                 };
-                for (neighbor_id, present) in resolved {
-                    if present {
-                        if !list.contains(&neighbor_id) {
+                // One pass per node instead of a scan per change. Scanning the
+                // adjacency for every changed neighbor is O(changes × degree), and a
+                // hub reached by an edit has both terms large. The two sets below are
+                // bounded by data already held — the adjacency itself and the change
+                // list — and are dropped before the next node.
+                let (added, removed): (Vec<_>, Vec<_>) =
+                    resolved.into_iter().partition(|(_, present)| *present);
+                if !removed.is_empty() {
+                    let removed: FxHashSet<u32> =
+                        removed.into_iter().map(|(neighbor, _)| neighbor).collect();
+                    list.retain(|existing| !removed.contains(existing));
+                }
+                if !added.is_empty() {
+                    let mut present: FxHashSet<u32> = list.iter().copied().collect();
+                    for (neighbor_id, _) in added {
+                        if present.insert(neighbor_id) {
                             list.push(neighbor_id);
                         }
-                    } else {
-                        list.retain(|&existing| existing != neighbor_id);
                     }
                 }
             }
@@ -1173,6 +1221,129 @@ mod tests {
             files: BTreeMap::new(),
             edges,
         })
+    }
+
+    /// The cold load builds the index straight from the archived record. That path
+    /// replaced a deserialize-then-expand chain, and a subtle mistake in it would not
+    /// fail loudly — every query would simply answer from a wrong adjacency. So pin it
+    /// against the shape it replaced: same edges in, identical index out.
+    #[test]
+    fn archived_cold_load_matches_building_from_the_owned_compact_form() {
+        let edges = vec![
+            edge("a.ts", "b.ts"),
+            edge("a.ts", "c.ts"),
+            edge("b.ts", "c.ts"),
+            edge("c.ts", "a.ts"),
+            edge("symbol://a.ts#value:A", "symbol://b.ts#value:B"),
+        ];
+        let built = GraphIndex::from_edges(&edges, "snap".into());
+        let compact = built.to_compact();
+        let flat = FlatCompactGraph::from_compact(compact.clone());
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat).unwrap();
+        let archived =
+            rkyv::access::<ArchivedFlatCompactGraph, rkyv::rancor::Error>(&bytes).unwrap();
+
+        let from_archive = GraphIndex::from_archived_flat(archived);
+        let from_owned = GraphIndex::from_compact(compact);
+
+        assert_eq!(from_archive.snapshot_id(), from_owned.snapshot_id());
+        assert_eq!(from_archive.edge_count(), from_owned.edge_count());
+        assert_eq!(from_archive.nodes, from_owned.nodes);
+        assert_eq!(from_archive.forward, from_owned.forward);
+        assert_eq!(from_archive.reverse, from_owned.reverse);
+        assert_eq!(from_archive.relations, from_owned.relations);
+        assert_eq!(
+            from_archive.forward_relation_ids,
+            from_owned.forward_relation_ids
+        );
+        assert_eq!(
+            from_archive.reverse_relation_ids,
+            from_owned.reverse_relation_ids
+        );
+
+        // And it answers queries the same way, which is what actually matters.
+        let limits = QueryLimits::default();
+        for node in ["a.ts", "b.ts", "c.ts"] {
+            for reverse in [true, false] {
+                let left = if reverse {
+                    from_archive.callers_of(node, &limits, None).unwrap()
+                } else {
+                    from_archive.impact_analysis(node, &limits, None).unwrap()
+                };
+                let right = if reverse {
+                    from_owned.callers_of(node, &limits, None).unwrap()
+                } else {
+                    from_owned.impact_analysis(node, &limits, None).unwrap()
+                };
+                assert_eq!(left.items, right.items, "node={node} reverse={reverse}");
+            }
+        }
+    }
+
+    /// Applying an overlay used to scan the whole adjacency once per changed
+    /// neighbour; it now partitions and makes a single pass. Adds and removes landing
+    /// in the same batch are where a partitioned rewrite goes wrong, so cover that
+    /// directly: an existing neighbour removed, a new one added, one re-added that is
+    /// already present, and one removed that was never there.
+    #[test]
+    fn overlay_applies_adds_and_removes_in_one_batch() {
+        let edges = vec![
+            edge("hub.ts", "keep.ts"),
+            edge("hub.ts", "drop.ts"),
+            edge("hub.ts", "already.ts"),
+        ];
+        let mut graph = GraphIndex::from_edges(&edges, "before".into());
+        // Observe through the BFS: `forward_changes` rewrites the u32 adjacency the
+        // traversal walks, which is a different structure from the relation views.
+        let reachable = |graph: &GraphIndex| -> Vec<String> {
+            graph
+                .impact_analysis(
+                    "hub.ts",
+                    &QueryLimits {
+                        depth: 1,
+                        page_size: 100,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+                .items
+        };
+        let before: BTreeSet<String> = reachable(&graph).into_iter().collect();
+        assert_eq!(
+            before,
+            ["already.ts", "drop.ts", "keep.ts"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+
+        let mut overlay = IncrementalGraphOverlay::default();
+        overlay.forward_changes.insert(
+            "hub.ts".into(),
+            [
+                ("drop.ts".to_owned(), None),       // present -> removed
+                ("fresh.ts".to_owned(), Some(1)),   // absent  -> added
+                ("already.ts".to_owned(), Some(1)), // present -> stays, not duplicated
+                ("never.ts".to_owned(), None),      // absent  -> no-op
+            ]
+            .into_iter()
+            .collect(),
+        );
+        graph.apply_incremental_overlay(&overlay, "after", 3);
+
+        let after: Vec<String> = reachable(&graph);
+        let unique: BTreeSet<&String> = after.iter().collect();
+        assert_eq!(
+            unique.len(),
+            after.len(),
+            "a neighbour already present must not be duplicated: {after:?}"
+        );
+        let after: BTreeSet<String> = after.into_iter().collect();
+        assert!(!after.contains("drop.ts"), "removed neighbour survived");
+        assert!(!after.contains("never.ts"), "invented a neighbour");
+        assert!(after.contains("keep.ts"), "untouched neighbour lost");
+        assert!(after.contains("already.ts"), "re-added neighbour lost");
     }
 
     fn edge(from: &str, to: &str) -> Edge {

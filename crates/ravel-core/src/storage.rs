@@ -35,12 +35,15 @@ use std::{
 };
 use thiserror::Error;
 
+/// 17: bincode record families are stored zstd-compressed inside the pack, and
+/// directory entries carry an uncompressed length. The pack header version moves
+/// too, so a reader that predates this rejects the file outright.
 /// 16: symbol-meta shards moved to rkyv archives read in place. Without this bump
 /// a binary that predates the layout rejects only the shard index and then answers
 /// queries from an empty symbol-meta backend, which is indistinguishable from a
 /// genuine "nothing found". The bump makes the mismatch loud in both directions:
 /// each side reports an unsupported schema and rebuilds.
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -366,6 +369,28 @@ impl StructuralPackStager {
         Ok(())
     }
 
+    /// bincode payloads compress 8x — long runs of repeated path and symbol strings —
+    /// and their readers deserialize them anyway, so expansion rides along with work
+    /// that already happens. Records borrowed zero-copy out of the mmap
+    /// (`query/graph`, `query/terms`, `query/symbols`, `query/symbol-meta2`) must stay
+    /// raw and keep using `add_meta` / `add_bytes`.
+    fn add_meta_compressed<T: serde::Serialize>(
+        &mut self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StorageError> {
+        let bytes = bincode::serialize(value).map_err(|source| StorageError::Bincode {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.writer
+            .add_compressed(key, bytes)
+            .map_err(|error| StorageError::Invalid {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })
+    }
+
     fn add_meta<T: serde::Serialize>(&mut self, key: &str, value: &T) -> Result<(), StorageError> {
         let bytes = bincode::serialize(value).map_err(|source| StorageError::Bincode {
             path: self.path.clone(),
@@ -393,7 +418,7 @@ impl StructuralPackStager {
     /// hydrating the complete snapshot.
     pub(crate) fn stage_snapshot(&mut self, snapshot: &IndexSnapshot) -> Result<(), StorageError> {
         let mut mark = std::time::Instant::now();
-        self.add_meta("snapshot/edges", &snapshot.edges)?;
+        self.add_meta_compressed("snapshot/edges", &snapshot.edges)?;
         crate::timing::stage("stage_snapshot.edges", mark, String::new);
         mark = std::time::Instant::now();
         let mut artifact_index = ArtifactIndex {
@@ -406,7 +431,7 @@ impl StructuralPackStager {
         // Encoding 20k artifacts is per-file CPU work; only the pack write has to
         // stay ordered. `collect` on an indexed parallel iterator preserves order,
         // so records land in the same sequence as before.
-        let encoded: Vec<(&String, &crate::model::FileArtifact, Vec<u8>)> = {
+        let encoded: Vec<(&String, &crate::model::FileArtifact, Vec<u8>, u64)> = {
             use rayon::prelude::*;
             snapshot
                 .files
@@ -414,16 +439,17 @@ impl StructuralPackStager {
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|(path, artifact)| {
-                    bincode::serialize(artifact)
-                        .map(|bytes| (path, artifact, bytes))
-                        .map_err(|source| StorageError::Bincode {
+                    let plain =
+                        bincode::serialize(artifact).map_err(|source| StorageError::Bincode {
                             path: self.path.clone(),
                             source,
-                        })
+                        })?;
+                    let bytes = shrink(&plain, &self.path)?;
+                    Ok((path, artifact, bytes, plain.len() as u64))
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, StorageError>>()?
         };
-        for (path, artifact, bytes) in encoded {
+        for (path, artifact, bytes, plain_len) in encoded {
             FileSnapshotStorage::xor_state(
                 &mut artifact_index.state,
                 FileSnapshotStorage::artifact_digest(path, &artifact.source_hash),
@@ -433,15 +459,20 @@ impl StructuralPackStager {
                 ArtifactLocation {
                     store: None,
                     offset: 0,
-                    len: bytes.len() as u64,
+                    len: plain_len,
                     source_hash: artifact.source_hash.clone(),
                     bytes_read: artifact.bytes_read,
                     parse_error: !artifact.diagnostics.is_empty(),
                 },
             );
-            self.add_bytes(format!("artifact/{path}"), bytes)?;
+            self.writer
+                .add_precompressed(format!("artifact/{path}"), &bytes, plain_len)
+                .map_err(|error| StorageError::Invalid {
+                    path: self.path.clone(),
+                    message: error.to_string(),
+                })?;
         }
-        self.add_meta("artifact/index", &artifact_index)?;
+        self.add_meta_compressed("artifact/index", &artifact_index)?;
         crate::timing::stage("stage_snapshot.artifacts", mark, || {
             format!("n={}", snapshot.files.len())
         });
@@ -772,7 +803,7 @@ impl StructuralPackReader {
         // Decode outside the reader lock: concurrent shard lookups (parallel resolution)
         // otherwise serialize on the pack mutex for the duration of every deserialize.
         let bytes = {
-            let mut reader = self.base_reader.lock().unwrap();
+            let reader = self.base_reader.lock().unwrap();
             match reader.read(key, MAX_DELTA_COMPONENT_BYTES) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -1009,7 +1040,7 @@ impl StructuralPackReader {
 
     /// Read raw base-pack bytes for many keys under one reader lock.
     fn read_base_bytes_batch(&self, keys: &[String]) -> Vec<Option<Vec<u8>>> {
-        let mut reader = self.base_reader.lock().unwrap();
+        let reader = self.base_reader.lock().unwrap();
         keys.iter()
             .map(|key| match reader.read(key, MAX_DELTA_COMPONENT_BYTES) {
                 Ok(bytes) => bytes,
@@ -1904,6 +1935,11 @@ pub struct FileSnapshotStorage {
     root: PathBuf,
     retention: usize,
     manifest_cache: Mutex<Option<(std::time::SystemTime, Manifest)>>,
+    /// Opened pack readers by file name. Opening one mmaps the file and decodes its
+    /// whole directory — tens of thousands of entries on a large workspace — so doing
+    /// it per record read made a batch of reads quadratic in the directory size.
+    /// Packs are immutable once published, so a reader stays valid for its name.
+    pack_readers: Mutex<std::collections::HashMap<String, Arc<GenerationPackReader>>>,
     /// Decoded artifact index, keyed by the component refs it was decoded from.
     /// Those refs are content-addressed, so a matching key means identical bytes.
     /// Per-path lookups used to decode the whole index — tens of thousands of
@@ -1927,6 +1963,7 @@ impl Clone for FileSnapshotStorage {
             root: self.root.clone(),
             retention: self.retention,
             manifest_cache: Mutex::new(None),
+            pack_readers: Mutex::new(std::collections::HashMap::new()),
             artifact_index_cache: Mutex::new(None),
         }
     }
@@ -1949,6 +1986,7 @@ impl FileSnapshotStorage {
         Self {
             root: root.as_ref().to_path_buf(),
             retention: retention.max(1),
+            pack_readers: Mutex::new(std::collections::HashMap::new()),
             artifact_index_cache: Mutex::new(None),
             manifest_cache: Mutex::new(None),
         }
@@ -2191,14 +2229,30 @@ impl FileSnapshotStorage {
         self.root.join(format!("snapshot-{id}.artifacts.store"))
     }
 
-    fn read_component_ref(&self, reference: &str, max_bytes: u64) -> Result<Vec<u8>, StorageError> {
-        if let Some((pack_name, record_key)) = reference.split_once('#') {
-            let path = self.root.join(pack_name);
-            let mut reader =
+    /// A pack reader for `pack_name`, opened once per handle.
+    fn pack_reader(&self, pack_name: &str) -> Result<Arc<GenerationPackReader>, StorageError> {
+        if let Some(reader) = self.pack_readers.lock().unwrap().get(pack_name) {
+            return Ok(Arc::clone(reader));
+        }
+        let path = self.root.join(pack_name);
+        let reader =
+            Arc::new(
                 GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
                     path: path.clone(),
                     message: error.to_string(),
-                })?;
+                })?,
+            );
+        self.pack_readers
+            .lock()
+            .unwrap()
+            .insert(pack_name.to_owned(), Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    fn read_component_ref(&self, reference: &str, max_bytes: u64) -> Result<Vec<u8>, StorageError> {
+        if let Some((pack_name, record_key)) = reference.split_once('#') {
+            let path = self.root.join(pack_name);
+            let reader = self.pack_reader(pack_name)?;
             return reader
                 .read(record_key, max_bytes)
                 .map_err(|error| StorageError::Invalid {
@@ -2571,11 +2625,10 @@ impl FileSnapshotStorage {
             return Ok(None);
         }
         let path = self.root.join(chain.base);
-        let mut reader =
-            GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
+        let reader = GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
         let Some(meta) =
             reader
                 .read("meta/graph2", 1024)
@@ -2623,13 +2676,12 @@ impl FileSnapshotStorage {
         // Apply each overlay's file section over the union, in chain order, before reconstruction.
         for overlay_name in chain.overlays {
             let overlay_path = self.root.join(overlay_name);
-            let mut overlay_reader =
-                GenerationPackReader::open(&overlay_path).map_err(|error| {
-                    StorageError::Invalid {
-                        path: overlay_path.clone(),
-                        message: error.to_string(),
-                    }
-                })?;
+            let overlay_reader = GenerationPackReader::open(&overlay_path).map_err(|error| {
+                StorageError::Invalid {
+                    path: overlay_path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
             let Some(bytes) = overlay_reader
                 .read("graph/overlay-v2", MAX_DELTA_COMPONENT_BYTES)
                 .map_err(|error| StorageError::Invalid {
@@ -4293,28 +4345,26 @@ impl FileSnapshotStorage {
                 let graph_record = graph_name
                     .split_once('#')
                     .map_or(graph_name.as_str(), |(_, record)| record);
-                let reader =
-                    GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
-                        path: path.clone(),
-                        message: error.to_string(),
-                    })?;
-                let compact = reader
+                let reader = self.pack_reader(self.component_ref_path(graph_name))?;
+                // Build the index straight from the archive. Deserializing the record
+                // into an owned `FlatCompactGraph` and expanding that into a
+                // `CompactGraph` produced two full copies of a ~90MB payload whose only
+                // consumer is the index built from it.
+                let graph = reader
                     .with_record_for_validation(graph_record, MAX_COMPACT_GRAPH_BYTES, |bytes| {
                         let archived = rkyv::access::<
                             crate::graph::ArchivedFlatCompactGraph,
                             rkyv::rancor::Error,
                         >(bytes)
                         .map_err(|error| error.to_string())?;
-                        rkyv::deserialize::<FlatCompactGraph, rkyv::rancor::Error>(archived)
-                            .map(FlatCompactGraph::into_compact)
-                            .map_err(|error| error.to_string())
+                        Ok(GraphIndex::from_archived_flat(archived))
                     })
                     .map_err(|error| StorageError::Invalid {
                         path: path.clone(),
                         message: error.to_string(),
                     })?
                     .transpose()
-                    .map_err(|message| StorageError::Invalid {
+                    .map_err(|message: String| StorageError::Invalid {
                         path: path.clone(),
                         message,
                     })?
@@ -4323,20 +4373,14 @@ impl FileSnapshotStorage {
                         message: format!("missing pack record {graph_record}"),
                     })?;
                 crate::timing::stage("graph.open.archive", open_started, String::new);
-                if compact.snapshot_id == self.component_snapshot_id(&manifest).stable_key() {
-                    let materialize_started = std::time::Instant::now();
-                    let mut graph = GraphIndex::from_compact(compact);
-                    crate::timing::stage(
-                        "graph.open.materialize",
-                        materialize_started,
-                        String::new,
-                    );
+                if graph.snapshot_id() == self.component_snapshot_id(&manifest).stable_key() {
+                    let mut graph = graph;
                     let edge_count = self
                         .open_stats_from_manifest(&manifest)?
                         .map_or_else(|| graph.edge_count(), |stats| stats.edges);
                     for overlay_name in &chain.overlays {
                         let overlay_path = self.root.join(overlay_name);
-                        let mut reader =
+                        let reader =
                             GenerationPackReader::open(&overlay_path).map_err(|error| {
                                 StorageError::Invalid {
                                     path: overlay_path.clone(),
@@ -5130,7 +5174,7 @@ impl SnapshotStorage for FileSnapshotStorage {
                     message: "packed payload is missing its base pack".into(),
                 })?;
             let base_path = self.root.join(base_name);
-            let mut reader =
+            let reader =
                 GenerationPackReader::open(&base_path).map_err(|error| StorageError::Invalid {
                     path: base_path.clone(),
                     message: error.to_string(),
@@ -5278,7 +5322,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             }
             for pack_name in pack_names {
                 let pack_path = self.root.join(&pack_name);
-                let mut reader = GenerationPackReader::open(&pack_path).map_err(|error| {
+                let reader = GenerationPackReader::open(&pack_path).map_err(|error| {
                     StorageError::Invalid {
                         path: pack_path.clone(),
                         message: error.to_string(),
@@ -5428,20 +5472,23 @@ fn add_shards_parallel<V: serde::Serialize + Sync>(
     const SHARD_SERIALIZE_CHUNK: usize = 256;
     let shards: Vec<(u16, V)> = shards.into_iter().collect();
     for chunk in shards.chunks(SHARD_SERIALIZE_CHUNK) {
-        let serialized: Vec<(String, Vec<u8>)> = chunk
+        // Serialize *and* compress on the worker: the write loop below is sequential,
+        // so leaving compression to it would put a CPU-bound step back on the critical
+        // path.
+        let serialized: Vec<(String, Vec<u8>, u64)> = chunk
             .par_iter()
             .map(|(id, shard)| {
-                bincode::serialize(shard)
-                    .map(|bytes| (format!("{prefix}{id:04x}"), bytes))
-                    .map_err(|source| StorageError::Bincode {
-                        path: path.to_path_buf(),
-                        source,
-                    })
+                let plain = bincode::serialize(shard).map_err(|source| StorageError::Bincode {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                let bytes = shrink(&plain, path)?;
+                Ok((format!("{prefix}{id:04x}"), bytes, plain.len() as u64))
             })
-            .collect::<Result<_, _>>()?;
-        for (key, bytes) in serialized {
+            .collect::<Result<_, StorageError>>()?;
+        for (key, bytes, plain_len) in serialized {
             writer
-                .add(key, bytes)
+                .add_precompressed(key, &bytes, plain_len)
                 .map_err(|error| StorageError::Invalid {
                     path: path.to_path_buf(),
                     message: error.to_string(),
@@ -5449,6 +5496,21 @@ fn add_shards_parallel<V: serde::Serialize + Sync>(
         }
     }
     Ok(())
+}
+
+/// Compress unless it fails to pay for itself; the raw bytes are the fallback.
+fn shrink(plain: &[u8], path: &Path) -> Result<Vec<u8>, StorageError> {
+    let compressed = crate::generation_pack::compress_record(plain, path).map_err(|error| {
+        StorageError::Invalid {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(if compressed.len() < plain.len() {
+        compressed
+    } else {
+        plain.to_vec()
+    })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
