@@ -6044,6 +6044,24 @@ mod tests {
         for revision in 1..=4 {
             publish_body_edit(&store, "src/file-0.ts", revision);
         }
+        // Pin the cheap-rejection path shut before timing anything. `compact_artifacts_if_amplified`
+        // returns Ok(false) in microseconds when the store is not amplified enough, never reaching
+        // the reader barrier -- so without this the "did not finish yet" assertion below fails
+        // identically whether the barrier broke or the store simply had nothing to compact. That
+        // ambiguity is what made this test flaky when disk pressure moved the physical size around.
+        let manifest = store.read_manifest().unwrap().unwrap();
+        let artifact_store = manifest.artifact_store.clone().unwrap();
+        assert!(!artifact_store.contains('#'));
+        let live = manifest.artifact_live_bytes.unwrap();
+        let physical = fs::metadata(dir.path().join(&artifact_store))
+            .unwrap()
+            .len();
+        assert!(
+            live > 0 && physical >= live,
+            "setup must leave the store amplified for max_amplification=1, \
+             else compaction short-circuits before the reader barrier: physical={physical} live={live}"
+        );
+
         let reader = store.acquire_artifact_read_lock().unwrap();
         let worker_store = store.clone();
         let (sent, received) = std::sync::mpsc::channel();
@@ -6051,16 +6069,17 @@ mod tests {
             let result = worker_store.compact_artifacts_if_amplified(1, 1);
             sent.send(result).unwrap();
         });
-        assert!(
-            received
-                .recv_timeout(std::time::Duration::from_millis(20))
-                .is_err()
-        );
+        // Any result arriving while the shared lock is held is now a genuine barrier violation,
+        // so report what came back instead of asserting on the clock alone.
+        if let Ok(result) = received.recv_timeout(std::time::Duration::from_millis(200)) {
+            panic!("compaction finished while a reader held artifact-gc.lock: {result:?}");
+        }
         drop(reader);
+        // Generous: this waits for real work, so a slow machine must not turn into a red release.
         assert!(
             received
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("compaction must finish once the reader releases the lock")
                 .unwrap()
         );
         worker.join().unwrap();
