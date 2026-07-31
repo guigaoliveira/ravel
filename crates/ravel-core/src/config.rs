@@ -699,54 +699,100 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
     counts
 }
 
-/// Single-path ignore test built from the same inputs `discover_files` walks with. The file watcher
-/// sees raw filesystem events, so without this it syncs paths a full index would never have
-/// collected. A gitignored nested worktree is the case that bites: it holds a second copy of the
-/// whole repo, so every symbol in it gets a twin, the index inflates, and the structural overlay can
-/// outgrow the read limit that makes it loadable at all.
-pub fn ignore_matcher(config: &Config) -> ignore::gitignore::Gitignore {
-    // Canonicalize once so the matcher's base is absolute. Callers hand this function absolute
-    // paths (the CLI resolves them) while the configured root can be relative -- `--root .`. With a
-    // relative base nothing strips, the absolute path is tested against relative rules, and every
-    // check silently answers "not ignored".
-    let root = &config
-        .project
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| config.project.root.clone());
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    // `WalkBuilder` only honours gitignore rules inside a repository, so matching that condition
-    // here keeps the two in step. Applying them unconditionally would invert the bug: in a
-    // workspace with no git but a stray `.gitignore`, the watcher would start dropping files the
-    // full index happily collects.
-    if config.ignore.gitignore && crate::git::is_git_repo(root) {
-        builder.add(root.join(".gitignore"));
-        builder.add(root.join(".git/info/exclude"));
-    }
-    let custom = root.join(".ravelignore");
-    if custom.is_file() {
-        builder.add(custom);
-    }
-    builder
-        .build()
-        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+/// Gitignore rules live at every level, not just the workspace root: `apps/web/.gitignore` holding
+/// `dist/` is what excludes `apps/web/dist`, and the index walk honours it. Consulting only the root
+/// file made this check pass exactly the paths a monorepo means to exclude.
+///
+/// Deliberately pure pattern matching rather than asking the walk whether it would collect the file:
+/// a *deleted* path is gone from the filesystem, and the watcher still has to process its removal.
+pub struct IgnoreChain {
+    root: PathBuf,
+    gitignore_enabled: bool,
+    per_directory:
+        std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<ignore::gitignore::Gitignore>>>,
 }
 
-/// True when `path` is excluded by the matcher above. Directory-aware through
-/// `matched_path_or_any_parents`, so a file deep inside an ignored directory is excluded even
-/// though no rule names the file itself.
-pub fn is_ignored_path(matcher: &ignore::gitignore::Gitignore, root: &Path, path: &Path) -> bool {
-    // Strip against whichever base actually prefixes the path. The caller's root and the matcher's
-    // own root can differ -- canonicalized or not, or simply a different field -- and a failed strip
-    // would test an absolute path against relative rules, matching nothing. That silent miss is
-    // exactly the failure this function exists to prevent.
-    let relative = path
-        .strip_prefix(matcher.path())
-        .or_else(|_| path.strip_prefix(root))
-        .unwrap_or(path);
-    matcher
-        .matched_path_or_any_parents(relative, false)
-        .is_ignore()
+impl IgnoreChain {
+    pub fn new(config: &Config) -> Self {
+        let root = config
+            .project
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| config.project.root.clone());
+        // `WalkBuilder` only honours gitignore inside a repository; matching that keeps the two in
+        // step. Applying the rules anyway would invert the bug -- a workspace with no git but a
+        // stray `.gitignore` would drop files the index collects.
+        let gitignore_enabled = config.ignore.gitignore && crate::git::is_git_repo(&root);
+        Self {
+            root,
+            gitignore_enabled,
+            per_directory: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn matcher_for(&self, directory: &Path) -> std::sync::Arc<ignore::gitignore::Gitignore> {
+        if let Some(cached) = self
+            .per_directory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(directory)
+        {
+            return cached.clone();
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(directory);
+        if self.gitignore_enabled {
+            builder.add(directory.join(".gitignore"));
+            if directory == self.root {
+                builder.add(directory.join(".git/info/exclude"));
+            }
+        }
+        let custom = directory.join(".ravelignore");
+        if custom.is_file() {
+            builder.add(custom);
+        }
+        let matcher = std::sync::Arc::new(
+            builder
+                .build()
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()),
+        );
+        self.per_directory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(directory.to_path_buf(), matcher.clone());
+        matcher
+    }
+
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let Ok(relative) = absolute.strip_prefix(&self.root) else {
+            // Outside the workspace: not this workspace's call to make.
+            return false;
+        };
+        // Deepest rules win in git, and a negation there can re-include a path an outer file
+        // excluded, so walk inward-out and stop at the first decisive verdict.
+        let mut directories: Vec<PathBuf> = Vec::new();
+        let mut current = relative.parent();
+        while let Some(parent) = current {
+            directories.push(self.root.join(parent));
+            current = parent.parent();
+        }
+        if directories.is_empty() {
+            directories.push(self.root.clone());
+        }
+        for directory in directories {
+            let matcher = self.matcher_for(&directory);
+            match matcher.matched_path_or_any_parents(&absolute, false) {
+                ignore::Match::Ignore(_) => return true,
+                ignore::Match::Whitelist(_) => return false,
+                ignore::Match::None => {}
+            }
+        }
+        false
+    }
 }
 
 /// Whether a raw filesystem event is worth queueing at all. Both watchers -- the shared daemon's
@@ -755,28 +801,26 @@ pub fn is_ignored_path(matcher: &ignore::gitignore::Gitignore, root: &Path, path
 /// left the other indexing gitignored trees.
 pub fn watch_event_is_relevant(
     config: &Config,
-    ignore: &ignore::gitignore::Gitignore,
+    ignore: &IgnoreChain,
     storage_root: &Path,
-    root: &Path,
     path: &Path,
 ) -> bool {
-    !path.starts_with(storage_root)
-        && !config.is_noise(path)
-        && !is_ignored_path(ignore, root, path)
+    // Cheap tests first: the chain may read `.gitignore` files, so only ask it about paths that
+    // could otherwise be indexed.
+    !path.starts_with(storage_root) && !config.is_noise(path) && !ignore.is_ignored(path)
 }
 
 /// Whether a watched path should actually be reindexed: an indexable source, and nothing a full
 /// index walk would have skipped.
 pub fn watched_path_is_indexable(
     config: &Config,
-    ignore: &ignore::gitignore::Gitignore,
-    root: &Path,
+    ignore: &IgnoreChain,
     extensions: &[String],
     path: &Path,
 ) -> bool {
     config.is_source_with_extensions(path, extensions)
         && !config.is_noise(path)
-        && !is_ignored_path(ignore, root, path)
+        && !ignore.is_ignored(path)
 }
 
 pub fn discover_files(config: &Config) -> Result<Vec<PathBuf>, ConfigError> {
@@ -956,13 +1000,13 @@ mod tests {
             "a full walk must not collect the ignored worktree: {discovered:?}"
         );
 
-        let matcher = ignore_matcher(&config);
+        let matcher = IgnoreChain::new(&config);
         assert!(
-            is_ignored_path(&matcher, dir.path(), &worktree.join("service.ts")),
+            matcher.is_ignored(&worktree.join("service.ts")),
             "the watcher must drop an event from inside the ignored worktree"
         );
         assert!(
-            !is_ignored_path(&matcher, dir.path(), &tracked.join("service.ts")),
+            !matcher.is_ignored(&tracked.join("service.ts")),
             "the watcher must keep an event for a tracked source"
         );
     }
@@ -981,13 +1025,13 @@ mod tests {
 
         let mut config = Config::default();
         config.project.root = dir.path().to_path_buf();
-        let matcher = ignore_matcher(&config);
+        let matcher = IgnoreChain::new(&config);
         assert!(
-            is_ignored_path(&matcher, dir.path(), &ignored),
+            matcher.is_ignored(&ignored),
             "absolute path under an anchored directory rule must be ignored"
         );
         assert!(
-            is_ignored_path(&matcher, dir.path(), Path::new("reports/probe.ts")),
+            matcher.is_ignored(Path::new("reports/probe.ts")),
             "the relative spelling must be ignored too"
         );
 
@@ -998,16 +1042,82 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
         let mut relative_config = Config::default();
         relative_config.project.root = PathBuf::from(".");
-        let relative_matcher = ignore_matcher(&relative_config);
-        let ignored_under_relative_root = is_ignored_path(
-            &relative_matcher,
-            Path::new("."),
-            &dir.path().canonicalize().unwrap().join("reports/probe.ts"),
-        );
+        let relative_matcher = IgnoreChain::new(&relative_config);
+        let ignored_under_relative_root = relative_matcher
+            .is_ignored(&dir.path().canonicalize().unwrap().join("reports/probe.ts"));
         std::env::set_current_dir(previous).unwrap();
         assert!(
             ignored_under_relative_root,
             "a relative root must still recognise an absolute ignored path"
+        );
+    }
+
+    #[test]
+    fn a_nested_gitignore_excludes_as_much_as_the_walk_does() {
+        // Rules live at every level. Consulting only the root `.gitignore` passed exactly the paths
+        // a monorepo means to exclude -- `apps/web/.gitignore` with `dist/` is what hides
+        // `apps/web/dist`, and the index walk honours it.
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "/reports/\n").unwrap();
+        let web = dir.path().join("apps/web");
+        fs::create_dir_all(web.join("src")).unwrap();
+        fs::create_dir_all(web.join("dist")).unwrap();
+        fs::write(web.join(".gitignore"), "dist/\n").unwrap();
+        fs::write(web.join("src/app.ts"), "export const a = 1;").unwrap();
+        fs::write(web.join("dist/app.js"), "export const a = 1;").unwrap();
+
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.parser.extensions = vec!["ts".into(), "js".into()];
+
+        let discovered: Vec<_> = discover_files(&config)
+            .unwrap()
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        assert!(
+            !discovered
+                .iter()
+                .any(|path| path.starts_with("apps/web/dist")),
+            "the walk honours the nested rule: {discovered:?}"
+        );
+
+        let chain = IgnoreChain::new(&config);
+        assert!(
+            chain.is_ignored(&web.join("dist/app.js")),
+            "the watcher must honour the nested rule too"
+        );
+        assert!(
+            !chain.is_ignored(&web.join("src/app.ts")),
+            "a nested rule must not spill onto sibling directories"
+        );
+    }
+
+    #[test]
+    fn a_negation_in_a_nested_gitignore_re_includes_the_path() {
+        // Deeper rules win in git, including negations, so the chain has to stop at the first
+        // decisive verdict walking outward rather than OR-ing every level together.
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.gen.ts\n").unwrap();
+        let keep = dir.path().join("packages/keep");
+        fs::create_dir_all(&keep).unwrap();
+        fs::write(keep.join(".gitignore"), "!*.gen.ts\n").unwrap();
+        fs::write(keep.join("schema.gen.ts"), "export const a = 1;").unwrap();
+
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.parser.extensions = vec!["ts".into()];
+
+        let discovered = discover_files(&config).unwrap();
+        let walk_keeps = discovered
+            .iter()
+            .any(|path| path.ends_with("schema.gen.ts"));
+        assert_eq!(
+            walk_keeps,
+            !IgnoreChain::new(&config).is_ignored(&keep.join("schema.gen.ts")),
+            "the chain must agree with the walk about a negated nested rule"
         );
     }
 
@@ -1032,7 +1142,7 @@ mod tests {
             "no repository here, so the walk keeps the file: {discovered:?}"
         );
         assert!(
-            !is_ignored_path(&ignore_matcher(&config), dir.path(), &source),
+            !IgnoreChain::new(&config).is_ignored(&source),
             "the watcher must keep it too"
         );
     }

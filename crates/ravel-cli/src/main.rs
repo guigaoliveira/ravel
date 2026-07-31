@@ -657,10 +657,23 @@ skip_sibling_emit = true
             );
             let watch_config = engine.config.clone();
             let storage_root = root.join(&engine.config.storage.home);
+            // Third copy of this predicate lived here. `ravel watch` re-filters through the engine,
+            // so the harm was wasted wakeups rather than wrong index membership -- but it is the copy
+            // that would drift next time the rule changes.
+            let event_ignore =
+                std::sync::Arc::new(ravel_core::config::IgnoreChain::new(&engine.config));
+            let batch_ignore = event_ignore.clone();
             let watcher = ravel_core::watch::PersistentWatcher::new_filtered(
                 &root,
                 engine.config.watch.queue_capacity,
-                move |path| !path.starts_with(&storage_root) && !watch_config.is_noise(path),
+                move |path| {
+                    ravel_core::config::watch_event_is_relevant(
+                        &watch_config,
+                        &event_ignore,
+                        &storage_root,
+                        path,
+                    )
+                },
             )?;
             loop {
                 let batch = watcher.next_batch(
@@ -678,7 +691,14 @@ skip_sibling_emit = true
                 let paths: Vec<_> = result
                     .paths
                     .into_iter()
-                    .filter(|p| cfg.is_source_with_extensions(p, &extensions) && !cfg.is_noise(p))
+                    .filter(|p| {
+                        ravel_core::config::watched_path_is_indexable(
+                            cfg,
+                            &batch_ignore,
+                            &extensions,
+                            p,
+                        )
+                    })
                     .collect();
                 if paths.is_empty() && !result.needs_reconcile {
                     continue;

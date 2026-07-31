@@ -431,8 +431,8 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
             };
             // Same question the shared daemon's watcher asks, answered by the same code: an event
             // from a gitignored tree must never reach the index from either watcher.
-            let event_ignore = crate::config::ignore_matcher(&engine.config);
-            let event_root = root.clone();
+            let event_ignore = std::sync::Arc::new(crate::config::IgnoreChain::new(&engine.config));
+            let batch_ignore = event_ignore.clone();
             let watcher = match crate::watch::PersistentWatcher::new_filtered(
                 &root,
                 queue_capacity,
@@ -441,7 +441,6 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         &watch_config,
                         &event_ignore,
                         &storage_root,
-                        &event_root,
                         path,
                     )
                 },
@@ -471,7 +470,6 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     }
                 };
                 let extensions = crate::config::effective_extensions(&engine.config);
-                let batch_ignore = crate::config::ignore_matcher(&engine.config);
                 let paths: Vec<_> = batch
                     .paths
                     .into_iter()
@@ -479,7 +477,6 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         crate::config::watched_path_is_indexable(
                             &engine.config,
                             &batch_ignore,
-                            &root,
                             &extensions,
                             path,
                         )

@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-31
+
+**If a workspace grew a gitignored copy of itself, reindex it once:** `ravel index`.
+On a 21k-file monorepo that took 9s and shrank `.ravel` from 12GB to 2.2GB.
+
+Most of this release comes from three blind adversarial reviews of the previous
+one. Several fixes correct earlier fixes that were incomplete.
+
+### Fixed — answers that could not be distinguished from real ones
+- `callers_of` and `calls_from` no longer report `total: 0` for a name that
+  resolved to nothing, or to several definitions. The resolver fell back to the
+  raw string, the graph returned an empty page for a non-node, and the response
+  was byte-identical to a symbol that genuinely has no references — the answer a
+  caller acts on when deciding a change is safe. Both now return
+  `resolved: false` with a reason and the candidate ids, and no count at all.
+- `impact` refuses the same two cases instead of reporting
+  `total_affected: 0, exact: true`. It is the blast-radius tool; that was the
+  most dangerous version of this bug. The silent-fallback resolver is deleted, so
+  no third caller can reintroduce it.
+- `explore` names an invented identifier before reporting ambiguity. The check
+  sat in an `else if` after the ambiguity branch, so `handleRequestzzz` came back
+  as `ambiguous: true` with two `file:line` locations for `handle` — asserting
+  the opposite of the truth. The lexical test also accepted a query that merely
+  *contained* a real name; only the other direction (a real name containing the
+  query, as in a prefix search) is a match now.
+- `status` reports `indexed: false` when the on-disk schema is not the one this
+  binary speaks. It read the manifest without the schema check, so it answered
+  "Index ready" with file counts while every query failed — the exact state a
+  running server hits after npm replaces the binary under it. Adds
+  `binary_version` and `schema: {on_disk, expected}`, and a hint that says which
+  direction the mismatch points and therefore whether to upgrade or reindex.
+- `n_affected_exact` is `false` when no impact analysis ran. It was
+  `unwrap_or(true)`: a positive claim of precision next to an unasked zero.
+- `sync` fails when every path it was given was skipped, rather than returning
+  whole-index stats that read as confirmation. Callers pass paths they just
+  edited; a mistyped relative path used to yield certainty of a stale answer.
+  Workspace metadata (`package.json`, `tsconfig.json`) is exempt — it carries no
+  symbols but legitimately drives a re-resolution.
+- `ravel ci` propagates validation errors instead of `unwrap_or_default()`.
+  Swallowing the error emptied the findings, which *satisfies* the strict gate,
+  so a policy-violating merge went green — while `ravel validate` exited non-zero
+  for the same repo. A gate that fails open is worse than no gate.
+
+### Fixed — the index no longer disagrees with itself about what belongs in it
+- The file watcher applies gitignore, at every directory level. Its filter was
+  "not inside `.ravel` and not a noise directory name", while a full index walks
+  with gitignore applied. Found on a 21k-file workspace holding ten agent
+  worktrees under a gitignored `.claude/worktrees/`: 279k TypeScript files, a
+  second copy of every source. The builtin noise list missed them because a
+  nested worktree's `.git` is a gitlink *file*, so no path component inside it is
+  named `.git`. In order: every symbol gained a twin and stopped resolving, the
+  index went 21228 -> 23969 files and 4.4GB -> 8.6GB, and the structural
+  overlay's graph record reached 426MB against the 256MB component read limit,
+  which makes `callers_of` fail outright.
+- Nested `.gitignore` files count. A first version of the fix consulted only the
+  root file, which is inert in the layout that matters: `apps/web/.gitignore`
+  holding `dist/` is what excludes `apps/web/dist`. The matcher now walks the
+  chain from the file outward and stops at the first decisive rule, so a negation
+  in a deeper file re-includes as git does. Tests assert it agrees with the walk
+  on both.
+- `sync` with explicit paths is bounded by the same rules. It accepted any source
+  path, so syncing a gitignored file indexed it and left index membership
+  dependent on which command ran last.
+- The predicate lives in one place and all four watchers use it — the shared
+  daemon's, the MCP server's, both post-batch filters, and `ravel watch`. It had
+  been inlined three times; fixing one copy is what left the others wrong.
+- Gitignore rules apply only inside a repository, matching the index walk.
+  Applying them unconditionally inverts the bug: a workspace with no git but a
+  stray `.gitignore` would drop files the index collects.
+- Paths are resolved against a canonicalized root. The CLI passes absolute paths
+  while `--root .` is relative, and with a relative base nothing stripped — so
+  every ignore check tested an absolute path against relative rules and answered
+  "not ignored", silently passing everything.
+- A newer index is never rebuilt downward. Two long-lived servers of different
+  versions can share one workspace, and the incremental paths decline on any
+  schema mismatch and fall back to a full rebuild — so an older binary rewrote a
+  newer index in its own format, the newer one rebuilt it back, and each flip
+  cost a full reindex. A full publish now refuses, naming the version that wrote
+  the index and offering the way out.
+- `coverage.authoritative_zero` reports whether an empty relation set was
+  actually asked. It was hard-coded `false`.
+
+### Known
+- A structural overlay component can be written larger than the 256MB the reader
+  accepts (`MAX_DELTA_COMPONENT_BYTES`), leaving the index unreadable until a full
+  reindex. Excluding ignored trees removes the case that triggered it here, but a
+  large enough legitimate workspace can still reach it: the writers enforce no
+  matching ceiling.
+- A malformed `tsconfig.json` is indistinguishable from an absent one, so every
+  path alias silently disappears from the index and `callers_of` understates
+  permanently, with no diagnostic.
+- A file that fails to scan (permissions, fd exhaustion) is dropped from the index
+  with no diagnostic, and the `parse_errors` count *decreases*.
+- An over-size file is kept with a `file_too_large` diagnostic by a full index and
+  removed by an incremental sync, so its coverage depends on which ran last.
+- A hash-sidecar read failure is treated as an absent sidecar, so auto-sync
+  silently does nothing and answers from the previous generation.
+
 ## [1.11.0] - 2026-07-31
 
 Closes both items 1.10.1 recorded as Known.

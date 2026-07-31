@@ -43,7 +43,7 @@ use thiserror::Error;
 /// queries from an empty symbol-meta backend, which is indistinguishable from a
 /// genuine "nothing found". The bump makes the mismatch loud in both directions:
 /// each side reports an unsupported schema and rebuilds.
-const SCHEMA_VERSION: u32 = 17;
+pub(crate) const SCHEMA_VERSION: u32 = 17;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -4322,8 +4322,10 @@ impl FileSnapshotStorage {
             path: self.current_path(),
             message: format!(
                 "workspace was indexed by a newer Ravel (schema {}; this binary writes \
-                 {SCHEMA_VERSION}) — upgrade the CLI rather than rebuilding the index downward",
-                existing.schema_version
+                 {SCHEMA_VERSION}) — upgrade the CLI, or delete {} to start this workspace over \
+                 with this version",
+                existing.schema_version,
+                self.root.display()
             ),
         })
     }

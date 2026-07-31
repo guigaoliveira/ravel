@@ -54,6 +54,11 @@ pub enum EngineError {
         #[source]
         source: std::io::Error,
     },
+    /// Reported instead of an empty page: a relation or impact count of zero for a name that never
+    /// resolved is indistinguishable from a symbol that genuinely has none, and that zero is what
+    /// callers act on when they decide a change is safe.
+    #[error("{message}")]
+    Unresolved { message: String },
     #[error("sync path is outside workspace {root}: {path}")]
     PathOutsideWorkspace { root: PathBuf, path: PathBuf },
     #[error("workspace sync queue {path}: {source}")]
@@ -481,6 +486,32 @@ const MAX_CONTEXT_SOURCE_LINES: usize = 200;
 
 /// Read only the selected declaration. Context must not hydrate every caller body: the agent can
 /// open a related site when it decides to follow that edge.
+/// How many candidates a failed resolution shows. Enough to disambiguate by hand, few enough that
+/// a common name does not turn the refusal into a wall of text.
+const CANDIDATE_PREVIEW: usize = 10;
+
+/// The outcome of turning a caller-supplied name into a graph node.
+enum NodeResolution {
+    Resolved(String),
+    Ambiguous(Vec<serde_json::Value>),
+    NotFound,
+}
+
+fn candidate_previews(entries: &[crate::model::SymbolMeta]) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "id": entry.id,
+                "qualified": entry.qualified_name,
+                "kind": entry.kind,
+                "path": entry.path,
+                "line": entry.span.start_line + 1,
+            })
+        })
+        .collect()
+}
+
 fn symbol_source_excerpt(
     root: &Path,
     symbol: &crate::model::SymbolMeta,
@@ -1150,19 +1181,40 @@ impl WorkspaceEngine {
             // gitignored path here makes the index depend on which command ran last: `sync` adds
             // the file, the next `ravel index` drops it again.
             Some(p) if !p.is_empty() => {
-                let ignore = crate::config::ignore_matcher(&self.config);
-                p.iter()
+                let ignore = crate::config::IgnoreChain::new(&self.config);
+                let kept: Vec<PathBuf> = p
+                    .iter()
                     .filter(|p| {
                         crate::config::watched_path_is_indexable(
                             &self.config,
                             &ignore,
-                            &self.root,
                             &extensions,
                             p,
                         )
                     })
                     .cloned()
-                    .collect()
+                    .collect();
+                // Every requested path skipped is not a successful sync. Callers pass paths they
+                // just edited and read the returned stats as confirmation, so a mistyped relative
+                // path would otherwise hand back an unchanged index that looks freshly synced.
+                // Workspace metadata is the exception: `package.json` and `tsconfig.json` carry no
+                // symbols yet legitimately drive a re-resolution, so they are real work.
+                let metadata_only = p.iter().any(|path| {
+                    matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("package.json" | "tsconfig.json" | "jsconfig.json")
+                    )
+                });
+                if kept.is_empty() && !metadata_only {
+                    return Err(EngineError::Unresolved {
+                        message: format!(
+                            "none of the {} requested path(s) is an indexable source in this workspace \
+                             (wrong path, unsupported extension, or excluded by gitignore/noise rules)",
+                            p.len()
+                        ),
+                    });
+                }
+                kept
             }
             _ => {
                 let discover_started = std::time::Instant::now();
@@ -1593,9 +1645,6 @@ impl WorkspaceEngine {
             };
             subset.insert(path.clone(), artifact);
         }
-        crate::timing::stage("delta.build_subset", subset_start, || {
-            format!("artifacts={}", subset.len())
-        });
         crate::timing::stage("delta.build_subset", subset_start, || {
             format!("artifacts={}", subset.len())
         });
@@ -2148,7 +2197,14 @@ impl WorkspaceEngine {
         let graph_present = manifest
             .as_ref()
             .is_some_and(|m| store.referenced_path_exists(m.graph.as_deref()));
-        let has = stats_present || graph_present;
+        // Presence is not health. A manifest written by a different schema is readable enough to
+        // report file counts while every query against it fails, so status must not call that
+        // "indexed" -- an agent told the index is ready reads the failures that follow as its own
+        // mistake, or worse, reports the workspace as healthy.
+        let on_disk_schema = manifest.as_ref().map(|m| m.schema_version);
+        let schema_matches =
+            on_disk_schema.is_none_or(|found| found == crate::storage::SCHEMA_VERSION);
+        let has = (stats_present || graph_present) && schema_matches;
         let home = self.root.join(&self.config.storage.home);
         let git = self.is_git_repo_cached();
         // Bounded walk, cached: enough to tell "indexed and covers this workspace"
@@ -2197,8 +2253,35 @@ impl WorkspaceEngine {
                 "unsupported_source_files": unsupported_total,
                 "unsupported_by_extension": unsupported.as_ref(),
             },
-            "hint": if !has {
-                "Run `ravel index` first.".to_owned()
+            "binary_version": crate::VERSION,
+            "schema": {
+                "on_disk": on_disk_schema,
+                "expected": crate::storage::SCHEMA_VERSION,
+            },
+            "hint": if !schema_matches {
+                // Named first: every other tool is about to fail, and which direction the mismatch
+                // points decides the remedy.
+                let found = on_disk_schema.unwrap_or_default();
+                if found > crate::storage::SCHEMA_VERSION {
+                    format!(
+                        "This workspace was indexed by a newer Ravel (schema {found}; this binary expects {}). Queries will fail until you upgrade the CLI — do not reindex, that would rebuild it downward.",
+                        crate::storage::SCHEMA_VERSION
+                    )
+                } else {
+                    format!(
+                        "Index was written by an older Ravel (schema {found}; this binary expects {}). Run `ravel index` once to rebuild it.",
+                        crate::storage::SCHEMA_VERSION
+                    )
+                }
+            } else if !has {
+                // An unsupported-language workspace must not be told to index: it already did, and
+                // indexing again produces the same near-empty graph.
+                match dominant_unsupported.filter(|(_, count)| *count > indexed_files) {
+                    Some((extension, count)) => format!(
+                        "Not indexed, and {count} .{extension} file(s) here are not parsed (Ravel covers TypeScript/JavaScript) — indexing will not make them queryable. Use text search for those."
+                    ),
+                    None => "Run `ravel index` first.".to_owned(),
+                }
             } else if let Some((extension, count)) = dominant_unsupported
                 .filter(|(_, count)| *count > indexed_files)
             {
@@ -2619,20 +2702,34 @@ impl WorkspaceEngine {
         // with empty warnings. Multi-word queries are excluded: term coverage is the whole point
         // there, and the caller did not spell an identifier.
         let identifier_query = query.chars().count() >= 3 && !query.contains(char::is_whitespace);
+        // The asked-for name has to actually appear among the matches. A two-way `contains` let a
+        // superstring through -- `handleRequestzzz` "matched" `handle` -- so any half-remembered or
+        // invented name that extends a short real symbol was reported as found.
+        // Only one direction counts. A real symbol whose name *contains* the query is a legitimate
+        // partial-name search (`PendingLegalPerson` finding `getPendingLegalPersonOnboarding`). The
+        // reverse -- the query containing a shorter real name -- is how `handleRequestzzz` passed as
+        // a match for `handle`, so an invented or half-remembered name looked found.
         let primary_is_lexical = {
             let asked = query.to_lowercase();
-            let got = primary.to_lowercase();
-            got.contains(&asked) || asked.contains(&got)
+            primary.to_lowercase().contains(&asked)
+                || matches
+                    .iter()
+                    .any(|name| name.to_lowercase().contains(&asked))
         };
+        let invented_name = identifier_query && exact_identity.is_empty() && !primary_is_lexical;
         let mut warnings = Vec::<String>::new();
+        // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
+        // the queried name exist, and "ambiguous symbol name" asserts the opposite -- it reads as
+        // confirmation that the name is real and appears in several places.
+        if invented_name {
+            warnings.push(format!(
+                "no symbol is named `{query}`; results below are term matches on shared tokens, not that name"
+            ));
+        }
         if ambiguous {
             warnings.push("ambiguous symbol name; select a candidate id or qualified name".into());
-        } else if no_result {
+        } else if no_result && !invented_name {
             warnings.push("no definition matched search evidence".into());
-        } else if identifier_query && exact_identity.is_empty() && !primary_is_lexical {
-            warnings.push(format!(
-                "no symbol is named `{query}`; primary is a term match on shared tokens, not that name"
-            ));
         }
         // The explore page caps at CONTEXT_RELATION_LIMIT_MAX; never promise a
         // re-query beyond what it can actually return.
@@ -2654,62 +2751,64 @@ impl WorkspaceEngine {
             truncation_hint("outgoing", outgoing_total);
         }
         Ok(serde_json::json!({
-            "q": query,
-            "primary": primary,
-            "matches": matches,
-            "matches_total": matches_total,
-            "candidates": candidates,
-            "ambiguous": ambiguous,
-            "detail": primary_meta.map(|d| serde_json::json!({
-                "id": d.id, "name": d.name, "qualified": d.qualified_name,
-                "kind": d.kind, "exported": d.exported, "path": d.path,
-                "line": d.span.start_line + 1, "end_line": d.span.end_line + 1
-            })),
-            "source": source,
-            "callers": callers_names,
-            "callees": callees_names,
-            "relations": {
-                "incoming": incoming_relations,
-                "outgoing": outgoing_relations,
-                // Full edge counts (all kinds); the lists above are bounded pages.
-                "incoming_total": incoming_total,
-                "outgoing_total": outgoing_total,
-                // Complete per-kind aggregates — never truncated, even for hubs.
-                "incoming_by_kind": incoming_by_kind,
-                "outgoing_by_kind": outgoing_by_kind,
-            },
-            // The blast-radius preview is a sample, and `n_affected` already carries
-            // the number a decision turns on. `impact` / `callers_of` give the list
-            // when it is actually wanted.
-            "impact": if detail { impact_top } else { Vec::new() },
-            "n_callers": caller_count,
-            "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
-            "n_affected_exact": impact.as_ref().map(|r| r.exact).unwrap_or(true),
-            "auto_synced": synced.is_some(),
-            "sync_warning": self.last_update_error(),
-            "warnings": warnings,
-            "truncation": {
-                "candidates": candidates_truncated,
-                "incoming": incoming_total > limit,
-                "outgoing": outgoing_total > limit,
-            },
-            "coverage": {
-                "imports_exports": "static",
-                "calls": "static_syntax",
-                "types": "static_syntax",
-                "instantiation": "static_syntax",
-                "decorators": "static_syntax",
-                "value_references": "partial",
-                "dynamic_dispatch": "unsupported",
-                // Whether an empty relation set means "nothing references this". It only does when
-                // a single definition was resolved and the graph was consulted for it; an ambiguous
-                // or unmatched name reports zeros because nothing was asked, not because the answer
-                // is zero. Hard-coding this false made it useless as a signal -- a caller could not
-                // tell a real zero from an unasked one.
-                "authoritative_zero": graph_primary.is_some(),
-            },
-            "sid": self.stats().map(|s| s.snapshot_id).ok(),
-        }))
+                    "q": query,
+                    "primary": primary,
+                    "matches": matches,
+                    "matches_total": matches_total,
+                    "candidates": candidates,
+                    "ambiguous": ambiguous,
+                    "detail": primary_meta.map(|d| serde_json::json!({
+                        "id": d.id, "name": d.name, "qualified": d.qualified_name,
+                        "kind": d.kind, "exported": d.exported, "path": d.path,
+                        "line": d.span.start_line + 1, "end_line": d.span.end_line + 1
+                    })),
+                    "source": source,
+                    "callers": callers_names,
+                    "callees": callees_names,
+                    "relations": {
+                        "incoming": incoming_relations,
+                        "outgoing": outgoing_relations,
+                        // Full edge counts (all kinds); the lists above are bounded pages.
+                        "incoming_total": incoming_total,
+                        "outgoing_total": outgoing_total,
+                        // Complete per-kind aggregates — never truncated, even for hubs.
+                        "incoming_by_kind": incoming_by_kind,
+                        "outgoing_by_kind": outgoing_by_kind,
+                    },
+                    // The blast-radius preview is a sample, and `n_affected` already carries
+                    // the number a decision turns on. `impact` / `callers_of` give the list
+                    // when it is actually wanted.
+                    "impact": if detail { impact_top } else { Vec::new() },
+                    "n_callers": caller_count,
+                    "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
+                    // No impact analysis ran when nothing resolved, so there is no exact count to claim.
+        // `true` next to a zero reads as "changing this affects nothing, precisely".
+        "n_affected_exact": impact.as_ref().is_some_and(|r| r.exact),
+                    "auto_synced": synced.is_some(),
+                    "sync_warning": self.last_update_error(),
+                    "warnings": warnings,
+                    "truncation": {
+                        "candidates": candidates_truncated,
+                        "incoming": incoming_total > limit,
+                        "outgoing": outgoing_total > limit,
+                    },
+                    "coverage": {
+                        "imports_exports": "static",
+                        "calls": "static_syntax",
+                        "types": "static_syntax",
+                        "instantiation": "static_syntax",
+                        "decorators": "static_syntax",
+                        "value_references": "partial",
+                        "dynamic_dispatch": "unsupported",
+                        // Whether an empty relation set means "nothing references this". It only does when
+                        // a single definition was resolved and the graph was consulted for it; an ambiguous
+                        // or unmatched name reports zeros because nothing was asked, not because the answer
+                        // is zero. Hard-coding this false made it useless as a signal -- a caller could not
+                        // tell a real zero from an unasked one.
+                        "authoritative_zero": graph_primary.is_some(),
+                    },
+                    "sid": self.stats().map(|s| s.snapshot_id).ok(),
+                }))
     }
 
     pub fn snapshot(&self) -> Result<Arc<IndexSnapshot>, EngineError> {
@@ -2853,23 +2952,60 @@ impl WorkspaceEngine {
         Ok(Some(meta))
     }
 
-    fn resolve_graph_node(&self, graph: &GraphIndex, node: &str) -> String {
+    /// Resolve a caller-supplied name to exactly one graph node, or say why not. `reference_sites`
+    /// must not answer a relation count for the failures: `total: 0` for a name that matched nothing
+    /// -- or matched several definitions -- is indistinguishable from a symbol that genuinely has no
+    /// references, which is the answer callers act on when they decide something is safe to change.
+    fn resolve_graph_node_outcome(&self, graph: &GraphIndex, node: &str) -> NodeResolution {
         if graph.contains_node(node) {
-            return node.to_owned();
+            return NodeResolution::Resolved(node.to_owned());
         }
-        self.symbol_meta_runtime()
-            .ok()
-            .flatten()
-            .and_then(|runtime| {
-                let (qualified, total) = runtime.exact_id_or_qualified(node, 2);
-                if total == 1 {
-                    return Some(qualified[0].id.clone());
-                }
-                let (by_name, total) = runtime.entries_for(node, 2);
-                (total == 1).then(|| by_name[0].id.clone())
-            })
-            .unwrap_or_else(|| node.to_owned())
+        let Ok(Some(runtime)) = self.symbol_meta_runtime() else {
+            return NodeResolution::NotFound;
+        };
+        let (qualified, total) = runtime.exact_id_or_qualified(node, CANDIDATE_PREVIEW);
+        if total == 1 {
+            return NodeResolution::Resolved(qualified[0].id.clone());
+        }
+        if total > 1 {
+            return NodeResolution::Ambiguous(candidate_previews(&qualified));
+        }
+        let (by_name, total) = runtime.entries_for(node, CANDIDATE_PREVIEW);
+        match total {
+            0 => NodeResolution::NotFound,
+            1 => NodeResolution::Resolved(by_name[0].id.clone()),
+            _ => NodeResolution::Ambiguous(candidate_previews(&by_name)),
+        }
     }
+
+    /// Resolve or refuse. `query_raw` and `impact_risk` return counts callers treat as blast radius,
+    /// so an unresolved name must not reach the graph as a literal string and come back as zero.
+    fn resolved_node_or_error(
+        &self,
+        graph: &GraphIndex,
+        node: &str,
+    ) -> Result<String, EngineError> {
+        match self.resolve_graph_node_outcome(graph, node) {
+            NodeResolution::Resolved(id) => Ok(id),
+            NodeResolution::Ambiguous(candidates) => Err(EngineError::Unresolved {
+                message: format!(
+                    "`{node}` names {} definitions; re-query with one id (for example {})",
+                    candidates.len(),
+                    candidates
+                        .first()
+                        .and_then(|candidate| candidate.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("a candidate id from explore")
+                ),
+            }),
+            NodeResolution::NotFound => Err(EngineError::Unresolved {
+                message: format!(
+                    "nothing in the index is named `{node}`; check the spelling, or use grep for text that is not a symbol"
+                ),
+            }),
+        }
+    }
+
     pub fn query(
         &self,
         node: &str,
@@ -2898,7 +3034,32 @@ impl WorkspaceEngine {
     ) -> Result<serde_json::Value, EngineError> {
         let _ = self.auto_sync_if_dirty()?;
         let graph = self.graph()?;
-        let resolved = self.resolve_graph_node(&graph, node);
+        // A name that resolved to nothing, or to several definitions, has no relation count to
+        // report. Answering `total: 0` there reads exactly like "nothing references this" -- the
+        // conclusion callers act on when deciding a symbol is safe to change.
+        let resolved = match self.resolve_graph_node_outcome(&graph, node) {
+            NodeResolution::Resolved(id) => id,
+            NodeResolution::Ambiguous(candidates) => {
+                return Ok(serde_json::json!({
+                    "node": node,
+                    "direction": if reverse { "incoming" } else { "outgoing" },
+                    "resolved": false,
+                    "reason": "ambiguous",
+                    "candidates": candidates,
+                    "hint": "several definitions share this name; re-query with one candidate id",
+                }));
+            }
+            NodeResolution::NotFound => {
+                return Ok(serde_json::json!({
+                    "node": node,
+                    "direction": if reverse { "incoming" } else { "outgoing" },
+                    "resolved": false,
+                    "reason": "no_symbol_named",
+                    "hint": "nothing in the index is named this; check the spelling, \
+                             or use grep for text that is not a symbol",
+                }));
+            }
+        };
         let symbols = self.symbol_meta_runtime()?;
         // Ask for the page plus everything before it, then slice: relation order is
         // deterministic, so a cursor is an offset into the same sequence.
@@ -2965,7 +3126,7 @@ impl WorkspaceEngine {
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<QueryPage, EngineError> {
         let graph = self.graph()?;
-        let resolved_node = self.resolve_graph_node(&graph, node);
+        let resolved_node = self.resolved_node_or_error(&graph, node)?;
         Ok(if reverse {
             graph.callers_of(&resolved_node, limits, cancel)?
         } else {
@@ -3150,7 +3311,7 @@ impl WorkspaceEngine {
         limits: &QueryLimits,
     ) -> Result<ImpactReport, EngineError> {
         let graph = self.graph()?;
-        let resolved_node = self.resolve_graph_node(&graph, node);
+        let resolved_node = self.resolved_node_or_error(&graph, node)?;
         Ok(analysis::impact_with_risk(&graph, &resolved_node, limits)?)
     }
 
@@ -3362,8 +3523,12 @@ impl WorkspaceEngine {
     pub fn ci(&self, strict: bool, cycle_threshold: usize) -> Result<CiReport, EngineError> {
         let stats = self.stats()?;
         let cycles = self.cycles(None)?;
-        let findings = self.validate().unwrap_or_default();
-        let orphans = self.orphans(10_000).map(|o| o.len()).unwrap_or(0);
+        // A gate that fails open is worse than no gate: swallowing the error empties `findings`,
+        // which *satisfies* the strict condition and turns a policy-violating merge green. `ravel
+        // validate` already exits non-zero here, so the two entry points disagreed exactly on
+        // failure.
+        let findings = self.validate()?;
+        let orphans = self.orphans(10_000)?.len();
         Ok(analysis::ci_report(
             stats.snapshot_id,
             stats.files,
@@ -3732,8 +3897,34 @@ mod agent_context_tests {
         let root = tempfile::tempdir().unwrap();
         let service = root.path().join("service.ts");
         std::fs::write(&service, "export function alpha() { return 1; }\n").unwrap();
+        // A real repository, or `auto_sync_if_dirty` returns `Ok(None)` on its first line and the
+        // assertions below pass without ever reaching the discovery order they exist to pin.
+        for command in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&command)
+                .current_dir(root.path())
+                .status()
+                .expect("git must be available for this test");
+            assert!(status.success(), "git {command:?} failed");
+        }
         let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
         engine.index().unwrap();
+        assert!(
+            engine.is_git_repo_cached(),
+            "the reordered discovery path only runs on a git repo"
+        );
 
         // Nothing changed since the index: no work, and no error.
         assert!(
@@ -4086,15 +4277,144 @@ mod agent_context_tests {
 
         // Handing the ignored path in explicitly must not get it indexed: otherwise the contents of
         // the index depend on which command ran last, and the next `index` silently drops it again.
-        let synced = engine.sync(Some(std::slice::from_ref(&ignored))).unwrap();
+        // And it must say so rather than returning stats that read as a successful sync.
+        let refused = engine
+            .sync(Some(std::slice::from_ref(&ignored)))
+            .expect_err("a sync whose every path was skipped is not a success");
+        let refused = refused.to_string();
+        assert!(
+            refused.contains("indexable source"),
+            "the refusal has to explain why nothing was synced: {refused}"
+        );
         assert_eq!(
-            synced.files, 1,
-            "an explicit sync must not smuggle in an ignored file: {synced:?}"
+            engine.stats().unwrap().files,
+            1,
+            "the index must be unchanged after the refusal"
         );
         let found = engine.context("generatedThing", 10).unwrap();
         assert_eq!(
             found["matches_total"], 0,
             "the ignored symbol must not be searchable: {found:?}"
+        );
+    }
+
+    #[test]
+    fn relation_and_impact_refuse_a_name_they_could_not_resolve() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        // Two definitions of `handle`, each with a real caller, plus a symbol with none.
+        std::fs::write(
+            root.path().join("src/a.ts"),
+            "export function handle() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/b.ts"),
+            "export function handle() { return 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/callers.ts"),
+            "import { handle } from './a';\nexport function useIt() { return handle(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/lonely.ts"),
+            "export function lonelyOne() { return 3; }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // Ambiguous: a zero here reads as "nothing references this", which is what a caller acts on
+        // when deciding a symbol is safe to delete. Both `handle` definitions exist.
+        let ambiguous = engine.reference_sites("handle", true, 10, 0).unwrap();
+        assert_eq!(ambiguous["resolved"], false, "{ambiguous:?}");
+        assert_eq!(ambiguous["reason"], "ambiguous");
+        assert!(
+            ambiguous.get("total").is_none(),
+            "no count may be reported: {ambiguous:?}"
+        );
+        assert!(
+            !ambiguous["candidates"].as_array().unwrap().is_empty(),
+            "the caller needs the ids to disambiguate: {ambiguous:?}"
+        );
+
+        // A name nobody defined.
+        let missing = engine
+            .reference_sites("handleRequestzzz", true, 10, 0)
+            .unwrap();
+        assert_eq!(missing["resolved"], false, "{missing:?}");
+        assert_eq!(missing["reason"], "no_symbol_named");
+        assert!(missing.get("total").is_none(), "{missing:?}");
+
+        // A genuine zero still answers, and says so with a count.
+        let real = engine.reference_sites("lonelyOne", true, 10, 0).unwrap();
+        assert_eq!(real["total"], 0, "{real:?}");
+        assert!(
+            real.get("resolved").is_none(),
+            "a resolved answer needs no flag: {real:?}"
+        );
+
+        // impact is the blast-radius tool; "affects zero, exactly" is the worst possible lie.
+        let refused = engine
+            .impact_risk("handleRequestzzz", &QueryLimits::default())
+            .expect_err("impact must refuse a name it cannot resolve");
+        assert!(
+            refused
+                .to_string()
+                .contains("nothing in the index is named"),
+            "{refused}"
+        );
+        let refused = engine
+            .impact_risk("handle", &QueryLimits::default())
+            .expect_err("impact must refuse an ambiguous name");
+        assert!(refused.to_string().contains("definitions"), "{refused}");
+    }
+
+    #[test]
+    fn an_invented_name_is_named_as_invented_even_when_something_else_is_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/a.ts"),
+            "export function handle() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/b.ts"),
+            "export function handle() { return 2; }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // `handleRequestzzz` does not exist. Reporting only "ambiguous symbol name" asserts the
+        // opposite -- that the queried name is real and appears in several places -- and hands over
+        // file:line for both, which is how an agent states a fabricated symbol as found.
+        let response = engine.context("handleRequestzzz", 10).unwrap();
+        let warnings: Vec<&str> = response["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| warning.as_str().unwrap())
+            .collect();
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|first| first.starts_with("no symbol is named")),
+            "the invented name must be called out first: {warnings:?}"
+        );
+
+        // A real partial name is a legitimate search and must stay quiet.
+        let partial = engine.context("handl", 10).unwrap();
+        assert!(
+            !partial["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().starts_with("no symbol is named")),
+            "a prefix of a real symbol is not an invented name: {partial:?}"
         );
     }
 
