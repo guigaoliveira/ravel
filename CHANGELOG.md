@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-31
+
+**The index is rebuilt once on first use after upgrading.** Pack records changed
+layout, so `SCHEMA_VERSION` and the pack header version both move and auto-sync
+rebuilds on the first command. Nothing to do by hand.
+
+### Changed
+- The pack is 67% smaller and a full index is slightly faster. Records whose
+  reader deserializes them anyway — every bincode payload — are stored
+  zstd-compressed; they are long runs of repeated path and symbol strings and
+  compress 8-14x on real payloads. On a 20.4k-file / 744k-edge workspace:
+  1731MB -> 562MB, and `index.total` 8849ms -> 8535ms over 3 alternating rounds,
+  because writing 1.17GB less pays for the compression. Records borrowed
+  zero-copy out of the mmap stay raw, and the zero-copy borrow refuses a
+  compressed record rather than hand back bytes the consumer would misread.
+- Syncing an edit is ~4x faster. `read_component_ref` opened a fresh pack reader
+  per call, and opening one decodes the pack's entire directory — 39305 entries
+  on that workspace — so resolving the 129 files affected by a single edit
+  decoded it 129 times. Readers are cached per pack name, which is sound because
+  a published pack is immutable: `delta.build_subset` 1059ms -> 22ms, and the
+  sync containing it 1512ms -> 418ms.
+- Cold graph load skips two full copies. It used to validate the ~90MB record,
+  deserialize it into an owned flat form, expand that into one `Vec` per node,
+  then move the result into the index — only the last shape is used. Building
+  straight from the archive: `graph.open` 85ms -> 41-61ms.
+- Indexing allocates in tight loops, which is where a general-purpose allocator
+  does worst. mimalloc is now the global allocator: full index -23%, peak RSS
+  3161MB -> 2738MB, cold CLI queries -27%. Not on musl, whose release builds
+  could not be verified for a C toolchain here — those keep the system
+  allocator, so no gain and no regression.
+- `status` no longer re-walks the workspace on every call. The coverage probe
+  added in 1.6.0 cost 77.9ms *per call*, making it the most expensive primary
+  tool; it is now cached behind a TTL, because coverage describes which files
+  exist on disk and has nothing to do with which index generation is published.
+  Warm `status` 77.9ms -> 0.6ms.
+- Auto-sync discovers dirty paths before loading the hash sidecar. The sidecar
+  unzips the artifact index into tens of thousands of owned strings, and on a
+  clean tree there is nothing to compare it against.
+- Applying an incremental overlay makes one pass per node instead of scanning the
+  adjacency once per changed neighbour — O(changes x degree) -> O(changes +
+  degree), which matters exactly when an edit reaches a hub.
+
+### Fixed
+- `scale_exact_prefix_sublinear_wall` asserted absolute milliseconds calibrated
+  for a release build while `cargo test` runs a debug build, so it failed on a
+  loaded machine while the property it exists to protect was intact. It now
+  asserts growth ratios. Verified by running it under 16 competing CPU hogs: the
+  test took 3.6x longer and still passed.
+
+### Notes
+Six tests were added, one per invariant introduced here: compressed round-trip
+with the bound applied to the expanded size, incompressible payloads stored raw,
+the zero-copy borrow refusing a compressed record, the archived graph load
+matching the path it replaced, overlay adds and removes in one batch, and
+auto-sync still catching an edit after the reorder. Two of them failed on first
+run — one caught a mistake in the test, one caught a payload that was not
+actually incompressible — which is the point of writing them.
+
 ## [1.9.0] - 2026-07-30
 
 Disk footprint, after a 13GB `.ravel` turned up on a workspace whose index is
@@ -358,7 +416,8 @@ Initial public release.
 - Automatic entry-point detection for application entry files/controllers and `main.ts` / `bootstrap`.
 - Install scripts (curl / PowerShell), npm distribution, and `cargo install` from source.
 
-[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/guigaoliveira/ravel/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/guigaoliveira/ravel/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/guigaoliveira/ravel/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/guigaoliveira/ravel/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/guigaoliveira/ravel/compare/v1.6.0...v1.7.0
