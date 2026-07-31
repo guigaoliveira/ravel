@@ -711,10 +711,19 @@ fn spawn_daemon_watcher(
                     }
                 }
             };
+            // The full index walks with gitignore applied, so the watcher has to as well. Without
+            // it the two paths disagree about what belongs in the workspace and a single filesystem
+            // event drags in files `ravel index` deliberately skipped.
+            let ignore_matcher = crate::config::ignore_matcher(&engine.config);
+            let ignore_root = root.clone();
             let watcher = match crate::watch::PersistentWatcher::new_filtered(
                 &root,
                 queue_capacity,
-                move |path| !path.starts_with(&storage_root) && !watch_config.is_noise(path),
+                move |path| {
+                    !path.starts_with(&storage_root)
+                        && !watch_config.is_noise(path)
+                        && !crate::config::is_ignored_path(&ignore_matcher, &ignore_root, path)
+                },
             ) {
                 Ok(watcher) => watcher,
                 Err(error) => {

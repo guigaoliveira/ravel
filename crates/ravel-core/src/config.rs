@@ -699,6 +699,41 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
     counts
 }
 
+/// Single-path ignore test built from the same inputs `discover_files` walks with. The file watcher
+/// sees raw filesystem events, so without this it syncs paths a full index would never have
+/// collected. A gitignored nested worktree is the case that bites: it holds a second copy of the
+/// whole repo, so every symbol in it gets a twin, the index inflates, and the structural overlay can
+/// outgrow the read limit that makes it loadable at all.
+pub fn ignore_matcher(config: &Config) -> ignore::gitignore::Gitignore {
+    let root = &config.project.root;
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    // `WalkBuilder` only honours gitignore rules inside a repository, so matching that condition
+    // here keeps the two in step. Applying them unconditionally would invert the bug: in a
+    // workspace with no git but a stray `.gitignore`, the watcher would start dropping files the
+    // full index happily collects.
+    if config.ignore.gitignore && crate::git::is_git_repo(root) {
+        builder.add(root.join(".gitignore"));
+        builder.add(root.join(".git/info/exclude"));
+    }
+    let custom = root.join(".ravelignore");
+    if custom.is_file() {
+        builder.add(custom);
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
+/// True when `path` is excluded by the matcher above. Directory-aware through
+/// `matched_path_or_any_parents`, so a file deep inside an ignored directory is excluded even
+/// though no rule names the file itself.
+pub fn is_ignored_path(matcher: &ignore::gitignore::Gitignore, root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    matcher
+        .matched_path_or_any_parents(relative, false)
+        .is_ignore()
+}
+
 pub fn discover_files(config: &Config) -> Result<Vec<PathBuf>, ConfigError> {
     let root = &config.project.root;
     let mut builder = ignore::WalkBuilder::new(root);
@@ -841,5 +876,75 @@ mod tests {
         assert!(names.contains(&"a.ts".into()));
         assert!(names.contains(&"b.vue".into()));
         assert!(!names.iter().any(|n| n == "c.ts"));
+    }
+
+    #[test]
+    fn the_watcher_filter_excludes_what_a_full_index_walk_excludes() {
+        let dir = tempdir().unwrap();
+        // The shape that broke a real workspace: an agent worktree parked inside the repo and
+        // gitignored, holding a second copy of every source file.
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), ".claude/*\n").unwrap();
+        let worktree = dir.path().join(".claude/worktrees/wt/apps/admin/src");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("service.ts"), "export class S {}").unwrap();
+        let tracked = dir.path().join("apps/admin/src");
+        fs::create_dir_all(&tracked).unwrap();
+        fs::write(tracked.join("service.ts"), "export class S {}").unwrap();
+
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.parser.extensions = vec!["ts".into()];
+
+        // What the full index collects is the reference the watcher has to agree with.
+        let discovered: Vec<_> = discover_files(&config)
+            .unwrap()
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        assert!(
+            discovered.iter().any(|path| path.starts_with("apps")),
+            "the tracked copy must be indexed: {discovered:?}"
+        );
+        assert!(
+            !discovered.iter().any(|path| path.starts_with(".claude")),
+            "a full walk must not collect the ignored worktree: {discovered:?}"
+        );
+
+        let matcher = ignore_matcher(&config);
+        assert!(
+            is_ignored_path(&matcher, dir.path(), &worktree.join("service.ts")),
+            "the watcher must drop an event from inside the ignored worktree"
+        );
+        assert!(
+            !is_ignored_path(&matcher, dir.path(), &tracked.join("service.ts")),
+            "the watcher must keep an event for a tracked source"
+        );
+    }
+
+    #[test]
+    fn a_stray_gitignore_outside_a_repo_does_not_shrink_the_watcher() {
+        // `WalkBuilder` only applies gitignore rules inside a repository. If the single-path
+        // matcher applied them anyway, the watcher would drop files the full index collects --
+        // the same divergence as the original bug, pointing the other way.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "src/*\n").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let source = dir.path().join("src/a.ts");
+        fs::write(&source, "export {}").unwrap();
+
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.parser.extensions = vec!["ts".into()];
+
+        let discovered = discover_files(&config).unwrap();
+        assert!(
+            discovered.iter().any(|path| path.ends_with("a.ts")),
+            "no repository here, so the walk keeps the file: {discovered:?}"
+        );
+        assert!(
+            !is_ignored_path(&ignore_matcher(&config), dir.path(), &source),
+            "the watcher must keep it too"
+        );
     }
 }

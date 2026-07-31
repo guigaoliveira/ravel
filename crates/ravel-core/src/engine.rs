@@ -2691,7 +2691,12 @@ impl WorkspaceEngine {
                 "decorators": "static_syntax",
                 "value_references": "partial",
                 "dynamic_dispatch": "unsupported",
-                "authoritative_zero": false,
+                // Whether an empty relation set means "nothing references this". It only does when
+                // a single definition was resolved and the graph was consulted for it; an ambiguous
+                // or unmatched name reports zeros because nothing was asked, not because the answer
+                // is zero. Hard-coding this false made it useless as a signal -- a caller could not
+                // tell a real zero from an unasked one.
+                "authoritative_zero": graph_primary.is_some(),
             },
             "sid": self.stats().map(|s| s.snapshot_id).ok(),
         }))
@@ -4047,6 +4052,38 @@ mod agent_context_tests {
         assert!(
             scores.windows(2).all(|pair| pair[0] >= pair[1]),
             "candidate scores must not climb down the list: {scores:?} in {response:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_relation_set_says_whether_it_was_actually_asked() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/lonely.ts"),
+            "export function lonelyThing() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/one.ts"), "export const dup = 1;\n").unwrap();
+        std::fs::write(root.path().join("src/two.ts"), "export const dup = 2;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // Resolved to one definition that genuinely has no callers: the zero is the answer.
+        let resolved = engine.context("lonelyThing", 10).unwrap();
+        assert_eq!(resolved["n_callers"], 0, "{resolved:?}");
+        assert_eq!(
+            resolved["coverage"]["authoritative_zero"], true,
+            "a resolved definition with no callers reports a real zero: {resolved:?}"
+        );
+
+        // Ambiguous: the zeros are there because nothing was asked, and that has to be visible.
+        let ambiguous = engine.context("dup", 10).unwrap();
+        assert_eq!(ambiguous["ambiguous"], true, "{ambiguous:?}");
+        assert_eq!(ambiguous["relations"]["incoming_total"], 0);
+        assert_eq!(
+            ambiguous["coverage"]["authoritative_zero"], false,
+            "an unasked zero must not look like a real one: {ambiguous:?}"
         );
     }
 
