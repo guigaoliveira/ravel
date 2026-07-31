@@ -2599,11 +2599,27 @@ impl WorkspaceEngine {
                 })
             })
             .unwrap_or_default();
+        // A term match on shared tokens is a fine search result but a lie as `primary`.
+        // `TotallyNotARealSymbolXyz` tokenizes to include `Symbol`, which names an unrelated
+        // constant, and `no_result` only fires when nothing matched at all -- so an
+        // identifier-shaped query for a name that does not exist came back confident and wrong,
+        // with empty warnings. Multi-word queries are excluded: term coverage is the whole point
+        // there, and the caller did not spell an identifier.
+        let identifier_query = query.chars().count() >= 3 && !query.contains(char::is_whitespace);
+        let primary_is_lexical = {
+            let asked = query.to_lowercase();
+            let got = primary.to_lowercase();
+            got.contains(&asked) || asked.contains(&got)
+        };
         let mut warnings = Vec::<String>::new();
         if ambiguous {
             warnings.push("ambiguous symbol name; select a candidate id or qualified name".into());
         } else if no_result {
             warnings.push("no definition matched search evidence".into());
+        } else if identifier_query && exact_identity.is_empty() && !primary_is_lexical {
+            warnings.push(format!(
+                "no symbol is named `{query}`; primary is a term match on shared tokens, not that name"
+            ));
         }
         // The explore page caps at CONTEXT_RELATION_LIMIT_MAX; never promise a
         // re-query beyond what it can actually return.
@@ -3957,6 +3973,36 @@ mod agent_context_tests {
         assert_eq!(qualified["ambiguous"], false);
         assert_eq!(qualified["detail"]["qualified"], "First.execute");
         assert_eq!(qualified["candidates"][0]["why"], "exact-qualified");
+
+        // An identifier nobody defined must not borrow a real symbol's identity just because the
+        // two share a token. Answering `getPendingLegalPersonOnboarding` here with empty warnings
+        // is how a caller ends up reasoning confidently about the wrong symbol.
+        let invented = engine.context("TotallyNotAPendingThingXyz", 10).unwrap();
+        let invented_warnings = invented["warnings"].as_array().unwrap();
+        assert!(
+            invented_warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().starts_with("no symbol is named")),
+            "an identifier-shaped miss must say so: {invented:?}"
+        );
+
+        // The same warning must stay off the paths that legitimately match by term coverage or
+        // by spelling, or it becomes noise the caller learns to ignore.
+        for legitimate in [
+            "pending legal person onboarding function",
+            "getPendingLegalPersonOnboarding",
+            "PendingLegalPerson",
+        ] {
+            let response = engine.context(legitimate, 10).unwrap();
+            assert!(
+                !response["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().starts_with("no symbol is named")),
+                "{legitimate} is a real match, not an invented name: {response:?}"
+            );
+        }
     }
 
     #[test]
