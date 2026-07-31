@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-31
+
+Closes both items 1.10.1 recorded as Known.
+
+### Fixed
+- `explore` candidate scores no longer contradict the order the candidates are
+  listed in. Exact id/qualified matches are deliberately listed ahead of scored
+  search hits, but they carried a hard-coded 1250000 while an `exact-case` hit
+  scores 1300000 — so reading the list top down found a higher score further
+  along, and a caller could not tell which signal to believe. The sentinel is now
+  `SCORE_EXACT_IDENTITY`, declared next to the scoring tiers it has to top, with a
+  test that fails if any tier ever passes it. Ranking is unchanged; only the
+  reported number was wrong.
+
+### Added
+- `callers_of` and `calls_from` report a failed background update as
+  `sync_warning`, the field `explore` already used. These sites are the whole
+  answer to "what breaks if I change this", and a dead watch update left them
+  quietly describing an older tree; `status` knew, but a caller that only asked
+  for relations had no way to find out. Present only when something actually
+  failed, so a healthy response does not grow a permanently null field.
+
 ## [1.10.1] - 2026-07-31
 
 ### Fixed

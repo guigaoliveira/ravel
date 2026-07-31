@@ -2346,7 +2346,7 @@ impl WorkspaceEngine {
             seen_ids.insert(entry.id.clone());
             if candidates.len() < limit {
                 candidate_entries.push((*entry).clone());
-                candidate_scores.push(1_250_000_u64);
+                candidate_scores.push(crate::search::SCORE_EXACT_IDENTITY);
                 candidate_reasons.push("exact-qualified".to_owned());
                 candidates.push(serde_json::json!({
                     "id": entry.id,
@@ -2356,7 +2356,7 @@ impl WorkspaceEngine {
                     "path": entry.path,
                     "line": entry.span.start_line + 1,
                     "end_line": entry.span.end_line + 1,
-                    "score": 1_250_000_u64,
+                    "score": crate::search::SCORE_EXACT_IDENTITY,
                     "why": "exact-qualified",
                 }));
             }
@@ -2922,14 +2922,23 @@ impl WorkspaceEngine {
             .collect();
         let next_cursor =
             (cursor + sites.len() < total).then(|| (cursor + sites.len()).to_string());
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "node": resolved,
             "direction": if reverse { "incoming" } else { "outgoing" },
             "sites": sites,
             "total": total,
             "by_kind": by_kind,
             "next_cursor": next_cursor,
-        }))
+        });
+        // These sites are the whole answer for "what breaks if I change this", and a background
+        // update that died leaves them quietly describing an older tree. `explore` already
+        // surfaces this and `status` reports it, but a caller that only asks for relations had no
+        // way to learn the index stopped following the working tree. Present only when set, so the
+        // common healthy response does not grow a field that is always null.
+        if let Some(warning) = self.last_update_error() {
+            response["sync_warning"] = serde_json::json!(warning);
+        }
+        Ok(response)
     }
 
     /// Query without auto-sync (for compound tools that already synced once).
@@ -4006,6 +4015,72 @@ mod agent_context_tests {
                 "{legitimate} is a real match, not an invented name: {response:?}"
             );
         }
+    }
+
+    #[test]
+    fn explore_candidate_scores_agree_with_the_order_they_arrive_in() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/config.ts"),
+            "export const create = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/repo.ts"),
+            "export class Repo {\n  create() { return 2; }\n}\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let response = engine.context("create", 10).unwrap();
+        let scores: Vec<u64> = response["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["score"].as_u64().unwrap())
+            .collect();
+        assert!(scores.len() >= 2, "{response:?}");
+        // Exact id/qualified matches are listed first on purpose. A caller reading the list top
+        // down must not find a higher score further along, or the number contradicts the ranking.
+        assert!(
+            scores.windows(2).all(|pair| pair[0] >= pair[1]),
+            "candidate scores must not climb down the list: {scores:?} in {response:?}"
+        );
+    }
+
+    #[test]
+    fn relation_sites_report_a_dead_background_update() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/dep.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/main.ts"),
+            "import { target } from './dep';\nexport function main() { return target(); }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let healthy = engine.reference_sites("target", true, 10, 0).unwrap();
+        assert!(healthy["total"].as_u64().unwrap() >= 1, "{healthy:?}");
+        assert!(
+            healthy.get("sync_warning").is_none(),
+            "a healthy answer must not carry an always-null field: {healthy:?}"
+        );
+
+        engine.record_update_error("daemon watch update", "invalid snapshot");
+        let stale = engine.reference_sites("target", true, 10, 0).unwrap();
+        assert_eq!(
+            stale["sync_warning"], "daemon watch update: invalid snapshot",
+            "these sites are the whole answer for what breaks; they must say when the index \
+             stopped following the working tree: {stale:?}"
+        );
     }
 
     #[test]

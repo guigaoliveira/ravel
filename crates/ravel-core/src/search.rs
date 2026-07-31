@@ -6,6 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
+/// A match on a symbol's exact id or fully qualified name outranks every scored search hit.
+/// `explore` deliberately lists those first, so this has to sit above the ceiling below or the
+/// reported `score` contradicts the order the candidates arrive in.
+pub(crate) const SCORE_EXACT_IDENTITY: u64 = 1_400_000;
 const SCORE_EXACT_CASE: u64 = 1_300_000;
 const SCORE_EXACT_CASE_INSENSITIVE: u64 = 1_200_000;
 const SCORE_PREFIX_CASE: u64 = 1_100_000;
@@ -1328,6 +1332,25 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::time::Instant;
+
+    #[test]
+    fn exact_identity_outranks_every_scored_hit() {
+        // `explore` lists id/qualified matches ahead of scored hits, and stamps them with
+        // SCORE_EXACT_IDENTITY. If any scoring tier ever reaches past it, the candidate list
+        // starts reporting a score that disagrees with its own order.
+        for ceiling in [
+            SCORE_EXACT_CASE,
+            SCORE_EXACT_CASE_INSENSITIVE,
+            SCORE_PREFIX_CASE,
+            SCORE_PREFIX,
+            SCORE_FUZZY_EXACT,
+        ] {
+            assert!(
+                SCORE_EXACT_IDENTITY > ceiling,
+                "SCORE_EXACT_IDENTITY ({SCORE_EXACT_IDENTITY}) must top every tier, found {ceiling}"
+            );
+        }
+    }
 
     fn snapshot_with_names(names: &[&str]) -> IndexSnapshot {
         let artifact = parse_source("a.ts", b"export class UserService {}");
