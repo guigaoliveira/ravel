@@ -714,15 +714,19 @@ fn spawn_daemon_watcher(
             // The full index walks with gitignore applied, so the watcher has to as well. Without
             // it the two paths disagree about what belongs in the workspace and a single filesystem
             // event drags in files `ravel index` deliberately skipped.
-            let ignore_matcher = crate::config::ignore_matcher(&engine.config);
-            let ignore_root = root.clone();
+            let event_ignore = crate::config::ignore_matcher(&engine.config);
+            let event_root = root.clone();
             let watcher = match crate::watch::PersistentWatcher::new_filtered(
                 &root,
                 queue_capacity,
                 move |path| {
-                    !path.starts_with(&storage_root)
-                        && !watch_config.is_noise(path)
-                        && !crate::config::is_ignored_path(&ignore_matcher, &ignore_root, path)
+                    crate::config::watch_event_is_relevant(
+                        &watch_config,
+                        &event_ignore,
+                        &storage_root,
+                        &event_root,
+                        path,
+                    )
                 },
             ) {
                 Ok(watcher) => watcher,
@@ -732,6 +736,7 @@ fn spawn_daemon_watcher(
                 }
             };
             let extensions = crate::config::effective_extensions(&engine.config);
+            let batch_ignore = crate::config::ignore_matcher(&engine.config);
             while !state.shutdown.load(Ordering::Acquire) {
                 let batch = match watcher.next_batch(
                     debounce,
@@ -751,8 +756,13 @@ fn spawn_daemon_watcher(
                     .paths
                     .into_iter()
                     .filter(|path| {
-                        engine.config.is_source_with_extensions(path, &extensions)
-                            && !engine.config.is_noise(path)
+                        crate::config::watched_path_is_indexable(
+                            &engine.config,
+                            &batch_ignore,
+                            &root,
+                            &extensions,
+                            path,
+                        )
                     })
                     .collect();
                 if !batch.needs_reconcile && paths.is_empty() {

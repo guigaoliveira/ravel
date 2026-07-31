@@ -705,7 +705,15 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
 /// whole repo, so every symbol in it gets a twin, the index inflates, and the structural overlay can
 /// outgrow the read limit that makes it loadable at all.
 pub fn ignore_matcher(config: &Config) -> ignore::gitignore::Gitignore {
-    let root = &config.project.root;
+    // Canonicalize once so the matcher's base is absolute. Callers hand this function absolute
+    // paths (the CLI resolves them) while the configured root can be relative -- `--root .`. With a
+    // relative base nothing strips, the absolute path is tested against relative rules, and every
+    // check silently answers "not ignored".
+    let root = &config
+        .project
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| config.project.root.clone());
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     // `WalkBuilder` only honours gitignore rules inside a repository, so matching that condition
     // here keeps the two in step. Applying them unconditionally would invert the bug: in a
@@ -728,10 +736,47 @@ pub fn ignore_matcher(config: &Config) -> ignore::gitignore::Gitignore {
 /// `matched_path_or_any_parents`, so a file deep inside an ignored directory is excluded even
 /// though no rule names the file itself.
 pub fn is_ignored_path(matcher: &ignore::gitignore::Gitignore, root: &Path, path: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+    // Strip against whichever base actually prefixes the path. The caller's root and the matcher's
+    // own root can differ -- canonicalized or not, or simply a different field -- and a failed strip
+    // would test an absolute path against relative rules, matching nothing. That silent miss is
+    // exactly the failure this function exists to prevent.
+    let relative = path
+        .strip_prefix(matcher.path())
+        .or_else(|_| path.strip_prefix(root))
+        .unwrap_or(path);
     matcher
         .matched_path_or_any_parents(relative, false)
         .is_ignore()
+}
+
+/// Whether a raw filesystem event is worth queueing at all. Both watchers -- the shared daemon's
+/// and the one an MCP server runs when it holds watch leadership -- must ask this exact question,
+/// which is why it lives here: the same predicate was inlined in two places, and fixing one of them
+/// left the other indexing gitignored trees.
+pub fn watch_event_is_relevant(
+    config: &Config,
+    ignore: &ignore::gitignore::Gitignore,
+    storage_root: &Path,
+    root: &Path,
+    path: &Path,
+) -> bool {
+    !path.starts_with(storage_root)
+        && !config.is_noise(path)
+        && !is_ignored_path(ignore, root, path)
+}
+
+/// Whether a watched path should actually be reindexed: an indexable source, and nothing a full
+/// index walk would have skipped.
+pub fn watched_path_is_indexable(
+    config: &Config,
+    ignore: &ignore::gitignore::Gitignore,
+    root: &Path,
+    extensions: &[String],
+    path: &Path,
+) -> bool {
+    config.is_source_with_extensions(path, extensions)
+        && !config.is_noise(path)
+        && !is_ignored_path(ignore, root, path)
 }
 
 pub fn discover_files(config: &Config) -> Result<Vec<PathBuf>, ConfigError> {
@@ -919,6 +964,50 @@ mod tests {
         assert!(
             !is_ignored_path(&matcher, dir.path(), &tracked.join("service.ts")),
             "the watcher must keep an event for a tracked source"
+        );
+    }
+
+    #[test]
+    fn ignored_paths_are_recognised_by_absolute_path_and_anchored_rule() {
+        // The CLI hands `sync` absolute paths, and real .gitignore files use anchored,
+        // directory-only rules like `/reports/`. Both have to work or the check silently passes
+        // everything through.
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "/reports/\n").unwrap();
+        fs::create_dir_all(dir.path().join("reports")).unwrap();
+        let ignored = dir.path().join("reports/probe.ts");
+        fs::write(&ignored, "export const x = 1;").unwrap();
+
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        let matcher = ignore_matcher(&config);
+        assert!(
+            is_ignored_path(&matcher, dir.path(), &ignored),
+            "absolute path under an anchored directory rule must be ignored"
+        );
+        assert!(
+            is_ignored_path(&matcher, dir.path(), Path::new("reports/probe.ts")),
+            "the relative spelling must be ignored too"
+        );
+
+        // The combination that actually shipped broken: a relative configured root (`--root .`)
+        // with the absolute paths the CLI resolves. Nothing stripped, so every check answered
+        // "not ignored" and gitignored files sailed into the index.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut relative_config = Config::default();
+        relative_config.project.root = PathBuf::from(".");
+        let relative_matcher = ignore_matcher(&relative_config);
+        let ignored_under_relative_root = is_ignored_path(
+            &relative_matcher,
+            Path::new("."),
+            &dir.path().canonicalize().unwrap().join("reports/probe.ts"),
+        );
+        std::env::set_current_dir(previous).unwrap();
+        assert!(
+            ignored_under_relative_root,
+            "a relative root must still recognise an absolute ignored path"
         );
     }
 

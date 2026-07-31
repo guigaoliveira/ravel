@@ -429,10 +429,22 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                 Some(lock) => lock,
                 None => return,
             };
+            // Same question the shared daemon's watcher asks, answered by the same code: an event
+            // from a gitignored tree must never reach the index from either watcher.
+            let event_ignore = crate::config::ignore_matcher(&engine.config);
+            let event_root = root.clone();
             let watcher = match crate::watch::PersistentWatcher::new_filtered(
                 &root,
                 queue_capacity,
-                move |path| !path.starts_with(&storage_root) && !watch_config.is_noise(path),
+                move |path| {
+                    crate::config::watch_event_is_relevant(
+                        &watch_config,
+                        &event_ignore,
+                        &storage_root,
+                        &event_root,
+                        path,
+                    )
+                },
             ) {
                 Ok(watcher) => watcher,
                 Err(error) => {
@@ -459,12 +471,18 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     }
                 };
                 let extensions = crate::config::effective_extensions(&engine.config);
+                let batch_ignore = crate::config::ignore_matcher(&engine.config);
                 let paths: Vec<_> = batch
                     .paths
                     .into_iter()
                     .filter(|path| {
-                        engine.config.is_source_with_extensions(path, &extensions)
-                            && !engine.config.is_noise(path)
+                        crate::config::watched_path_is_indexable(
+                            &engine.config,
+                            &batch_ignore,
+                            &root,
+                            &extensions,
+                            path,
+                        )
                     })
                     .collect();
                 if batch.needs_reconcile {

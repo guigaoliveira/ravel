@@ -1146,14 +1146,24 @@ impl WorkspaceEngine {
             self.validate_sync_paths(paths)?;
         }
         let paths: Vec<PathBuf> = match only_paths {
-            Some(p) if !p.is_empty() => p
-                .iter()
-                .filter(|p| {
-                    self.config.is_source_with_extensions(p, &extensions)
-                        && !self.config.is_noise(p)
-                })
-                .cloned()
-                .collect(),
+            // Explicit paths are still bounded by what a full index would collect. Accepting a
+            // gitignored path here makes the index depend on which command ran last: `sync` adds
+            // the file, the next `ravel index` drops it again.
+            Some(p) if !p.is_empty() => {
+                let ignore = crate::config::ignore_matcher(&self.config);
+                p.iter()
+                    .filter(|p| {
+                        crate::config::watched_path_is_indexable(
+                            &self.config,
+                            &ignore,
+                            &self.root,
+                            &extensions,
+                            p,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            }
             _ => {
                 let discover_started = std::time::Instant::now();
                 let discovered = self.discover_dirty_sources();
@@ -4052,6 +4062,39 @@ mod agent_context_tests {
         assert!(
             scores.windows(2).all(|pair| pair[0] >= pair[1]),
             "candidate scores must not climb down the list: {scores:?} in {response:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_sync_cannot_add_a_file_a_full_index_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "/reports/\n").unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join("reports")).unwrap();
+        std::fs::write(
+            root.path().join("src/kept.ts"),
+            "export function kept() { return 1; }\n",
+        )
+        .unwrap();
+        let ignored = root.path().join("reports/generated.ts");
+        std::fs::write(&ignored, "export function generatedThing() { return 2; }\n").unwrap();
+
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let indexed = engine.index().unwrap();
+        assert_eq!(indexed.files, 1, "the walk excludes reports/: {indexed:?}");
+
+        // Handing the ignored path in explicitly must not get it indexed: otherwise the contents of
+        // the index depend on which command ran last, and the next `index` silently drops it again.
+        let synced = engine.sync(Some(std::slice::from_ref(&ignored))).unwrap();
+        assert_eq!(
+            synced.files, 1,
+            "an explicit sync must not smuggle in an ignored file: {synced:?}"
+        );
+        let found = engine.context("generatedThing", 10).unwrap();
+        assert_eq!(
+            found["matches_total"], 0,
+            "the ignored symbol must not be searchable: {found:?}"
         );
     }
 
