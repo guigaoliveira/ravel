@@ -2389,6 +2389,7 @@ impl FileSnapshotStorage {
         staged: StagedStructuralPack,
     ) -> Result<(), StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
+        self.ensure_not_a_downgrade()?;
         let id = snapshot.id.stable_key();
         if staged.generation != id {
             return Err(StorageError::Invalid {
@@ -4304,6 +4305,29 @@ impl FileSnapshotStorage {
         Ok(())
     }
 
+    /// Forward-only writes. Two long-lived servers of different versions can share one workspace —
+    /// a second editor window, or an MCP process still running the binary that npm replaced under
+    /// it. The incremental paths bail on any schema mismatch and fall back to a full rebuild, so an
+    /// older binary would rewrite a newer index in its own older format, the newer one would
+    /// rebuild it back, and each flip costs a full reindex of the workspace. Refuse to rebuild
+    /// downward and name the cause; upgrading forward stays allowed, which is the normal path.
+    fn ensure_not_a_downgrade(&self) -> Result<(), StorageError> {
+        let Some(existing) = self.read_manifest()? else {
+            return Ok(());
+        };
+        if existing.schema_version <= SCHEMA_VERSION {
+            return Ok(());
+        }
+        Err(StorageError::Invalid {
+            path: self.current_path(),
+            message: format!(
+                "workspace was indexed by a newer Ravel (schema {}; this binary writes \
+                 {SCHEMA_VERSION}) — upgrade the CLI rather than rebuilding the index downward",
+                existing.schema_version
+            ),
+        })
+    }
+
     fn ensure_supported_schema(&self, manifest: &Manifest) -> Result<(), StorageError> {
         if manifest.schema_version == SCHEMA_VERSION {
             return Ok(());
@@ -4990,6 +5014,7 @@ impl SnapshotStorage for FileSnapshotStorage {
     fn publish(&self, snapshot: &IndexSnapshot) -> Result<(), StorageError> {
         fs::create_dir_all(&self.root).map_err(|source| self.io(source, self.root.clone()))?;
         let generation_guard = self.acquire_generation_read_guard()?;
+        self.ensure_not_a_downgrade()?;
         let id = snapshot.id.stable_key();
         let payload_name = format!("snapshot-{id}.bin");
         let graph_name = format!("snapshot-{id}.graph.bin");
@@ -5901,6 +5926,42 @@ mod tests {
         assert!(store.open_search_dir().unwrap().is_some());
         assert!(store.open_symbol_meta().unwrap().is_some());
         assert!(store.open_file_list().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_newer_index_is_not_rebuilt_downward_by_an_older_binary() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        store.publish(&snapshot()).unwrap();
+        let current = fs::read_to_string(store.current_path()).unwrap();
+        let manifest_path = dir.path().join(current.trim());
+        let mut manifest: Manifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+
+        // Stand in for the workspace a newer Ravel already indexed. Two servers of different
+        // versions sharing one root would otherwise rebuild it back and forth, a full reindex each
+        // way, because the incremental paths decline on any mismatch.
+        manifest.schema_version = SCHEMA_VERSION + 1;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = store.publish(&snapshot()).unwrap_err().to_string();
+        assert!(
+            error.contains("newer Ravel") && error.contains("upgrade the CLI"),
+            "the refusal has to name the cause and the remedy: {error}"
+        );
+        let after: Manifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            after.schema_version,
+            SCHEMA_VERSION + 1,
+            "the newer index must survive the refused write"
+        );
+
+        // Upgrading forward is the normal path and must stay open.
+        manifest.schema_version = SCHEMA_VERSION - 1;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        store
+            .publish(&snapshot())
+            .expect("rebuilding an older index forward is how an upgrade lands");
     }
 
     #[test]
