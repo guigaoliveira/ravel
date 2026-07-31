@@ -515,6 +515,9 @@ fn symbol_source_excerpt(
     }
     let truncated = declared_len > bytes_read || has_more_lines;
     Some(serde_json::json!({
+        // The concise response omits `detail`, so without the path here the caller resolves a
+        // symbol and still cannot say which file it lives in without a second query.
+        "path": symbol.path,
         "text": numbered,
         "start_line": start_line,
         "end_line": start_line + line_count.saturating_sub(1),

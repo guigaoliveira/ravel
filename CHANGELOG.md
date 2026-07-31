@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-07-31
+
+### Fixed
+- `explore` no longer answers a name nobody defined with a real symbol's
+  identity. An identifier-shaped query is tokenized, so
+  `TotallyNotARealSymbolXyz` matched an unrelated constant on the shared
+  `Symbol` token and that constant became `primary` — carrying its definition,
+  its source excerpt and its callers, with an empty `warnings` array. The old
+  guard only fired when *nothing* matched, so any partial token hit silenced it.
+  A query that looks like an identifier, matches nothing by identity, and
+  resolves to a primary sharing no substring with what was asked now says so.
+  Multi-word queries are untouched: term coverage is the point there and the
+  caller never spelled an identifier. Found while using the MCP surface against
+  a 25k-file workspace, then reproduced in the fixture, where the same query
+  resolved to `getPendingLegalPersonOnboarding` and reported a caller for it.
+- The `source` block carries its own `path`. `detail` already had it, but a
+  source excerpt that does not name its file forces a second lookup to place it.
+
+### Known
+- `explore` candidates are not ordered by score: for a name like `create` in a
+  large workspace, five `exact-qualified` hits scoring 1250000 precede
+  `exact-case` hits scoring 1300000. The higher-scoring definitions are present,
+  just below the lower-scoring ones.
+- `callers_of` and `calls_from` expose no health channel. `explore` echoes a
+  failed background update as `sync_warning` and `status` reports
+  `last_update_error`; the relation tools return only their sites, so a client
+  that never calls `status` cannot learn the index stopped updating.
+
 ## [1.10.0] - 2026-07-31
 
 **The index is rebuilt once on first use after upgrading.** Pack records changed
