@@ -20,8 +20,12 @@ release pipeline could not see.
   trees were indexed on both platforms while Linux stayed green. Both spellings of the
   root are now accepted, and the path is re-spelled onto the canonical root before
   matching, because `ignore` *panics* when handed a path outside the matcher root.
-  Reproduced on Linux through a symlinked root. This is why CI's `Runtime` jobs were
-  red on four platforms since 1.12.0 while `validate` — ubuntu only — stayed green.
+  A third spelling — macOS aliases a tempdir's own `/var/folders/...` to the canonical
+  `/private/var/folders/...` — falls back to canonicalizing the parent directory, which
+  still exists when the file itself was just deleted and the watcher must process the
+  removal. Reproduced on Linux with two symlinks to one directory. This is why CI's
+  `Runtime` jobs were red on four platforms since 1.12.0 while `validate` — ubuntu
+  only — stayed green; all four are green again.
 
 ### Added
 - `scope` on `callers_of` / `calls_from` (`--scope` on the CLI): a path fragment that
