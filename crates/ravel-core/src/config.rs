@@ -780,14 +780,30 @@ impl IgnoreChain {
         // in through a symlinked or non-canonical root matches only the spelling it arrived with.
         // Deliberately not canonicalizing `path`: a deleted file cannot be canonicalized, and the
         // watcher still has to process its removal.
-        let Some(relative) = absolute
+        let stripped = absolute
             .strip_prefix(&self.root)
             .or_else(|_| absolute.strip_prefix(&self.root_as_given))
             .ok()
-        else {
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                // A third spelling of the same directory -- another symlink, or the platform's own
+                // alias -- matches neither root. Canonicalize the *parent* and retry: the parent
+                // still exists even when the file itself was just deleted, which the watcher has to
+                // keep handling. Only reached when both cheap comparisons failed, so the common path
+                // pays no syscall.
+                let parent = absolute.parent()?.canonicalize().ok()?;
+                let name = absolute.file_name()?;
+                parent
+                    .join(name)
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            });
+        let Some(relative) = stripped else {
             // Outside the workspace: not this workspace's call to make.
             return false;
         };
+        let relative = relative.as_path();
         // Re-spell the path onto the canonical root before matching. The matchers are built from
         // canonical directories, and `ignore` *panics* ("path is expected to be under the root") when
         // handed a path outside the matcher root -- so passing the incoming spelling through would
@@ -1142,6 +1158,11 @@ mod tests {
         );
     }
 
+    // Symlinks only: Windows needs privileges to create them, and an early `return` in the test
+    // body trips `-D warnings` with unreachable code. The behaviour under review -- accepting a path
+    // spelled differently from the configured root -- is exercised on Windows by the canonicalized
+    // `\\?\C:\...` form, which the same code path handles.
+    #[cfg(unix)]
     #[test]
     fn a_root_reached_through_a_symlink_still_applies_gitignore() {
         // macOS hands out `/var/folders/...`, a symlink to `/private/var/folders/...`, and Windows
@@ -1157,10 +1178,12 @@ mod tests {
 
         let link_parent = tempdir().unwrap();
         let link = link_parent.path().join("link");
-        #[cfg(unix)]
+        let other_link = link_parent.path().join("other");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
-        #[cfg(not(unix))]
-        return;
+        // A second alias for the same directory. macOS exposed this shape on its own: there the
+        // tempdir's "real" path (`/var/folders/...`) is itself an alias for the canonical
+        // `/private/var/folders/...`, so a path can arrive spelled a third way.
+        std::os::unix::fs::symlink(real.path(), &other_link).unwrap();
 
         let mut config = Config::default();
         config.project.root = link.clone();
@@ -1174,8 +1197,16 @@ mod tests {
             "and so must the same file spelled through the real path"
         );
         assert!(
+            chain.is_ignored(&other_link.join("generated/out.ts")),
+            "and so must a third spelling of the same directory"
+        );
+        assert!(
             !chain.is_ignored(&link.join("src/keep.ts")),
             "while a normal path stays indexable"
+        );
+        assert!(
+            !chain.is_ignored(&other_link.join("src/keep.ts")),
+            "through any spelling"
         );
     }
 
