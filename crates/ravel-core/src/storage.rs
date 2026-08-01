@@ -2307,6 +2307,20 @@ impl FileSnapshotStorage {
     fn locator_name(id: &str) -> String {
         format!("snapshot-{id}.artifacts.loc")
     }
+    /// The manifest as it is on disk right now, ignoring the mtime-keyed cache.
+    fn read_manifest_uncached(&self) -> Result<Option<Manifest>, StorageError> {
+        if !self.current_path().is_file() {
+            return Ok(None);
+        }
+        let name = fs::read_to_string(self.current_path())
+            .map_err(|source| self.io(source, self.current_path()))?;
+        let path = self.root.join(name.trim());
+        let bytes = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| StorageError::Json { path, source })
+    }
+
     pub fn read_manifest(&self) -> Result<Option<Manifest>, StorageError> {
         if !self.current_path().is_file() {
             *self.manifest_cache.lock().unwrap() = None;
@@ -4401,7 +4415,11 @@ impl FileSnapshotStorage {
     }
 
     fn ensure_not_a_downgrade(&self) -> Result<(), StorageError> {
-        let Some(existing) = self.read_manifest()? else {
+        // Deliberately bypasses the manifest cache. That cache is keyed on mtime, and coarse
+        // filesystem timestamps -- Windows in particular -- can return the previous manifest for one
+        // written in the same tick. A stale read here either refuses a legitimate upgrade or lets a
+        // real downgrade through, so this one check pays for a fresh read.
+        let Some(existing) = self.read_manifest_uncached()? else {
             return Ok(());
         };
         if existing.schema_version <= SCHEMA_VERSION {

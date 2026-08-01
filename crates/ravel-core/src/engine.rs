@@ -5355,6 +5355,10 @@ mod agent_context_tests {
             r#"{ "compilerOptions": { "paths": { "@app/*": ["src/*"] },,, }"#,
         )
         .unwrap();
+        // A fresh engine: on Windows the mapped readers held by the first phase's queries block
+        // rewriting the files a second index publishes.
+        drop(engine);
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
         engine.index().unwrap();
         let broken = engine.status().unwrap();
         let problems = broken["config_problems"].as_array().unwrap();
