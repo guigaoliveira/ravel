@@ -42,7 +42,39 @@ pub fn validate_snapshot(
             });
         }
         let target_path = symbol_path_from_id(&edge.to).unwrap_or(&edge.to);
+        // An unresolved import keeps its raw specifier as `to`, so `@lib/pay` versus `src` looked
+        // like a boundary violation and every alias the resolver failed on was reported as an
+        // architecture problem. That is a confident misdiagnosis of the caller's code when the real
+        // fault is a config the resolver could not apply -- and it is the same state where relation
+        // answers silently understate.
+        // Only specifiers that *must* resolve to a file in this workspace. A bare package name, a
+        // Node builtin and an asset import are all unresolved by design, so flagging every
+        // unresolved import turned `validate` permanently red on any repo with dependencies -- and
+        // buried the case this exists for under every npm import. Alias failures are reported by
+        // `status.config_problems` instead, which can see the config that failed.
+        // A relative specifier naming a non-source file is an asset import (`./styles.css`,
+        // `./logo.svg`): it never resolves to a node in this graph and never should.
+        let asset_import = std::path::Path::new(edge.to.as_str())
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                !crate::config::DEFAULT_SOURCE_EXTENSIONS.contains(&extension)
+            });
+        let must_resolve = (edge.to.starts_with('.') || edge.to.starts_with('/')) && !asset_import;
         if edge.kind == EdgeKind::Import
+            && must_resolve
+            && !matches!(edge.confidence, EdgeConfidence::Resolved { .. })
+        {
+            findings.push(PolicyFinding {
+                code: "unresolved_import".into(),
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                message:
+                    "relative import did not resolve to a file in the graph; its edges are missing"
+                        .into(),
+            });
+        } else if edge.kind == EdgeKind::Import
+            && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
             && edge.from.split('/').next() != target_path.split('/').next()
         {
             findings.push(PolicyFinding {

@@ -55,24 +55,7 @@ pub fn scan_workspace(config: &Config) -> Result<(Vec<FileArtifact>, ScanStats),
                 .to_owned();
             let mut artifact = match scan_file_with_path(path, &rel, max_bytes) {
                 Ok(a) => a,
-                Err(error) => FileArtifact {
-                    path: rel.clone(),
-                    language: language(path),
-                    source_hash: String::new(),
-                    parser_version: Arc::clone(&GRAMMAR_VERSION_SHARED),
-                    extractor_version: Arc::clone(&EXTRACTOR_VERSION_SHARED),
-                    diagnostics: vec![Diagnostic {
-                        code: "read_failed".into(),
-                        message: error.to_string(),
-                        path: Some(path.to_string_lossy().into_owned()),
-                        span: None,
-                    }],
-                    symbols: Vec::new(),
-                    imports: Vec::new(),
-                    exports: Vec::new(),
-                    symbol_refs: Vec::new(),
-                    bytes_read: 0,
-                },
+                Err(error) => unreadable_artifact(path, &rel, &error),
             };
             artifact.path = rel;
             artifact
@@ -102,6 +85,35 @@ fn normalize_path(s: &str) -> String {
         return s.to_owned();
     }
     s.replace('\\', "/").replace("/./", "/")
+}
+
+/// A file that exists but cannot be read still belongs in the index, carrying the reason. Dropping
+/// it instead makes a permissions problem or an exhausted descriptor look like a deletion: the
+/// symbol disappears, the file count falls, and nothing says why. Shared so the full walk and the
+/// incremental path cannot drift on it.
+pub fn unreadable_artifact(
+    path: &Path,
+    logical_path: &str,
+    error: &std::io::Error,
+) -> FileArtifact {
+    FileArtifact {
+        path: logical_path.to_owned(),
+        language: language(path),
+        source_hash: String::new(),
+        parser_version: Arc::clone(&GRAMMAR_VERSION_SHARED),
+        extractor_version: Arc::clone(&EXTRACTOR_VERSION_SHARED),
+        diagnostics: vec![Diagnostic {
+            code: "read_failed".into(),
+            message: error.to_string(),
+            path: Some(path.to_string_lossy().into_owned()),
+            span: None,
+        }],
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        symbol_refs: Vec::new(),
+        bytes_read: 0,
+    }
 }
 
 pub fn scan_file(path: &Path, max_bytes: u64) -> std::io::Result<FileArtifact> {

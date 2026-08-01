@@ -205,6 +205,11 @@ pub const BUILTIN_NOISE_DIRS: &[&str] = &[
     "venv",
 ];
 
+/// Formats that *contain* TypeScript and import TS symbols. Unlike the rest of the known-source list,
+/// their absence from the graph hides real references -- which is why they, and only they, make an
+/// empty relation answer untrustworthy.
+pub const COMPONENT_SOURCE_EXTENSIONS: &[&str] = &["vue", "svelte", "astro"];
+
 /// Default product extensions when `languages = ["auto"]` (TypeScript/JavaScript projects).
 /// Override with `parser.extensions = [...]` for any set you want.
 pub const DEFAULT_SOURCE_EXTENSIONS: &[&str] =
@@ -658,9 +663,22 @@ fn parse_num<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, Config
 /// files reports as healthy otherwise, which reads as "the graph is empty" rather
 /// than "the graph does not apply here". The walk stops after `budget` entries so
 /// status stays cheap; the counts are a signal, not a census.
-pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<String, usize> {
+/// Returns the per-extension counts, how many indexable sources the same walk saw, and whether the
+/// budget cut the walk short. The counts alone were quoted as fact in prose while being capped, and
+/// the "mostly another language" warning compared a capped number against the *uncapped* index total
+/// -- so on a large repo the warning could never fire.
+pub fn unsupported_source_counts(
+    config: &Config,
+    budget: usize,
+) -> (BTreeMap<String, usize>, usize, bool) {
     /// Extensions worth naming. Anything else is not obviously project source.
     const KNOWN_SOURCE: &[&str] = &[
+        // Single-file component formats come first because they are the dangerous ones: they *contain*
+        // TypeScript and import TS symbols, so leaving them out let a Vue workspace answer
+        // `total: 0` for a function called from every component -- with `authoritative_zero: true`
+        // and `orphans` naming it dead code. The rest are languages that never reference TS symbols,
+        // where the warning only says "the graph covers part of this repo".
+        "vue", "svelte", "astro", //
         "rs", "py", "go", "java", "kt", "rb", "php", "cs", "swift", "c", "cc", "cpp", "h", "hpp",
         "scala", "ex", "exs", "dart", "lua", "zig",
     ];
@@ -676,11 +694,15 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
     if custom.is_file() {
         builder.add_ignore(custom);
     }
+    let effective = effective_extensions(config);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut supported_seen = 0usize;
+    let mut truncated = false;
     let mut seen = 0usize;
     for entry in builder.build().flatten() {
         seen += 1;
         if seen > budget {
+            truncated = true;
             break;
         }
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -695,8 +717,13 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
         {
             *counts.entry(extension.to_owned()).or_default() += 1;
         }
+        // Counted in the same bounded pass, so the comparison that drives the warning is between two
+        // numbers gathered under the same cap.
+        if ext_matches(&path, &effective) {
+            supported_seen += 1;
+        }
     }
-    counts
+    (counts, supported_seen, truncated)
 }
 
 /// Gitignore rules live at every level, not just the workspace root: `apps/web/.gitignore` holding

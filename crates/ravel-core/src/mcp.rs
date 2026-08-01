@@ -960,7 +960,7 @@ impl ServerHandler for RavelMcp {
                  question and Ravel has no advantage there.\n\
                  \n\
                  Answers include uncommitted edits: each call auto-syncs Git-dirty files against \
-                 a content-hash sidecar first, so results match the working tree, not the last \
+                 a tracked git-dirty discovery first, so results match the working tree, not the last \
                  commit. Pass edited paths to sync for immediate certainty after a write.\n\
                  \n\
                  Call status once at session start. It reports how much of the workspace is \

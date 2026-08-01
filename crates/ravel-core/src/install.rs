@@ -421,7 +421,7 @@ ravel sync path/to/edited.ts   # after a write, for immediate certainty
 ```
 
 Answers reflect **uncommitted edits**: every call auto-syncs Git-dirty files against a
-content-hash sidecar first, so results match the working tree rather than the last commit.
+tracked git-dirty discovery first, so results match the working tree rather than the last commit.
 
 Relation and impact results are pages carrying exact totals — follow `next_cursor` instead
 of treating one page as the whole answer.

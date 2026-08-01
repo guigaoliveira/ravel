@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-08-01
+
+Answers stop being confident about what the index could not see. Every item below was
+found by a blind or adversarial review and reproduced before being changed; two
+reported problems turned out not to exist and were dropped rather than "fixed".
+
+### Fixed — a zero that meant "I could not look"
+- **A workspace of `.vue`, `.svelte` or `.astro` components certified false zeros.**
+  Those formats contain TypeScript and import TS symbols, and the known-source list
+  covered only languages that never do — so a function called from every component
+  answered `total: 0` with `authoritative_zero: true`, `n_affected_exact: true`, and
+  `orphans` naming it dead code. Nothing in any response contradicted "safe to
+  delete". They are counted now, and `status` names them.
+- `authoritative_zero` and `n_affected_exact` consult what the index could not read.
+  They used to report only that a name resolved — that the question was *asked*, not
+  that it could be answered. Both are false when a component format is unparsed, a
+  file failed to read, or the resolver config is broken, and `explore`,
+  `callers_of` and `calls_from` all carry `degraded_by` naming the cause. Gated on
+  the component formats only: a Python build script does not reference TS symbols and
+  must not make every later answer untrustworthy.
+- A reverted edit is no longer answered from content that is no longer on disk. Auto-sync
+  asks git what changed, which is a valid staleness oracle only while the index matches
+  HEAD; once a sync publishes a generation built from uncommitted content, a clean tree
+  stops implying "index equals tree". Edit, query, `git checkout --` used to leave the
+  phantom edit in the index permanently with every health field green. Paths absorbed
+  while dirty are recorded, checked against the index's own hashes, and pruned as soon
+  as they match.
+- A file that fails to read stays in the index with the reason, and `status` shows it.
+  The scanner already recorded `read_failed` and `file_too_large`; the reason was
+  collapsed into an unlabelled `parse_errors` integer that nothing inspected, so the
+  unresolved-name hint accused the caller of a typo for a symbol defined in a file the
+  indexer could not open. Adds `status.diagnostics`, read from the artifact index
+  rather than by hydrating the snapshot.
+- An incremental sync treats an unusable file exactly as a full index does — including a
+  newly added one, which used to look "unchanged" because it had no bytes to hash. The
+  stats a sync returns now match the generation it published; they disagreed whenever a
+  path was rewritten outside the changed set.
+
+### Fixed — diagnosis that blamed the wrong thing
+- `validate` no longer reports an unresolved alias as an architecture violation. An
+  unresolved import keeps its raw specifier, so `@utils/money` versus `src` looked like
+  a boundary crossing. Relative imports that should resolve and do not are reported as
+  `unresolved_import`; bare package names, Node builtins and asset imports are left
+  alone, and `cross_package` only judges edges that actually resolved.
+- A `tsconfig.json` that parses but loses its base is reported. Aliases usually live in
+  the base config of a monorepo, so a missing base — sparse checkout, uninitialised
+  submodule, renamed file — took every alias with it while the top file parsed fine.
+  A `tsconfig.json` that is not a regular file is reported too; an empty one is treated
+  as `{}`, which is what `tsc` does.
+- A schema mismatch outranks a config problem in the `status` hint: when the on-disk
+  index is newer, "fix it and run `ravel index`" is the one action that makes it worse.
+
+### Fixed — an index its own reader refuses
+- Every delta component is checked against the ceiling the reader enforces, not just the
+  graph record, and the same check covers overlay compaction — composition is a union, so
+  that is where a chain actually reaches the limit. Two overlays that each fit could merge
+  into one that did not, producing the exact "exceeding read limit" failure the guard was
+  written for.
+- `sync` fails on a path that exists neither on disk nor in the index. It cannot be a
+  deletion, and returning whole-index stats for it read as "synced, you are up to date".
+- The coverage walk reports `walk_truncated`, and the "mostly another language" warning
+  compares counts gathered in the same bounded pass. It used to compare a capped number
+  against the uncapped index total, so on a large repo it could never fire.
+
+### Not changed, and why
+- `parse_errors` was reported as decreasing when a file failed to scan. Not reproducible:
+  the count held at 0 on both sides of the failure.
+- A hash-sidecar read failure was reported as silently disabling auto-sync. Unreachable:
+  `publish_packed_snapshot` — the path `ravel index` takes — records `file_hashes: None`,
+  so the sidecar is never written. The status hint and the MCP tool descriptions no longer
+  advertise it.
+
 ## [1.13.0] - 2026-08-01
 
 Two parameters that exist to cut what a caller has to read, plus a platform bug the

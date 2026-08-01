@@ -74,7 +74,12 @@ pub enum EngineError {
 static SYNC_TICKET: AtomicU64 = AtomicU64::new(0);
 
 /// When the coverage walk last ran, and what it found.
-type CoverageProbe = (std::time::Instant, Arc<BTreeMap<String, usize>>);
+/// Instant of the walk, plus its result: per-extension counts of sources this indexer cannot parse,
+/// how many indexable sources the same pass saw, and whether the budget cut it short.
+type CoverageProbe = (
+    std::time::Instant,
+    Arc<(BTreeMap<String, usize>, usize, bool)>,
+);
 
 #[derive(Debug)]
 struct EngineInner {
@@ -82,9 +87,11 @@ struct EngineInner {
     graph_cache: Mutex<Option<Arc<GraphIndex>>>,
     search_cache: Mutex<Option<Arc<SearchIndex>>>,
     symbol_meta_cache: Mutex<Option<Arc<SymbolMetaRuntime>>>,
-    /// Auto-sync reads the hash sidecar on every tool call to decide whether the
-    /// index is stale. Rebuilding it means unzipping the artifact index into
-    /// 20k+ owned paths, so cache it for the generation it describes.
+    /// Auto-sync reads the hash sidecar when one exists, to decide whether the index is stale.
+    /// Rebuilding it means unzipping the artifact index into 20k+ owned paths, so cache it for the
+    /// generation it describes. Note that `publish_packed_snapshot` -- the path `ravel index` takes
+    /// -- records `file_hashes: None`, so on a normally indexed workspace this cache stays empty and
+    /// dirty discovery falls back to git. Kept because the other publish path still writes it.
     file_hashes_cache: Mutex<Option<Arc<crate::model::FileHashIndex>>>,
     /// Which source extensions this workspace has that the indexer cannot parse.
     /// A bounded directory walk — cheap once, but `status` is called repeatedly in a
@@ -475,6 +482,9 @@ impl SymbolMetaRuntime {
 }
 
 struct PreparedPath {
+    /// Whether the file exists on disk. Without this, "deleted" and "present but unusable" both
+    /// arrive as `bytes: None`, and the second was silently treated as the first.
+    exists: bool,
     path: PathBuf,
     relative: String,
     bytes: Option<Vec<u8>>,
@@ -489,6 +499,8 @@ const MAX_CONTEXT_SOURCE_LINES: usize = 200;
 /// How many candidates a failed resolution shows. Enough to disambiguate by hand, few enough that
 /// a common name does not turn the refusal into a wall of text.
 const CANDIDATE_PREVIEW: usize = 10;
+/// Enough to see what failed without turning `status` into a report of its own.
+const STATUS_DIAGNOSTIC_LIMIT: usize = 20;
 
 /// Optional narrowing and shaping for a relation query. Both exist to cut what the caller has to
 /// read: `scope` removes a round trip when a bare name is ambiguous, and `rollup` answers "where is
@@ -1009,6 +1021,60 @@ impl WorkspaceEngine {
         result
     }
 
+    /// Paths whose indexed content came from a dirty working tree.
+    ///
+    /// Auto-sync asks git what changed, which is only a valid staleness oracle while the index
+    /// matches HEAD. The moment a sync publishes a generation built from uncommitted content, a clean
+    /// tree stops implying "index equals tree" -- so an edit, one query, and `git checkout --` left
+    /// the phantom edit in the index permanently, with `parse_errors: 0`, `last_update_error: null`
+    /// and `ci` green. Recording those paths lets the existing hash comparison see them; it prunes
+    /// itself as soon as a path's hash matches what the index holds, so a committed edit costs
+    /// nothing beyond the next call.
+    ///
+    /// Deliberately a plain file rather than a manifest field: it is recoverable state, not part of
+    /// the index format, and it must not force a schema version.
+    fn dirty_synced_path(&self) -> PathBuf {
+        self.root
+            .join(&self.config.storage.home)
+            .join("dirty-synced.json")
+    }
+
+    fn dirty_synced(&self) -> BTreeSet<String> {
+        let path = self.dirty_synced_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return BTreeSet::new();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(paths) => paths,
+            Err(error) => {
+                // A truncated record silently meaning "nothing was ever synced dirty" restores the
+                // exact phantom-edit state this mechanism exists to prevent. Say so, and drop the
+                // unusable file so the next sync starts a clean record.
+                self.record_update_error(
+                    "dirty-synced record",
+                    &format!(
+                        "{error}; re-run `ravel index` to be certain the index matches the tree"
+                    ),
+                );
+                let _ = std::fs::remove_file(&path);
+                BTreeSet::new()
+            }
+        }
+    }
+
+    fn write_dirty_synced(&self, paths: &BTreeSet<String>) {
+        let path = self.dirty_synced_path();
+        if paths.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(paths) {
+            // Same durability as every other file under `.ravel`: a torn write here reads as "no
+            // records", which is the failure mode this guards against.
+            let _ = crate::storage::atomic_write(&path, &bytes);
+        }
+    }
+
     fn sync_queue_dir(&self) -> PathBuf {
         self.root
             .join(&self.config.storage.home)
@@ -1350,6 +1416,63 @@ impl WorkspaceEngine {
                         Some("package.json" | "tsconfig.json" | "jsconfig.json")
                     )
                 });
+                // A path that is absent from disk *and* absent from the index is not a deletion --
+                // there is nothing to delete. It is a typo, a wrong cwd, or a relative-vs-absolute
+                // slip, and returning whole-index stats for it reads as "synced, you are up to date".
+                let indexed = self.storage().source_hashes_for_paths(
+                    &kept
+                        .iter()
+                        .map(|path| {
+                            let absolute = if path.is_absolute() {
+                                path.to_path_buf()
+                            } else {
+                                self.root.join(path)
+                            };
+                            absolute
+                                .strip_prefix(&self.root)
+                                .unwrap_or(absolute.as_path())
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+                let phantom: Vec<&PathBuf> = kept
+                    .iter()
+                    .filter(|path| {
+                        // Resolve against the workspace, not the process cwd: callers pass relative
+                        // paths (the MCP tool does), and testing those against cwd made a brand new
+                        // file look nonexistent.
+                        let absolute = if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            self.root.join(path)
+                        };
+                        if absolute.exists() {
+                            return false;
+                        }
+                        let rel = absolute
+                            .strip_prefix(&self.root)
+                            .unwrap_or(absolute.as_path())
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        // The map answers for every requested path, with `None` when the index has
+                        // no hash for it -- so presence of the key proves nothing.
+                        indexed.get(&rel).and_then(Option::as_ref).is_none()
+                    })
+                    .collect();
+                if !phantom.is_empty() && phantom.len() == kept.len() {
+                    return Err(EngineError::Unresolved {
+                        message: format!(
+                            "none of the {} requested path(s) exists on disk or in the index: {}",
+                            kept.len(),
+                            phantom
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
                 if kept.is_empty() && !metadata_only {
                     return Err(EngineError::Unresolved {
                         message: format!(
@@ -1374,6 +1497,31 @@ impl WorkspaceEngine {
         // Read/hash each path once. The prepared bytes are reused below if publication is needed.
         let sync_start = std::time::Instant::now();
         let (fast_noop, prepared) = self.prepare_paths(&paths)?;
+        // Any path whose working-tree content differs from HEAD is about to enter the index in that
+        // uncommitted form; remember it so a later revert is not mistaken for "nothing changed".
+        // Pruned first, so a path that has since gone back to matching stops being carried.
+        {
+            let git_dirty: BTreeSet<String> = self
+                .discover_dirty_sources()
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.root)
+                        .unwrap_or(path.as_path())
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            let mut recorded = self.dirty_synced();
+            let synced_now: BTreeSet<String> = prepared
+                .iter()
+                .map(|prepared| prepared.relative.clone())
+                .collect();
+            recorded.retain(|rel| !synced_now.contains(rel) || git_dirty.contains(rel));
+            let still_dirty: BTreeSet<String> =
+                synced_now.intersection(&git_dirty).cloned().collect();
+            recorded.extend(still_dirty);
+            self.write_dirty_synced(&recorded);
+        }
         crate::timing::stage("sync.prepare_paths", sync_start, || {
             format!("paths={}", paths.len())
         });
@@ -1424,9 +1572,14 @@ impl WorkspaceEngine {
         if prepared.is_empty() {
             return Ok(stats_from(&snapshot));
         }
-        let overlay_paths: BTreeSet<String> = prepared
+        // A path can be `unchanged` by hash and still be rewritten here: an over-size or unreadable
+        // file has no bytes to hash, so it looks unchanged while its artifact becomes a stub. Those
+        // paths must be in this set, or the stats fold below and the overlay's `changed_paths` both
+        // miss them -- which is how `sync` came to report `parse_errors: 0` for a generation whose
+        // `status` reported 1.
+        let mut overlay_paths: BTreeSet<String> = prepared
             .iter()
-            .filter(|prepared| !prepared.unchanged)
+            .filter(|prepared| !prepared.unchanged || (prepared.bytes.is_none() && prepared.exists))
             .map(|prepared| prepared.relative.clone())
             .collect();
         let mut any_changed = false;
@@ -1435,63 +1588,51 @@ impl WorkspaceEngine {
             .map(|path| (path.clone(), snapshot.files.get(path).cloned()))
             .collect();
         for prepared in prepared {
-            let rel = prepared.relative;
-            let Some(bytes) = prepared.bytes else {
+            let rel = prepared.relative.clone();
+            if prepared.unchanged && prepared.bytes.is_some() {
+                continue;
+            }
+            overlay_paths.insert(rel.clone());
+            let Some(artifact) = self.artifact_for(&prepared, max_bytes) else {
                 if snapshot.files.remove(&rel).is_some() {
                     any_changed = true;
                     edge_inputs_changed = true;
                 }
                 continue;
             };
-            if prepared.unchanged {
-                continue;
-            }
-            let scanned = if bytes.len() as u64 > max_bytes {
-                crate::scanner::scan_file(&prepared.path, max_bytes)
-            } else {
-                Ok(crate::scanner::parse_source(&rel, &bytes))
-            };
-            match scanned {
-                Ok(mut artifact) => {
-                    artifact.path = rel.clone();
-                    edge_inputs_changed |= snapshot.files.get(&rel).is_none_or(|previous| {
-                        previous.imports != artifact.imports
-                            || previous.exports != artifact.exports
-                            || previous.symbol_refs != artifact.symbol_refs
-                            || previous
-                                .symbols
-                                .iter()
-                                .map(|symbol| {
-                                    (
-                                        symbol.id.as_str(),
-                                        symbol.name.as_str(),
-                                        symbol.qualified_name.as_str(),
-                                        symbol.kind.as_ref(),
-                                        symbol.span,
-                                        symbol.exported,
-                                    )
-                                })
-                                .ne(artifact.symbols.iter().map(|symbol| {
-                                    (
-                                        symbol.id.as_str(),
-                                        symbol.name.as_str(),
-                                        symbol.qualified_name.as_str(),
-                                        symbol.kind.as_ref(),
-                                        symbol.span,
-                                        symbol.exported,
-                                    )
-                                }))
-                    });
-                    snapshot.files.insert(rel, artifact);
-                    any_changed = true;
-                }
-                Err(_) => {
-                    if snapshot.files.remove(&rel).is_some() {
-                        any_changed = true;
-                        edge_inputs_changed = true;
-                    }
-                }
-            }
+            let mut artifact = artifact;
+
+            artifact.path = rel.clone();
+            edge_inputs_changed |= snapshot.files.get(&rel).is_none_or(|previous| {
+                previous.imports != artifact.imports
+                    || previous.exports != artifact.exports
+                    || previous.symbol_refs != artifact.symbol_refs
+                    || previous
+                        .symbols
+                        .iter()
+                        .map(|symbol| {
+                            (
+                                symbol.id.as_str(),
+                                symbol.name.as_str(),
+                                symbol.qualified_name.as_str(),
+                                symbol.kind.as_ref(),
+                                symbol.span,
+                                symbol.exported,
+                            )
+                        })
+                        .ne(artifact.symbols.iter().map(|symbol| {
+                            (
+                                symbol.id.as_str(),
+                                symbol.name.as_str(),
+                                symbol.qualified_name.as_str(),
+                                symbol.kind.as_ref(),
+                                symbol.span,
+                                symbol.exported,
+                            )
+                        }))
+            });
+            snapshot.files.insert(rel, artifact);
+            any_changed = true;
         }
         if !any_changed {
             return Ok(stats_from(&snapshot));
@@ -1624,6 +1765,7 @@ impl WorkspaceEngine {
         prepared: &[PreparedPath],
     ) -> Result<Option<IndexStats>, EngineError> {
         let storage = self.storage();
+        let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         // Loading the previous artifact and re-parsing the new bytes are both
         // per-file work with no shared state; a burst of edits (or a pull) used
         // to parse them one at a time on a single core.
@@ -1634,11 +1776,7 @@ impl WorkspaceEngine {
                 .filter(|prepared| !prepared.unchanged)
                 .map(|prepared| {
                     let old = storage.open_artifact(&prepared.relative)?;
-                    let new = prepared.bytes.as_ref().map(|bytes| {
-                        let mut artifact = crate::scanner::parse_source(&prepared.relative, bytes);
-                        artifact.path = prepared.relative.clone();
-                        artifact
-                    });
+                    let new = self.artifact_for(prepared, max_bytes);
                     Ok((prepared.relative.clone(), old, new))
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
@@ -2052,6 +2190,31 @@ impl WorkspaceEngine {
     }
 
     /// Prepare changed-path bytes once and decide whether the entire sync is a no-op.
+    /// What a prepared path should become in the index. `None` means the file is gone; everything
+    /// else -- including a file that exists but is too large or unreadable -- becomes an artifact
+    /// carrying the reason, because that is what a full index produces for it. Two call sites decided
+    /// this independently before, and they disagreed: the delta path reported a permissions error as
+    /// a deletion while a full walk kept the file with a diagnostic.
+    fn artifact_for(
+        &self,
+        prepared: &PreparedPath,
+        max_bytes: u64,
+    ) -> Option<crate::model::FileArtifact> {
+        let mut artifact = match prepared.bytes.as_ref() {
+            Some(bytes) if bytes.len() as u64 <= max_bytes => {
+                crate::scanner::parse_source(&prepared.relative, bytes)
+            }
+            Some(_) | None if prepared.exists => {
+                crate::scanner::scan_file(&prepared.path, max_bytes).unwrap_or_else(|error| {
+                    crate::scanner::unreadable_artifact(&prepared.path, &prepared.relative, &error)
+                })
+            }
+            _ => return None,
+        };
+        artifact.path = prepared.relative.clone();
+        Some(artifact)
+    }
+
     fn prepare_paths(&self, paths: &[PathBuf]) -> Result<(bool, Vec<PreparedPath>), EngineError> {
         if paths.is_empty() {
             return Ok((true, Vec::new()));
@@ -2063,7 +2226,7 @@ impl WorkspaceEngine {
         // Reading a batch of edited files is independent per path. `collect` on an
         // indexed parallel iterator keeps input order, so the prepared list stays
         // deterministic.
-        let candidates: Vec<(PathBuf, String, Option<Vec<u8>>)> = {
+        let candidates: Vec<(PathBuf, String, Option<Vec<u8>>, bool)> = {
             use rayon::prelude::*;
             paths
                 .par_iter()
@@ -2084,8 +2247,15 @@ impl WorkspaceEngine {
                             path,
                         });
                     };
-                    let bytes = path
-                        .is_file()
+                    // `is_file()` is false when the stat itself fails -- a parent directory with no
+                    // search permission, for instance -- so a permissions problem one level up read
+                    // as a deletion. `symlink_metadata` distinguishes "not there" from "cannot tell".
+                    let exists = path.is_file()
+                        || matches!(
+                            std::fs::symlink_metadata(&path).map_err(|error| error.kind()),
+                            Err(std::io::ErrorKind::PermissionDenied)
+                        );
+                    let bytes = exists
                         .then(|| {
                             std::fs::metadata(&path)
                                 .ok()
@@ -2093,7 +2263,7 @@ impl WorkspaceEngine {
                                 .and_then(|_| std::fs::read(&path).ok())
                         })
                         .flatten();
-                    Ok((path, rel, bytes))
+                    Ok((path, rel, bytes, exists))
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         };
@@ -2107,7 +2277,7 @@ impl WorkspaceEngine {
         );
         let requested: Vec<_> = candidates
             .iter()
-            .map(|(_, relative, _)| relative.clone())
+            .map(|(_, relative, _, _)| relative.clone())
             .collect();
         let hashes_started = std::time::Instant::now();
         let hashes = storage.source_hashes_for_paths(&requested)?;
@@ -2117,15 +2287,22 @@ impl WorkspaceEngine {
             use rayon::prelude::*;
             candidates
                 .into_par_iter()
-                .map(|(path, rel, bytes)| {
+                .map(|(path, rel, bytes, exists)| {
+                    // The second arm means "absent from disk and absent from the index" -- a path
+                    // that was never there. A file that exists but has no readable bytes (over the
+                    // size limit, or unreadable) must not take that branch: it has an artifact to
+                    // write, and calling it unchanged made a newly added over-size file vanish from
+                    // `sync` while `index` reported it.
                     let unchanged = bytes.as_ref().is_some_and(|bytes| {
                         hashes
                             .get(&rel)
                             .and_then(Option::as_ref)
                             .is_some_and(|old| blake3::hash(bytes).to_hex().as_str() == old)
                     }) || (bytes.is_none()
+                        && !exists
                         && hashes.get(&rel).is_some_and(Option::is_none));
                     PreparedPath {
+                        exists,
                         path,
                         relative: rel,
                         bytes,
@@ -2325,8 +2502,84 @@ impl WorkspaceEngine {
         (bytes, generations)
     }
 
+    fn file_diagnostics(&self, limit: usize) -> Vec<serde_json::Value> {
+        let storage = self.storage();
+        // The artifact index already flags which paths carry a diagnostic, so only those artifacts are
+        // opened. Hydrating the whole snapshot to print at most `limit` entries made every `status` on
+        // a repo with one over-size generated file an order of magnitude slower -- permanently, since
+        // such a repo always has `parse_errors >= 1`.
+        let Ok(paths) = storage.paths_with_diagnostics(limit) else {
+            return Vec::new();
+        };
+        paths
+            .iter()
+            .filter_map(|path| {
+                let artifact = storage.open_artifact(path).ok().flatten()?;
+                Some(
+                    artifact
+                        .diagnostics
+                        .into_iter()
+                        .map(|diagnostic| {
+                            serde_json::json!({
+                                "path": path,
+                                "code": diagnostic.code,
+                                "message": diagnostic.message,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .take(limit)
+            .collect()
+    }
+
+    fn degradation(&self) -> serde_json::Value {
+        let config_problems = crate::resolver::load_tsconfig_reporting(&self.root)
+            .problems
+            .len();
+        let unparsed_files = self
+            .stats()
+            .ok()
+            .map(|stats| stats.parse_errors)
+            .unwrap_or(0);
+        // Only the formats that carry TypeScript. A Python build script or a vendored `.h` does not
+        // reference TS symbols, so counting them made every query on any polyglot repo report its
+        // zeros as unreliable forever -- destroying the signal in the opposite direction.
+        let probe = self.unsupported_sources_cached();
+        let hidden_references = crate::config::COMPONENT_SOURCE_EXTENSIONS
+            .iter()
+            .filter_map(|extension| probe.0.get(*extension))
+            .sum::<usize>();
+        serde_json::json!({
+            "config_problems": config_problems,
+            "unparsed_files": unparsed_files,
+            "unparsed_components": hidden_references,
+        })
+    }
+
+    /// True only when nothing known would make an empty relation set misleading.
+    fn index_is_undegraded(&self, degradation: &serde_json::Value) -> bool {
+        // Every key must exist and be zero. A missing key reads as `Null`, whose `as_u64()` is
+        // `None` -- which is why a rename that missed this list made every workspace degraded.
+        ["config_problems", "unparsed_files", "unparsed_components"]
+            .iter()
+            .all(|key| degradation[key].as_u64() == Some(0))
+    }
+
     /// Index health for agents. Cheap: does not spawn git status.
+    /// Why an empty answer from this index might not mean "nothing references it". `authoritative_zero`
+    /// used to report only that a name resolved, which says the question was *asked*, not that the
+    /// index could answer it: a Vue workspace, an unparsed tsconfig, or an unreadable file all yielded
+    /// `total: 0` with the flag set true.
+    /// File-level diagnostics the scanner recorded -- a read failure, a file past the size limit.
+    /// The scanner deliberately keeps such a file with the reason attached, and until now nothing
+    /// could see it: the reason was collapsed into an unlabelled `parse_errors` integer. Reading the
+    /// snapshot is only worth it when something actually failed, so the count gates the load.
     pub fn status(&self) -> Result<serde_json::Value, EngineError> {
+        // Cheap: one file read, and it is the difference between "healthy" and "every aliased
+        // import silently resolves to nothing".
+        let config_problems = crate::resolver::load_tsconfig_reporting(&self.root).problems;
         let store = self.storage();
         let mark = std::time::Instant::now();
         // Status reports presence, so read the manifest once and never deserialize graph/symbol
@@ -2358,8 +2611,9 @@ impl WorkspaceEngine {
         let unsupported = self.unsupported_sources_cached();
         crate::timing::stage("status.coverage", mark, String::new);
         let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
-        let unsupported_total: usize = unsupported.values().sum();
-        let dominant_unsupported = unsupported
+        let (unsupported_counts, supported_seen, walk_truncated) = unsupported.as_ref();
+        let unsupported_total: usize = unsupported_counts.values().sum();
+        let dominant_unsupported = unsupported_counts
             .iter()
             .max_by_key(|(_, count)| **count)
             .map(|(extension, count)| (extension.clone(), *count));
@@ -2396,9 +2650,19 @@ impl WorkspaceEngine {
             "coverage": {
                 "indexed_files": indexed_files,
                 "unsupported_source_files": unsupported_total,
-                "unsupported_by_extension": unsupported.as_ref(),
+                "unsupported_by_extension": unsupported_counts,
+                // The walk is budgeted, so these are a floor, not a census. Saying so keeps the
+                // number from being quoted as fact.
+                "walk_truncated": walk_truncated,
             },
             "binary_version": crate::VERSION,
+            "diagnostics": self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT),
+            "config_problems": config_problems
+                .iter()
+                .map(|problem| {
+                    serde_json::json!({ "code": problem.code, "message": problem.message, "path": problem.path })
+                })
+                .collect::<Vec<_>>(),
             "schema": {
                 "on_disk": on_disk_schema,
                 "expected": crate::storage::SCHEMA_VERSION,
@@ -2421,14 +2685,28 @@ impl WorkspaceEngine {
             } else if !has {
                 // An unsupported-language workspace must not be told to index: it already did, and
                 // indexing again produces the same near-empty graph.
-                match dominant_unsupported.filter(|(_, count)| *count > indexed_files) {
+                match dominant_unsupported.filter(|(_, count)| *count > *supported_seen) {
                     Some((extension, count)) => format!(
                         "Not indexed, and {count} .{extension} file(s) here are not parsed (Ravel covers TypeScript/JavaScript) — indexing will not make them queryable. Use text search for those."
                     ),
                     None => "Run `ravel index` first.".to_owned(),
                 }
+            } else if let Some(problem) = config_problems.first() {
+                // Named before anything about freshness: an index built with an unparsed tsconfig is
+                // internally consistent and quietly missing every aliased edge.
+                format!("{} Fix it and run `ravel index`.", problem.message)
+            } else if stats.as_ref().is_some_and(|stats| stats.parse_errors > 0) {
+                // Named before freshness: those files contribute no symbols and no edges, so every
+                // answer about what they contain is short by however much they held.
+                let failed = stats.as_ref().map_or(0, |stats| stats.parse_errors);
+                format!(
+                    "Index ready, but {failed} file(s) could not be read or parsed — their symbols and edges are missing. See `diagnostics`."
+                )
             } else if let Some((extension, count)) = dominant_unsupported
-                .filter(|(_, count)| *count > indexed_files)
+                // Compared against what the *same* bounded pass saw, not against the unbounded index
+                // total: the unsupported side is capped, so on a large repo the old comparison could
+                // never be true and the warning never fired.
+                .filter(|(_, count)| *count > *supported_seen)
             {
                 // Say this before anything about freshness: an agent that trusts
                 // "index ready" here will read an almost-empty graph as "no callers".
@@ -2440,7 +2718,12 @@ impl WorkspaceEngine {
             } else if !git {
                 "Index ready (no git). Freshness: `ravel watch` or `ravel sync <paths>`.".to_owned()
             } else {
-                "Index ready. Auto-sync: tracked dirty + hash sidecar.".to_owned()
+                // The hash sidecar was named here for years while `ravel index` writes
+                // `file_hashes: None` -- only the non-packed publish path produces it, and the
+                // indexer does not use that path. Describing the mechanism that actually runs beats
+                // advertising an optimisation that never engages. `sidecars.file_hashes` reports
+                // whether it happens to be present.
+                "Index ready. Auto-sync: git-dirty tracked files.".to_owned()
             },
         }))
     }
@@ -2862,6 +3145,8 @@ impl WorkspaceEngine {
                     .any(|name| name.to_lowercase().contains(&asked))
         };
         let invented_name = identifier_query && exact_identity.is_empty() && !primary_is_lexical;
+        let degradation = self.degradation();
+        let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
         // the queried name exist, and "ambiguous symbol name" asserts the opposite -- it reads as
@@ -2928,7 +3213,7 @@ impl WorkspaceEngine {
                     "n_affected": impact.as_ref().map(|r| r.total_affected).unwrap_or(0),
                     // No impact analysis ran when nothing resolved, so there is no exact count to claim.
         // `true` next to a zero reads as "changing this affects nothing, precisely".
-        "n_affected_exact": impact.as_ref().is_some_and(|r| r.exact),
+        "n_affected_exact": impact.as_ref().is_some_and(|r| r.exact) && undegraded,
                     "auto_synced": synced.is_some(),
                     "sync_warning": self.last_update_error(),
                     "warnings": warnings,
@@ -2945,12 +3230,15 @@ impl WorkspaceEngine {
                         "decorators": "static_syntax",
                         "value_references": "partial",
                         "dynamic_dispatch": "unsupported",
+                // What is known to make an empty answer unreliable here. Zeros across the board are
+                // the only case in which `authoritative_zero` may be true.
+                "degraded_by": degradation,
                         // Whether an empty relation set means "nothing references this". It only does when
                         // a single definition was resolved and the graph was consulted for it; an ambiguous
                         // or unmatched name reports zeros because nothing was asked, not because the answer
                         // is zero. Hard-coding this false made it useless as a signal -- a caller could not
                         // tell a real zero from an unasked one.
-                        "authoritative_zero": graph_primary.is_some(),
+                        "authoritative_zero": graph_primary.is_some() && undegraded,
                     },
                     "sid": self.stats().map(|s| s.snapshot_id).ok(),
                 }))
@@ -3039,7 +3327,9 @@ impl WorkspaceEngine {
     /// Coverage is a signal, not a census: it answers "does this graph apply to this
     /// workspace at all", and that answer does not change between two `status` calls
     /// seconds apart. Bounded staleness beats walking the tree on every call.
-    fn unsupported_sources_cached(&self) -> Arc<BTreeMap<String, usize>> {
+    /// Counts, how many indexable sources the same walk saw, and whether the budget cut it short.
+    /// All three come from one pass so the warning compares like with like.
+    fn unsupported_sources_cached(&self) -> Arc<(BTreeMap<String, usize>, usize, bool)> {
         /// Long enough that a burst of tool calls walks once, short enough that a
         /// workspace gaining a new language is noticed within the same session.
         const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -3288,8 +3578,13 @@ impl WorkspaceEngine {
                     "direction": if reverse { "incoming" } else { "outgoing" },
                     "resolved": false,
                     "reason": "no_symbol_named",
-                    "hint": "nothing in the index is named this; check the spelling, \
-                             or use grep for text that is not a symbol",
+                    "hint": if self.stats().ok().is_some_and(|stats| stats.parse_errors > 0) {
+                        "nothing in the index is named this, but file(s) failed to read or parse — \
+                         it may be defined in one of them; see `status.diagnostics`"
+                    } else {
+                        "nothing in the index is named this; check the spelling, \
+                         or use grep for text that is not a symbol"
+                    },
                 }));
             }
         };
@@ -3455,6 +3750,13 @@ impl WorkspaceEngine {
         // common healthy response does not grow a field that is always null.
         if let Some(warning) = self.last_update_error() {
             response["sync_warning"] = serde_json::json!(warning);
+        }
+        // These sites are the whole answer to "what breaks if I change this". A zero here from a
+        // workspace whose components are unparsed, whose tsconfig failed, or whose files could not be
+        // read is not the same as a symbol nothing references -- and nothing in the response said so.
+        let degradation = self.degradation();
+        if !self.index_is_undegraded(&degradation) {
+            response["degraded_by"] = degradation;
         }
         Ok(response)
     }
@@ -3746,7 +4048,27 @@ impl WorkspaceEngine {
         // there is nothing to compare it against — loading it before knowing whether
         // any path is dirty charged every query for work no query needed.
         let dirty_started = std::time::Instant::now();
-        let dirty = self.discover_dirty_sources();
+        let mut dirty = self.discover_dirty_sources();
+        // A path the index absorbed while it was dirty stays suspect until its content matches what
+        // the index holds, even once git calls the tree clean.
+        let recorded = self.dirty_synced();
+        if !recorded.is_empty() {
+            let known: BTreeSet<String> = dirty
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.root)
+                        .unwrap_or(path.as_path())
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            dirty.extend(
+                recorded
+                    .iter()
+                    .filter(|rel| !known.contains(*rel))
+                    .map(|rel| self.root.join(rel)),
+            );
+        }
         crate::timing::stage("autosync.discover_dirty", dirty_started, || {
             format!("paths={}", dirty.len())
         });
@@ -3762,6 +4084,7 @@ impl WorkspaceEngine {
         crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
         let mut need_sync = false;
+        let mut settled: BTreeSet<String> = BTreeSet::new();
         for path in &dirty {
             let rel = path
                 .strip_prefix(&self.root)
@@ -3789,7 +4112,20 @@ impl WorkspaceEngine {
                         need_sync = true;
                         break;
                     }
+                    // Content matches what the index holds, so this path is no longer suspect.
+                    // Without pruning here the record only ever grew: a committed edit is never
+                    // dirty again, so nothing revisited it, and every query paid for the whole
+                    // history of the workspace.
+                    settled.insert(rel);
                 }
+            }
+        }
+        if !settled.is_empty() {
+            let mut carried = recorded.clone();
+            let before = carried.len();
+            carried.retain(|rel| !settled.contains(rel));
+            if carried.len() != before {
+                self.write_dirty_synced(&carried);
             }
         }
         if !need_sync {
@@ -4898,6 +5234,211 @@ mod agent_context_tests {
         assert!(
             counts.windows(2).all(|pair| pair[0] >= pair[1]),
             "groups must be ranked: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_of_unparsed_components_does_not_certify_its_zeros() {
+        // `.vue`, `.svelte` and `.astro` contain TypeScript and import TS symbols. Leaving them out of
+        // the known-source list meant a Vue workspace answered `total: 0` for a function called from
+        // every component -- with `authoritative_zero: true`, `n_affected_exact: true`, and `orphans`
+        // naming it dead code. Nothing in any response contradicted "safe to delete".
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/api.ts"),
+            "export function chargeIt() { return 1; }\n",
+        )
+        .unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(
+                root.path().join(format!("src/{name}.vue")),
+                "<script lang=\"ts\">\nimport { chargeIt } from './api';\nchargeIt();\n</script>\n",
+            )
+            .unwrap();
+        }
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let status = engine.status().unwrap();
+        assert_eq!(
+            status["coverage"]["unsupported_source_files"], 3,
+            "the components must be counted as unparsed: {status:?}"
+        );
+        assert!(
+            status["hint"].as_str().unwrap().contains(".vue"),
+            "and named in the hint: {status:?}"
+        );
+
+        let explored = engine.context("chargeIt", 10).unwrap();
+        assert_eq!(
+            explored["coverage"]["authoritative_zero"], false,
+            "an empty answer from a partly unreadable workspace is not authoritative: {explored:?}"
+        );
+        assert_eq!(explored["n_affected_exact"], false);
+        let relations = engine.reference_sites("chargeIt", true, 10, 0).unwrap();
+        assert_eq!(
+            relations["degraded_by"]["unparsed_components"].as_u64(),
+            Some(3),
+            "the relation answer must carry the reason too: {relations:?}"
+        );
+    }
+
+    #[test]
+    fn syncing_a_path_that_never_existed_is_an_error_not_a_success() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // A path absent from disk *and* from the index cannot be a deletion -- there is nothing to
+        // delete. Returning whole-index stats for it reads as "synced, you are up to date".
+        let typo = root.path().join("src/typo.ts");
+        let refused = engine
+            .sync(Some(std::slice::from_ref(&typo)))
+            .expect_err("a path that never existed is not a successful sync");
+        assert!(
+            refused
+                .to_string()
+                .contains("exists on disk or in the index"),
+            "{refused}"
+        );
+
+        // A real deletion still works: the file was indexed, so removing it is meaningful.
+        let existing = root.path().join("src/a.ts");
+        std::fs::remove_file(&existing).unwrap();
+        let synced = engine
+            .sync(Some(std::slice::from_ref(&existing)))
+            .expect("deleting an indexed file is a legitimate sync");
+        assert_eq!(synced.files, 0, "{synced:?}");
+    }
+
+    #[test]
+    fn an_unparsed_tsconfig_is_reported_instead_of_silently_dropping_aliases() {
+        // A tsconfig that exists but does not parse yields the same empty config as an absent one:
+        // no baseUrl, no paths. On an alias-heavy workspace every aliased import then resolves to
+        // nothing, `callers_of` understates permanently, and the index looks healthy -- same file
+        // count, zero parse errors. One stray character is enough.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/dep.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/main.ts"),
+            "import { target } from '@app/dep';\nexport function main() { return target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let healthy = engine.status().unwrap();
+        assert!(
+            healthy["config_problems"].as_array().unwrap().is_empty(),
+            "a valid tsconfig is not a problem: {healthy:?}"
+        );
+        let resolved = engine.reference_sites("target", true, 10, 0).unwrap();
+        assert_eq!(
+            resolved["by_kind"]["Calls"], 1,
+            "the alias resolves: {resolved:?}"
+        );
+
+        std::fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@app/*": ["src/*"] },,, }"#,
+        )
+        .unwrap();
+        engine.index().unwrap();
+        let broken = engine.status().unwrap();
+        let problems = broken["config_problems"].as_array().unwrap();
+        assert_eq!(
+            problems.len(),
+            1,
+            "the unparsed config must be named: {broken:?}"
+        );
+        assert_eq!(problems[0]["code"], "tsconfig_unparsed");
+        assert!(
+            broken["hint"].as_str().unwrap().contains("tsconfig.json"),
+            "and named first, before anything about freshness: {broken:?}"
+        );
+    }
+
+    #[test]
+    fn an_incremental_sync_keeps_an_unusable_file_exactly_as_a_full_index_does() {
+        // Present-but-unusable is not a deletion. The incremental path used to drop such a file with
+        // no diagnostic while a full walk kept it with one, so a file's coverage -- and whether
+        // anything reported the problem -- depended on which command ran last.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let grown = root.path().join("src/grown.ts");
+        std::fs::write(&grown, "export function growThing() { return 1; }\n").unwrap();
+        std::fs::write(
+            root.path().join("src/caller.ts"),
+            "import { growThing } from './grown';\nexport function c() { return growThing(); }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let indexed = engine.index().unwrap();
+        assert_eq!(indexed.files, 2);
+        assert_eq!(indexed.parse_errors, 0);
+
+        let limit = engine.config.parser.max_file_size_kb.saturating_mul(1024) as usize;
+        let mut oversized = std::fs::read_to_string(&grown).unwrap();
+        while oversized.len() <= limit {
+            oversized.push_str("// pad pad pad pad pad pad pad pad\n");
+        }
+        std::fs::write(&grown, &oversized).unwrap();
+
+        let synced = engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
+        let rebuilt = engine.index().unwrap();
+        assert_eq!(
+            (synced.files, synced.parse_errors),
+            (rebuilt.files, rebuilt.parse_errors),
+            "the two paths must agree: sync {synced:?} vs index {rebuilt:?}"
+        );
+        assert_eq!(synced.files, 2, "the file stays in the index: {synced:?}");
+        assert_eq!(
+            synced.parse_errors, 1,
+            "and carries the reason it could not be parsed: {synced:?}"
+        );
+    }
+
+    // Permissions only: running as root defeats the chmod, and Windows has no equivalent.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_stays_in_the_index_with_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let dep = root.path().join("src/dep.ts");
+        std::fs::write(&dep, "export function target() { return 1; }\n").unwrap();
+        std::fs::write(
+            root.path().join("src/main.ts"),
+            "import { target } from './dep';\nexport function main() { return target(); }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let indexed = engine.index().unwrap();
+        assert_eq!((indexed.files, indexed.parse_errors), (2, 0));
+
+        // A read failure is not a deletion: dropping the file makes a permissions problem look like
+        // one, with the symbol gone, the count down, and nothing saying why.
+        std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let synced = engine.sync(Some(std::slice::from_ref(&dep))).unwrap();
+        std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(synced.files, 2, "the file stays: {synced:?}");
+        assert_eq!(
+            synced.parse_errors, 1,
+            "with the reason attached: {synced:?}"
         );
     }
 

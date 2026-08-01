@@ -43,6 +43,31 @@ use thiserror::Error;
 /// queries from an empty symbol-meta backend, which is indistinguishable from a
 /// genuine "nothing found". The bump makes the mismatch loud in both directions:
 /// each side reports an unsupported schema and rebuilds.
+/// Whether a delta component can be written in a form every reader will accept. The read sites all
+/// cap at `MAX_DELTA_COMPONENT_BYTES`; the writer had no matching bound, so a large enough overlay
+/// produced an index whose every relation query failed until someone reindexed by hand.
+/// A delta component may never be allowed to exceed a full one. Checked at compile time so the
+/// relationship cannot drift when either ceiling is tuned.
+const _: () = assert!(MAX_DELTA_COMPONENT_BYTES <= MAX_COMPONENT_BYTES);
+
+fn delta_component_fits(len: usize) -> bool {
+    len as u64 <= delta_component_ceiling()
+}
+
+fn delta_component_ceiling() -> u64 {
+    #[cfg(test)]
+    {
+        let override_bytes = DELTA_CEILING_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if override_bytes > 0 {
+            return override_bytes;
+        }
+    }
+    MAX_DELTA_COMPONENT_BYTES
+}
+
+/// On-disk format identity. Bumping it makes a version mismatch loud -- both directions report an
+/// unsupported schema and rebuild -- rather than letting a reader silently return nothing from a
+/// layout it half-understands.
 pub(crate) const SCHEMA_VERSION: u32 = 17;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
@@ -60,6 +85,11 @@ const GRAPH_ADJ_BITS: u8 = 12;
 // centralized so every reader enforces the same bounds.
 const MAX_COMPONENT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DELTA_COMPONENT_BYTES: u64 = 256 * 1024 * 1024;
+/// Test-only override for the write-side ceiling. Driving the real writer past 256MB would mean
+/// allocating a quarter of a gigabyte per case; the mechanism is scale-free, so the tests lower the
+/// bound instead of inflating the data.
+#[cfg(test)]
+static DELTA_CEILING_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const MAX_COMPACT_GRAPH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_STATS_BYTES: u64 = 16 * 1024 * 1024;
 static STRUCTURAL_PUBLISH_FAILPOINT: AtomicU8 = AtomicU8::new(0);
@@ -2765,7 +2795,7 @@ impl FileSnapshotStorage {
         &self,
         generation: &str,
         records: &StructuralOverlayRecords,
-    ) -> Result<String, StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let name = format!(
             "snapshot-{generation}.structural-merge-{}.pack",
             records.weight
@@ -2806,6 +2836,12 @@ impl FileSnapshotStorage {
                 })?,
             ),
         ] {
+            // Composition is a union, so this is where a chain actually reaches the ceiling: two
+            // overlays that each fit can merge into one that does not. Refusing keeps the chain --
+            // slower to read, but readable -- instead of collapsing it into a pack nothing can open.
+            if !delta_component_fits(bytes.len()) {
+                return Ok(None);
+            }
             writer
                 .add(key, bytes)
                 .map_err(|error| StorageError::Invalid {
@@ -2817,7 +2853,7 @@ impl FileSnapshotStorage {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        Ok(name)
+        Ok(Some(name))
     }
 
     fn compact_structural_overlay_chain(
@@ -2843,7 +2879,12 @@ impl FileSnapshotStorage {
                     },
                 )?,
             };
-            let merged_name = self.write_structural_overlay_merge(generation, &current)?;
+            let Some(merged_name) = self.write_structural_overlay_merge(generation, &current)?
+            else {
+                // The merged records would not fit under the read ceiling. Keeping the un-merged
+                // chain costs an extra hop per read; writing the merge would cost the whole index.
+                break;
+            };
             chain.overlays.truncate(previous_index);
             chain.overlays.push(merged_name);
         }
@@ -2854,6 +2895,12 @@ impl FileSnapshotStorage {
         clippy::too_many_arguments,
         reason = "one atomic generation pack intentionally stages every coupled component"
     )]
+    /// `Ok(None)` when the overlay cannot be written in a form the reader accepts. Every read site
+    /// caps a delta component at `MAX_DELTA_COMPONENT_BYTES`, and nothing used to cap the write --
+    /// so a large enough overlay produced an index that only a full reindex could recover, with
+    /// every relation query failing on `pack record graph/overlay-v2 is N bytes, exceeding read
+    /// limit`. Refusing here leaves the caller to publish a full generation instead, which is slower
+    /// but readable.
     fn stage_structural_overlay_pack(
         &self,
         manifest: &mut Manifest,
@@ -2865,7 +2912,7 @@ impl FileSnapshotStorage {
         stats: &[u8],
         symbol_meta_overlay: Option<&SymbolMetaOverlay>,
         search_overlay: Option<&SearchTermOverlay>,
-    ) -> Result<String, StorageError> {
+    ) -> Result<Option<String>, StorageError> {
         let Some(chain) = manifest.structural_packs.as_mut() else {
             return Err(StorageError::Invalid {
                 path: self.current_path(),
@@ -2899,6 +2946,10 @@ impl FileSnapshotStorage {
                 source,
             })?;
         crate::timing::note("overlay.graph_bytes", || graph_bytes.len().to_string());
+        if !delta_component_fits(graph_bytes.len()) {
+            return Ok(None);
+        }
+
         writer
             .add("graph/overlay-v2", graph_bytes)
             .map_err(|error| StorageError::Invalid {
@@ -2922,6 +2973,11 @@ impl FileSnapshotStorage {
                 path: path.clone(),
                 source,
             })?;
+        // Read at the same ceiling as the graph record, so guarded the same way: covering one of the
+        // three left the other two able to produce an index its own reader refuses.
+        if !delta_component_fits(universe_bytes.len()) {
+            return Ok(None);
+        }
         crate::timing::note("overlay.universe_bytes", || {
             universe_bytes.len().to_string()
         });
@@ -2936,6 +2992,9 @@ impl FileSnapshotStorage {
                 path: path.clone(),
                 source,
             })?;
+        if !delta_component_fits(reverse_bytes.len()) {
+            return Ok(None);
+        }
         crate::timing::note("overlay.reverse_bytes", || reverse_bytes.len().to_string());
         writer
             .add("reverse/overlay-v2", reverse_bytes)
@@ -2987,7 +3046,7 @@ impl FileSnapshotStorage {
             },
         )?;
         chain.current_snapshot = generation;
-        Ok(name)
+        Ok(Some(name))
     }
 
     /// Read stats using a manifest already loaded by the caller.
@@ -3820,7 +3879,7 @@ impl FileSnapshotStorage {
         let packed_generation =
             if let Some((graph_overlay, universe_overlay, reverse_overlay)) = structural_overlay {
                 structural_publish_failpoint(1, &self.current_path())?;
-                let name = self.stage_structural_overlay_pack(
+                let staged = self.stage_structural_overlay_pack(
                     &mut manifest,
                     &snapshot.id,
                     graph_overlay,
@@ -3831,6 +3890,12 @@ impl FileSnapshotStorage {
                     None,
                     None,
                 )?;
+                let Some(name) = staged else {
+                    // The overlay would exceed the size any reader accepts. Decline the incremental
+                    // publish so the caller rebuilds a full generation: slower, but readable, instead
+                    // of an index whose every relation query fails until someone reindexes by hand.
+                    return Ok(false);
+                };
                 structural_publish_failpoint(2, &self.current_path())?;
                 Some(name)
             } else {
@@ -4082,7 +4147,7 @@ impl FileSnapshotStorage {
             None
         };
         structural_publish_failpoint(1, &self.current_path())?;
-        let pack_name = self.stage_structural_overlay_pack(
+        let staged = self.stage_structural_overlay_pack(
             &mut manifest,
             snapshot_id,
             graph_overlay,
@@ -4093,6 +4158,11 @@ impl FileSnapshotStorage {
             None,
             None,
         )?;
+        let Some(pack_name) = staged else {
+            // Same refusal as the other publish path: an overlay past the reader's ceiling is worse
+            // than no overlay, so decline and let a full generation be written instead.
+            return Ok(false);
+        };
         structural_publish_failpoint(2, &self.current_path())?;
 
         manifest.snapshot_id = snapshot_id.clone();
@@ -4311,6 +4381,25 @@ impl FileSnapshotStorage {
     /// older binary would rewrite a newer index in its own older format, the newer one would
     /// rebuild it back, and each flip costs a full reindex of the workspace. Refuse to rebuild
     /// downward and name the cause; upgrading forward stays allowed, which is the normal path.
+    /// Paths whose artifact carries at least one diagnostic, read from the artifact index rather than
+    /// by hydrating the snapshot. `status` needs at most a handful of these; deserializing every
+    /// artifact to print twenty entries made a repo with one generated file permanently slow.
+    pub(crate) fn paths_with_diagnostics(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let Some(manifest) = self.read_manifest()? else {
+            return Ok(Vec::new());
+        };
+        let Some(index) = self.read_artifact_index(&manifest)? else {
+            return Ok(Vec::new());
+        };
+        Ok(index
+            .entries
+            .iter()
+            .filter(|(_, location)| location.parse_error)
+            .map(|(path, _)| path.clone())
+            .take(limit)
+            .collect())
+    }
+
     fn ensure_not_a_downgrade(&self) -> Result<(), StorageError> {
         let Some(existing) = self.read_manifest()? else {
             return Ok(());
@@ -5540,7 +5629,7 @@ fn shrink(plain: &[u8], path: &Path) -> Result<Vec<u8>, StorageError> {
     })
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     // fsync the temp file before renaming so a crash can never expose a renamed-but-unflushed
     // (truncated/garbage) sidecar — the rename itself is atomic on POSIX.
@@ -5928,6 +6017,100 @@ mod tests {
         assert!(store.open_search_dir().unwrap().is_some());
         assert!(store.open_symbol_meta().unwrap().is_some());
         assert!(store.open_file_list().unwrap().is_some());
+    }
+
+    #[test]
+    fn an_overlay_past_the_read_ceiling_is_refused_rather_than_written() {
+        // Observed in production at 426MB against the 256MB ceiling: every relation query failed with
+        // "pack record graph/overlay-v2 is N bytes, exceeding read limit" until someone reindexed by
+        // hand. The ceiling is lowered rather than the payload inflated -- the comparison is
+        // scale-free, and building a real 256MB overlay would make this unusable in CI.
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        assert!(delta_component_fits(0));
+        assert!(delta_component_fits(MAX_DELTA_COMPONENT_BYTES as usize));
+        assert!(!delta_component_fits(
+            MAX_DELTA_COMPONENT_BYTES as usize + 1
+        ));
+
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+        let staged = store
+            .stage_structural_pack_base(StructuralPackBase {
+                snapshot_id: base.id.stable_key(),
+                universe: ResolutionUniverse::default(),
+                reverse: ReverseShardSet {
+                    format_version: ReverseShardSet::FORMAT_VERSION,
+                    resolver_fingerprint: String::new(),
+                    shard_bits: 0,
+                    shards: BTreeMap::new(),
+                },
+                graph: IncrementalGraphState::default(),
+            })
+            .unwrap();
+        store.attach_structural_pack_base(staged).unwrap();
+
+        let mut overlay_snapshot = base.clone();
+        overlay_snapshot.id.content_state = "over-ceiling".to_owned();
+        let mut graph = IncrementalGraphOverlay::default();
+        graph
+            .file_upserts
+            .insert("changed.ts".into(), BTreeSet::new());
+        let mut universe = ResolutionUniverseOverlay::default();
+        universe.files.insert("changed.ts".into(), true);
+        let mut reverse_shard = crate::structural_reverse::ReverseShardOverlay::default();
+        reverse_shard
+            .files
+            .upserts
+            .insert("changed.ts".into(), FileContribution::default());
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::from([(0, reverse_shard)]),
+        };
+        let changed = BTreeSet::from(["changed.ts".to_owned()]);
+        let current_before = fs::read(store.current_path()).unwrap();
+
+        // A one-byte ceiling cannot fit any real component, so the publish must decline.
+        DELTA_CEILING_OVERRIDE.store(1, Ordering::Release);
+        let declined = store.publish_structural_overlay(
+            &overlay_snapshot,
+            &changed,
+            Some((&graph, &universe, &reverse)),
+            false,
+            None,
+        );
+        DELTA_CEILING_OVERRIDE.store(0, Ordering::Release);
+
+        assert!(
+            !declined.expect("declining is not an error"),
+            "an overlay that could not be read back must not be published"
+        );
+        assert_eq!(
+            fs::read(store.current_path()).unwrap(),
+            current_before,
+            "the generation marker must not move when the publish declined"
+        );
+        assert!(
+            store.open_structural_reader().is_ok(),
+            "and the index must still be readable, which is the point of declining"
+        );
+
+        // With the real ceiling the same overlay publishes normally.
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &overlay_snapshot,
+                    &changed,
+                    Some((&graph, &universe, &reverse)),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            "the refusal must be about size, not about this overlay"
+        );
     }
 
     #[test]

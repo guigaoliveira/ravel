@@ -1724,20 +1724,64 @@ fn normalize_path_components(path: &Path) -> PathBuf {
 }
 
 pub fn load_tsconfig(root: &Path) -> ResolverConfig {
-    load_tsconfig_recursive(root, &root.join("tsconfig.json"), &mut BTreeSet::new())
-        .unwrap_or_default()
+    load_tsconfig_reporting(root).config
+}
+
+/// A tsconfig that exists but cannot be parsed and one that is absent produce the same empty
+/// config -- no `baseUrl`, no `paths`. On an alias-heavy workspace that means every aliased import
+/// resolves to nothing, `callers_of` understates permanently, and the index reports itself healthy:
+/// same file count, zero parse errors. One stray character is enough. Reporting the problem is the
+/// difference between a caller seeing a smaller answer and a caller seeing a wrong one.
+pub fn load_tsconfig_reporting(root: &Path) -> LoadedResolverConfig {
+    let path = root.join("tsconfig.json");
+    let mut problems = Vec::new();
+    let config = load_tsconfig_recursive(root, &path, &mut BTreeSet::new(), &mut problems);
+    if path.exists() && !path.is_file() {
+        // A directory named `tsconfig.json` reads as "no config" to every layer below.
+        problems.push(crate::model::Diagnostic {
+            code: "tsconfig_not_a_file".into(),
+            message: "tsconfig.json exists but is not a regular file; no baseUrl or path aliases are applied".into(),
+            path: Some("tsconfig.json".into()),
+            span: None,
+        });
+    } else if config.is_none() && path.is_file() {
+        problems.push(crate::model::Diagnostic {
+            code: "tsconfig_unparsed".into(),
+            message: "tsconfig.json exists but could not be parsed; path aliases and baseUrl are not applied, so aliased imports resolve to nothing"
+                .into(),
+            path: Some("tsconfig.json".into()),
+            span: None,
+        });
+    }
+    LoadedResolverConfig {
+        config: config.unwrap_or_default(),
+        problems,
+    }
+}
+
+/// A resolver config plus whatever went wrong producing it.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedResolverConfig {
+    pub config: ResolverConfig,
+    pub problems: Vec<crate::model::Diagnostic>,
 }
 
 fn load_tsconfig_recursive(
     root: &Path,
     path: &Path,
     visited: &mut BTreeSet<PathBuf>,
+    problems: &mut Vec<crate::model::Diagnostic>,
 ) -> Option<ResolverConfig> {
     let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(identity) {
         return None;
     }
     let text = fs::read_to_string(path).ok()?;
+    // `tsc` treats an empty file as `{}`. Reporting it as unparseable turns a harmless placeholder
+    // into a permanent hint telling the caller to fix a file that is already fine.
+    if text.trim().is_empty() {
+        return Some(ResolverConfig::default());
+    }
     let value = parse_jsonc(&text)?;
     let directory = path.parent().unwrap_or(root);
     let mut config = ResolverConfig::default();
@@ -1759,7 +1803,21 @@ fn load_tsconfig_recursive(
         if !inherited_path.is_file() {
             inherited_path = PathBuf::from(format!("{}.json", inherited_path.to_string_lossy()));
         }
-        if let Some(base) = load_tsconfig_recursive(root, &inherited_path, visited) {
+        let base = load_tsconfig_recursive(root, &inherited_path, visited, problems);
+        if base.is_none() {
+            // The aliases usually live in the base config of a monorepo, so a base that cannot be
+            // read takes them all with it -- and the top file parses fine, so nothing else notices.
+            // Sparse checkouts, uninitialised submodules and renamed base configs all land here.
+            problems.push(crate::model::Diagnostic {
+                code: "tsconfig_extends_unresolved".into(),
+                message: format!(
+                    "tsconfig.json extends `{inherited}`, which could not be read or parsed; any baseUrl and path aliases it defines are not applied, so imports relying on them resolve to nothing"
+                ),
+                path: Some("tsconfig.json".into()),
+                span: None,
+            });
+        }
+        if let Some(base) = base {
             if base.base_url.is_some() {
                 config.base_url = base.base_url;
             }
@@ -1901,6 +1959,54 @@ fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_config_that_parses_but_loses_its_base_is_still_reported() {
+        // The aliases usually live in the base config of a monorepo. A missing base -- sparse
+        // checkout, uninitialised submodule, renamed file -- takes them all with it while the top
+        // file parses fine, so the earlier "did it parse?" check saw nothing wrong.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{ "extends": "./tsconfig.base.json" }"#,
+        )
+        .unwrap();
+        let loaded = load_tsconfig_reporting(root.path());
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(|problem| problem.code.as_str())
+                .collect::<Vec<_>>(),
+            ["tsconfig_extends_unresolved"],
+            "a base that cannot be read must be named"
+        );
+
+        // With the base present there is nothing to report.
+        fs::write(
+            root.path().join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@lib/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        let healthy = load_tsconfig_reporting(root.path());
+        assert!(healthy.problems.is_empty(), "{:?}", healthy.problems);
+        assert!(!healthy.config.paths.is_empty(), "the aliases are applied");
+    }
+
+    #[test]
+    fn a_tsconfig_that_is_not_a_regular_file_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("tsconfig.json")).unwrap();
+        let loaded = load_tsconfig_reporting(root.path());
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .map(|problem| problem.code.as_str())
+                .collect::<Vec<_>>(),
+            ["tsconfig_not_a_file"]
+        );
+    }
     use super::*;
     use crate::scanner::parse_source;
     use tempfile::tempdir;
