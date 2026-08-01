@@ -817,7 +817,9 @@ impl RavelMcp {
         }
     }
 
-    #[tool(description = "Validate index integrity (dangling edges, cross-package)")]
+    #[tool(
+        description = "Validate index integrity (dangling edges, unresolved relative imports, declared boundary rules)"
+    )]
     async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> String {
         match self.engine(request.root) {
             Ok(engine) => match engine.validate() {

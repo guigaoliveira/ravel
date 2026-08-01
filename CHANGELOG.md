@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — a diagnostic that was wrong more often than right
+- **`validate` no longer reports `cross_package`.** It compared the first path
+  component of each side, so a monorepo laid out as `apps/<service>` and
+  `libs/<shared>` had every descent into a shared library reported as a boundary
+  violation — while coupling between peer services was invisible, because `apps`
+  equals `apps`. On a 19,489-file workspace: 122,324 findings, 48,220 of them legal
+  app-to-library descents, against 25,258 app-to-app imports it could not see.
+  Aggregated to directory pairs the entire report was 15 distinct rows.
+  **If you gate merges on this, read on:** `policy_report.by_code` loses the key,
+  `total` drops, and `ravel ci --strict` now passes on repos that previously failed.
+  Plain `ravel ci` is unaffected — it has always gated on cycles alone. Imports that
+  point nowhere (`dangling_edge`) and relative imports that did not resolve
+  (`unresolved_import`) are unchanged, and a declared `ravel.boundaries.toml`
+  still reports `layer_bypass` / `cross_package_deny` at package granularity.
+  Known limitation, measured rather than assumed: an acyclic `libs/* -> apps/*`
+  inversion outside an existing import cycle is now reported by nothing.
+
+### Fixed — a policy file that could not be read meant "no violations"
+- **An unparsable `ravel.boundaries.toml` was swallowed.** `validate` returned
+  `{"total":0}` and exit 0, indistinguishable from a clean repository, so a broken
+  policy protected nothing while looking like it protected everything. Both
+  `validate` and `ci` now fail with the file named. Consumers piping `ravel validate`
+  into `jq` should expect exit 1 and no stdout in that case.
+- **`boundaries` blamed git for a TOML syntax error.** The same loader failure was
+  reported as `worktree identity: …`, sending the reader to an unrelated file. Both
+  commands now share one error that names the policy file exactly once.
+
+### Fixed — a full index could delete the pack it was writing
+- **`index` could fail with `No such file or directory` on its own staged pack.**
+  Generation GC removes every unreachable name containing `.tmp-`, which is exactly
+  what an in-flight pack write is called; staging held no GC barrier, so a collection
+  scheduled by the preceding sync could delete the file mid-write. Staging now holds
+  the shared generation guard for the lifetime of the temp file, and GC defers as it
+  already does for readers. Reproduced under parallel load at ~5% and now covered by
+  a deterministic test.
+
 ## [1.14.0] - 2026-08-01
 
 Answers stop being confident about what the index could not see. Every item below was

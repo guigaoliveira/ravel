@@ -97,12 +97,6 @@ pub fn stable_symbol_id_for_kind(
     )
 }
 
-pub fn symbol_path_from_id(id: &str) -> Option<&str> {
-    id.strip_prefix("symbol://")?
-        .split_once('#')
-        .map(|(path, _)| path)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ImportBindingKind {
     Default,

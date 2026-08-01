@@ -726,9 +726,9 @@ mod tests {
             message: "m".into(),
         };
         let findings = vec![
-            finding("cross_package", 0),
-            finding("cross_package", 1),
-            finding("cross_package", 2),
+            finding("dangling_edge", 0),
+            finding("dangling_edge", 1),
+            finding("dangling_edge", 2),
             finding("orphan_export", 3),
             finding("orphan_export", 4),
         ];
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(report.total, 5);
         assert_eq!(report.findings.len(), 2);
         assert!(report.truncated);
-        assert_eq!(report.by_code.get("cross_package"), Some(&3));
+        assert_eq!(report.by_code.get("dangling_edge"), Some(&3));
         assert_eq!(report.by_code.get("orphan_export"), Some(&2));
 
         let complete = policy_report(Vec::new(), 2);

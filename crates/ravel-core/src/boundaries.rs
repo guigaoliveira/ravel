@@ -59,9 +59,10 @@ pub fn load_boundaries(root: &Path) -> Result<Option<BoundariesConfig>, String> 
     if !path.is_file() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let cfg: BoundariesConfig =
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The path is not repeated here: every caller wraps this in `EngineError::Policy`, which names
+    // the file. Prefixing on both sides printed it twice in one sentence.
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let cfg: BoundariesConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
     Ok(Some(cfg))
 }
 

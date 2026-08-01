@@ -50,18 +50,23 @@ use thiserror::Error;
 /// relationship cannot drift when either ceiling is tuned.
 const _: () = assert!(MAX_DELTA_COMPONENT_BYTES <= MAX_COMPONENT_BYTES);
 
-fn delta_component_fits(len: usize) -> bool {
-    len as u64 <= delta_component_ceiling()
+fn delta_component_fits(len: usize, store_root: &Path) -> bool {
+    len as u64 <= delta_component_ceiling(store_root)
 }
 
-fn delta_component_ceiling() -> u64 {
+fn delta_component_ceiling(store_root: &Path) -> u64 {
     #[cfg(test)]
     {
         let override_bytes = DELTA_CEILING_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-        if override_bytes > 0 {
+        // Gated on the store that armed it, exactly like `structural_publish_failpoint`: the
+        // override is process-global, and the resident-sync tests publish overlays in parallel. An
+        // ungated one-byte ceiling silently pushed *their* deltas onto the full-rebuild fallback,
+        // which is a legal outcome -- so they failed on a later assertion, rarely, under load.
+        if override_bytes > 0 && DELTA_CEILING_PATH.lock().unwrap().as_deref() == Some(store_root) {
             return override_bytes;
         }
     }
+    let _ = store_root;
     MAX_DELTA_COMPONENT_BYTES
 }
 
@@ -90,6 +95,9 @@ const MAX_DELTA_COMPONENT_BYTES: u64 = 256 * 1024 * 1024;
 /// bound instead of inflating the data.
 #[cfg(test)]
 static DELTA_CEILING_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Which store the lowered ceiling applies to. Without this the bound is process-wide.
+#[cfg(test)]
+static DELTA_CEILING_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 const MAX_COMPACT_GRAPH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_STATS_BYTES: u64 = 16 * 1024 * 1024;
 static STRUCTURAL_PUBLISH_FAILPOINT: AtomicU8 = AtomicU8::new(0);
@@ -237,6 +245,12 @@ pub(crate) struct StructuralPackStager {
     name: String,
     path: PathBuf,
     writer: StreamingGenerationPackWriter,
+    /// Held for as long as the in-flight `.tmp-` file exists. Generation GC deletes every
+    /// unreachable name containing `.tmp-`, and the pack a full index is still writing is exactly
+    /// that: unreachable until its manifest lands. Without this barrier a GC scheduled by the
+    /// previous sync removed the file mid-write and the index failed with a bare
+    /// "No such file or directory" on its own staged pack.
+    _generation_guard: crate::generation_gc::GenerationGuard,
 }
 
 impl StructuralPackStager {
@@ -674,6 +688,9 @@ impl StructuralPackStager {
             name,
             path,
             writer,
+            // Bound, not dropped: `publish` renames the temp into place, so the GC barrier has to
+            // outlive it. A bare `_` would release the lock before the rename.
+            _generation_guard,
         } = self;
         writer.publish().map_err(|error| StorageError::Invalid {
             path,
@@ -2375,6 +2392,10 @@ impl FileSnapshotStorage {
         // reference it has completed. `attach_structural_pack_base` atomically promotes it.
         let name = format!("staged-{generation}.structural.pack");
         let path = self.root.join(&name);
+        // Before the writer exists: the temp is created inside `new`, so the barrier has to be up
+        // first. Lock order is `update.lock` -> `generation-gc.lock`, and the caller already holds
+        // the update lock.
+        let generation_guard = self.acquire_generation_read_guard()?;
         let writer =
             StreamingGenerationPackWriter::new(&path).map_err(|error| StorageError::Invalid {
                 path: path.clone(),
@@ -2385,6 +2406,7 @@ impl FileSnapshotStorage {
             name,
             path,
             writer,
+            _generation_guard: generation_guard,
         })
     }
 
@@ -2853,7 +2875,7 @@ impl FileSnapshotStorage {
             // Composition is a union, so this is where a chain actually reaches the ceiling: two
             // overlays that each fit can merge into one that does not. Refusing keeps the chain --
             // slower to read, but readable -- instead of collapsing it into a pack nothing can open.
-            if !delta_component_fits(bytes.len()) {
+            if !delta_component_fits(bytes.len(), &self.root) {
                 return Ok(None);
             }
             writer
@@ -2960,7 +2982,7 @@ impl FileSnapshotStorage {
                 source,
             })?;
         crate::timing::note("overlay.graph_bytes", || graph_bytes.len().to_string());
-        if !delta_component_fits(graph_bytes.len()) {
+        if !delta_component_fits(graph_bytes.len(), &self.root) {
             return Ok(None);
         }
 
@@ -2989,7 +3011,7 @@ impl FileSnapshotStorage {
             })?;
         // Read at the same ceiling as the graph record, so guarded the same way: covering one of the
         // three left the other two able to produce an index its own reader refuses.
-        if !delta_component_fits(universe_bytes.len()) {
+        if !delta_component_fits(universe_bytes.len(), &self.root) {
             return Ok(None);
         }
         crate::timing::note("overlay.universe_bytes", || {
@@ -3006,7 +3028,7 @@ impl FileSnapshotStorage {
                 path: path.clone(),
                 source,
             })?;
-        if !delta_component_fits(reverse_bytes.len()) {
+        if !delta_component_fits(reverse_bytes.len(), &self.root) {
             return Ok(None);
         }
         crate::timing::note("overlay.reverse_bytes", || reverse_bytes.len().to_string());
@@ -6037,6 +6059,48 @@ mod tests {
         assert!(store.open_file_list().unwrap().is_some());
     }
 
+    /// Generation GC must not delete the pack a full index is still writing.
+    ///
+    /// Deterministic stand-in for a race seen only under parallel load: the in-flight temp is named
+    /// `...pack.tmp-<pid>-<n>`, GC removes every unreachable name containing `.tmp-`, and staging
+    /// held no barrier. The index then failed on its own staged pack with `No such file or
+    /// directory` -- a bare I/O error for what is really a lifetime bug.
+    #[test]
+    fn generation_gc_defers_while_a_structural_pack_is_being_staged() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+
+        let stager = store
+            .begin_structural_pack_base(base.id.stable_key())
+            .unwrap();
+        let in_flight = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .map(|entry| entry.path())
+        };
+        let temp = in_flight().expect("staging must have created an in-flight temp");
+
+        let report = store.gc_generations().unwrap();
+        assert!(
+            report.deferred_for_readers,
+            "GC must yield to an in-flight staging, not run beside it"
+        );
+        assert_eq!(report.removed_files, 0);
+        assert!(
+            temp.exists(),
+            "the pack being written must survive a concurrent GC"
+        );
+
+        // Once staging is over the barrier is down and GC is free again.
+        drop(stager);
+        let after = store.gc_generations().unwrap();
+        assert!(!after.deferred_for_readers);
+    }
+
     #[test]
     fn an_overlay_past_the_read_ceiling_is_refused_rather_than_written() {
         // Observed in production at 426MB against the 256MB ceiling: every relation query failed with
@@ -6044,10 +6108,16 @@ mod tests {
         // hand. The ceiling is lowered rather than the payload inflated -- the comparison is
         // scale-free, and building a real 256MB overlay would make this unusable in CI.
         let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
-        assert!(delta_component_fits(0));
-        assert!(delta_component_fits(MAX_DELTA_COMPONENT_BYTES as usize));
+        // No store armed: these exercise the real bound.
+        let unarmed = Path::new("");
+        assert!(delta_component_fits(0, unarmed));
+        assert!(delta_component_fits(
+            MAX_DELTA_COMPONENT_BYTES as usize,
+            unarmed
+        ));
         assert!(!delta_component_fits(
-            MAX_DELTA_COMPONENT_BYTES as usize + 1
+            MAX_DELTA_COMPONENT_BYTES as usize + 1,
+            unarmed
         ));
 
         let dir = tempdir().unwrap();
@@ -6091,7 +6161,9 @@ mod tests {
         let changed = BTreeSet::from(["changed.ts".to_owned()]);
         let current_before = fs::read(store.current_path()).unwrap();
 
-        // A one-byte ceiling cannot fit any real component, so the publish must decline.
+        // A one-byte ceiling cannot fit any real component, so the publish must decline. Armed for
+        // this store only -- other tests publish overlays concurrently against their own.
+        *DELTA_CEILING_PATH.lock().unwrap() = Some(store.root.clone());
         DELTA_CEILING_OVERRIDE.store(1, Ordering::Release);
         let declined = store.publish_structural_overlay(
             &overlay_snapshot,
@@ -6101,6 +6173,7 @@ mod tests {
             None,
         );
         DELTA_CEILING_OVERRIDE.store(0, Ordering::Release);
+        *DELTA_CEILING_PATH.lock().unwrap() = None;
 
         assert!(
             !declined.expect("declining is not an error"),

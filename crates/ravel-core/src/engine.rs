@@ -42,6 +42,10 @@ pub enum EngineError {
     Scan(#[from] crate::scanner::ScanError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// A declared policy file exists but could not be applied. Distinct from `Git` -- reporting a
+    /// TOML syntax error as "worktree identity" sends the reader to the wrong file entirely.
+    #[error("{path} could not be applied: {message}")]
+    Policy { path: PathBuf, message: String },
     #[error("worktree identity: {0}")]
     Git(String),
     #[error("query: {0}")]
@@ -3806,13 +3810,16 @@ impl WorkspaceEngine {
         let mut findings = validate_snapshot(&snapshot, &Suppressions::default());
         // T018 architecture boundaries (optional file).
         let graph = self.graph()?;
-        if let Ok(extra) = crate::boundaries::evaluate_boundaries(
+        // Propagated, not swallowed: a policy file that cannot be parsed silently meaning "no
+        // violations" is the same failure this command exists to prevent, one level up.
+        match crate::boundaries::evaluate_boundaries(
             &self.root,
             &snapshot,
             graph.as_ref(),
             &Suppressions::default(),
         ) {
-            findings.extend(extra);
+            Ok(extra) => findings.extend(extra),
+            Err(error) => return Err(self.policy_error(error)),
         }
         Ok(findings)
     }
@@ -3826,7 +3833,16 @@ impl WorkspaceEngine {
             graph.as_ref(),
             &Suppressions::default(),
         )
-        .map_err(EngineError::Git)
+        .map_err(|error| self.policy_error(error))
+    }
+
+    /// Both `validate` and `boundaries` reach the same loader; they used to disagree about whose
+    /// fault a failure was.
+    fn policy_error(&self, message: String) -> EngineError {
+        EngineError::Policy {
+            path: crate::boundaries::boundaries_path(&self.root),
+            message,
+        }
     }
 
     /// Schema summary: node kinds / edge kinds counts (no full dump).
