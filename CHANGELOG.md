@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-07-31
+
+### Fixed
+- The file watcher no longer feeds itself. Indexing a path reads it, Linux reports
+  that read as `Access(Open(Any))`, and the watcher treated every event kind except
+  `Other` as a change — so one edit scheduled a sync, the sync's own reads raised
+  more events, and those scheduled more syncs. Measured on a two-file repository:
+  **53 publications for a single edit**, all returning the same snapshot, at ~6/s
+  until the process was killed. Now 1. Reads are dropped in the producer, before
+  they can occupy the bounded queue and raise the overflow signal that escalates to
+  a full reconcile.
+- `Access(Close(Write))` is deliberately kept: some backends report a completed
+  write only that way, and dropping it would lose real edits. A test covers both
+  directions, using the event modes Linux actually emits — the first version of
+  this filter matched `Open(Read)`, which the kernel never sends, so it passed its
+  own test while the loop continued.
+
 ## [1.12.0] - 2026-07-31
 
 **If a workspace grew a gitignored copy of itself, reindex it once:** `ravel index`.

@@ -196,6 +196,29 @@ impl PersistentWatcher {
     }
 }
 
+/// Reading a file is not a change to it. inotify reports opens, reads and read-closes, and indexing
+/// a path necessarily reads it -- so treating those as changes makes the watcher feed itself: sync
+/// reads the file, the read raises an event, the event schedules another sync. One edit produced
+/// dozens of identical republications per second until the process was killed.
+///
+/// `Close(Write)` stays: some backends report a completed write only that way, and dropping it would
+/// lose real edits. Anything not obviously read-only is kept, since a missed change is worse than an
+/// extra pass.
+fn is_read_only_access(kind: &EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    matches!(
+        kind,
+        // An open is never itself a change, whatever the mode -- a write announces itself through
+        // `Modify` and `Close(Write)`. Linux reports plain reads as `Open(Any)`, so matching only
+        // the `Read` mode misses every one of them.
+        EventKind::Access(
+            AccessKind::Read
+                | AccessKind::Open(_)
+                | AccessKind::Close(AccessMode::Read | AccessMode::Execute)
+        )
+    )
+}
+
 fn accumulate_event(
     event: Event,
     paths: &mut BTreeSet<PathBuf>,
@@ -205,6 +228,9 @@ fn accumulate_event(
     if matches!(event.kind, EventKind::Other) {
         *needs_reconcile = true;
         paths.clear();
+        return;
+    }
+    if is_read_only_access(&event.kind) {
         return;
     }
     if !*needs_reconcile {
@@ -225,6 +251,11 @@ fn filter_event<F>(mut event: Event, path_is_relevant: &F) -> Option<Event>
 where
     F: Fn(&Path) -> bool + ?Sized,
 {
+    // Dropped in the producer so a read storm never even occupies the bounded queue -- filling it
+    // would raise the overflow signal and turn self-inflicted reads into full reconciliations.
+    if is_read_only_access(&event.kind) {
+        return None;
+    }
     event.paths.retain(|path| path_is_relevant(path));
     (!event.paths.is_empty() || matches!(event.kind, EventKind::Other)).then_some(event)
 }
@@ -235,6 +266,11 @@ pub fn coalesce(events: impl IntoIterator<Item = Event>) -> CoalescedChange {
     for event in events {
         if matches!(event.kind, EventKind::Other) {
             needs_reconcile = true;
+        }
+        // Same rule as the queue: a read is not a change. Three places decided this independently
+        // before; they now share `is_read_only_access`.
+        if is_read_only_access(&event.kind) {
+            continue;
         }
         for path in event.paths {
             paths.insert(path);
@@ -261,6 +297,82 @@ pub fn reconcile_hash(path: &Path) -> std::io::Result<Option<Hash>> {
 mod tests {
     use super::*;
     use notify::event::CreateKind;
+    #[test]
+    fn reading_a_file_is_not_a_change_to_it() {
+        use notify::event::{AccessKind, AccessMode, ModifyKind};
+        let path = PathBuf::from("/ws/src/a.ts");
+        // `Open(Any)` is what Linux actually reports for a read, and it is what the first version
+        // of this filter missed: the loop survived because the test used modes the kernel never
+        // sends. Measured on a two-file repo, one edit produced 42 of these.
+        let read_only = [
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ];
+        for kind in read_only {
+            // Indexing a path reads it, so accepting these makes the watcher feed itself: the sync
+            // reads the file, the read raises an event, the event schedules another sync.
+            let mut paths = BTreeSet::new();
+            let mut needs_reconcile = false;
+            accumulate_event(
+                Event {
+                    kind,
+                    paths: vec![path.clone()],
+                    attrs: Default::default(),
+                },
+                &mut paths,
+                &mut needs_reconcile,
+                16,
+            );
+            assert!(paths.is_empty(), "{kind:?} must not schedule work");
+            assert!(!needs_reconcile, "{kind:?} must not force a reconcile");
+            assert!(
+                filter_event(
+                    Event {
+                        kind,
+                        paths: vec![path.clone()],
+                        attrs: Default::default(),
+                    },
+                    &(|_: &Path| true) as &dyn Fn(&Path) -> bool,
+                )
+                .is_none(),
+                "{kind:?} must be dropped before it occupies the queue"
+            );
+            assert!(
+                coalesce([Event {
+                    kind,
+                    paths: vec![path.clone()],
+                    attrs: Default::default(),
+                }])
+                .paths
+                .is_empty(),
+                "{kind:?} must not survive coalescing either"
+            );
+        }
+
+        // A completed write is reported as a close on some backends; dropping it would lose edits.
+        let mut paths = BTreeSet::new();
+        let mut needs_reconcile = false;
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            accumulate_event(
+                Event {
+                    kind,
+                    paths: vec![path.clone()],
+                    attrs: Default::default(),
+                },
+                &mut paths,
+                &mut needs_reconcile,
+                16,
+            );
+            assert!(paths.contains(&path), "{kind:?} is a real change");
+            paths.clear();
+        }
+    }
+
     #[test]
     fn duplicate_events_are_coalesced() {
         let path = PathBuf::from("src/a.ts");
