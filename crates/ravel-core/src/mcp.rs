@@ -295,11 +295,14 @@ impl RavelMcp {
         })
     }
 
-    fn daemon_client(&self, root: Option<&str>) -> Option<DaemonUse> {
+    fn daemon_client(&self, root: Option<&str>) -> Result<DaemonUse, String> {
         let base = root
             .map(PathBuf::from)
             .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())?;
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| {
+                "no workspace root: pass `root` or start the server inside one".to_owned()
+            })?;
         let root = base.canonicalize().unwrap_or(base);
         let key = root.to_string_lossy().into_owned();
         let mut daemons = self.daemons.lock().unwrap();
@@ -307,7 +310,7 @@ impl RavelMcp {
         if let Some(binding) = daemons.get_mut(&key) {
             binding.last_used = tick;
             binding.active.fetch_add(1, Ordering::AcqRel);
-            return Some(DaemonUse {
+            return Ok(DaemonUse {
                 client: binding.client.clone(),
                 active: binding.active.clone(),
                 cache: self.daemons.clone(),
@@ -315,7 +318,10 @@ impl RavelMcp {
             });
         }
         evict_inactive_daemon(&mut daemons, self.max_cached_roots.saturating_sub(1));
-        let (client, lease) = crate::daemon::ensure_transient(&root).ok()?;
+        // Keep the cause. Collapsing it into `None` here is what turned an upgraded-binary
+        // situation into "shared daemon could not be started", with no hint of the remedy.
+        let (client, lease) = crate::daemon::ensure_transient(&root)
+            .map_err(|error| format!("shared daemon could not be started: {error}"))?;
         let active = Arc::new(AtomicUsize::new(1));
         daemons.insert(
             key,
@@ -326,7 +332,7 @@ impl RavelMcp {
                 last_used: tick,
             },
         );
-        Some(DaemonUse {
+        Ok(DaemonUse {
             client,
             active,
             cache: self.daemons.clone(),
@@ -354,16 +360,12 @@ impl RavelMcp {
         root: Option<&str>,
         operation: crate::daemon::DaemonOperation,
     ) -> Result<serde_json::Value, String> {
-        let client = self
-            .daemon_client(root)
-            .ok_or_else(|| "shared daemon could not be started".to_owned())?;
+        let client = self.daemon_client(root)?;
         match client.client.call(operation.clone()) {
             Ok(value) => Ok(value),
             Err(error) if should_respawn_after(&error) => {
                 self.forget_daemon(root);
-                let retry = self
-                    .daemon_client(root)
-                    .ok_or_else(|| "shared daemon could not be restarted".to_owned())?;
+                let retry = self.daemon_client(root)?;
                 retry
                     .client
                     .call(operation)

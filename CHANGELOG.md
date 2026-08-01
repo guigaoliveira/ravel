@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-07-31
+
+### Fixed
+- `shared daemon could not be started` now names its cause and the remedy. That
+  message was the one dead end left in the surface: no reason, no next action. Its
+  most common cause is an upgrade — a long-lived MCP server keeps running from a
+  deleted inode after npm replaces the package, the daemon endpoint is
+  version-scoped so it cannot borrow the new build's daemon, and spawning its own
+  fails with a bare `ENOENT`. The client is now told which version it is running,
+  that its binary no longer exists on disk, and to restart or reconnect. Two
+  layers were hiding it: `daemon_client` collapsed the error into `None`, and the
+  caller replaced it with a fixed string; the cause is propagated instead.
+
 ## [1.12.1] - 2026-07-31
 
 ### Fixed

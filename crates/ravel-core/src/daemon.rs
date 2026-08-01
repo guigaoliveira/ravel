@@ -435,6 +435,22 @@ pub fn ensure_running(
         return Ok((client, None));
     }
     let executable = std::env::current_exe().map_err(DaemonCallError::Transport)?;
+    // A long-lived server keeps running from a deleted inode after its package is replaced on disk,
+    // and the daemon endpoint is version-scoped, so it cannot borrow the new build's daemon either.
+    // The spawn then fails with a bare ENOENT, which surfaced as "shared daemon could not be
+    // started" -- an opaque dead end for the one situation with an obvious remedy.
+    if !executable.exists() {
+        return Err(DaemonCallError::Transport(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "this process is running Ravel {} from a binary that no longer exists at {} \
+                 (it was replaced, most likely by an upgrade). Restart or reconnect the client so \
+                 it picks up the installed version.",
+                crate::VERSION,
+                executable.display()
+            ),
+        )));
+    }
     let mut child = std::process::Command::new(executable)
         .arg("--root")
         .arg(root)
