@@ -118,19 +118,39 @@ enum Command {
     #[command(name = "callers-of")]
     CallersOf {
         node: String,
-        #[arg(long, default_value_t = 100)]
+        /// `--limit` is accepted as an alias: the MCP tool calls this `limit`, and the two names
+        /// disagreeing is a papercut that costs a round trip every time.
+        #[arg(long, visible_alias = "limit", default_value_t = 100)]
         page_size: usize,
         #[arg(long, default_value_t = 0)]
         cursor: usize,
+        /// Path fragment picking one definition when a bare name matches several. Only narrows
+        /// which definition is resolved — it does not filter the sites of a symbol that already
+        /// resolved to one.
+        #[arg(long)]
+        scope: Option<String>,
+        /// `dir` (or `dir:N`): counts per directory prefix, N levels deep, instead of the site list.
+        #[arg(long)]
+        rollup: Option<String>,
     },
     /// What this symbol calls or imports — resolved forward edges
     #[command(name = "calls-from")]
     CallsFrom {
         node: String,
-        #[arg(long, default_value_t = 100)]
+        /// `--limit` is accepted as an alias: the MCP tool calls this `limit`, and the two names
+        /// disagreeing is a papercut that costs a round trip every time.
+        #[arg(long, visible_alias = "limit", default_value_t = 100)]
         page_size: usize,
         #[arg(long, default_value_t = 0)]
         cursor: usize,
+        /// Path fragment picking one definition when a bare name matches several. Only narrows
+        /// which definition is resolved — it does not filter the sites of a symbol that already
+        /// resolved to one.
+        #[arg(long)]
+        scope: Option<String>,
+        /// `dir` (or `dir:N`): counts per directory prefix, N levels deep, instead of the site list.
+        #[arg(long)]
+        rollup: Option<String>,
     },
     Query {
         node: String,
@@ -489,9 +509,19 @@ skip_sibling_emit = true
             node,
             page_size,
             cursor,
+            scope,
+            rollup,
         }) => {
             emit_json(
-                &reference_sites(&root, &node, true, page_size, cursor)?,
+                &reference_sites(
+                    &root,
+                    &node,
+                    true,
+                    page_size,
+                    cursor,
+                    scope.as_deref(),
+                    rollup.as_deref(),
+                )?,
                 pretty,
             )?;
         }
@@ -499,9 +529,19 @@ skip_sibling_emit = true
             node,
             page_size,
             cursor,
+            scope,
+            rollup,
         }) => {
             emit_json(
-                &reference_sites(&root, &node, false, page_size, cursor)?,
+                &reference_sites(
+                    &root,
+                    &node,
+                    false,
+                    page_size,
+                    cursor,
+                    scope.as_deref(),
+                    rollup.as_deref(),
+                )?,
                 pretty,
             )?;
         }
@@ -768,9 +808,25 @@ fn reference_sites(
     reverse: bool,
     page_size: usize,
     cursor: usize,
+    scope: Option<&str>,
+    rollup: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
+    let rollup = match rollup {
+        None => None,
+        Some(value) => Some(ravel_core::engine::RollupMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
+            )
+        })?),
+    };
     let engine = WorkspaceEngine::load(root, &Flags::default())?;
-    Ok(engine.reference_sites(node, reverse, page_size, cursor)?)
+    Ok(engine.reference_sites_with(
+        node,
+        reverse,
+        page_size,
+        cursor,
+        ravel_core::engine::RelationOptions { scope, rollup },
+    )?)
 }
 
 fn daemon_call_if_running(

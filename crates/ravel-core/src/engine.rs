@@ -490,11 +490,156 @@ const MAX_CONTEXT_SOURCE_LINES: usize = 200;
 /// a common name does not turn the refusal into a wall of text.
 const CANDIDATE_PREVIEW: usize = 10;
 
+/// Optional narrowing and shaping for a relation query. Both exist to cut what the caller has to
+/// read: `scope` removes a round trip when a bare name is ambiguous, and `rollup` answers "where is
+/// this concentrated" without paging every site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelationOptions<'a> {
+    /// Path substring that must appear in a candidate's path. Only narrows resolution -- it never
+    /// widens it, and it never filters the sites of an already-resolved symbol.
+    pub scope: Option<&'a str>,
+    /// Replace the site list with counts grouped by directory prefix.
+    pub rollup: Option<RollupMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupMode {
+    /// Group by the first `depth` directory components of each site's path.
+    Dir { depth: usize },
+}
+
+impl RollupMode {
+    /// `dir` groups at the default depth, `dir:5` at five. A monorepo of `apps/<svc>/src/...` wants
+    /// 3, while `packages/app/src/features/<f>/...` collapses into a single bucket at 3 and needs
+    /// more to say anything. An out-of-range or unparseable depth is rejected rather than clamped:
+    /// silently grouping at a depth the caller did not ask for reads as a real answer.
+    pub fn parse(value: &str) -> Option<Self> {
+        let (name, depth) = match value.split_once(':') {
+            Some((name, depth)) => (
+                name,
+                depth
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|depth| (1..=ROLLUP_MAX_DEPTH).contains(depth))?,
+            ),
+            None => (value, ROLLUP_PREFIX_DEPTH),
+        };
+        matches!(name, "dir" | "directory").then_some(Self::Dir { depth })
+    }
+}
+
+/// `apps/<service>/src` is the useful unit in a typical monorepo: shallower buckets everything under
+/// `apps`, deeper splits one service across dozens of rows. Override per query with `dir:N`.
+const ROLLUP_PREFIX_DEPTH: usize = 3;
+/// Grouping needs every site, not a page, so the walk is bounded. Beyond this the rollup reports
+/// what it covered instead of pretending the counts are complete.
+const ROLLUP_MAX_SITES: usize = 50_000;
+/// Deeper than this stops being a grouping and becomes the site list again.
+const ROLLUP_MAX_DEPTH: usize = 10;
+/// Enough rows to see the shape, few enough that the answer stays a constant size whether the
+/// symbol has two thousand references or two hundred thousand.
+const ROLLUP_TOP_GROUPS: usize = 12;
+/// How many definitions a scope may be matched against. Far above any real overload of one name, so
+/// the cap is a backstop rather than a routine truncation -- and when it does bite, nothing resolves.
+const SCOPE_MATCH_LIMIT: usize = 10_000;
+
 /// The outcome of turning a caller-supplied name into a graph node.
 enum NodeResolution {
     Resolved(String),
-    Ambiguous(Vec<serde_json::Value>),
+    Ambiguous {
+        candidates: Vec<serde_json::Value>,
+        /// How many definitions exist, not how many are shown. A capped preview with no count reads
+        /// as "there are ten of these".
+        definitions_total: usize,
+    },
+    /// The name exists, but nothing matching it lives under the requested scope.
+    NotInScope {
+        candidates: Vec<serde_json::Value>,
+        definitions_total: usize,
+    },
     NotFound,
+}
+
+/// The path embedded in a symbol id (`symbol://<path>#<kind>:<qualified>`). Used to group outgoing
+/// relations by where the referenced symbol lives rather than by the caller's own file.
+fn symbol_id_path(id: &str) -> Option<&str> {
+    id.strip_prefix("symbol://")
+        .and_then(|rest| rest.split('#').next())
+        .filter(|path| !path.is_empty())
+}
+
+/// The directory a site lives in, trimmed to `depth` components. The filename is dropped first: a
+/// path shallower than the depth would otherwise put the file itself in the `prefix` field, so a
+/// root-level `util.ts` came back as a "directory" named `util.ts`.
+fn directory_prefix(path: &str, depth: usize) -> String {
+    // `src/a.ts` and `./src/a.ts` are the same directory. Without trimming, the second produced a
+    // bucket named `.` that reads as the repo root.
+    let path = path.trim_start_matches("./");
+    let components: Vec<&str> = path.split('/').collect();
+    let directories = &components[..components.len().saturating_sub(1)];
+    if directories.is_empty() {
+        return "(repo root)".to_owned();
+    }
+    directories[..directories.len().min(depth)].join("/")
+}
+
+/// Turn the matched definitions into an outcome, honouring `scope` in every case.
+///
+/// A caller usually knows roughly where it is looking even when it does not know the symbol id, so a
+/// path fragment is a cheaper way to say which definition than copying a hundred-character id out of
+/// the previous response. Three rules keep that from becoming a lie:
+///
+/// * the scope is applied even when only one definition matched, so it can never be silently ignored;
+/// * narrowing to none is reported as such, because falling back to "ambiguous" or to an unscoped
+///   answer would hide a typo in the scope;
+/// * if the fetched set was itself capped, no scope can be resolved from it -- the one definition
+///   left after filtering may not be the only one that would have matched.
+fn decide(
+    entries: &[crate::model::SymbolMeta],
+    definitions_total: usize,
+    scope: Option<&str>,
+) -> NodeResolution {
+    let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
+    let Some(scope) = scope else {
+        return match entries {
+            [only] if definitions_total == 1 => NodeResolution::Resolved(only.id.clone()),
+            _ => NodeResolution::Ambiguous {
+                candidates: candidate_previews(preview(entries)),
+                definitions_total,
+            },
+        };
+    };
+    if definitions_total > entries.len() {
+        // Filtering a capped list could resolve to something that is merely the first match, not the
+        // only one. Refusing keeps the caller from acting on a guess.
+        return NodeResolution::Ambiguous {
+            candidates: candidate_previews(preview(entries)),
+            definitions_total,
+        };
+    }
+    let matched: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.path.contains(scope))
+        .cloned()
+        .collect();
+    match matched.len() {
+        0 => NodeResolution::NotInScope {
+            candidates: candidate_previews(preview(entries)),
+            definitions_total,
+        },
+        1 => NodeResolution::Resolved(matched[0].id.clone()),
+        // `definitions_total` always means "how many definitions carry this name", never "how many
+        // survived the scope" -- one field with two meanings is its own trap. The narrowed count is
+        // reported separately.
+        _ => NodeResolution::Ambiguous {
+            candidates: candidate_previews(preview(&matched)),
+            definitions_total,
+        },
+    }
+}
+
+fn preview(entries: &[crate::model::SymbolMeta]) -> &[crate::model::SymbolMeta] {
+    &entries[..entries.len().min(CANDIDATE_PREVIEW)]
 }
 
 fn candidate_previews(entries: &[crate::model::SymbolMeta]) -> Vec<serde_json::Value> {
@@ -2956,25 +3101,63 @@ impl WorkspaceEngine {
     /// must not answer a relation count for the failures: `total: 0` for a name that matched nothing
     /// -- or matched several definitions -- is indistinguishable from a symbol that genuinely has no
     /// references, which is the answer callers act on when they decide something is safe to change.
-    fn resolve_graph_node_outcome(&self, graph: &GraphIndex, node: &str) -> NodeResolution {
+    fn resolve_graph_node_outcome(
+        &self,
+        graph: &GraphIndex,
+        node: &str,
+        scope: Option<&str>,
+    ) -> NodeResolution {
         if graph.contains_node(node) {
             return NodeResolution::Resolved(node.to_owned());
         }
         let Ok(Some(runtime)) = self.symbol_meta_runtime() else {
             return NodeResolution::NotFound;
         };
-        let (qualified, total) = runtime.exact_id_or_qualified(node, CANDIDATE_PREVIEW);
-        if total == 1 {
-            return NodeResolution::Resolved(qualified[0].id.clone());
+        // A scope has to be matched against every definition, not against the display preview. The
+        // preview is deliberately small, so filtering it would pick one of an arbitrary ten and
+        // return it shaped exactly like a successful answer -- a confident answer about a definition
+        // the caller never named. `definitions_total` is carried so the response can say how many
+        // exist even when only a few are shown.
+        let fetch = if scope.is_some() {
+            SCOPE_MATCH_LIMIT
+        } else {
+            CANDIDATE_PREVIEW
+        };
+        let (qualified, qualified_total) = runtime.exact_id_or_qualified(node, fetch);
+        let outcome = if qualified_total >= 1 {
+            decide(&qualified, qualified_total, scope)
+        } else {
+            NodeResolution::NotFound
+        };
+        // The exact-id/qualified tier wins when it decides, but a scope can legitimately name where a
+        // *method* lives -- and methods carry a qualified name like `Class.method`, so they only ever
+        // match by short name. Concluding "not under that scope" from the qualified tier alone told
+        // the caller a definition does not exist there when it plainly does.
+        let scope_missed = matches!(outcome, NodeResolution::NotInScope { .. });
+        if !matches!(outcome, NodeResolution::NotFound) && !scope_missed {
+            return outcome;
         }
-        if total > 1 {
-            return NodeResolution::Ambiguous(candidate_previews(&qualified));
+        let (by_name, by_name_total) = runtime.entries_for(node, fetch);
+        if by_name_total == 0 {
+            // Nothing by short name either: keep whichever answer the first tier already formed, so
+            // a missed scope stays a missed scope rather than becoming "no such symbol".
+            return outcome;
         }
-        let (by_name, total) = runtime.entries_for(node, CANDIDATE_PREVIEW);
-        match total {
-            0 => NodeResolution::NotFound,
-            1 => NodeResolution::Resolved(by_name[0].id.clone()),
-            _ => NodeResolution::Ambiguous(candidate_previews(&by_name)),
+        let fallback = decide(&by_name, by_name_total, scope);
+        match (&outcome, &fallback) {
+            // Both tiers agree the scope matched nothing. Report the union of what exists, counting
+            // each definition once.
+            (
+                NodeResolution::NotInScope { .. },
+                NodeResolution::NotInScope {
+                    candidates,
+                    definitions_total,
+                },
+            ) => NodeResolution::NotInScope {
+                candidates: candidates.clone(),
+                definitions_total: (*definitions_total).max(qualified_total),
+            },
+            _ => fallback,
         }
     }
 
@@ -2985,18 +3168,23 @@ impl WorkspaceEngine {
         graph: &GraphIndex,
         node: &str,
     ) -> Result<String, EngineError> {
-        match self.resolve_graph_node_outcome(graph, node) {
+        match self.resolve_graph_node_outcome(graph, node, None) {
             NodeResolution::Resolved(id) => Ok(id),
-            NodeResolution::Ambiguous(candidates) => Err(EngineError::Unresolved {
+            NodeResolution::Ambiguous {
+                candidates,
+                definitions_total,
+            } => Err(EngineError::Unresolved {
                 message: format!(
-                    "`{node}` names {} definitions; re-query with one id (for example {})",
-                    candidates.len(),
+                    "`{node}` names {definitions_total} definitions; re-query with one id (for example {})",
                     candidates
                         .first()
                         .and_then(|candidate| candidate.get("id"))
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("a candidate id from explore")
                 ),
+            }),
+            NodeResolution::NotInScope { .. } => Err(EngineError::Unresolved {
+                message: format!("`{node}` exists, but not under the requested scope"),
             }),
             NodeResolution::NotFound => Err(EngineError::Unresolved {
                 message: format!(
@@ -3032,21 +3220,66 @@ impl WorkspaceEngine {
         limit: usize,
         cursor: usize,
     ) -> Result<serde_json::Value, EngineError> {
+        self.reference_sites_with(node, reverse, limit, cursor, RelationOptions::default())
+    }
+
+    pub fn reference_sites_with(
+        &self,
+        node: &str,
+        reverse: bool,
+        limit: usize,
+        cursor: usize,
+        options: RelationOptions<'_>,
+    ) -> Result<serde_json::Value, EngineError> {
         let _ = self.auto_sync_if_dirty()?;
         let graph = self.graph()?;
         // A name that resolved to nothing, or to several definitions, has no relation count to
         // report. Answering `total: 0` there reads exactly like "nothing references this" -- the
         // conclusion callers act on when deciding a symbol is safe to change.
-        let resolved = match self.resolve_graph_node_outcome(&graph, node) {
+        // A caller that passes an id already picked the definition, so the scope has nothing to do.
+        // Reporting that plainly beats accepting the argument and ignoring it.
+        // An empty or whitespace scope is discarded downstream, so reporting it as applied would be
+        // the exact silent-ignore this field exists to expose -- a caller interpolating a blank
+        // variable would be told the filter took effect.
+        let effective_scope = options
+            .scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty());
+        let scope_applied = effective_scope.is_some() && !graph.contains_node(node);
+        let resolved = match self.resolve_graph_node_outcome(&graph, node, options.scope) {
             NodeResolution::Resolved(id) => id,
-            NodeResolution::Ambiguous(candidates) => {
+            NodeResolution::Ambiguous {
+                candidates,
+                definitions_total,
+            } => {
                 return Ok(serde_json::json!({
                     "node": node,
                     "direction": if reverse { "incoming" } else { "outgoing" },
                     "resolved": false,
                     "reason": "ambiguous",
+                    "definitions_total": definitions_total,
+                    "showing": candidates.len(),
+                    "scope": options.scope,
+                    "scope_applied": scope_applied,
                     "candidates": candidates,
-                    "hint": "several definitions share this name; re-query with one candidate id",
+                    "hint": "several definitions share this name; re-query with one candidate id, \
+                             or pass scope with a path fragment that picks one",
+                }));
+            }
+            NodeResolution::NotInScope {
+                candidates,
+                definitions_total,
+            } => {
+                return Ok(serde_json::json!({
+                    "node": node,
+                    "direction": if reverse { "incoming" } else { "outgoing" },
+                    "resolved": false,
+                    "reason": "not_in_scope",
+                    "scope": options.scope,
+                    "definitions_total": definitions_total,
+                    "showing": candidates.len(),
+                    "candidates": candidates,
+                    "hint": "the name exists, but not under that scope; the candidates show where it does",
                 }));
             }
             NodeResolution::NotFound => {
@@ -3061,6 +3294,108 @@ impl WorkspaceEngine {
             }
         };
         let symbols = self.symbol_meta_runtime()?;
+        // Grouping needs the whole relation set, so it is answered before the page is sliced -- and
+        // instead of the page, never alongside it. Paging 2128 sites to learn they concentrate in
+        // three services costs six figures of tokens; this costs a few hundred, and the cost does
+        // not grow with the symbol.
+        if let Some(RollupMode::Dir { depth }) = options.rollup {
+            let (relations, total) =
+                graph.direct_relations_limit(&resolved, reverse, ROLLUP_MAX_SITES);
+            let covered = relations.len();
+            // Edges and files answer different questions. Two edges from one file (an import plus an
+            // extends) are one place to change, so reporting only the edge count doubles a migration
+            // estimate; both are carried.
+            let mut counts: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
+                Default::default();
+            for relation in &relations {
+                // Which path answers "where is this concentrated" depends on the direction. For
+                // callers it is where the reference is written. For callees that path is the queried
+                // symbol's own file, identical for every row -- grouping by it collapses the whole
+                // answer into one bucket and erases the very thing being asked about, so the
+                // referenced symbol's own file is used instead.
+                let grouping_path = if reverse {
+                    relation.source_path.as_deref()
+                } else {
+                    symbol_id_path(&relation.node)
+                };
+                // A site without a usable path is real -- it just cannot be grouped by one, and
+                // folding it into some arbitrary bucket would misreport where the impact sits.
+                let key = match grouping_path {
+                    Some(path) => directory_prefix(path, depth),
+                    None => "(unknown path)".to_owned(),
+                };
+                let bucket = counts.entry(key).or_default();
+                bucket.0 += 1;
+                if let Some(path) = grouping_path {
+                    bucket.1.insert(path.to_owned());
+                }
+            }
+            let group_total = counts.len();
+            let mut ranked: Vec<(String, usize, usize)> = counts
+                .into_iter()
+                .map(|(prefix, (edges, files))| (prefix, edges, files.len()))
+                .collect();
+            // Count first, then name, so equal counts stay in a stable order across calls.
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            let head: Vec<_> = ranked.iter().take(ROLLUP_TOP_GROUPS).cloned().collect();
+            let tail: usize = ranked
+                .iter()
+                .skip(ROLLUP_TOP_GROUPS)
+                .map(|(_, n, _)| n)
+                .sum();
+            let tail_files: usize = ranked
+                .iter()
+                .skip(ROLLUP_TOP_GROUPS)
+                .map(|(_, _, f)| f)
+                .sum();
+            let mut groups: Vec<serde_json::Value> = head
+                .iter()
+                .map(|(prefix, n, files)| {
+                    serde_json::json!({ "prefix": prefix, "n": n, "files": files })
+                })
+                .collect();
+            if tail > 0 {
+                groups.push(serde_json::json!({
+                    "prefix": "(other)",
+                    "n": tail,
+                    "files": tail_files,
+                    "groups": group_total.saturating_sub(head.len()),
+                }));
+            }
+            let mut response = serde_json::json!({
+                "node": resolved,
+                "direction": if reverse { "incoming" } else { "outgoing" },
+                "total": total,
+                "by_kind": graph.direct_relation_kind_counts(&resolved, reverse),
+                "by_dir": groups,
+                "grouped_sites": covered,
+                "prefix_depth": depth,
+                // Says which path the buckets describe, so the two directions cannot be read as if
+                // they meant the same thing.
+                "grouped_by": if reverse { "referencing_file" } else { "referenced_file" },
+            });
+            if let Some(scope) = options.scope {
+                response["scope"] = serde_json::json!(scope);
+                response["scope_applied"] = serde_json::json!(scope_applied);
+            }
+            if let Some(cursor_ignored) = (cursor > 0).then_some(cursor) {
+                // A grouping has no pages, so a cursor cannot be honoured. Saying so beats returning
+                // the whole grouping as though the offset had been applied.
+                response["cursor_ignored"] = serde_json::json!(cursor_ignored);
+            }
+            // Say so rather than letting bounded counts read as complete ones.
+            if covered < total {
+                response["rollup_truncated"] = serde_json::json!(true);
+                response["hint"] = serde_json::json!(format!(
+                    "counts cover the first {covered} of {total} sites (cap {ROLLUP_MAX_SITES}); \
+                     directories beyond that point are missing entirely, not merely undercounted"
+                ));
+            }
+            if let Some(warning) = self.last_update_error() {
+                response["sync_warning"] = serde_json::json!(warning);
+            }
+            return Ok(response);
+        }
         // Ask for the page plus everything before it, then slice: relation order is
         // deterministic, so a cursor is an offset into the same sequence.
         let end = cursor.saturating_add(limit);
@@ -3106,6 +3441,13 @@ impl WorkspaceEngine {
             "by_kind": by_kind,
             "next_cursor": next_cursor,
         });
+        if let Some(scope) = options.scope {
+            // Without this echo a scope that matched nothing useful -- or was ignored because an id
+            // was passed -- is byte-identical to one that worked, so a stale or mistyped fragment
+            // silently returns an answer about something else.
+            response["scope"] = serde_json::json!(scope);
+            response["scope_applied"] = serde_json::json!(scope_applied);
+        }
         // These sites are the whole answer for "what breaks if I change this", and a background
         // update that died leaves them quietly describing an older tree. `explore` already
         // surfaces this and `status` reports it, but a caller that only asks for relations had no
@@ -4296,6 +4638,436 @@ mod agent_context_tests {
             found["matches_total"], 0,
             "the ignored symbol must not be searchable: {found:?}"
         );
+    }
+
+    fn workspace_with_two_handles(root: &Path) {
+        std::fs::create_dir_all(root.join("apps/alpha/src")).unwrap();
+        std::fs::create_dir_all(root.join("apps/beta/src")).unwrap();
+        std::fs::write(
+            root.join("apps/alpha/src/service.ts"),
+            "export function handle() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/beta/src/service.ts"),
+            "export function handle() { return 2; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/alpha/src/caller.ts"),
+            "import { handle } from './service';\nexport function useAlpha() { return handle(); }\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_scope_picks_one_definition_without_a_second_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        workspace_with_two_handles(root.path());
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // Without a scope the name is ambiguous, and the caller has to copy an id back.
+        let ambiguous = engine.reference_sites("handle", true, 10, 0).unwrap();
+        assert_eq!(ambiguous["resolved"], false, "{ambiguous:?}");
+
+        let scoped = engine
+            .reference_sites_with(
+                "handle",
+                true,
+                10,
+                0,
+                RelationOptions {
+                    scope: Some("apps/alpha"),
+                    rollup: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            scoped.get("resolved").is_none(),
+            "a scope that picks one definition must answer, not refuse: {scoped:?}"
+        );
+        assert_eq!(scoped["by_kind"]["Calls"], 1, "{scoped:?}");
+        assert!(
+            scoped["node"].as_str().unwrap().contains("apps/alpha"),
+            "the resolved node must be the scoped one: {scoped:?}"
+        );
+
+        // A scope that matches nothing is its own answer. Falling back to "ambiguous" would hide a
+        // typo in the scope, and falling back to an unscoped answer would silently ignore it.
+        let missed = engine
+            .reference_sites_with(
+                "handle",
+                true,
+                10,
+                0,
+                RelationOptions {
+                    scope: Some("apps/gamma"),
+                    rollup: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(missed["reason"], "not_in_scope", "{missed:?}");
+        assert!(
+            missed.get("total").is_none(),
+            "no count for an unresolved name"
+        );
+        assert!(!missed["candidates"].as_array().unwrap().is_empty());
+
+        // A scope that still leaves several stays ambiguous, but only over what it narrowed to.
+        let broad = engine
+            .reference_sites_with(
+                "handle",
+                true,
+                10,
+                0,
+                RelationOptions {
+                    scope: Some("apps/"),
+                    rollup: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(broad["reason"], "ambiguous", "{broad:?}");
+        assert_eq!(broad["candidates"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_scope_is_never_resolved_out_of_a_truncated_candidate_list() {
+        // The failure this guards: candidates were fetched at display width, the scope filtered
+        // those, and whichever one survived was returned shaped exactly like a successful answer --
+        // a confident report about a definition the caller never named.
+        let entries: Vec<crate::model::SymbolMeta> = (0..3)
+            .map(|i| crate::model::SymbolMeta {
+                id: format!("symbol://apps/alpha/src/f{i}.ts#value:handle"),
+                name: "handle".into(),
+                qualified_name: "handle".into(),
+                kind: "function_declaration".into(),
+                path: format!("apps/alpha/src/f{i}.ts"),
+                span: crate::model::Span {
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: 0,
+                    start_column: 0,
+                    end_line: 0,
+                    end_column: 1,
+                },
+                exported: true,
+                complexity: None,
+            })
+            .collect();
+
+        // One entry matches the scope, but the caller was handed 3 of 40 definitions: the survivor
+        // is merely the first match, not the only one.
+        let capped = decide(&entries[..1], 40, Some("apps/alpha"));
+        assert!(
+            matches!(
+                capped,
+                NodeResolution::Ambiguous {
+                    definitions_total: 40,
+                    ..
+                }
+            ),
+            "a capped list must refuse, and report how many definitions exist"
+        );
+
+        // With the full set present, the same scope resolves.
+        let resolved = decide(&entries[..1], 1, Some("apps/alpha"));
+        assert!(matches!(resolved, NodeResolution::Resolved(_)));
+
+        // And a scope is applied even when a single definition matched, so it cannot be ignored.
+        let elsewhere = decide(&entries[..1], 1, Some("apps/beta"));
+        assert!(
+            matches!(
+                elsewhere,
+                NodeResolution::NotInScope {
+                    definitions_total: 1,
+                    ..
+                }
+            ),
+            "a scope that does not match the only definition is not a silent pass"
+        );
+
+        // No scope keeps the old behaviour untouched.
+        assert!(matches!(
+            decide(&entries[..1], 1, None),
+            NodeResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            decide(&entries, 3, None),
+            NodeResolution::Ambiguous {
+                definitions_total: 3,
+                ..
+            }
+        ));
+        // An empty or whitespace scope is treated as no scope rather than as a filter matching
+        // everything, which would resolve an ambiguous name to whichever came first.
+        assert!(matches!(
+            decide(&entries, 3, Some("   ")),
+            NodeResolution::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn a_directory_rollup_replaces_the_page_and_stays_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("libs/core/src")).unwrap();
+        std::fs::write(
+            root.join("libs/core/src/base.ts"),
+            "export function base() { return 0; }\n",
+        )
+        .unwrap();
+        // Spread callers across more directories than the rollup keeps, so the tail bucket is real.
+        let services = ROLLUP_TOP_GROUPS + 4;
+        for i in 0..services {
+            let dir = root.join(format!("apps/svc{i}/src"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for j in 0..=i {
+                std::fs::write(
+                    dir.join(format!("caller{j}.ts")),
+                    "import { base } from '../../../libs/core/src/base';\n                     export function c() { return base(); }\n",
+                )
+                .unwrap();
+            }
+        }
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let page = engine.reference_sites("base", true, 5, 0).unwrap();
+        let rollup = engine
+            .reference_sites_with(
+                "base",
+                true,
+                5,
+                0,
+                RelationOptions {
+                    scope: None,
+                    rollup: Some(RollupMode::Dir {
+                        depth: ROLLUP_PREFIX_DEPTH,
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            rollup.get("sites").is_none(),
+            "the rollup replaces the site list rather than adding to it: {rollup:?}"
+        );
+        assert_eq!(rollup["total"], page["total"], "totals must agree");
+        assert_eq!(rollup["prefix_depth"], ROLLUP_PREFIX_DEPTH);
+
+        let groups = rollup["by_dir"].as_array().unwrap();
+        // Edges and files are different numbers, and both have to be there: one import plus one
+        // extends from the same file is one place to change, not two.
+        assert!(
+            groups.iter().all(|group| group["files"].is_u64()),
+            "every bucket reports distinct files: {groups:?}"
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|group| group["files"].as_u64().unwrap() <= group["n"].as_u64().unwrap()),
+            "files can never exceed edges: {groups:?}"
+        );
+        assert!(
+            groups.len() <= ROLLUP_TOP_GROUPS + 1,
+            "bounded output: {} groups",
+            groups.len()
+        );
+        let tail = groups.last().unwrap();
+        assert_eq!(
+            tail["prefix"], "(other)",
+            "the tail is named, not dropped: {groups:?}"
+        );
+        assert!(tail["groups"].as_u64().unwrap() > 0);
+
+        // Every site is accounted for: the visible groups plus the tail must sum to the total.
+        let summed: u64 = groups.iter().map(|g| g["n"].as_u64().unwrap()).sum();
+        assert_eq!(
+            summed,
+            rollup["grouped_sites"].as_u64().unwrap(),
+            "counts must not lose or duplicate sites: {groups:?}"
+        );
+
+        // Descending by count, so reading top down is reading by importance.
+        let counts: Vec<u64> = groups
+            .iter()
+            .take(groups.len() - 1)
+            .map(|g| g["n"].as_u64().unwrap())
+            .collect();
+        assert!(
+            counts.windows(2).all(|pair| pair[0] >= pair[1]),
+            "groups must be ranked: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_scope_naming_where_a_method_lives_resolves_it() {
+        // Methods carry a qualified name like `Class.method`, so they only ever match by short name.
+        // Deciding from the exact-qualified tier alone told the caller the definition does not exist
+        // under that scope when it plainly does.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("libs/x/src")).unwrap();
+        std::fs::create_dir_all(root.path().join("apps/foo/src")).unwrap();
+        std::fs::write(
+            root.path().join("libs/x/src/i.ts"),
+            "export function handle() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("apps/foo/src/foo.ts"),
+            "export class Foo { handle() { return 2; } }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let scoped = engine
+            .reference_sites_with(
+                "handle",
+                true,
+                10,
+                0,
+                RelationOptions {
+                    scope: Some("apps/foo"),
+                    rollup: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            scoped.get("resolved").is_none(),
+            "the method under that scope must resolve: {scoped:?}"
+        );
+        assert!(
+            scoped["node"].as_str().unwrap().contains("Foo.handle"),
+            "and it must be the method, not the free function: {scoped:?}"
+        );
+        assert_eq!(scoped["scope_applied"], true);
+    }
+
+    #[test]
+    fn an_outgoing_rollup_groups_by_what_is_referenced() {
+        // Grouping outgoing edges by the caller's own path buckets everything into the queried
+        // symbol's own directory, which erases the answer.
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["hub", "libs/one", "libs/two", "apps/three"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        for (dir, name) in [
+            ("libs/one", "one"),
+            ("libs/two", "two"),
+            ("apps/three", "three"),
+        ] {
+            std::fs::write(
+                root.path().join(dir).join("m.ts"),
+                format!("export function f_{name}() {{ return 1; }}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.path().join("hub/hub.ts"),
+            "import { f_one } from '../libs/one/m';\n             import { f_two } from '../libs/two/m';\n             import { f_three } from '../apps/three/m';\n             export function hub() { return f_one() + f_two() + f_three(); }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let rollup = engine
+            .reference_sites_with(
+                "hub",
+                false,
+                10,
+                0,
+                RelationOptions {
+                    scope: None,
+                    rollup: Some(RollupMode::Dir { depth: 2 }),
+                },
+            )
+            .unwrap();
+        assert_eq!(rollup["grouped_by"], "referenced_file", "{rollup:?}");
+        let prefixes: Vec<&str> = rollup["by_dir"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["prefix"].as_str().unwrap())
+            .collect();
+        assert!(
+            prefixes.len() >= 3,
+            "the three referenced locations must be visible, not collapsed into `hub`: {prefixes:?}"
+        );
+        assert!(
+            !prefixes.contains(&"hub"),
+            "the queried symbol's own directory is not the answer: {prefixes:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_is_not_reported_as_applied() {
+        let root = tempfile::tempdir().unwrap();
+        workspace_with_two_handles(root.path());
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        // A blank scope is discarded, so claiming it was applied is the silent-ignore this field
+        // exists to expose -- a caller interpolating an unset variable would trust the filter.
+        for blank in ["", "   "] {
+            let response = engine
+                .reference_sites_with(
+                    "handle",
+                    true,
+                    10,
+                    0,
+                    RelationOptions {
+                        scope: Some(blank),
+                        rollup: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                response["scope_applied"], false,
+                "blank scope must not read as applied: {response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollup_mode_parses_only_what_it_supports() {
+        let default_depth = RollupMode::Dir {
+            depth: ROLLUP_PREFIX_DEPTH,
+        };
+        assert_eq!(RollupMode::parse("dir"), Some(default_depth));
+        assert_eq!(RollupMode::parse("directory"), Some(default_depth));
+        assert_eq!(
+            RollupMode::parse("dir:5"),
+            Some(RollupMode::Dir { depth: 5 })
+        );
+        // An unrecognised value must not silently behave like "no rollup": the caller would read a
+        // normal page as a grouping that came out flat. Same for a depth outside the range -- it is
+        // rejected, not clamped, so nobody gets a grouping at a depth they did not ask for.
+        assert_eq!(RollupMode::parse("directory-ish"), None);
+        assert_eq!(RollupMode::parse(""), None);
+        assert_eq!(RollupMode::parse("dir:0"), None);
+        assert_eq!(RollupMode::parse("dir:99"), None);
+        assert_eq!(RollupMode::parse("dir:abc"), None);
+    }
+
+    #[test]
+    fn a_directory_prefix_never_reports_a_file_as_a_directory() {
+        // A path shallower than the depth used to put the filename in the `prefix` field, so a
+        // root-level `util.ts` came back as a directory called `util.ts`.
+        assert_eq!(directory_prefix("util.ts", 3), "(repo root)");
+        assert_eq!(directory_prefix("apps/util.ts", 3), "apps");
+        assert_eq!(directory_prefix("apps/svc/util.ts", 3), "apps/svc");
+        assert_eq!(
+            directory_prefix("apps/svc/src/a/b/util.ts", 3),
+            "apps/svc/src"
+        );
+        assert_eq!(
+            directory_prefix("apps/svc/src/a/b/util.ts", 5),
+            "apps/svc/src/a/b"
+        );
+        // Deeper than the path goes is the whole directory, not padding.
+        assert_eq!(directory_prefix("apps/util.ts", 9), "apps");
     }
 
     #[test]

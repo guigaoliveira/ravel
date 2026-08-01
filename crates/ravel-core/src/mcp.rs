@@ -78,6 +78,14 @@ pub struct ReferenceSitesRequest {
     pub limit: Option<usize>,
     /// Resume offset: pass the previous page's next_cursor.
     pub cursor: Option<usize>,
+    /// Path fragment that picks one definition when a bare name matches several — cheaper than
+    /// copying a candidate id back. Only narrows which definition is resolved; it does not filter
+    /// the sites of a symbol that already resolved.
+    pub scope: Option<String>,
+    /// `dir`, or `dir:N` for N directory levels: return counts per directory prefix instead of the
+    /// site list. Answers "where is this concentrated" in one bounded response rather than paging
+    /// every site. Each bucket carries `n` (edges) and `files` (distinct files).
+    pub rollup: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
@@ -879,11 +887,30 @@ async fn reference_sites_tool(
 ) -> String {
     let limit = request.limit.unwrap_or(50).max(1);
     let cursor = request.cursor.unwrap_or(0);
-    match mcp.engine(request.root) {
-        Ok(engine) => match engine.reference_sites(&request.node, reverse, limit, cursor) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error.to_string()),
+    // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
+    // `rollup: "directory-ish"` looks like the grouping was applied and came out flat.
+    let rollup = match request.rollup.as_deref() {
+        None => None,
+        Some(value) => match crate::engine::RollupMode::parse(value) {
+            Some(mode) => Some(mode),
+            None => {
+                return error_json(format!(
+                    "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
+                ));
+            }
         },
+    };
+    let options = crate::engine::RelationOptions {
+        scope: request.scope.as_deref(),
+        rollup,
+    };
+    match mcp.engine(request.root) {
+        Ok(engine) => {
+            match engine.reference_sites_with(&request.node, reverse, limit, cursor, options) {
+                Ok(value) => value.to_string(),
+                Err(error) => error_json(error.to_string()),
+            }
+        }
         Err(error) => error_json(error.to_string()),
     }
 }

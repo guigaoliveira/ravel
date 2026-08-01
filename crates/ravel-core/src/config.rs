@@ -706,7 +706,14 @@ pub fn unsupported_source_counts(config: &Config, budget: usize) -> BTreeMap<Str
 /// Deliberately pure pattern matching rather than asking the walk whether it would collect the file:
 /// a *deleted* path is gone from the filesystem, and the watcher still has to process its removal.
 pub struct IgnoreChain {
+    /// Canonical form, used to build the matchers.
     root: PathBuf,
+    /// The root exactly as configured. Callers hand paths spelled the way *they* got them -- from a
+    /// filesystem event, from a CLI argument -- and those keep the non-canonical spelling. macOS
+    /// resolves `/var/folders/...` to `/private/var/folders/...` and Windows canonicalizes to
+    /// `\\?\C:\...`, so comparing against the canonical root alone made every check answer
+    /// "outside the workspace" on both platforms: the filter went inert while Linux stayed green.
+    root_as_given: PathBuf,
     gitignore_enabled: bool,
     per_directory:
         std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<ignore::gitignore::Gitignore>>>,
@@ -725,6 +732,7 @@ impl IgnoreChain {
         let gitignore_enabled = config.ignore.gitignore && crate::git::is_git_repo(&root);
         Self {
             root,
+            root_as_given: config.project.root.clone(),
             gitignore_enabled,
             per_directory: std::sync::Mutex::new(BTreeMap::new()),
         }
@@ -768,10 +776,23 @@ impl IgnoreChain {
         } else {
             self.root.join(path)
         };
-        let Ok(relative) = absolute.strip_prefix(&self.root) else {
+        // Try both spellings of the root. `strip_prefix` is a byte comparison, so a path that came
+        // in through a symlinked or non-canonical root matches only the spelling it arrived with.
+        // Deliberately not canonicalizing `path`: a deleted file cannot be canonicalized, and the
+        // watcher still has to process its removal.
+        let Some(relative) = absolute
+            .strip_prefix(&self.root)
+            .or_else(|_| absolute.strip_prefix(&self.root_as_given))
+            .ok()
+        else {
             // Outside the workspace: not this workspace's call to make.
             return false;
         };
+        // Re-spell the path onto the canonical root before matching. The matchers are built from
+        // canonical directories, and `ignore` *panics* ("path is expected to be under the root") when
+        // handed a path outside the matcher root -- so passing the incoming spelling through would
+        // turn a symlinked workspace into a crash rather than a wrong answer.
+        let absolute = self.root.join(relative);
         // Deepest rules win in git, and a negation there can re-include a path an outer file
         // excluded, so walk inward-out and stop at the first decisive verdict.
         let mut directories: Vec<PathBuf> = Vec::new();
@@ -1118,6 +1139,43 @@ mod tests {
             walk_keeps,
             !IgnoreChain::new(&config).is_ignored(&keep.join("schema.gen.ts")),
             "the chain must agree with the walk about a negated nested rule"
+        );
+    }
+
+    #[test]
+    fn a_root_reached_through_a_symlink_still_applies_gitignore() {
+        // macOS hands out `/var/folders/...`, a symlink to `/private/var/folders/...`, and Windows
+        // canonicalizes to `\\?\C:\...`. Canonicalizing only the root and then byte-comparing
+        // prefixes makes every check answer "outside the workspace", so the filter goes inert on
+        // both platforms while passing on Linux.
+        let real = tempdir().unwrap();
+        fs::create_dir_all(real.path().join(".git")).unwrap();
+        fs::write(real.path().join(".gitignore"), "/generated/\n").unwrap();
+        fs::create_dir_all(real.path().join("generated")).unwrap();
+        let ignored_real = real.path().join("generated/out.ts");
+        fs::write(&ignored_real, "export const a = 1;").unwrap();
+
+        let link_parent = tempdir().unwrap();
+        let link = link_parent.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let mut config = Config::default();
+        config.project.root = link.clone();
+        let chain = IgnoreChain::new(&config);
+        assert!(
+            chain.is_ignored(&link.join("generated/out.ts")),
+            "a path spelled through the symlinked root must still be ignored"
+        );
+        assert!(
+            chain.is_ignored(&ignored_real),
+            "and so must the same file spelled through the real path"
+        );
+        assert!(
+            !chain.is_ignored(&link.join("src/keep.ts")),
+            "while a normal path stays indexable"
         );
     }
 

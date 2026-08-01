@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-08-01
+
+Two parameters that exist to cut what a caller has to read, plus a platform bug the
+release pipeline could not see.
+
+### Fixed
+- **The gitignore filter was inert on macOS and Windows.** `IgnoreChain` canonicalized
+  the workspace root but compared incoming paths against it byte for byte. macOS hands
+  out `/var/folders/...` for `/private/var/folders/...` and Windows canonicalizes to
+  `\\?\C:\...`, so every check answered "outside the workspace" — meaning gitignored
+  trees were indexed on both platforms while Linux stayed green. Both spellings of the
+  root are now accepted, and the path is re-spelled onto the canonical root before
+  matching, because `ignore` *panics* when handed a path outside the matcher root.
+  Reproduced on Linux through a symlinked root. This is why CI's `Runtime` jobs were
+  red on four platforms since 1.12.0 while `validate` — ubuntu only — stayed green.
+
+### Added
+- `scope` on `callers_of` / `calls_from` (`--scope` on the CLI): a path fragment that
+  picks one definition when a bare name matches several, instead of copying a
+  hundred-character candidate id out of the previous response. Measured on a 21k-file
+  monorepo: 801 tokens across two calls becomes 348 in one.
+  - Applied even when a single definition matched, so it can never be silently ignored,
+    and echoed back as `scope` plus `scope_applied` — a mistyped fragment used to be
+    byte-identical to a working one.
+  - Matched against every definition, never the display preview. Filtering the preview
+    would return one of an arbitrary ten shaped exactly like a successful answer.
+  - Falls through to the short-name tier, so a scope naming where a *method* lives
+    resolves it rather than falsely reporting `not_in_scope`.
+  - Narrowing to none reports `not_in_scope` with the candidates showing where the name
+    does live; narrowing to several stays ambiguous over just those.
+- `rollup: "dir"` / `--rollup dir` (or `dir:N` for N levels): counts per directory
+  prefix **instead of** the site list, top 12 plus a named `(other)` bucket. Answers
+  "where is this concentrated" without paging every site: on a symbol with 2128
+  references, 104,732 tokens across 22 pages becomes 202 in one call, and the size does
+  not grow with the symbol. Each bucket carries `n` (edges) and `files` (distinct
+  files) — one import plus one extends from the same file is one place to change, not
+  two. Outgoing rollups group by the *referenced* file, since the referencing path is
+  the queried symbol's own and identical on every row; `grouped_by` says which.
+- `definitions_total` and `showing` on unresolved relation answers. A capped list of
+  candidates with no count reads as "there are ten of these".
+
+### Changed
+- `--limit` is a visible alias for `--page-size` on `callers-of` / `calls-from`, so the
+  CLI and the MCP tool stop disagreeing about the name of the page size.
+- An unknown `rollup` value, or a depth outside 1–10, is refused rather than ignored:
+  returning a normal page would read as a grouping that came out flat. A `cursor` passed
+  with a rollup is reported back as `cursor_ignored` rather than silently dropped.
+
 ## [1.12.2] - 2026-07-31
 
 ### Fixed
