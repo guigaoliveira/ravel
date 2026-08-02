@@ -2559,6 +2559,10 @@ impl WorkspaceEngine {
             "config_problems": config_problems,
             "unparsed_files": unparsed_files,
             "unparsed_components": hidden_references,
+            // A count gathered under a cap is a floor, not a total -- including the count of
+            // component formats above, which is what `unparsed_components: 0` claims to be. Where
+            // the probe stopped early, no zero it produced can certify anything.
+            "walk_truncated": u64::from(probe.2),
         })
     }
 
@@ -2566,9 +2570,14 @@ impl WorkspaceEngine {
     fn index_is_undegraded(&self, degradation: &serde_json::Value) -> bool {
         // Every key must exist and be zero. A missing key reads as `Null`, whose `as_u64()` is
         // `None` -- which is why a rename that missed this list made every workspace degraded.
-        ["config_problems", "unparsed_files", "unparsed_components"]
-            .iter()
-            .all(|key| degradation[key].as_u64() == Some(0))
+        [
+            "config_problems",
+            "unparsed_files",
+            "unparsed_components",
+            "walk_truncated",
+        ]
+        .iter()
+        .all(|key| degradation[key].as_u64() == Some(0))
     }
 
     /// Index health for agents. Cheap: does not spawn git status.
@@ -5387,6 +5396,58 @@ mod agent_context_tests {
         assert!(
             broken["hint"].as_str().unwrap().contains("tsconfig.json"),
             "and named first, before anything about freshness: {broken:?}"
+        );
+    }
+
+    /// The key has to be emitted, not just consulted.
+    ///
+    /// `index_is_undegraded` treats a missing key as degraded, which fails safe -- and would have
+    /// made every workspace permanently degraded had `degradation()` not carried it. That is the
+    /// regression this pair of tests brackets: one proves truncation blocks certification, this one
+    /// proves a clean workspace still certifies.
+    #[test]
+    fn a_complete_probe_still_certifies() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let degradation = engine.degradation();
+        assert_eq!(
+            degradation["walk_truncated"].as_u64(),
+            Some(0),
+            "a workspace this small cannot truncate: {degradation}"
+        );
+        assert!(engine.index_is_undegraded(&degradation), "{degradation}");
+    }
+
+    /// A probe that stopped early cannot certify anything, including its own zeros.
+    ///
+    /// `unparsed_components` is gathered by the coverage probe, so when the probe is capped that
+    /// zero means "did not finish looking", not "nothing to find" -- and it was being read as the
+    /// latter to set `authoritative_zero`. Testing the predicate directly rather than by building a
+    /// workspace past the cap: the cap is 20,000 files, and the contract is what matters.
+    #[test]
+    fn a_truncated_coverage_probe_cannot_certify_a_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+
+        let clean = serde_json::json!({
+            "config_problems": 0,
+            "unparsed_files": 0,
+            "unparsed_components": 0,
+            "walk_truncated": 0,
+        });
+        assert!(
+            engine.index_is_undegraded(&clean),
+            "a complete probe that found nothing must still certify"
+        );
+
+        let mut truncated = clean.clone();
+        truncated["walk_truncated"] = serde_json::json!(1);
+        assert!(
+            !engine.index_is_undegraded(&truncated),
+            "every other counter is zero, but they were counted under a cap"
         );
     }
 

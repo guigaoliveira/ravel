@@ -699,16 +699,30 @@ pub fn unsupported_source_counts(
     let mut supported_seen = 0usize;
     let mut truncated = false;
     let mut seen = 0usize;
-    for entry in builder.build().flatten() {
+    // Git already maintains the worktree file list, honouring the same ignore rules the walk
+    // applies. Asking for it costs one process and has no budget to exceed, so the cap -- and the
+    // truncation that made a partial count look like a total -- only survives where there is no
+    // repository to ask.
+    let tracked = crate::git::worktree_source_paths(root).ok();
+    let budget_applies = tracked.is_none();
+    let walked: Box<dyn Iterator<Item = PathBuf>> = match tracked {
+        Some(paths) => Box::new(paths.into_iter()),
+        None => Box::new(builder.build().flatten().filter_map(|entry| {
+            entry
+                .file_type()
+                .is_some_and(|kind| kind.is_file())
+                .then(|| entry.into_path())
+        })),
+    };
+    let bounded = walked.take_while(|_| {
         seen += 1;
-        if seen > budget {
+        if budget_applies && seen > budget {
             truncated = true;
-            break;
+            return false;
         }
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.into_path();
+        true
+    });
+    for path in bounded {
         if config.is_noise(&path) {
             continue;
         }
@@ -955,6 +969,70 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn seed_probe_workspace(root: &std::path::Path, extra: usize) {
+        fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.join("b.py"), "a = 1\n").unwrap();
+        for index in 0..extra {
+            fs::write(root.join(format!("pad{index}.py")), "a = 1\n").unwrap();
+        }
+    }
+
+    fn probe_config(root: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.project.root = root.to_path_buf();
+        config
+    }
+
+    /// In a repository the budget is irrelevant: git already knows the file list.
+    ///
+    /// The bounded walk reported its partial counts as totals, so a large repository answered
+    /// `unsupported_source_files: 0` and `walk_truncated: true` in the same object -- and the zero
+    /// was then used to certify that relation answers were complete.
+    #[test]
+    fn a_git_worktree_is_counted_whole_regardless_of_budget() {
+        let dir = tempdir().unwrap();
+        seed_probe_workspace(dir.path(), 6);
+        for args in [
+            vec!["init", "-q", "."],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        }
+
+        // A budget far below the file count: the walk would stop after two entries.
+        let (counts, supported, truncated) =
+            unsupported_source_counts(&probe_config(dir.path()), 2);
+        assert!(!truncated, "git enumeration has no budget to exceed");
+        assert_eq!(counts.get("py").copied(), Some(7), "{counts:?}");
+        assert_eq!(supported, 1);
+    }
+
+    /// Without a repository the cap still applies -- and must be reported.
+    #[test]
+    fn a_walk_without_git_reports_that_it_stopped_early() {
+        let dir = tempdir().unwrap();
+        seed_probe_workspace(dir.path(), 6);
+
+        let (_, _, truncated) = unsupported_source_counts(&probe_config(dir.path()), 2);
+        assert!(
+            truncated,
+            "the fallback walk is bounded, and saying so is the only honest option"
+        );
+    }
 
     #[test]
     fn defaults_are_deterministic() {

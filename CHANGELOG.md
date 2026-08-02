@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by an earlier version is refused with that instruction rather than quietly answering
   from a graph that is missing those edges.
 
+### Fixed — a coverage probe that stopped early reported its floor as a total
+- **`walk_truncated: true` and `unsupported_source_files: 0` appeared in the same
+  response, and the zero was used to certify answers.** The probe walked the
+  filesystem under a 20,000-file cap; `unparsed_components` is derived from that walk,
+  and `authoritative_zero` required it to be zero — so on any large repository the
+  certification rested on a count that had stopped early. Where there is a git
+  worktree the file list now comes from `git ls-files` (same ignore rules, one process,
+  no cap), and the cap survives only as the non-git fallback. When a walk *is*
+  truncated it now blocks certification and appears in `degraded_by`.
+  Measured on the 21,228-file corpus: `walk_truncated` `true → false`, and
+  `unsupported_source_files: 0` is now a real total — independently confirmed against
+  `git ls-files`. Cold `status` stays at 110–120 ms. A clean small workspace still
+  answers `authoritative_zero: true`; the flag was added to make the signal honest, not
+  to switch it off.
+
 ### Known, measured, not yet fixed
 - Asking for the *public* name of such an alias still resolves only to an unrelated
   declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup

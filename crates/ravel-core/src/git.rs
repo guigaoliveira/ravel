@@ -174,6 +174,42 @@ impl Default for DirtyDiscovery {
 ///
 /// **Default (fast):** tracked changes only (`git status --untracked-files=no`).
 /// Untracked is opt-in — it is correct for brand-new files but expensive and noisy.
+/// Every path git would consider part of the worktree, ignored files excluded.
+///
+/// The coverage probe used to walk the filesystem under a file-count cap, which on a large
+/// repository stopped early and then reported the partial counts as if they were totals. Git
+/// already maintains this list; asking for it is one process instead of a bounded walk, so the
+/// cap -- and the truncation it produced -- disappears wherever there is a repository.
+pub fn worktree_source_paths(root: &Path) -> Result<Vec<PathBuf>, GitError> {
+    if !is_git_repo(root) {
+        return Err(GitError::NotWorktree(root.to_path_buf()));
+    }
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            // Same exclusion the walk applied: .gitignore, .git/info/exclude, global excludes.
+            "--exclude-standard",
+        ])
+        .output()
+        .map_err(|source| GitError::Operation(source.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::Operation(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| root.join(String::from_utf8_lossy(entry).as_ref()))
+        .collect())
+}
+
 pub fn changed_paths(root: &Path) -> Result<Vec<PathBuf>, GitError> {
     changed_paths_with(root, &DirtyDiscovery::default())
 }
