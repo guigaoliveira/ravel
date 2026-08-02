@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-08-01
+
 ### Removed — a diagnostic that was wrong more often than right
 - **`validate` no longer reports `cross_package`.** It compared the first path
   component of each side, so a monorepo laid out as `apps/<service>` and
