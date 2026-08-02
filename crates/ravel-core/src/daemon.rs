@@ -301,6 +301,9 @@ pub enum DaemonOperation {
         /// wire shape readable by a peer that predates the field.
         #[serde(default)]
         detail: bool,
+        /// Path fragment narrowing which definition the answer is about.
+        #[serde(default)]
+        scope: Option<String>,
     },
     Sync {
         paths: Vec<PathBuf>,
@@ -893,8 +896,9 @@ fn handle_connection(
             query,
             limit,
             detail,
+            scope,
         } => engine
-            .context_with_detail(&query, limit, detail)
+            .context_with_detail(&query, limit, detail, scope.as_deref())
             .map_err(|error| error.to_string()),
         DaemonOperation::Sync { paths } => engine
             .sync_resident((!paths.is_empty()).then_some(paths.as_slice()))

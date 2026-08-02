@@ -42,6 +42,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers `authoritative_zero: true`; the flag was added to make the signal honest, not
   to switch it off.
 
+### Added — `explore` / `context` can disambiguate without a second call
+- **`--scope` (MCP: `scope`) on the one-call command.** `callers-of` and `calls-from`
+  already took it; the command whose whole purpose is answering in one hop did not, so
+  a name defined once per package forced the caller to copy a symbol id back. Measured
+  on the 21,228-file corpus: a service name matching **10 definitions across 10
+  packages** now resolves with `--scope apps/<name>/` and answers `n_callers` directly.
+  The three rules `callers-of` follows hold here too — the scope is matched against
+  every definition rather than the bounded preview, a scope matching nothing is
+  reported instead of quietly answering unscoped, and a set too large to examine
+  refuses to be scoped at all. Term-search candidates are scoped too, so the scope
+  cannot be bypassed by a match arriving through a different route.
+- **A scope that still matches several now says so.** It is a path *fragment*, so
+  `apps/banking` also matches `apps/banking-accounts`; the response used to report a
+  bare "ambiguous" and leave the reason to be guessed. It now names the surviving count
+  and the fix.
+
 ### Known, measured, not yet fixed
 - Asking for the *public* name of such an alias still resolves only to an unrelated
   declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup

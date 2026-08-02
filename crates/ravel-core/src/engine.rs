@@ -2752,14 +2752,19 @@ impl WorkspaceEngine {
     /// relation pages, and every total. `detail = true` restores the full
     /// payload for a human reading the CLI output.
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
-        self.context_with_detail(query, limit, false)
+        self.context_with_detail(query, limit, false, None)
     }
 
+    /// `scope` is a path fragment that narrows *which definition* the answer is about, exactly as
+    /// `callers-of --scope` does. The one-call command was the only one without it, so a name that
+    /// matched ten definitions in ten different packages forced the caller into a second round trip
+    /// to copy an id back -- the round trip this command exists to avoid.
     pub fn context_with_detail(
         &self,
         query: &str,
         limit: usize,
         detail: bool,
+        scope: Option<&str>,
     ) -> Result<serde_json::Value, EngineError> {
         /// Hard cap on the relation page: keeps one-shot output bounded for
         /// agents. Totals beyond this must route to the paginated walk.
@@ -2861,8 +2866,32 @@ impl WorkspaceEngine {
         });
         crate::timing::stage("context.graph_rank_meta", after_terms, String::new);
         let candidates_started = std::time::Instant::now();
-        let (exact_identity, exact_identity_total) =
-            symbol_runtime.exact_id_or_qualified(query, limit);
+        let scope = scope.map(str::trim).filter(|value| !value.is_empty());
+        // A scope has to be matched against every definition, not against the bounded preview:
+        // filtering the preview would pick one of an arbitrary `limit` and return it shaped like a
+        // successful answer. Same rule and same bound as `resolve_graph_node_outcome`.
+        let fetch = if scope.is_some() {
+            SCOPE_MATCH_LIMIT
+        } else {
+            limit
+        };
+        let (fetched, fetched_total) = symbol_runtime.exact_id_or_qualified(query, fetch);
+        // Even `SCOPE_MATCH_LIMIT` can be exceeded. The definition left after filtering a partial
+        // set may not be the only one that would have matched, so no scope can be resolved from it.
+        let scope_unusable = scope.is_some() && fetched_total > fetched.len();
+        let in_scope = |path: &str| scope.is_none_or(|fragment| path.contains(fragment));
+        let (exact_identity, exact_identity_total) = match scope {
+            Some(_) if !scope_unusable => {
+                let kept: Vec<_> = fetched
+                    .into_iter()
+                    .filter(|entry| in_scope(&entry.path))
+                    .collect();
+                let total = kept.len();
+                (kept, total)
+            }
+            _ => (fetched, fetched_total),
+        };
+        let scope_matched_none = scope.is_some() && !scope_unusable && exact_identity.is_empty();
         let exact_primary = (exact_identity_total == 1).then(|| exact_identity[0].clone());
         let required_terms = crate::search::query_tokens(query);
         let mut candidates = Vec::new();
@@ -2906,7 +2935,12 @@ impl WorkspaceEngine {
             ($entry:expr, $hit:expr) => {{
                 let entry = $entry;
                 let hit = $hit;
-                if seen_ids.insert(entry.id.clone()) {
+                // Term evidence is scoped too, otherwise a scope that excluded every exact match
+                // would still produce a primary from somewhere else entirely.
+                if !in_scope(&entry.path) {
+                    // Skipped, not counted: a definition outside the scope is not a candidate the
+                    // caller declined to see, it is one they said they were not asking about.
+                } else if seen_ids.insert(entry.id.clone()) {
                     *candidate_counts.entry(entry.name.clone()).or_default() += 1;
                     candidate_total += 1;
                     if candidates.len() < limit {
@@ -3161,6 +3195,23 @@ impl WorkspaceEngine {
         let degradation = self.degradation();
         let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
+        if let Some(fragment) = scope {
+            if scope_unusable {
+                warnings.push(format!(
+                    "scope `{fragment}` was not applied: more definitions of `{query}` matched than could be examined; narrow the query"
+                ));
+            } else if scope_matched_none {
+                warnings.push(format!(
+                    "no definition of `{query}` lies under scope `{fragment}`"
+                ));
+            } else if exact_identity_total > 1 {
+                // The scope is a path *fragment*, so `apps/pay` also matches `apps/payments-api`.
+                // Saying how many survived turns a puzzling "still ambiguous" into an obvious fix.
+                warnings.push(format!(
+                    "scope `{fragment}` still matches {exact_identity_total} definitions; extend it (a trailing `/` excludes sibling directories that share the prefix)"
+                ));
+            }
+        }
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
         // the queried name exist, and "ambiguous symbol name" asserts the opposite -- it reads as
         // confirmation that the name is real and appears in several places.
@@ -5396,6 +5447,88 @@ mod agent_context_tests {
         assert!(
             broken["hint"].as_str().unwrap().contains("tsconfig.json"),
             "and named first, before anything about freshness: {broken:?}"
+        );
+    }
+
+    /// The one-call command can disambiguate without a second call.
+    ///
+    /// A common service name matches a definition per package, and `context` had no way to say
+    /// which one -- forcing the caller to copy a symbol id back, which is the round trip this
+    /// command exists to remove. The three rules `callers-of --scope` already follows hold here
+    /// too, and the third is the one worth a test: a scope matching nothing must say so rather than
+    /// quietly answering as if it were absent.
+    #[test]
+    fn context_scope_picks_one_definition_and_admits_when_it_matches_none() {
+        let root = tempfile::tempdir().unwrap();
+        for package in ["alpha", "beta"] {
+            let dir = root.path().join("apps").join(package).join("src");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("handler.ts"),
+                "export class Handler { run() { return 1; } }\n",
+            )
+            .unwrap();
+        }
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let unscoped = engine.context("Handler", 10).unwrap();
+        assert_eq!(
+            unscoped["ambiguous"], true,
+            "two packages define it: {unscoped}"
+        );
+
+        let scoped = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta"))
+            .unwrap();
+        assert_eq!(scoped["ambiguous"], false, "{scoped}");
+        assert_eq!(
+            scoped["detail"]["path"], "apps/beta/src/handler.ts",
+            "the scope must decide which definition, not merely filter the preview: {scoped}"
+        );
+
+        // A fragment also matches a sibling that shares the prefix, which is the trap worth naming.
+        std::fs::create_dir_all(root.path().join("apps/beta-legacy/src")).unwrap();
+        std::fs::write(
+            root.path().join("apps/beta-legacy/src/handler.ts"),
+            "export class Handler { run() { return 2; } }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let prefix_collision = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta"))
+            .unwrap();
+        assert!(
+            prefix_collision["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("still matches 2")),
+            "a fragment that keeps two definitions must say so: {prefix_collision}"
+        );
+        let disambiguated = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta/"))
+            .unwrap();
+        assert_eq!(disambiguated["ambiguous"], false, "{disambiguated}");
+
+        let missed = engine
+            .context_with_detail("Handler", 10, false, Some("apps/gamma"))
+            .unwrap();
+        assert!(
+            missed["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap_or_default().contains("apps/gamma")),
+            "a scope that matches nothing must be reported, not ignored: {missed}"
+        );
+        assert!(
+            missed["detail"].is_null(),
+            "and it must not answer about some other definition: {missed}"
         );
     }
 

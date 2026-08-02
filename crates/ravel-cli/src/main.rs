@@ -62,6 +62,10 @@ enum Command {
         /// Full payload: every similar spelling and the blast-radius sample
         #[arg(long)]
         detail: bool,
+        /// Path fragment picking one definition when a name matches several. Narrows which
+        /// definition resolves; it does not filter the relations of one already resolved.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
     /// Prefer `ravel install` for multi-agent MCP wiring.
@@ -412,6 +416,7 @@ skip_sibling_emit = true
             query,
             limit,
             detail,
+            scope,
         }) => {
             if let Some(value) = daemon_call_if_running(
                 &root,
@@ -419,13 +424,17 @@ skip_sibling_emit = true
                     query: query.clone(),
                     limit,
                     detail,
+                    scope: scope.clone(),
                 },
             )? {
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
+            emit_json(
+                &engine.context_with_detail(&query, limit, detail, scope.as_deref())?,
+                pretty,
+            )?;
         }
         Some(Command::Setup { claude, force }) => {
             write_agent_setup(&root, claude, force)?;

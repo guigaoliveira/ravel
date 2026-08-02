@@ -112,6 +112,10 @@ pub struct ExploreRequest {
     /// sample. Off by default: the concise response carries the resolved symbol,
     /// the candidates, the relation pages and every total.
     pub detail: Option<bool>,
+    /// Path fragment picking one definition when a name matches several — the same
+    /// flag `callers_of` takes. Use it instead of a second call when the first one
+    /// comes back with candidates.
+    pub scope: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SymbolDetailRequest {
@@ -562,6 +566,7 @@ impl RavelMcp {
                 query: request.query.clone(),
                 limit,
                 detail: request.detail.unwrap_or(false),
+                scope: request.scope.clone(),
             },
         ) {
             Ok(value) => value.to_string(),
