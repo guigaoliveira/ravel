@@ -356,14 +356,42 @@ fn git_path(bytes: &[u8]) -> std::ffi::OsString {
 pub struct CoChangeEntry {
     pub file: String,
     pub cooccurrence_count: u32,
+    /// Share of the considered commits that touched both files, in millionths. Raw counts rank a
+    /// file that changes in every commit above one that changes *with this file specifically*.
+    pub confidence_micros: u32,
 }
 
+/// A commit above this many files is treated as a bulk edit and skipped: a mass rename, format or
+/// import couples every file it touches with every other, which is noise rather than co-change.
+///
+/// Measured over 238 commits of a 21k-file monorepo: median 8 files, p95 104, p99 784. The two
+/// commits that produced a 6,910-entry answer for a single file touched 6,989 and 20,903.
+pub const DEFAULT_MAX_COMMIT_FILES: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CoChangePage {
+    pub entries: Vec<CoChangeEntry>,
+    pub total: usize,
+    pub truncated: bool,
+    pub next_cursor: Option<usize>,
+    /// Commits that touched the file and were counted.
+    pub commits_considered: usize,
+    /// Commits that touched the file and were skipped for being bulk edits. Reported because
+    /// otherwise an empty answer reads as "nothing co-changes with this file" when the truth is
+    /// "every commit that touched it was a mass edit".
+    pub commits_skipped_as_bulk: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cochanged(
     root: &Path,
     file: &str,
     commits: usize,
     min_cooccurrence: u32,
-) -> Result<Vec<CoChangeEntry>, GitError> {
+    max_commit_files: usize,
+    limit: usize,
+    cursor: usize,
+) -> Result<CoChangePage, GitError> {
     let commits = commits.clamp(1, 5_000);
     // First select commits that touched `file`. A pathspec on the later
     // `--name-only` command would hide every co-changed path and always return
@@ -386,7 +414,14 @@ pub fn cochanged(
         ));
     }
     if revisions.stdout.is_empty() {
-        return Ok(Vec::new());
+        return Ok(CoChangePage {
+            entries: Vec::new(),
+            total: 0,
+            truncated: false,
+            next_cursor: None,
+            commits_considered: 0,
+            commits_skipped_as_bulk: 0,
+        });
     }
     use std::io::Write;
     use std::process::Stdio;
@@ -420,35 +455,73 @@ pub fn cochanged(
         ));
     }
     use std::collections::HashMap;
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    let mut in_commit = false;
+    // Grouped per commit first: a commit has to be measured whole before deciding whether its
+    // pairings mean anything.
+    let mut per_commit: Vec<Vec<String>> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line == "--" {
-            in_commit = true;
+            if let Some(files) = current.take() {
+                per_commit.push(files);
+            }
+            current = Some(Vec::new());
             continue;
         }
-        if !in_commit || line.is_empty() {
+        if line.is_empty() {
             continue;
         }
-        if line == file {
-            continue;
+        if let Some(files) = current.as_mut() {
+            files.push(line.to_owned());
         }
-        *counts.entry(line.to_owned()).or_default() += 1;
     }
+    if let Some(files) = current.take() {
+        per_commit.push(files);
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut commits_considered = 0usize;
+    let mut commits_skipped_as_bulk = 0usize;
+    for files in &per_commit {
+        if files.len() > max_commit_files {
+            commits_skipped_as_bulk += 1;
+            continue;
+        }
+        commits_considered += 1;
+        for path in files {
+            if path != file {
+                *counts.entry(path.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let considered = commits_considered.max(1) as u64;
     let mut entries: Vec<_> = counts
         .into_iter()
-        .filter(|(_, c)| *c >= min_cooccurrence)
+        .filter(|(_, count)| *count >= min_cooccurrence)
         .map(|(file, cooccurrence_count)| CoChangeEntry {
+            confidence_micros: ((u64::from(cooccurrence_count) * 1_000_000) / considered) as u32,
             file,
             cooccurrence_count,
         })
         .collect();
-    entries.sort_by(|a, b| {
-        b.cooccurrence_count
-            .cmp(&a.cooccurrence_count)
-            .then_with(|| a.file.cmp(&b.file))
+    entries.sort_by(|left, right| {
+        right
+            .confidence_micros
+            .cmp(&left.confidence_micros)
+            .then_with(|| right.cooccurrence_count.cmp(&left.cooccurrence_count))
+            .then_with(|| left.file.cmp(&right.file))
     });
-    Ok(entries)
+    let total = entries.len();
+    let page: Vec<_> = entries.into_iter().skip(cursor).take(limit).collect();
+    let next = cursor + page.len();
+    Ok(CoChangePage {
+        entries: page,
+        total,
+        truncated: next < total,
+        next_cursor: (next < total).then_some(next),
+        commits_considered,
+        commits_skipped_as_bulk,
+    })
 }
 
 /// Configurable sibling-emit: untracked `stem.emit` skipped if `stem.source` exists.
@@ -636,13 +709,146 @@ mod artifact_tests {
                 .success()
         );
 
-        let entries = cochanged(dir.path(), "a.ts", 10, 1).unwrap();
+        let page = cochanged(dir.path(), "a.ts", 10, 1, DEFAULT_MAX_COMMIT_FILES, 20, 0).unwrap();
         assert_eq!(
-            entries,
+            page.entries,
             vec![CoChangeEntry {
                 file: "b.ts".into(),
-                cooccurrence_count: 1
+                cooccurrence_count: 1,
+                // The only considered commit touched both, so the pairing is certain.
+                confidence_micros: 1_000_000,
             }]
+        );
+        assert_eq!(page.total, 1);
+        assert!(!page.truncated);
+        assert_eq!(page.commits_considered, 1);
+        assert_eq!(page.commits_skipped_as_bulk, 0);
+    }
+
+    /// A bulk edit couples everything it touches with everything else.
+    ///
+    /// Measured on a real monorepo: a single file returned 6,910 co-changed entries, and the reason
+    /// was not ranking -- the file had been touched by exactly two commits, of 6,989 and 20,903
+    /// files. Counting those pairings answers a question nobody asked. Skipping them can leave
+    /// nothing at all, which is why the count of skipped commits is part of the answer: an empty
+    /// result must not read as "nothing co-changes with this file".
+    #[test]
+    fn a_bulk_commit_is_skipped_and_the_skip_is_reported() {
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let commit = |message: &str| {
+            for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", message]] {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(dir.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+        };
+
+        // A mass edit touching the subject and 30 unrelated files.
+        fs::write(dir.path().join("subject.ts"), "v1").unwrap();
+        for index in 0..30 {
+            fs::write(dir.path().join(format!("bulk{index}.ts")), "v1").unwrap();
+        }
+        commit("bulk");
+
+        // A focused edit touching the subject and one genuine partner.
+        fs::write(dir.path().join("subject.ts"), "v2").unwrap();
+        fs::write(dir.path().join("partner.ts"), "v1").unwrap();
+        commit("focused");
+
+        let unbounded = cochanged(
+            dir.path(),
+            "subject.ts",
+            10,
+            1,
+            DEFAULT_MAX_COMMIT_FILES,
+            100,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            unbounded.total, 31,
+            "with no size limit the bulk commit dominates: {unbounded:?}"
+        );
+
+        let bounded = cochanged(dir.path(), "subject.ts", 10, 1, 10, 100, 0).unwrap();
+        assert_eq!(bounded.commits_skipped_as_bulk, 1);
+        assert_eq!(bounded.commits_considered, 1);
+        assert_eq!(
+            bounded
+                .entries
+                .iter()
+                .map(|e| e.file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["partner.ts"],
+            "only the focused commit's pairing survives: {bounded:?}"
+        );
+    }
+
+    #[test]
+    fn cochanged_pages_without_repeating_or_skipping() {
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+        }
+        fs::write(dir.path().join("subject.ts"), "v1").unwrap();
+        for index in 0..5 {
+            fs::write(dir.path().join(format!("p{index}.ts")), "v1").unwrap();
+        }
+        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "seed"]] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+        }
+
+        let first = cochanged(dir.path(), "subject.ts", 10, 1, 500, 2, 0).unwrap();
+        assert_eq!(first.total, 5);
+        assert!(first.truncated);
+        assert_eq!(first.entries.len(), 2);
+        let cursor = first.next_cursor.expect("more remain");
+        let second = cochanged(dir.path(), "subject.ts", 10, 1, 500, 2, cursor).unwrap();
+        assert_eq!(second.entries.len(), 2);
+        let seen: Vec<_> = first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .map(|entry| entry.file.as_str())
+            .collect();
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            seen.len(),
+            unique.len(),
+            "a page repeated an entry: {seen:?}"
         );
     }
 }

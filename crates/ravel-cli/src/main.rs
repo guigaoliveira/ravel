@@ -232,6 +232,15 @@ enum Command {
         commits: usize,
         #[arg(long, default_value_t = 2)]
         min_cooccurrence: u32,
+        /// Entries per page (complete `total` always included)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
+        /// Skip commits touching more files than this: a mass rename couples everything it
+        /// touches with everything else, which is noise rather than co-change
+        #[arg(long, default_value_t = ravel_core::git::DEFAULT_MAX_COMMIT_FILES)]
+        max_commit_files: usize,
     },
     Validate {
         /// Max findings listed (complete per-code counts always included)
@@ -644,9 +653,22 @@ skip_sibling_emit = true
             file,
             commits,
             min_cooccurrence,
+            limit,
+            cursor,
+            max_commit_files,
         }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.cochanged(&file, commits, min_cooccurrence)?, pretty)?;
+            emit_json(
+                &engine.cochanged(
+                    &file,
+                    commits,
+                    min_cooccurrence,
+                    max_commit_files,
+                    limit.max(1),
+                    cursor,
+                )?,
+                pretty,
+            )?;
         }
         Some(Command::Validate { limit }) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;

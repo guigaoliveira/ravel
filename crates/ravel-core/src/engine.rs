@@ -4295,14 +4295,26 @@ impl WorkspaceEngine {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn cochanged(
         &self,
         file: &str,
         commits: usize,
         min_cooccurrence: u32,
-    ) -> Result<Vec<crate::git::CoChangeEntry>, EngineError> {
-        crate::git::cochanged(&self.root, file, commits, min_cooccurrence)
-            .map_err(|e| EngineError::Git(e.to_string()))
+        max_commit_files: usize,
+        limit: usize,
+        cursor: usize,
+    ) -> Result<crate::git::CoChangePage, EngineError> {
+        crate::git::cochanged(
+            &self.root,
+            file,
+            commits,
+            min_cooccurrence,
+            max_commit_files,
+            limit,
+            cursor,
+        )
+        .map_err(|e| EngineError::Git(e.to_string()))
     }
 
     /// Candidate test paths for a source file (existence checked on disk).

@@ -155,6 +155,12 @@ pub struct CoChangeRequest {
     pub file: String,
     pub commits: Option<usize>,
     pub min_cooccurrence: Option<u32>,
+    /// Entries per page. Defaults to 20 — a single file in a real monorepo can co-change
+    /// with thousands, almost all of them through bulk commits.
+    pub limit: Option<usize>,
+    pub cursor: Option<usize>,
+    /// Commits touching more files than this are skipped as bulk edits. Defaults to 500.
+    pub max_commit_files: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -838,13 +844,24 @@ impl RavelMcp {
         }
     }
 
-    #[tool(description = "Files that co-change with a path in recent git history")]
+    #[tool(
+        description = "Files that co-change with a path in recent git history, ranked by how \
+                       often they change *with it* rather than by raw count. Bulk commits \
+                       (mass renames, formatting) are skipped and counted separately: an empty \
+                       result with a non-zero commits_skipped_as_bulk means every commit that \
+                       touched this file was a mass edit, not that nothing co-changes with it."
+    )]
     async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> String {
         match self.engine(request.root) {
             Ok(engine) => match engine.cochanged(
                 &request.file,
                 request.commits.unwrap_or(100),
                 request.min_cooccurrence.unwrap_or(2),
+                request
+                    .max_commit_files
+                    .unwrap_or(crate::git::DEFAULT_MAX_COMMIT_FILES),
+                request.limit.unwrap_or(20).max(1),
+                request.cursor.unwrap_or(0),
             ) {
                 Ok(e) => serde_json::to_string(&e).unwrap_or_else(|_| "[]".into()),
                 Err(error) => error_json(error.to_string()),

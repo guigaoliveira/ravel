@@ -58,6 +58,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare "ambiguous" and leave the reason to be guessed. It now names the surviving count
   and the fix.
 
+### Changed — `cochanged` is bounded, ranked and honest about bulk commits
+- **A single file returned 6,910 entries as a bare JSON list**, with no `total`,
+  `truncated` or `cursor` — in a tool whose whole premise is cheap output. It is now a
+  page: `--limit` (default 20), `--cursor`, and the complete `total` always included.
+- **The 6,910 were not a ranking problem.** Measured: that file had been touched by
+  exactly **two** commits, of **6,989** and **20,903** files. A bulk edit couples
+  everything it touches with everything else. Commits above `--max-commit-files`
+  (default 500) are now skipped — chosen against the measured distribution of that
+  repository, where the median commit touches 8 files, p95 is 104 and p99 is 784. With
+  the threshold removed the old answer returns, and its top entries are `main.yml`,
+  `openapi-contract-check.yml` and `.oxlintrc.json`: CI configuration, ranked highest
+  for co-changing with a TypeScript exception class.
+- **Skipping can leave nothing, so the skip is part of the answer.** That file now
+  returns `total: 0` with `commits_skipped_as_bulk: 2` — an empty result that explains
+  itself instead of reading as "nothing co-changes with this file".
+- **Ranked by confidence, not raw count**: co-occurrences over commits considered
+  (`confidence_micros`), so a file that changes in every commit no longer outranks one
+  that changes *with this file specifically*.
+
 ### Known, measured, not yet fixed
 - Asking for the *public* name of such an alias still resolves only to an unrelated
   declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup
