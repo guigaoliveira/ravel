@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as `worktree identity: …`, sending the reader to an unrelated file. Both
   commands now share one error that names the policy file exactly once.
 
+### Fixed — publishing failed when anyone was reading, on Windows
+- **`index` and `sync` could fail with "Access is denied." while replacing
+  `CURRENT`.** Unlike POSIX `rename`, `MoveFileExW` refuses to replace a
+  destination another handle has open, so a second Ravel process merely *reading*
+  the generation pointer was enough to abort the publish — reported as a
+  permissions error, which it is not. The replace now retries for up to two
+  seconds on the two contention codes (`ERROR_ACCESS_DENIED`,
+  `ERROR_SHARING_VIOLATION`) and still fails immediately on anything that waiting
+  cannot fix. Each attempt remains atomic. Unix is untouched.
+
 ### Fixed — two concurrent starts could not share a daemon on Windows
 - **`ravel daemon start` raced itself with a bare "The system cannot find the
   file specified".** Startup asked `is_ready()` and then made the real call on a
