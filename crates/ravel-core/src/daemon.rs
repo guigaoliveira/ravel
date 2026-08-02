@@ -427,12 +427,24 @@ pub fn ensure_running(
     transient: bool,
 ) -> Result<(DaemonClient, Option<DaemonClientLease>), DaemonCallError> {
     let client = DaemonClient::for_root(root).map_err(DaemonCallError::Transport)?;
-    if client.is_ready() {
-        if transient {
-            return client.acquire_lease().map(|lease| (client, Some(lease)));
+    // One connect, not two. `is_ready()` followed by a separate call opens a second connection, and
+    // reaching the daemon once does not promise the next connect succeeds: a Windows named-pipe
+    // server serves each client from its own instance, so a server that has not re-armed one yet
+    // answers `NotFound`. Two concurrent `daemon start` runs then failed with a bare
+    // "The system cannot find the file specified" instead of sharing the daemon that was right
+    // there. The operation itself proves reachability, so ask for it directly.
+    if transient {
+        if let Ok(lease) = client.acquire_lease() {
+            return Ok((client, Some(lease)));
         }
-        client.call(DaemonOperation::PromotePersistent)?;
-        return Ok((client, None));
+    } else {
+        match client.call(DaemonOperation::PromotePersistent) {
+            Ok(_) => return Ok((client, None)),
+            // The daemon answered and refused: that is a real answer, not a startup race.
+            Err(error @ DaemonCallError::Remote(_)) => return Err(error),
+            // Not reachable (yet). Fall through to start one and poll.
+            Err(DaemonCallError::Transport(_)) => {}
+        }
     }
     let executable = std::env::current_exe().map_err(DaemonCallError::Transport)?;
     // A long-lived server keeps running from a deleted inode after its package is replaced on disk,
@@ -472,9 +484,14 @@ pub fn ensure_running(
                 drop(child.stdin.take());
                 return Ok((client, Some(lease)));
             }
-        } else if client.is_ready() {
-            client.call(DaemonOperation::PromotePersistent)?;
-            return Ok((client, None));
+        } else {
+            match client.call(DaemonOperation::PromotePersistent) {
+                Ok(_) => return Ok((client, None)),
+                Err(error @ DaemonCallError::Remote(_)) => return Err(error),
+                // Still coming up, or another process won singleton startup and has not armed a
+                // listener instance yet. Keep polling until the deadline.
+                Err(DaemonCallError::Transport(_)) => {}
+            }
         }
         if child
             .try_wait()

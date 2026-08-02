@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as `worktree identity: …`, sending the reader to an unrelated file. Both
   commands now share one error that names the policy file exactly once.
 
+### Fixed — two concurrent starts could not share a daemon on Windows
+- **`ravel daemon start` raced itself with a bare "The system cannot find the
+  file specified".** Startup asked `is_ready()` and then made the real call on a
+  second connection. Reaching the daemon once does not promise the next connect
+  succeeds: a Windows named-pipe server serves each client from its own instance,
+  so one that has not re-armed a listener yet answers `NotFound` — and that error
+  aborted the whole readiness wait instead of being retried. Both paths now issue
+  the operation directly, which proves reachability by succeeding; a daemon that
+  answers and refuses is still reported as the error it is.
+
 ### Fixed — a full index could delete the pack it was writing
 - **`index` could fail with `No such file or directory` on its own staged pack.**
   Generation GC removes every unreachable name containing `.tmp-`, which is exactly
