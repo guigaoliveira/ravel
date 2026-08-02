@@ -290,7 +290,9 @@ impl ResolutionUniverseOverlay {
 }
 
 impl ResolutionUniverse {
-    pub const FORMAT_VERSION: u32 = 6;
+    /// v7 fills `ModuleExport::source` for a local re-export whose name was imported, so a universe
+    /// written by v6 resolves the same barrel differently. Refusing it is the point.
+    pub const FORMAT_VERSION: u32 = 7;
 
     pub fn build(artifacts: &BTreeMap<String, FileArtifact>, config: &ResolverConfig) -> Self {
         use rayon::prelude::*;
@@ -538,15 +540,47 @@ fn module_exports(artifact: &FileArtifact) -> Vec<ModuleExport> {
         .exports
         .iter()
         .flat_map(|export| {
-            export.bindings.iter().map(move |binding| ModuleExport {
-                local: binding.local.clone(),
-                exported: binding.exported.clone(),
-                source: export.specifier.clone(),
-                kind: binding.kind.clone(),
-                type_only: binding.type_only,
+            export.bindings.iter().map(move |binding| {
+                // `export { X as Y }` with no `from` republishes a name this file already has. When
+                // that name arrived by import rather than by declaration, the chain has to continue
+                // through the import -- otherwise it stops at a file that never defined `X`, and
+                // every consumer of `Y` resolves to nothing. Rewriting it into the equivalent
+                // `export { X as Y } from '<the import specifier>'` reuses the barrel walk that
+                // already exists instead of adding a second one.
+                let (local, source) = match export.specifier.as_ref() {
+                    Some(specifier) => (binding.local.clone(), Some(specifier.clone())),
+                    None => forwarded_import(artifact, &binding.local)
+                        .map(|(imported, specifier)| (imported, Some(specifier)))
+                        .unwrap_or_else(|| (binding.local.clone(), None)),
+                };
+                ModuleExport {
+                    local,
+                    exported: binding.exported.clone(),
+                    source,
+                    kind: binding.kind.clone(),
+                    type_only: binding.type_only,
+                }
             })
         })
         .collect()
+}
+
+/// The import that gave this file `local`, as `(name in the source module, specifier)`.
+///
+/// `None` when the name is declared here (a declaration wins, and the existing in-file lookup
+/// already handles it), or when it came from a namespace import: `import * as NS` binds a module
+/// object, not a declaration, which is why namespace exports are skipped downstream too.
+fn forwarded_import(artifact: &FileArtifact, local: &str) -> Option<(String, String)> {
+    if artifact.symbols.iter().any(|symbol| symbol.name == local) {
+        return None;
+    }
+    artifact.imports.iter().find_map(|import| {
+        import
+            .bindings
+            .iter()
+            .find(|binding| binding.local == local && binding.kind != ImportBindingKind::Namespace)
+            .map(|binding| (binding.imported.clone(), import.specifier.clone()))
+    })
 }
 
 #[derive(Debug, Default)]
@@ -2214,6 +2248,60 @@ mod tests {
                 && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         }));
         assert_eq!(reverse.affected_by("src/b.ts"), vec!["src/a.ts"]);
+    }
+
+    /// A re-export whose local name was *imported*, not declared here.
+    ///
+    /// `export { X as Y }` with no `from` clause is the dominant barrel shape in NestJS-style
+    /// monorepos: the module imports a name and republishes it under a public one. The chain used
+    /// to stop at the barrel, because the local name is not defined in the barrel file -- it was
+    /// imported by it. Every consumer of the public name then resolved to nothing, with no
+    /// diagnostic: the import produced a file-to-file edge and no symbol edge at all.
+    #[test]
+    fn a_local_reexport_follows_the_import_that_produced_the_name() {
+        let root = tempdir().unwrap();
+        let origin = write_artifact(
+            root.path(),
+            "src/origin.ts",
+            "export function target() {}\nexport function other() {}\n",
+        );
+        let barrel = write_artifact(
+            root.path(),
+            "src/barrel.ts",
+            // Imported, then republished under a different name -- no `from` on the export.
+            "import { target, other as localOther } from './origin';\n\
+             export { target as PublicTarget, localOther as PublicOther };\n",
+        );
+        let consumer = write_artifact(
+            root.path(),
+            "src/consumer.ts",
+            "import { PublicTarget, PublicOther } from './barrel';\n\
+             export function use() { return PublicTarget() + PublicOther(); }\n",
+        );
+        let map: BTreeMap<String, FileArtifact> = [
+            (origin.path.clone(), origin.clone()),
+            (barrel.path.clone(), barrel.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]
+        .into();
+
+        let edges = resolve_edges(root.path(), &map, &ResolverConfig::default());
+        let use_fn = symbol_id(&consumer, "use");
+        let has = |to: &str, kind: EdgeKind| {
+            edges
+                .iter()
+                .any(|edge| edge.from == use_fn && edge.to == to && edge.kind == kind)
+        };
+        assert!(
+            has(&symbol_id(&origin, "target"), EdgeKind::Calls),
+            "the public name must reach the definition the barrel imported: {edges:#?}"
+        );
+        // The import itself was aliased too, so the name in the source module differs from both
+        // the barrel's local name and the public one.
+        assert!(
+            has(&symbol_id(&origin, "other"), EdgeKind::Calls),
+            "an aliased import republished under a third name must still resolve: {edges:#?}"
+        );
     }
 
     #[test]

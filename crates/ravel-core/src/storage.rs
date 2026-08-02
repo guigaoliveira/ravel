@@ -73,7 +73,7 @@ fn delta_component_ceiling(store_root: &Path) -> u64 {
 /// On-disk format identity. Bumping it makes a version mismatch loud -- both directions report an
 /// unsupported schema and rebuild -- rather than letting a reader silently return nothing from a
 /// layout it half-understands.
-pub(crate) const SCHEMA_VERSION: u32 = 17;
+pub(crate) const SCHEMA_VERSION: u32 = 18;
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;

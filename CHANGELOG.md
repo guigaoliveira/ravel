@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a barrel that imported a name and republished it resolved to nothing
+- **`export { X as Y }` with no `from` clause broke the chain.** The name being
+  republished is usually one the module *imported*, not one it declared, and the
+  resolver only looked for a local declaration — so it stopped at a file that never
+  defined `X`. Every consumer of the public name `Y` then got a file-to-file import
+  edge and no symbol edge at all, with nothing in the response saying so:
+  `ambiguous: false`, `authoritative_zero: true`. This is the dominant barrel shape
+  in NestJS-style monorepos. Measured on a 21,228-file corpus where one such alias is
+  used in 921 tracked files: `callers-of` on the canonical symbol went from **1 to
+  1,841** (921 `Decorates`, matching the 921 files exactly, plus 920 `Import`), and a
+  second aliased export went from **5 to 3,739**. Total edges **774,357 → 786,144**;
+  the index directory did not grow measurably (3.2 GiB before and after).
+  A local re-export is now rewritten into its equivalent
+  `export { X as Y } from '<the import specifier>'` at index time, so it reuses the
+  barrel walk that already existed rather than adding a second one. Namespace imports
+  are still skipped: `import * as NS` binds a module object, not a declaration.
+- **Requires one `ravel index`.** The storage schema is bumped to 18 so an index built
+  by an earlier version is refused with that instruction rather than quietly answering
+  from a graph that is missing those edges.
+
+### Known, measured, not yet fixed
+- Asking for the *public* name of such an alias still resolves only to an unrelated
+  declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup
+  is keyed by declared names, so the alias is not a candidate. The edges are now
+  correct and reachable from the canonical symbol; the name is not yet.
+
 ## [1.15.0] - 2026-08-01
 
 ### Removed — a diagnostic that was wrong more often than right
