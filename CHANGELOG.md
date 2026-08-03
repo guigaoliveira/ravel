@@ -77,7 +77,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`confidence_micros`), so a file that changes in every commit no longer outranks one
   that changes *with this file specifically*.
 
+### Added — `status` says which part of the index is reclaimable
+- **A single `disk.bytes` total read as inherent cost.** It now carries
+  `reclaimable_generations` (how many generations past retention `ravel gc` would drop)
+  and `artifact_overlay_bytes` (the artifact sidecar, a separate cost that `gc` does not
+  touch). Measured on a 21,228-file corpus: of **3.35 GB**, **1.27 GiB** was generations
+  past retention that `ravel gc` freed on demand — nothing in any response had said so,
+  so there was no reason to run it — and a further **1.27 GiB** is the overlay sidecar.
+
 ### Known, measured, not yet fixed
+- **Artifact compaction never runs on a packed index.** `ravel index` publishes artifacts
+  inside the shared pack, so `manifest.artifact_store` is a pack reference
+  (`snapshot-<id>.pack#artifact/`) and every later write appends to
+  `artifacts.overlay.store`. The amplification check measures the manifest reference as a
+  filesystem path, finds nothing there, and reports "not amplified" — so the sidecar grows
+  without bound. Measured: **1,366,254,902 bytes of overlay against 319,045,027 live, a
+  4.28x amplification that never trips the 4x threshold.** Two further layers were found
+  while attempting the fix and are why it is not in this release: the compaction body
+  reads artifacts through a filesystem-path resolver that cannot reach a pack record, and
+  its own recomputed `live` total disagrees with the manifest's. `ravel gc` still reclaims
+  stale generations; only the sidecar is affected.
 - Asking for the *public* name of such an alias still resolves only to an unrelated
   declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup
   is keyed by declared names, so the alias is not a candidate. The edges are now
