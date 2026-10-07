@@ -567,6 +567,7 @@ impl StructuralPackStager {
         crate::timing::stage("stage_snapshot.symbol_dict", mark, String::new);
         mark = std::time::Instant::now();
         let term_index = TermIndex::from_snapshot(snapshot);
+        crate::timing::stage("stage_snapshot.term_index.build", mark, String::new);
         let term_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).map_err(|error| {
             StorageError::Invalid {
                 path: self.path.clone(),

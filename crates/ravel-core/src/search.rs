@@ -285,76 +285,104 @@ impl TermIndex {
         /// keep every worker's temporary map cheap, large enough to amortize the merge.
         const POSTING_CHUNK: usize = 4_096;
 
-        // Per-file document construction is independent; collecting per file and
-        // flattening in BTreeMap order reproduces the sequential order exactly.
-        let mut term_documents: Vec<SymbolTermDocument> = snapshot
-            .files
-            .iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(path, artifact)| {
-                artifact
-                    .symbols
-                    .iter()
-                    .map(|symbol| SymbolTermDocument::from_symbol(path, symbol, 0))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
+        /// One symbol awaiting inversion, borrowed from the snapshot. Its path and kind are
+        /// shared by many symbols, so their tokens are computed once (per file, per kind) and
+        /// referenced by index instead of being re-tokenized and stored for every symbol.
+        struct Pending<'a> {
+            symbol: &'a crate::model::Symbol,
+            file: u32,
+        }
+
+        let files: Vec<(&String, &crate::model::FileArtifact)> = snapshot.files.iter().collect();
+        let path_tokens: Vec<BTreeSet<String>> = files
+            .par_iter()
+            .map(|(path, _)| search_tokens(path))
             .collect();
-        // Stable sort, same comparator: ties keep insertion order as before.
-        term_documents
-            .par_sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        let kind_tokens: BTreeMap<&str, BTreeSet<String>> = files
+            .iter()
+            .flat_map(|(_, artifact)| artifact.symbols.iter().map(|symbol| symbol.kind.as_ref()))
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .map(|kind| (kind, search_tokens(kind)))
+            .collect();
+        // Flattened in BTreeMap order, then the same stable sort as before: ties keep insertion
+        // order, so every document lands at the index the previous construction gave it.
+        let mut pending: Vec<Pending<'_>> = files
+            .iter()
+            .enumerate()
+            .flat_map(|(file, (_, artifact))| {
+                artifact.symbols.iter().map(move |symbol| Pending {
+                    symbol,
+                    file: file as u32,
+                })
+            })
+            .collect();
+        pending.par_sort_by(|left, right| {
+            (&left.symbol.name, &left.symbol.id).cmp(&(&right.symbol.name, &right.symbol.id))
+        });
 
         // Invert in document-index order per chunk, then merge chunks in order. Each
         // token's postings therefore stay ascending by document_index, which
         // `is_well_formed` requires and the binary-search readers rely on.
-        let chunks: Vec<BTreeMap<&str, Vec<TermPosting>>> = term_documents
+        let chunks: Vec<BTreeMap<String, Vec<TermPosting>>> = pending
             .par_chunks(POSTING_CHUNK)
             .enumerate()
             .map(|(chunk_index, documents)| {
                 let base = chunk_index * POSTING_CHUNK;
-                let mut chunk_postings: BTreeMap<&str, Vec<TermPosting>> = BTreeMap::new();
+                let mut chunk_postings: BTreeMap<String, Vec<TermPosting>> = BTreeMap::new();
                 for (offset, document) in documents.iter().enumerate() {
+                    let name = search_tokens(&document.symbol.name);
+                    let qualified = search_tokens(&document.symbol.qualified_name);
                     let mut document_tokens = BTreeMap::<&str, u8>::new();
-                    for (terms, field) in [
-                        (&document.name_terms, 1),
-                        (&document.qualified_terms, 2),
-                        (&document.path_terms, 4),
-                        (&document.kind_terms, 8),
+                    for (tokens, field) in [
+                        (&name, 1),
+                        (&qualified, 2),
+                        (&path_tokens[document.file as usize], 4),
+                        (&kind_tokens[document.symbol.kind.as_ref()], 8),
                     ] {
-                        for token in terms.split_whitespace() {
+                        for token in tokens {
                             *document_tokens.entry(token).or_default() |= field;
                         }
                     }
+                    let posting_index = (base + offset) as u32;
                     for (token, fields) in document_tokens {
-                        chunk_postings.entry(token).or_default().push(TermPosting {
-                            document_index: (base + offset) as u32,
+                        let posting = TermPosting {
+                            document_index: posting_index,
                             fields,
-                        });
+                        };
+                        match chunk_postings.get_mut(token) {
+                            Some(postings) => postings.push(posting),
+                            None => {
+                                chunk_postings.insert(token.to_owned(), vec![posting]);
+                            }
+                        }
                     }
                 }
                 chunk_postings
             })
             .collect();
-        let mut postings: BTreeMap<&str, Vec<TermPosting>> = BTreeMap::new();
+        let mut postings: BTreeMap<String, Vec<TermPosting>> = BTreeMap::new();
         for chunk_postings in chunks {
             for (token, entries) in chunk_postings {
-                postings.entry(token).or_default().extend(entries);
+                match postings.get_mut(&token) {
+                    Some(existing) => existing.extend(entries),
+                    None => {
+                        postings.insert(token, entries);
+                    }
+                }
             }
         }
-        let term_tokens: Vec<String> = postings.keys().map(|token| (*token).to_owned()).collect();
-        let term_postings: Vec<Vec<TermPosting>> = postings.into_values().collect();
+        let (term_tokens, term_postings): (Vec<String>, Vec<Vec<TermPosting>>) =
+            postings.into_iter().unzip();
 
         Self {
             format_version: Self::FORMAT_VERSION,
             snapshot_id: snapshot.id.stable_key(),
-            documents: term_documents
+            documents: pending
                 .into_iter()
                 .map(|document| TermDocument {
-                    id: document.id,
-                    name: document.name,
+                    id: document.symbol.id.clone(),
+                    name: document.symbol.name.clone(),
                 })
                 .collect(),
             term_tokens,
@@ -1114,6 +1142,15 @@ impl SearchIndex {
         });
         self
     }
+}
+
+/// The distinct search tokens of `text`. Tokens are lowercase alphanumeric runs, so they never
+/// contain whitespace: joining them with spaces and splitting again (what the stored `*_terms`
+/// fields do) yields exactly this set.
+fn search_tokens(text: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    add_search_tokens(&mut tokens, text);
+    tokens
 }
 
 fn add_search_tokens(tokens: &mut BTreeSet<String>, text: &str) {
