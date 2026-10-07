@@ -501,6 +501,7 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         engine.record_update_error("watch sync", &error.to_string());
                     }
                 }
+                crate::release_memory();
             }
         });
 }

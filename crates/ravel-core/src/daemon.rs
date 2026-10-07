@@ -814,6 +814,7 @@ fn spawn_daemon_watcher(
                 if let Err(error) = result {
                     engine.record_update_error("daemon watch update", &error.to_string());
                 }
+                crate::release_memory();
             }
         });
 }
@@ -886,6 +887,7 @@ fn handle_connection(
         return Ok(false);
     }
     let shutdown = matches!(operation, DaemonOperation::Shutdown);
+    let operation_kind = OperationKind::of(&operation);
     let request_guard = RequestGuard::new(state);
     let response: Result<Value, String> = match operation {
         DaemonOperation::Status => engine.status().map_err(|error| error.to_string()),
@@ -907,9 +909,15 @@ fn handle_connection(
         }
         DaemonOperation::Shutdown => Ok(serde_json::json!({ "shutdown": true })),
     };
+    let published = matches!(operation_kind, OperationKind::Sync);
     match response {
         Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
         Err(error) => write_frame(stream, &WireResponse::Error(error.to_string()))?,
+    }
+    if published {
+        // After the reply is on the wire: a sync's working set is freed by now, and the
+        // collection must not add to the latency the agent sees.
+        crate::release_memory();
     }
     if shutdown {
         state.shutdown.store(true, Ordering::Release);
@@ -917,6 +925,21 @@ fn handle_connection(
         wake_if_drained(state);
     }
     Ok(shutdown)
+}
+
+#[derive(PartialEq, Eq)]
+enum OperationKind {
+    Sync,
+    Other,
+}
+
+impl OperationKind {
+    fn of(operation: &DaemonOperation) -> Self {
+        match operation {
+            DaemonOperation::Sync { .. } => Self::Sync,
+            _ => Self::Other,
+        }
+    }
 }
 
 struct LeaseGuard<'a>(&'a DaemonState);

@@ -28,3 +28,4 @@ tempfile.workspace = true
 
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 mimalloc.workspace = true
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
