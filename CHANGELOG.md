@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-10-07
+
+Less CPU and memory everywhere a workspace has names that many files share, which
+is every real one: `get`, `execute`, `render`, a constructor. Every answer is
+unchanged — a full index writes `.ravel/` byte-identical to 1.15.0's, and every
+query dump, including after a series of structural syncs, matches 1.15.0's. Each
+change's own before/after is in its commit message; the corpus generator and the
+harness are `scripts/gen_corpus.py` and `scripts/perf_bench.py` (wall, CPU and
+peak RSS from each child's `rusage`; medians of 3–5 runs).
+
+**No reindex.** The schema version does not move. Structural overlays store their
+universe delta under a new key, so a binary from either side of this release
+declines the other's overlay chain and republishes a fresh base on its next
+structural sync — once, automatically.
+
+Measured on a 20,040-file / 697,728-edge synthetic monorepo and on 3,591 files of
+real npm sources (effect, rxjs, typeorm, zod), 4 cores, against 1.15.0:
+
+| | 20k synthetic | real npm |
+|---|---|---|
+| `index` wall / CPU | 36.0 s / 101.5 s → 20.4 s / 42.0 s | unchanged within noise |
+| `index` peak RSS | 1,779 MB → 1,468 MB | 588 MB → 497 MB |
+| one-file structural `sync` | 3,894 ms / 1,355 MB → 461 ms / 364 MB | 408 ms / 191 MB → 190 ms / 141 MB |
+| cold `query --reverse` | 155 ms / 228 MB → 116 ms / 192 MB | 51 ms → 21 ms |
+| cold `context` | 238 ms / 299 MB → 195 ms / 251 MB | 60 ms / 84 MB → 46 ms / 71 MB |
+| cold `hubs` | 1,769 ms / 479 MB → 12 ms / 29 MB | 286 ms / 132 MB → 10 ms / 23 MB |
+| cold `search` | 28 ms → 9 ms | 15 ms → 7 ms |
+
+### Changed — indexing
+- **References resolve in O(log n) per lookup instead of O(definers).** Every
+  reference asked "which definitions of this name are in this file?" by filtering
+  the name's workspace-wide list, so a method name declared by thousands of classes
+  made resolution quadratic. The lists were already sorted by path; a binary search
+  returns the same run in the same order. `resolve.symbol_refs` 17,277 ms → 402 ms.
+- **The graph base is sharded straight from the resolved edges.** The intermediate
+  state held a second owned copy of every edge only to reduce it to a digest; that
+  copy set the full-index RSS peak. Peak RSS −15%, graph build + shard 4.0 s → 2.0 s.
+- **The term index is built without per-symbol term strings.** A file's path was
+  re-tokenized for every symbol it declares and four strings per symbol were joined
+  only to be split again. Build 1,116 ms → 722 ms.
+- **zstd contexts are reused per thread**, and compressed buffers trimmed to their
+  length, instead of allocating a fresh context for each of tens of thousands of
+  records. Index CPU −4%; the bytes written are identical.
+
+### Changed — sync
+- **Universe overlays store per-file deltas.** An overlay carried the complete
+  definition list of every name the edited file declares — 78 MB for a one-line
+  edit on the synthetic workspace, written, compacted and re-read by every later
+  sync. It now stores only the edited files' runs: 6.5 KB.
+- **The reverse overlay is computed from the edited files' contributions.** A file
+  is in a key's membership set exactly when its own contribution names the key, so
+  the change is known without decoding sets that, for a common name, span most of
+  the workspace. It is always written as a delta, which applies to the same state.
+
+### Changed — queries
+- **`hubs` looks each hub up by id** instead of materializing metadata for every
+  symbol to annotate at most a thousand entries, and without `--kind` annotates only
+  the entries it returns.
+- **Opening the pack no longer allocates per record.** Every command opens it at
+  least once (`context` four times), and decoding its directory into a map cost 16 ms
+  per open on 38k records; the directory is now indexed in place: 2 ms.
+- **The graph keeps its adjacency flat.** A cold load expanded the archived arrays
+  into one `Vec` per node per table — about two million allocations — before reading
+  a single neighbor.
+
+### Known — present in 1.15.0, unchanged here
+- After a structural sync, `search --kind terms` can return low-score hits a fresh
+  index would not, and `context` can report a `matches_total` one higher. Found while
+  verifying this release; incremental answers match 1.15.0's exactly, so it is not
+  new, and it is not fixed here.
+
 ## [1.15.0] - 2026-08-01
 
 ### Removed — a diagnostic that was wrong more often than right
