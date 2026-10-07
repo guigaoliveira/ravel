@@ -1891,7 +1891,6 @@ impl WorkspaceEngine {
         }
         let overlay_start = std::time::Instant::now();
         let universe_overlay = ResolutionUniverseOverlay::from_artifact_changes(
-            reader.as_ref(),
             changes
                 .iter()
                 .map(|(_, old, new)| (old.as_ref(), new.as_ref())),

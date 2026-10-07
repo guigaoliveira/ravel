@@ -74,6 +74,12 @@ fn delta_component_ceiling(store_root: &Path) -> u64 {
 /// unsupported schema and rebuild -- rather than letting a reader silently return nothing from a
 /// layout it half-understands.
 pub(crate) const SCHEMA_VERSION: u32 = 17;
+/// Universe delta inside a structural overlay pack. Overlays used to store, under `meta/universe`,
+/// every touched name's complete definition list; they now store only the changed files' runs (see
+/// `ResolutionUniverseOverlay`). The new key keeps the two layouts from ever being decoded as each
+/// other: a reader that predates this finds no `meta/universe` in a new overlay and falls back to a
+/// tier that republishes a fresh base, and this reader does the same for an old overlay.
+const UNIVERSE_OVERLAY_KEY: &str = "meta/universe2";
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -1682,9 +1688,7 @@ fn compose_universe_overlay(
     mut older: ResolutionUniverseOverlay,
     newer: ResolutionUniverseOverlay,
 ) -> ResolutionUniverseOverlay {
-    older.files.extend(newer.files);
-    older.symbol_definitions.extend(newer.symbol_definitions);
-    older.module_exports.extend(newer.module_exports);
+    older.compose(newer);
     older
 }
 
@@ -1978,7 +1982,10 @@ fn apply_universe_overlay_to_shard(
             shard.files.remove(path);
         }
     }
-    apply_optional_map_values(&mut shard.symbol_definitions, &overlay.symbol_definitions);
+    crate::resolver::apply_definition_overlay(
+        &mut shard.symbol_definitions,
+        &overlay.symbol_definitions,
+    );
     apply_optional_map_values(&mut shard.module_exports, &overlay.module_exports);
 }
 
@@ -2650,7 +2657,7 @@ impl FileSnapshotStorage {
             let Some(universe) = read_pack_value_from_reader(
                 &mut overlay_reader,
                 &path,
-                "meta/universe",
+                UNIVERSE_OVERLAY_KEY,
                 MAX_DELTA_COMPONENT_BYTES,
             )?
             else {
@@ -2834,7 +2841,7 @@ impl FileSnapshotStorage {
         let universe = read_pack_value_from_reader(
             &mut reader,
             &path,
-            "meta/universe",
+            UNIVERSE_OVERLAY_KEY,
             MAX_DELTA_COMPONENT_BYTES,
         )?
         .ok_or_else(|| StorageError::Invalid {
@@ -2890,7 +2897,7 @@ impl FileSnapshotStorage {
                 })?,
             ),
             (
-                "meta/universe",
+                UNIVERSE_OVERLAY_KEY,
                 bincode::serialize(&records.universe).map_err(|source| StorageError::Bincode {
                     path: path.clone(),
                     source,
@@ -3050,7 +3057,7 @@ impl FileSnapshotStorage {
             universe_bytes.len().to_string()
         });
         writer
-            .add("meta/universe", universe_bytes)
+            .add(UNIVERSE_OVERLAY_KEY, universe_bytes)
             .map_err(|error| StorageError::Invalid {
                 path: path.clone(),
                 message: error.to_string(),
@@ -5988,6 +5995,88 @@ mod tests {
         }
         STRUCTURAL_PUBLISH_FAILPOINT.store(0, Ordering::Relaxed);
         *STRUCTURAL_FAILPOINT_PATH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn an_overlay_in_the_previous_universe_layout_is_declined_not_misread() {
+        // Overlays written before the per-path universe delta stored `meta/universe`. Decoding
+        // those bytes as the new type would misread the lists, so the reader must decline the
+        // chain -- the caller then republishes a fresh base -- instead of answering from it.
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+        let staged = store
+            .stage_structural_pack_base(StructuralPackBase {
+                snapshot_id: base.id.stable_key(),
+                universe: ResolutionUniverse::default(),
+                reverse: ReverseShardSet {
+                    format_version: ReverseShardSet::FORMAT_VERSION,
+                    resolver_fingerprint: String::new(),
+                    shard_bits: 0,
+                    shards: BTreeMap::new(),
+                },
+                graph: IncrementalGraphState::default(),
+            })
+            .unwrap();
+        store.attach_structural_pack_base(staged).unwrap();
+        let mut next = base;
+        next.id.content_state = "revision-1".into();
+        let mut universe = ResolutionUniverseOverlay::default();
+        universe.files.insert("changed.ts".into(), true);
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &next,
+                    &BTreeSet::from(["changed.ts".to_owned()]),
+                    Some((&IncrementalGraphOverlay::default(), &universe, &reverse)),
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(store.open_structural_reader().unwrap().is_some());
+
+        // Rewrite the overlay with its universe record under the previous key.
+        let chain = store
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .structural_packs
+            .unwrap();
+        let overlay_path = dir.path().join(&chain.overlays[0]);
+        let reader = GenerationPackReader::open(&overlay_path).unwrap();
+        let records: Vec<(String, Vec<u8>)> = reader
+            .keys()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|key| {
+                let bytes = reader.read(&key, u64::MAX).unwrap().unwrap();
+                let key = if key == UNIVERSE_OVERLAY_KEY {
+                    "meta/universe".to_owned()
+                } else {
+                    key
+                };
+                (key, bytes)
+            })
+            .collect();
+        drop(reader);
+        let mut writer = StreamingGenerationPackWriter::new(&overlay_path).unwrap();
+        for (key, bytes) in records {
+            writer.add(key, bytes).unwrap();
+        }
+        writer.publish().unwrap();
+        store.clear_manifest_cache();
+
+        assert!(store.open_structural_reader().unwrap().is_none());
     }
 
     #[test]
