@@ -3983,9 +3983,20 @@ impl WorkspaceEngine {
             let graph = self.graph()?;
             analysis::hubs(&graph, top_k)
         };
-        let meta = self.symbol_meta()?;
-        let mut enriched = analysis::enrich_hubs(raw, meta.as_deref(), kind_filter);
-        enriched.truncate(limit.max(1));
+        let limit = limit.max(1);
+        let mut raw = raw;
+        if kind_filter.is_none() {
+            // Without a filter, enrichment neither reorders nor drops entries, so only the ones
+            // returned need annotating.
+            raw.truncate(limit);
+        }
+        // Look each hub up by id instead of materializing metadata for every symbol: the packed
+        // backend resolves an id to the same entry (the widest span among definitions sharing it)
+        // that the materialized dictionary's id map kept.
+        let meta = self.symbol_meta_runtime()?;
+        let mut enriched =
+            analysis::enrich_hubs_with(raw, |id| meta.as_ref()?.get_by_id(id), kind_filter);
+        enriched.truncate(limit);
         Ok(enriched)
     }
 
