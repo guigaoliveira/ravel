@@ -1994,8 +1994,7 @@ impl WorkspaceEngine {
             reverse_updates.insert(path.clone(), contribution);
         }
         let reverse_start = std::time::Instant::now();
-        let mut reverse = reader.reverse_for_updates(&reverse_updates);
-        let reverse_overlay = reverse.replace_files(reverse_updates);
+        let reverse_overlay = reader.reverse_overlay_for_updates(reverse_updates);
         crate::timing::stage("delta.reverse", reverse_start, String::new);
 
         let Some(old_stats) = storage.open_stats()? else {

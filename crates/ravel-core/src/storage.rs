@@ -734,7 +734,6 @@ pub(crate) struct StructuralPackReader {
     universe_format_version: u32,
     resolver_fingerprint: String,
     universe_shard_bits: u8,
-    reverse_format_version: u32,
     reverse_shard_bits: u8,
     graph_format_version: u32,
     graph_file_bits: u8,
@@ -1411,6 +1410,31 @@ impl StructuralPackReader {
         changed_paths: impl IntoIterator<Item = &'a str>,
         changed_symbols: impl IntoIterator<Item = &'a str>,
     ) -> BTreeSet<String> {
+        let changed_paths: Vec<&str> = changed_paths.into_iter().collect();
+        let changed_symbols: Vec<&str> = changed_symbols.into_iter().collect();
+        let id = |key: &str| reverse_shard_id(key, self.reverse_shard_bits);
+        let stems = || {
+            changed_paths
+                .iter()
+                .filter_map(|path| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
+        };
+        // Decode every section shard this needs in parallel up front; the lookups below then hit
+        // the cache. A contract change that touches many exported names otherwise decoded each
+        // shard serially.
+        self.prefetch_reverse_membership_shards(
+            ReverseSection::ModuleImporters,
+            changed_paths.iter().map(|path| id(path)),
+        );
+        self.prefetch_reverse_membership_shards(ReverseSection::BasenameImporters, stems().map(id));
+        for section in [
+            ReverseSection::SymbolDefiners,
+            ReverseSection::SymbolReferrers,
+        ] {
+            self.prefetch_reverse_membership_shards(
+                section,
+                changed_symbols.iter().map(|symbol| id(symbol)),
+            );
+        }
         let mut affected = BTreeSet::new();
         for path in changed_paths {
             affected.insert(path.to_owned());
@@ -1453,86 +1477,34 @@ impl StructuralPackReader {
     /// the `files` records of the updated paths plus the membership sets of every key referenced
     /// by their old/new contributions. Cloning whole shards for a handful of keys dominated
     /// structural sync time and RSS on large workspaces.
-    pub(crate) fn reverse_for_updates(
+    /// The reverse overlay for replacing `updates`, read from the updated files' previous
+    /// contributions only. Membership sections are never decoded: see
+    /// [`ReverseOverlaySet::from_file_updates`] for why they are not needed. Hydrating them cost a
+    /// structural sync most of its time and memory, because the sets for a commonly declared name
+    /// span most of the workspace.
+    pub(crate) fn reverse_overlay_for_updates(
         &self,
-        updates: &BTreeMap<String, Option<FileContribution>>,
-    ) -> ReverseShardSet {
+        updates: BTreeMap<String, Option<FileContribution>>,
+    ) -> ReverseOverlaySet {
         self.prefetch_reverse_files_shards(
             updates
                 .keys()
                 .map(|path| reverse_shard_id(path, self.reverse_shard_bits)),
         );
-        let mut set = ReverseShardSet {
-            format_version: self.reverse_format_version,
-            resolver_fingerprint: self.resolver_fingerprint.clone(),
-            shard_bits: self.reverse_shard_bits,
-            shards: BTreeMap::new(),
-        };
-        // Membership keys touched by removals of old contributions and inserts of new ones.
-        let mut module_keys = BTreeSet::new();
-        let mut basename_keys = BTreeSet::new();
-        let mut definer_keys = BTreeSet::new();
-        let mut referrer_keys = BTreeSet::new();
-        let mut collect_keys = |contribution: &FileContribution| {
-            module_keys.extend(contribution.module_candidates.iter().cloned());
-            basename_keys.extend(contribution.bare_specifiers.iter().cloned());
-            definer_keys.extend(contribution.symbol_definitions.iter().cloned());
-            referrer_keys.extend(contribution.symbol_references.iter().cloned());
-        };
-        for (path, replacement) in updates {
-            let id = reverse_shard_id(path, self.reverse_shard_bits);
-            let files = self.reverse_files_shard(id);
-            if let Some(old) = files.get(path) {
-                collect_keys(old);
-                set.shards
-                    .entry(id)
-                    .or_default()
-                    .files
-                    .insert(path.clone(), old.clone());
-            }
-            if let Some(new) = replacement {
-                collect_keys(new);
-            }
-        }
-        let key_id = |key: &String| reverse_shard_id(key, self.reverse_shard_bits);
-        // Each key class prefetches only its own section — a symbol-heavy delta no longer
-        // decodes module/basename maps it will never read (and vice versa).
-        let classes = [
-            (ReverseSection::ModuleImporters, &module_keys),
-            (ReverseSection::BasenameImporters, &basename_keys),
-            (ReverseSection::SymbolDefiners, &definer_keys),
-            (ReverseSection::SymbolReferrers, &referrer_keys),
-        ];
-        for (section, keys) in &classes {
-            self.prefetch_reverse_membership_shards(*section, keys.iter().map(key_id));
-        }
-        let insert_members = |section: ReverseSection, key: String, set: &mut ReverseShardSet| {
-            let id = key_id(&key);
-            let members = self.reverse_membership_shard(section, id);
-            if let Some(members) = members.get(&key) {
-                let shard = set.shards.entry(id).or_default();
-                let target = match section {
-                    ReverseSection::ModuleImporters => &mut shard.module_importers,
-                    ReverseSection::BasenameImporters => &mut shard.basename_importers,
-                    ReverseSection::SymbolDefiners => &mut shard.symbol_definers,
-                    ReverseSection::SymbolReferrers => &mut shard.symbol_referrers,
-                };
-                target.insert(key, members.clone());
-            }
-        };
-        for key in module_keys {
-            insert_members(ReverseSection::ModuleImporters, key, &mut set);
-        }
-        for key in basename_keys {
-            insert_members(ReverseSection::BasenameImporters, key, &mut set);
-        }
-        for key in definer_keys {
-            insert_members(ReverseSection::SymbolDefiners, key, &mut set);
-        }
-        for key in referrer_keys {
-            insert_members(ReverseSection::SymbolReferrers, key, &mut set);
-        }
-        set
+        let previous: BTreeMap<String, FileContribution> = updates
+            .keys()
+            .filter_map(|path| {
+                let files =
+                    self.reverse_files_shard(reverse_shard_id(path, self.reverse_shard_bits));
+                files.get(path).map(|old| (path.clone(), old.clone()))
+            })
+            .collect();
+        ReverseOverlaySet::from_file_updates(
+            self.resolver_fingerprint.clone(),
+            self.reverse_shard_bits,
+            &previous,
+            updates,
+        )
     }
 
     /// Build a partial [`IncrementalGraphState`] holding only what `replace_owned_files` will
@@ -2612,7 +2584,7 @@ impl FileSnapshotStorage {
         else {
             return Ok(None);
         };
-        let Some((reverse_format_version, reverse_fingerprint, reverse_shard_bits)) =
+        let Some((_reverse_format_version, reverse_fingerprint, reverse_shard_bits)) =
             read_pack_value_from_reader::<(u32, String, u8)>(
                 &mut base_reader,
                 &base,
@@ -2698,7 +2670,6 @@ impl FileSnapshotStorage {
             universe_format_version,
             resolver_fingerprint,
             universe_shard_bits,
-            reverse_format_version,
             reverse_shard_bits,
             graph_format_version,
             graph_file_bits,
