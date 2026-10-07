@@ -1243,7 +1243,9 @@ pub fn resolve_subset_with_structural_data(
 
 pub fn resolver_fingerprint(config: &ResolverConfig) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ravel-resolver-v2\0");
+    // v3: a file's contribution also records each segment of a member reference, so an index
+    // built before that must take the rebuild tier once rather than trust its referrer sets.
+    hasher.update(b"ravel-resolver-v3\0");
     if let Ok(bytes) = bincode::serialize(config) {
         hasher.update(&bytes);
     }

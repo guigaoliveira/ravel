@@ -1406,25 +1406,29 @@ impl StructuralPackReader {
         }
     }
 
+    /// Files to re-resolve after `changed_paths` changed their public contract and
+    /// `changed_symbols` changed meaning. Each changed path carries whether all of its importers
+    /// are affected or only those `keep_importer` accepts (the ones binding a changed name).
     pub(crate) fn affected_files<'a>(
         &self,
-        changed_paths: impl IntoIterator<Item = &'a str>,
+        changed_paths: impl IntoIterator<Item = (&'a str, bool)>,
         changed_symbols: impl IntoIterator<Item = &'a str>,
+        mut keep_importer: impl FnMut(&str) -> bool,
     ) -> BTreeSet<String> {
-        let changed_paths: Vec<&str> = changed_paths.into_iter().collect();
+        let changed_paths: Vec<(&str, bool)> = changed_paths.into_iter().collect();
         let changed_symbols: Vec<&str> = changed_symbols.into_iter().collect();
         let id = |key: &str| reverse_shard_id(key, self.reverse_shard_bits);
         let stems = || {
             changed_paths
                 .iter()
-                .filter_map(|path| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
+                .filter_map(|(path, _)| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
         };
         // Decode every section shard this needs in parallel up front; the lookups below then hit
         // the cache. A contract change that touches many exported names otherwise decoded each
         // shard serially.
         self.prefetch_reverse_membership_shards(
             ReverseSection::ModuleImporters,
-            changed_paths.iter().map(|path| id(path)),
+            changed_paths.iter().map(|(path, _)| id(path)),
         );
         self.prefetch_reverse_membership_shards(ReverseSection::BasenameImporters, stems().map(id));
         for section in [
@@ -1437,14 +1441,15 @@ impl StructuralPackReader {
             );
         }
         let mut affected = BTreeSet::new();
-        for path in changed_paths {
+        for (path, all_importers) in changed_paths {
             affected.insert(path.to_owned());
+            let mut keep = |importer: &String| all_importers || keep_importer(importer);
             let importers = self.reverse_membership_shard(
                 ReverseSection::ModuleImporters,
                 reverse_shard_id(path, self.reverse_shard_bits),
             );
             if let Some(importers) = importers.get(path) {
-                affected.extend(importers.iter().cloned());
+                affected.extend(importers.iter().filter(|p| keep(p)).cloned());
             }
             if let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
                 let importers = self.reverse_membership_shard(
@@ -1452,7 +1457,7 @@ impl StructuralPackReader {
                     reverse_shard_id(stem, self.reverse_shard_bits),
                 );
                 if let Some(importers) = importers.get(stem) {
-                    affected.extend(importers.iter().cloned());
+                    affected.extend(importers.iter().filter(|p| keep(p)).cloned());
                 }
             }
         }

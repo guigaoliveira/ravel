@@ -804,6 +804,131 @@ fn public_resolution_contract_changed(
     }
 }
 
+/// What changed in a file's public contract, for deciding which importers to re-resolve.
+struct ContractChange {
+    /// Exported names whose declaration or export binding differs between the two versions.
+    names: BTreeSet<String>,
+    /// Every name visible through the file may resolve differently: the file appeared or
+    /// disappeared, or a star re-export changed.
+    all: bool,
+}
+
+/// An importer's resolution depends on the file through its bindings: a named import or
+/// re-export depends on that one name, a namespace import on every name. Nothing else about
+/// the file reaches the importer, so when only some names changed, an importer that binds
+/// none of them resolves exactly as before. (`resolve_exported_symbol` looks up one name at a
+/// time; the module edge itself depends only on the file's existence.)
+fn changed_export_names(
+    old: Option<&crate::model::FileArtifact>,
+    new: Option<&crate::model::FileArtifact>,
+) -> ContractChange {
+    fn symbol_keys(artifact: &crate::model::FileArtifact) -> BTreeMap<String, String> {
+        artifact
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.exported)
+            .map(|symbol| {
+                (
+                    format!(
+                        "{}\0{}\0{}\0{}",
+                        symbol.id, symbol.name, symbol.qualified_name, symbol.kind
+                    ),
+                    symbol.name.clone(),
+                )
+            })
+            .collect()
+    }
+    fn export_keys(
+        artifact: &crate::model::FileArtifact,
+    ) -> BTreeMap<String, (String, String, bool)> {
+        artifact
+            .exports
+            .iter()
+            .flat_map(|export| {
+                export.bindings.iter().map(move |binding| {
+                    (
+                        format!(
+                            "{:?}\0{}\0{}\0{:?}\0{}",
+                            export.specifier,
+                            binding.local,
+                            binding.exported,
+                            binding.kind,
+                            binding.type_only
+                        ),
+                        (
+                            binding.local.clone(),
+                            binding.exported.clone(),
+                            binding.kind == crate::model::ExportBindingKind::Star,
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+    let (Some(old), Some(new)) = (old, new) else {
+        let names = old
+            .into_iter()
+            .chain(new)
+            .flat_map(|artifact| {
+                symbol_keys(artifact).into_values().chain(
+                    export_keys(artifact)
+                        .into_values()
+                        .flat_map(|(local, exported, _)| [local, exported]),
+                )
+            })
+            .collect();
+        return ContractChange { names, all: true };
+    };
+    let mut change = ContractChange {
+        names: BTreeSet::new(),
+        all: false,
+    };
+    let (old_symbols, new_symbols) = (symbol_keys(old), symbol_keys(new));
+    for (key, name) in old_symbols.iter().chain(&new_symbols) {
+        if old_symbols.get(key) != new_symbols.get(key) {
+            change.names.insert(name.clone());
+        }
+    }
+    let (old_exports, new_exports) = (export_keys(old), export_keys(new));
+    for (key, (local, exported, star)) in old_exports.iter().chain(&new_exports) {
+        if old_exports.get(key) != new_exports.get(key) {
+            change.all |= *star;
+            change.names.insert(local.clone());
+            change.names.insert(exported.clone());
+        }
+    }
+    change
+}
+
+/// Whether `artifact` binds any of `names` from some module, or binds a whole namespace. A
+/// file that does neither cannot resolve differently after those names changed in a file it
+/// imports; see [`changed_export_names`].
+fn imports_depend_on_names(
+    artifact: &crate::model::FileArtifact,
+    names: &BTreeSet<String>,
+) -> bool {
+    use crate::model::{ExportBindingKind, ImportBindingKind};
+    let imports = artifact.imports.iter().flat_map(|import| &import.bindings);
+    if imports.clone().any(|binding| match binding.kind {
+        ImportBindingKind::Namespace | ImportBindingKind::ImportEquals => true,
+        ImportBindingKind::Default => names.contains("default"),
+        ImportBindingKind::Named => names.contains(&binding.imported),
+    }) {
+        return true;
+    }
+    artifact
+        .exports
+        .iter()
+        .filter(|export| export.specifier.is_some())
+        .flat_map(|export| &export.bindings)
+        .any(|binding| {
+            !matches!(
+                binding.kind,
+                ExportBindingKind::Star | ExportBindingKind::Namespace
+            ) && names.contains(&binding.local)
+        })
+}
+
 /// Shared, cloneable workspace engine with in-memory snapshot and graph caching.
 /// All query methods use `&self` (interior mutability via Mutex).
 /// Cloning is cheap (`Arc` bump) and shares the same cache.
@@ -1876,17 +2001,13 @@ impl WorkspaceEngine {
 
         let changed_paths: BTreeSet<_> = changes.iter().map(|(path, ..)| path.clone()).collect();
         let mut changed_symbols = BTreeSet::new();
-        let mut contract_changed_paths = BTreeSet::new();
+        // Path -> whether every importer must be re-resolved, or only those binding a changed name.
+        let mut contract_changed_paths: BTreeMap<String, bool> = BTreeMap::new();
         for (path, old, new) in &changes {
             if public_resolution_contract_changed(old.as_ref(), new.as_ref()) {
-                contract_changed_paths.insert(path.clone());
-                changed_symbols.extend(
-                    old.iter()
-                        .flat_map(|artifact| artifact.symbols.iter())
-                        .chain(new.iter().flat_map(|artifact| artifact.symbols.iter()))
-                        .filter(|symbol| symbol.exported)
-                        .map(|symbol| symbol.name.clone()),
-                );
+                let change = changed_export_names(old.as_ref(), new.as_ref());
+                contract_changed_paths.insert(path.clone(), change.all);
+                changed_symbols.extend(change.names);
             }
         }
         let overlay_start = std::time::Instant::now();
@@ -1898,19 +2019,55 @@ impl WorkspaceEngine {
         crate::timing::stage("delta.universe_overlay", overlay_start, String::new);
         let universe = OverlayResolutionLookup::new(reader.as_ref(), &universe_overlay);
         let affected_start = std::time::Instant::now();
+        // Importers consulted here are opened once and reused for the subset below.
+        let opened_artifacts: std::cell::RefCell<
+            BTreeMap<String, Option<crate::model::FileArtifact>>,
+        > = std::cell::RefCell::new(BTreeMap::new());
+        let mut open_failed = false;
+        let mut skipped_importers = 0usize;
         let mut affected = reader.affected_files(
-            contract_changed_paths.iter().map(String::as_str),
+            contract_changed_paths
+                .iter()
+                .map(|(path, all)| (path.as_str(), *all)),
             changed_symbols.iter().map(String::as_str),
+            |importer| {
+                if changed_paths.contains(importer) {
+                    return true;
+                }
+                let mut opened = opened_artifacts.borrow_mut();
+                let artifact = match opened.entry(importer.to_owned()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        match storage.open_artifact(importer) {
+                            Ok(artifact) => entry.insert(artifact),
+                            Err(_) => {
+                                open_failed = true;
+                                return true;
+                            }
+                        }
+                    }
+                };
+                let depends = artifact
+                    .as_ref()
+                    .is_none_or(|artifact| imports_depend_on_names(artifact, &changed_symbols));
+                skipped_importers += usize::from(!depends);
+                depends
+            },
         );
         affected.extend(changed_paths.iter().cloned());
         crate::timing::stage("delta.affected_files", affected_start, || {
             format!(
-                "affected={} changed_symbols={} contract_changed={}",
+                "affected={} importers_skipped={} changed_symbols={} contract_changed={}",
                 affected.len(),
+                skipped_importers,
                 changed_symbols.len(),
                 contract_changed_paths.len()
             )
         });
+        if open_failed {
+            return Ok(None);
+        }
+        let mut opened_artifacts = opened_artifacts.into_inner();
 
         let changed_artifacts: BTreeMap<_, _> = changes
             .iter()
@@ -1924,7 +2081,10 @@ impl WorkspaceEngine {
                     continue;
                 };
                 (*new).clone()
-            } else if let Some(artifact) = storage.open_artifact(path)? {
+            } else if let Some(artifact) = match opened_artifacts.remove(path) {
+                Some(opened) => opened,
+                None => storage.open_artifact(path)?,
+            } {
                 artifact
             } else {
                 return Ok(None);
