@@ -347,7 +347,7 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false
+include_untracked = true
 discovery_cache_ms = 50
 skip_sibling_emit = true
 "#,
