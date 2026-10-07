@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-07
+
 This release is about the two harnesses most MCP sessions run in — Claude Code and
 Codex — and the places where the wiring, not the graph, decided whether an agent
 used Ravel.
