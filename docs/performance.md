@@ -41,7 +41,8 @@ done
 
 Record results under `reports/perf-*.md` when changing performance-sensitive
 code. Treat timings as machine- and project-dependent rather than universal
-guarantees.
+guarantees. `scripts/gen_corpus.py` builds a reproducible synthetic monorepo and
+`scripts/perf_bench.py` measures wall time, CPU and peak RSS per command.
 
 ## Config knobs that affect latency
 
