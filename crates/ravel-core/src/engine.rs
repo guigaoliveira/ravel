@@ -2353,8 +2353,23 @@ impl WorkspaceEngine {
             });
         }
         crate::timing::stage("delta.advance_reader", advance_start, String::new);
+        // Advance the resident query graph the same way, by applying the overlay just published
+        // -- exactly what `open_graph` does with the chain on disk, one step later. Dropping it
+        // made the first query after every sync rebuild the whole graph from the archive, and
+        // held old and new graph in memory while it did. If a query still holds the Arc, it is
+        // dropped and the next query reopens it.
+        let graph_start = std::time::Instant::now();
+        {
+            let mut cache_slot = self.inner.graph_cache.lock().unwrap();
+            *cache_slot = cache_slot.take().and_then(|cached| {
+                let mut graph = Arc::try_unwrap(cached).ok()?;
+                graph.apply_incremental_overlay(&graph_overlay, &generation, stats.edges);
+                graph.finish_incremental_overlays();
+                Some(Arc::new(graph))
+            });
+        }
+        crate::timing::stage("delta.advance_graph", graph_start, String::new);
         *self.inner.snapshot_cache.lock().unwrap() = None;
-        *self.inner.graph_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
         *self.inner.file_hashes_cache.lock().unwrap() = None;
         if search_overlay.is_some() {
@@ -4567,6 +4582,49 @@ mod resident_sync_tests {
                 .any(|relation| relation["kind"] == "Calls")
         );
         assert_eq!(engine.stats().unwrap().edges, 3);
+    }
+
+    #[test]
+    fn the_resident_graph_advanced_in_place_answers_like_a_cold_open() {
+        let (root, engine, service) = fixture();
+        // Warm the graph before the edit so the sync has a resident graph to advance.
+        let before = engine.context("answer", 10).unwrap();
+        assert!(
+            before["relations"]["incoming"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty())
+        );
+        std::fs::write(
+            root.path().join("other.ts"),
+            "import { answer } from './service';\nexport const twice = () => answer() * 2;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const extra = 1;\n",
+        )
+        .unwrap();
+        engine
+            .sync_resident(Some(&[service.clone(), root.path().join("other.ts")]))
+            .unwrap();
+        let warm = engine.context("answer", 10).unwrap();
+        let cold = WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .context("answer", 10)
+            .unwrap();
+        assert_eq!(warm, cold);
+        // Both callers, including the one added by the sync, are visible through the resident graph.
+        assert_eq!(warm["n_callers"], 2, "{warm}");
+        assert_eq!(warm["relations"]["incoming_by_kind"]["Calls"], 2, "{warm}");
+        for node in ["twice", "value"] {
+            assert_eq!(
+                engine.reference_sites(node, false, 50, 0).unwrap(),
+                WorkspaceEngine::load(root.path(), &Flags::default())
+                    .unwrap()
+                    .reference_sites(node, false, 50, 0)
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
