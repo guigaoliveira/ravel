@@ -96,8 +96,10 @@ pub struct SyncConfig {
     pub mode: String,
     /// Auto re-sync dirty sources on query/search/context.
     pub auto: bool,
-    /// Include **untracked** files in dirty discovery. Default **false** (perf).
-    /// Enable when you create brand-new files and want auto-sync without `watch`.
+    /// Include **untracked** files in dirty discovery, so a file created since the last commit
+    /// reaches auto-sync and `ravel sync` like an edited one. Default **true**: listing them costs
+    /// `git status` about 20 ms more on a 20k-file tree. Set false on a tree with thousands of
+    /// untracked build outputs that are not gitignored.
     pub include_untracked: bool,
     /// When untracked is on: skip emit next to a source sibling (`sibling_emit` rules).
     pub skip_sibling_emit: bool,
@@ -417,7 +419,7 @@ impl Default for SyncConfig {
         Self {
             mode: "auto".into(),
             auto: true,
-            include_untracked: false, // tracked-only dirty = sub-200ms auto-sync path
+            include_untracked: true,
             skip_sibling_emit: true,
             discovery_cache_ms: 50,
             queue_max_ticket_bytes: 1024 * 1024,

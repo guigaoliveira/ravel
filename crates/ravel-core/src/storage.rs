@@ -4,7 +4,7 @@ use crate::{
     generation_pack::{GenerationPackReader, StreamingGenerationPackWriter},
     graph::{CompactGraph, FlatCompactGraph, GraphIndex},
     incremental_graph::{
-        GraphAdjShard, GraphEdgeShard, GraphFileShard, IncrementalGraphOverlay,
+        GraphAdjShard, GraphEdgeShard, GraphFileShard, GraphSectionShards, IncrementalGraphOverlay,
         IncrementalGraphState, OwnedEdge, digest_shard_id, graph_shard_id, owned_edge_digest,
     },
     model::{
@@ -74,6 +74,12 @@ fn delta_component_ceiling(store_root: &Path) -> u64 {
 /// unsupported schema and rebuild -- rather than letting a reader silently return nothing from a
 /// layout it half-understands.
 pub(crate) const SCHEMA_VERSION: u32 = 17;
+/// Universe delta inside a structural overlay pack. Overlays used to store, under `meta/universe`,
+/// every touched name's complete definition list; they now store only the changed files' runs (see
+/// `ResolutionUniverseOverlay`). The new key keeps the two layouts from ever being decoded as each
+/// other: a reader that predates this finds no `meta/universe` in a new overlay and falls back to a
+/// tier that republishes a fresh base, and this reader does the same for an old overlay.
+const UNIVERSE_OVERLAY_KEY: &str = "meta/universe2";
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -525,7 +531,7 @@ impl StructuralPackStager {
         let graph = GraphIndex::from_snapshot(snapshot);
         crate::timing::stage("stage_snapshot.graph_from_snapshot", mark, String::new);
         mark = std::time::Instant::now();
-        let flat_graph = FlatCompactGraph::from_compact(graph.to_compact());
+        let flat_graph = FlatCompactGraph::from_index(&graph);
         let graph_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat_graph).map_err(|error| {
             StorageError::Invalid {
                 path: self.path.clone(),
@@ -561,6 +567,7 @@ impl StructuralPackStager {
         crate::timing::stage("stage_snapshot.symbol_dict", mark, String::new);
         mark = std::time::Instant::now();
         let term_index = TermIndex::from_snapshot(snapshot);
+        crate::timing::stage("stage_snapshot.term_index.build", mark, String::new);
         let term_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).map_err(|error| {
             StorageError::Invalid {
                 path: self.path.clone(),
@@ -617,7 +624,20 @@ impl StructuralPackStager {
                 universe.shard_bits,
             ),
         )?;
-        add_shards_parallel(&mut self.writer, &self.path, "universe/", universe.shards)
+        // The resolver probes a dozen candidate paths per import (`x.ts`, `x.tsx`, `x/index.ts`,
+        // ...), and each probe decoded the whole universe shard its path hashes to -- symbol
+        // definitions and module exports included -- to check one set. A one-file sync on a
+        // 20k-file workspace read 130 of 256 shards that way. The file sets get a record of
+        // their own; `meta/universe-files` tells a reader they are complete for this pack.
+        let files: BTreeMap<u16, BTreeSet<String>> = universe
+            .shards
+            .iter()
+            .filter(|(_, shard)| !shard.files.is_empty())
+            .map(|(id, shard)| (*id, shard.files.clone()))
+            .collect();
+        add_shards_parallel(&mut self.writer, &self.path, "universe/", universe.shards)?;
+        self.add_meta("meta/universe-files", &universe.shard_bits)?;
+        add_shards_parallel(&mut self.writer, &self.path, "universe-files/", files)
     }
 
     pub(crate) fn stage_reverse(&mut self, reverse: ReverseShardSet) -> Result<(), StorageError> {
@@ -659,6 +679,7 @@ impl StructuralPackStager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn stage_graph(&mut self, graph: IncrementalGraphState) -> Result<(), StorageError> {
         let mark = std::time::Instant::now();
         let graph = graph
@@ -668,6 +689,27 @@ impl StructuralPackStager {
                 message: "invalid graph shard layout".into(),
             })?;
         crate::timing::stage("stage_graph.section_shards", mark, String::new);
+        self.stage_graph_sections(graph)
+    }
+
+    /// Stage the graph base for a full index directly from the resolved edges; see
+    /// [`GraphSectionShards::from_edges`] for why no `IncrementalGraphState` is built.
+    pub(crate) fn stage_graph_edges(
+        &mut self,
+        edges: &[crate::model::Edge],
+    ) -> Result<(), StorageError> {
+        let mark = std::time::Instant::now();
+        let graph =
+            GraphSectionShards::from_edges(edges, GRAPH_FILE_BITS, GRAPH_EDGE_BITS, GRAPH_ADJ_BITS)
+                .ok_or_else(|| StorageError::Invalid {
+                    path: self.path.clone(),
+                    message: "invalid graph shard layout".into(),
+                })?;
+        crate::timing::stage("stage_graph.section_shards", mark, String::new);
+        self.stage_graph_sections(graph)
+    }
+
+    fn stage_graph_sections(&mut self, graph: GraphSectionShards) -> Result<(), StorageError> {
         self.add_meta(
             "meta/graph2",
             &(
@@ -706,7 +748,6 @@ pub(crate) struct StructuralPackReader {
     universe_format_version: u32,
     resolver_fingerprint: String,
     universe_shard_bits: u8,
-    reverse_format_version: u32,
     reverse_shard_bits: u8,
     graph_format_version: u32,
     graph_file_bits: u8,
@@ -719,6 +760,10 @@ pub(crate) struct StructuralPackReader {
     /// for each import lookup, and warm syncs are all hits — shared read locks keep the hot
     /// path concurrent while the rare miss takes the write lock to insert.
     universe_cache: RwLock<BTreeMap<u16, Arc<ResolutionUniverseShard>>>,
+    /// Whether the base pack carries `universe-files/` records (see `stage_universe`). Without
+    /// them a file probe decodes the full shard, as before.
+    universe_files_recorded: bool,
+    universe_files_cache: Mutex<BTreeMap<u16, Arc<BTreeSet<String>>>>,
     reverse_files_cache: Mutex<BTreeMap<u16, Arc<BTreeMap<String, FileContribution>>>>,
     /// One cache per membership section, indexed by [`ReverseSection`].
     reverse_membership_caches: [ReverseMembershipCache; 4],
@@ -816,11 +861,11 @@ pub(crate) struct StagedStructuralPack {
     name: String,
 }
 
-struct StructuralOverlayRecords {
-    weight: u64,
-    graph: IncrementalGraphOverlay,
-    universe: ResolutionUniverseOverlay,
-    reverse: ReverseOverlaySet,
+pub(crate) struct StructuralOverlayRecords {
+    pub(crate) weight: u64,
+    pub(crate) graph: IncrementalGraphOverlay,
+    pub(crate) universe: ResolutionUniverseOverlay,
+    pub(crate) reverse: ReverseOverlaySet,
 }
 
 pub(crate) struct ResidentStructuralDelta<'a> {
@@ -868,7 +913,7 @@ impl StructuralPackReader {
         }
     }
 
-    fn universe_shard(&self, key: &str) -> Arc<ResolutionUniverseShard> {
+    pub(crate) fn universe_shard(&self, key: &str) -> Arc<ResolutionUniverseShard> {
         let id = resolution_shard_id(key, self.universe_shard_bits);
         if let Some(shard) = self.universe_cache.read().unwrap().get(&id).cloned() {
             return shard;
@@ -887,6 +932,33 @@ impl StructuralPackReader {
             .unwrap()
             .insert(id, Arc::clone(&shard));
         shard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn records_universe_files(&self) -> bool {
+        self.universe_files_recorded
+    }
+
+    /// The file set of universe shard `id`, from its own record with the overlays' file deltas
+    /// applied. Only called when the pack records file sets.
+    fn universe_files_shard(&self, id: u16) -> Arc<BTreeSet<String>> {
+        if let Some(files) = self.universe_files_cache.lock().unwrap().get(&id).cloned() {
+            return files;
+        }
+        let mut files: BTreeSet<String> = self
+            .read_base(&format!("universe-files/{id:04x}"))
+            .unwrap_or_default();
+        for overlays in &self.universe_overlays {
+            if let Some(overlay) = overlays.get(&id) {
+                apply_universe_file_overlay(&mut files, overlay);
+            }
+        }
+        let files = Arc::new(files);
+        self.universe_files_cache
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&files));
+        files
     }
 
     fn reverse_files_shard(&self, id: u16) -> Arc<BTreeMap<String, FileContribution>> {
@@ -1010,6 +1082,14 @@ impl StructuralPackReader {
             for (id, shard) in cache.iter_mut() {
                 if let Some(overlay) = universe_split.get(id) {
                     apply_universe_overlay_to_shard(Arc::make_mut(shard), overlay);
+                }
+            }
+        }
+        {
+            let mut cache = self.universe_files_cache.lock().unwrap();
+            for (id, files) in cache.iter_mut() {
+                if let Some(overlay) = universe_split.get(id) {
+                    apply_universe_file_overlay(Arc::make_mut(files), overlay);
                 }
             }
         }
@@ -1378,20 +1458,50 @@ impl StructuralPackReader {
         }
     }
 
+    /// Files to re-resolve after `changed_paths` changed their public contract and
+    /// `changed_symbols` changed meaning. Each changed path carries whether all of its importers
+    /// are affected or only those `keep_importer` accepts (the ones binding a changed name).
     pub(crate) fn affected_files<'a>(
         &self,
-        changed_paths: impl IntoIterator<Item = &'a str>,
+        changed_paths: impl IntoIterator<Item = (&'a str, bool)>,
         changed_symbols: impl IntoIterator<Item = &'a str>,
+        mut keep_importer: impl FnMut(&str) -> bool,
     ) -> BTreeSet<String> {
+        let changed_paths: Vec<(&str, bool)> = changed_paths.into_iter().collect();
+        let changed_symbols: Vec<&str> = changed_symbols.into_iter().collect();
+        let id = |key: &str| reverse_shard_id(key, self.reverse_shard_bits);
+        let stems = || {
+            changed_paths
+                .iter()
+                .filter_map(|(path, _)| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
+        };
+        // Decode every section shard this needs in parallel up front; the lookups below then hit
+        // the cache. A contract change that touches many exported names otherwise decoded each
+        // shard serially.
+        self.prefetch_reverse_membership_shards(
+            ReverseSection::ModuleImporters,
+            changed_paths.iter().map(|(path, _)| id(path)),
+        );
+        self.prefetch_reverse_membership_shards(ReverseSection::BasenameImporters, stems().map(id));
+        for section in [
+            ReverseSection::SymbolDefiners,
+            ReverseSection::SymbolReferrers,
+        ] {
+            self.prefetch_reverse_membership_shards(
+                section,
+                changed_symbols.iter().map(|symbol| id(symbol)),
+            );
+        }
         let mut affected = BTreeSet::new();
-        for path in changed_paths {
+        for (path, all_importers) in changed_paths {
             affected.insert(path.to_owned());
+            let mut keep = |importer: &String| all_importers || keep_importer(importer);
             let importers = self.reverse_membership_shard(
                 ReverseSection::ModuleImporters,
                 reverse_shard_id(path, self.reverse_shard_bits),
             );
             if let Some(importers) = importers.get(path) {
-                affected.extend(importers.iter().cloned());
+                affected.extend(importers.iter().filter(|p| keep(p)).cloned());
             }
             if let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
                 let importers = self.reverse_membership_shard(
@@ -1399,7 +1509,7 @@ impl StructuralPackReader {
                     reverse_shard_id(stem, self.reverse_shard_bits),
                 );
                 if let Some(importers) = importers.get(stem) {
-                    affected.extend(importers.iter().cloned());
+                    affected.extend(importers.iter().filter(|p| keep(p)).cloned());
                 }
             }
         }
@@ -1425,86 +1535,101 @@ impl StructuralPackReader {
     /// the `files` records of the updated paths plus the membership sets of every key referenced
     /// by their old/new contributions. Cloning whole shards for a handful of keys dominated
     /// structural sync time and RSS on large workspaces.
-    pub(crate) fn reverse_for_updates(
+    /// The reverse overlay for replacing `updates`, read from the updated files' previous
+    /// contributions only. Membership sections are never decoded: see
+    /// [`ReverseOverlaySet::from_file_updates`] for why they are not needed. Hydrating them cost a
+    /// structural sync most of its time and memory, because the sets for a commonly declared name
+    /// span most of the workspace.
+    pub(crate) fn reverse_overlay_for_updates(
         &self,
-        updates: &BTreeMap<String, Option<FileContribution>>,
-    ) -> ReverseShardSet {
+        updates: BTreeMap<String, Option<FileContribution>>,
+    ) -> ReverseOverlaySet {
         self.prefetch_reverse_files_shards(
             updates
                 .keys()
                 .map(|path| reverse_shard_id(path, self.reverse_shard_bits)),
         );
-        let mut set = ReverseShardSet {
-            format_version: self.reverse_format_version,
-            resolver_fingerprint: self.resolver_fingerprint.clone(),
-            shard_bits: self.reverse_shard_bits,
-            shards: BTreeMap::new(),
-        };
-        // Membership keys touched by removals of old contributions and inserts of new ones.
-        let mut module_keys = BTreeSet::new();
-        let mut basename_keys = BTreeSet::new();
-        let mut definer_keys = BTreeSet::new();
-        let mut referrer_keys = BTreeSet::new();
-        let mut collect_keys = |contribution: &FileContribution| {
-            module_keys.extend(contribution.module_candidates.iter().cloned());
-            basename_keys.extend(contribution.bare_specifiers.iter().cloned());
-            definer_keys.extend(contribution.symbol_definitions.iter().cloned());
-            referrer_keys.extend(contribution.symbol_references.iter().cloned());
-        };
-        for (path, replacement) in updates {
-            let id = reverse_shard_id(path, self.reverse_shard_bits);
-            let files = self.reverse_files_shard(id);
-            if let Some(old) = files.get(path) {
-                collect_keys(old);
-                set.shards
-                    .entry(id)
-                    .or_default()
-                    .files
-                    .insert(path.clone(), old.clone());
-            }
-            if let Some(new) = replacement {
-                collect_keys(new);
+        let previous: BTreeMap<String, FileContribution> = updates
+            .keys()
+            .filter_map(|path| {
+                let files =
+                    self.reverse_files_shard(reverse_shard_id(path, self.reverse_shard_bits));
+                files.get(path).map(|old| (path.clone(), old.clone()))
+            })
+            .collect();
+        ReverseOverlaySet::from_file_updates(
+            self.resolver_fingerprint.clone(),
+            self.reverse_shard_bits,
+            &previous,
+            updates,
+        )
+    }
+
+    /// Drop any decoded-shard cache that outgrew its budget. The caches are a sync's working
+    /// set: the universe, reverse and graph shards its lookups touched, kept so the lookups that
+    /// follow in the same sync hit. Kept across syncs they grew with every file a session edited
+    /// (a hub's membership sets alone run to megabytes), while the hot few shards a session keeps
+    /// touching are worth their re-decode. The file sets are small and stay.
+    pub(crate) fn trim_decoded_caches(&self) {
+        const MAX_RESIDENT_SHARDS: usize = 16;
+        fn trim<K, V>(cache: &mut BTreeMap<K, V>) {
+            if cache.len() > MAX_RESIDENT_SHARDS {
+                cache.clear();
             }
         }
-        let key_id = |key: &String| reverse_shard_id(key, self.reverse_shard_bits);
-        // Each key class prefetches only its own section — a symbol-heavy delta no longer
-        // decodes module/basename maps it will never read (and vice versa).
-        let classes = [
-            (ReverseSection::ModuleImporters, &module_keys),
-            (ReverseSection::BasenameImporters, &basename_keys),
-            (ReverseSection::SymbolDefiners, &definer_keys),
-            (ReverseSection::SymbolReferrers, &referrer_keys),
-        ];
-        for (section, keys) in &classes {
-            self.prefetch_reverse_membership_shards(*section, keys.iter().map(key_id));
+        trim(&mut self.universe_cache.write().unwrap());
+        trim(&mut self.reverse_files_cache.lock().unwrap());
+        for cache in &self.reverse_membership_caches {
+            trim(&mut cache.lock().unwrap());
         }
-        let insert_members = |section: ReverseSection, key: String, set: &mut ReverseShardSet| {
-            let id = key_id(&key);
-            let members = self.reverse_membership_shard(section, id);
-            if let Some(members) = members.get(&key) {
-                let shard = set.shards.entry(id).or_default();
-                let target = match section {
-                    ReverseSection::ModuleImporters => &mut shard.module_importers,
-                    ReverseSection::BasenameImporters => &mut shard.basename_importers,
-                    ReverseSection::SymbolDefiners => &mut shard.symbol_definers,
-                    ReverseSection::SymbolReferrers => &mut shard.symbol_referrers,
+        trim(&mut self.graph_file_cache.lock().unwrap());
+        trim(&mut self.graph_edge_cache.lock().unwrap());
+        trim(&mut self.graph_adj_cache.lock().unwrap());
+    }
+
+    /// The paths in `graph_updates` whose new edge set and reverse contribution equal what the
+    /// current generation already records for them, so applying their update would change
+    /// nothing. The edited files themselves (`always_keep`) are never reported: their artifact
+    /// changed even when their edges did not.
+    pub(crate) fn unchanged_file_updates(
+        &self,
+        graph_updates: &BTreeMap<String, Option<BTreeSet<OwnedEdge>>>,
+        reverse_updates: &BTreeMap<String, Option<FileContribution>>,
+        always_keep: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        if self.graph_format_version != IncrementalGraphState::FORMAT_VERSION {
+            return BTreeSet::new();
+        }
+        let candidates: Vec<&String> = graph_updates
+            .keys()
+            .filter(|path| !always_keep.contains(*path))
+            .collect();
+        self.prefetch_graph_file_shards(
+            candidates
+                .iter()
+                .map(|path| graph_shard_id(path, self.graph_file_bits)),
+        );
+        self.prefetch_reverse_files_shards(
+            candidates
+                .iter()
+                .map(|path| reverse_shard_id(path, self.reverse_shard_bits)),
+        );
+        candidates
+            .into_iter()
+            .filter(|path| {
+                let (Some(Some(new_edges)), Some(Some(new_contribution))) =
+                    (graph_updates.get(*path), reverse_updates.get(*path))
+                else {
+                    return false;
                 };
-                target.insert(key, members.clone());
-            }
-        };
-        for key in module_keys {
-            insert_members(ReverseSection::ModuleImporters, key, &mut set);
-        }
-        for key in basename_keys {
-            insert_members(ReverseSection::BasenameImporters, key, &mut set);
-        }
-        for key in definer_keys {
-            insert_members(ReverseSection::SymbolDefiners, key, &mut set);
-        }
-        for key in referrer_keys {
-            insert_members(ReverseSection::SymbolReferrers, key, &mut set);
-        }
-        set
+                let files = self.graph_file_shard(graph_shard_id(path, self.graph_file_bits));
+                let contributions =
+                    self.reverse_files_shard(reverse_shard_id(path, self.reverse_shard_bits));
+                files.by_file.get(path.as_str()) == Some(new_edges)
+                    && contributions.get(path.as_str()) == Some(new_contribution)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Build a partial [`IncrementalGraphState`] holding only what `replace_owned_files` will
@@ -1590,6 +1715,11 @@ impl ResolutionLookup for StructuralPackReader {
     }
 
     fn contains_file(&self, path: &str) -> bool {
+        if self.universe_files_recorded {
+            return self
+                .universe_files_shard(resolution_shard_id(path, self.universe_shard_bits))
+                .contains(path);
+        }
         self.universe_shard(path).files.contains(path)
     }
 
@@ -1621,6 +1751,16 @@ impl ResolutionLookup for StructuralPackReader {
                 .unwrap_or_default(),
         )
     }
+
+    /// Slice the cached shard in place: going through `symbol_definitions` cloned the name's whole
+    /// workspace-wide list on every reference, only to keep the handful declared in `path`.
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        self.universe_shard(name)
+            .symbol_definitions
+            .get(name)
+            .map(|definitions| crate::resolver::definitions_in_path(definitions, path).to_vec())
+            .unwrap_or_default()
+    }
 }
 
 fn read_pack_value_from_reader<T: serde::de::DeserializeOwned>(
@@ -1650,9 +1790,7 @@ fn compose_universe_overlay(
     mut older: ResolutionUniverseOverlay,
     newer: ResolutionUniverseOverlay,
 ) -> ResolutionUniverseOverlay {
-    older.files.extend(newer.files);
-    older.symbol_definitions.extend(newer.symbol_definitions);
-    older.module_exports.extend(newer.module_exports);
+    older.compose(newer);
     older
 }
 
@@ -1935,18 +2073,25 @@ fn apply_adjacency_changes(
     }
 }
 
+fn apply_universe_file_overlay(files: &mut BTreeSet<String>, overlay: &ResolutionUniverseOverlay) {
+    for (path, present) in &overlay.files {
+        if *present {
+            files.insert(path.clone());
+        } else {
+            files.remove(path);
+        }
+    }
+}
+
 fn apply_universe_overlay_to_shard(
     shard: &mut ResolutionUniverseShard,
     overlay: &ResolutionUniverseOverlay,
 ) {
-    for (path, present) in &overlay.files {
-        if *present {
-            shard.files.insert(path.clone());
-        } else {
-            shard.files.remove(path);
-        }
-    }
-    apply_optional_map_values(&mut shard.symbol_definitions, &overlay.symbol_definitions);
+    apply_universe_file_overlay(&mut shard.files, overlay);
+    crate::resolver::apply_definition_overlay(
+        &mut shard.symbol_definitions,
+        &overlay.symbol_definitions,
+    );
     apply_optional_map_values(&mut shard.module_exports, &overlay.module_exports);
 }
 
@@ -2573,7 +2718,10 @@ impl FileSnapshotStorage {
         else {
             return Ok(None);
         };
-        let Some((reverse_format_version, reverse_fingerprint, reverse_shard_bits)) =
+        let universe_files_recorded =
+            read_pack_value_from_reader::<u8>(&mut base_reader, &base, "meta/universe-files", 64)?
+                .is_some_and(|bits| bits == universe_shard_bits);
+        let Some((_reverse_format_version, reverse_fingerprint, reverse_shard_bits)) =
             read_pack_value_from_reader::<(u32, String, u8)>(
                 &mut base_reader,
                 &base,
@@ -2618,7 +2766,7 @@ impl FileSnapshotStorage {
             let Some(universe) = read_pack_value_from_reader(
                 &mut overlay_reader,
                 &path,
-                "meta/universe",
+                UNIVERSE_OVERLAY_KEY,
                 MAX_DELTA_COMPONENT_BYTES,
             )?
             else {
@@ -2659,7 +2807,6 @@ impl FileSnapshotStorage {
             universe_format_version,
             resolver_fingerprint,
             universe_shard_bits,
-            reverse_format_version,
             reverse_shard_bits,
             graph_format_version,
             graph_file_bits,
@@ -2669,6 +2816,8 @@ impl FileSnapshotStorage {
             reverse_overlays,
             graph_overlays,
             universe_cache: RwLock::new(BTreeMap::new()),
+            universe_files_recorded,
+            universe_files_cache: Mutex::new(BTreeMap::new()),
             reverse_files_cache: Mutex::new(BTreeMap::new()),
             reverse_membership_caches: Default::default(),
             graph_file_cache: Mutex::new(BTreeMap::new()),
@@ -2777,7 +2926,7 @@ impl FileSnapshotStorage {
         *self.manifest_cache.lock().unwrap() = None;
     }
 
-    fn read_structural_overlay_records(
+    pub(crate) fn read_structural_overlay_records(
         &self,
         name: &str,
     ) -> Result<StructuralOverlayRecords, StorageError> {
@@ -2802,7 +2951,7 @@ impl FileSnapshotStorage {
         let universe = read_pack_value_from_reader(
             &mut reader,
             &path,
-            "meta/universe",
+            UNIVERSE_OVERLAY_KEY,
             MAX_DELTA_COMPONENT_BYTES,
         )?
         .ok_or_else(|| StorageError::Invalid {
@@ -2858,7 +3007,7 @@ impl FileSnapshotStorage {
                 })?,
             ),
             (
-                "meta/universe",
+                UNIVERSE_OVERLAY_KEY,
                 bincode::serialize(&records.universe).map_err(|source| StorageError::Bincode {
                     path: path.clone(),
                     source,
@@ -3018,7 +3167,7 @@ impl FileSnapshotStorage {
             universe_bytes.len().to_string()
         });
         writer
-            .add("meta/universe", universe_bytes)
+            .add(UNIVERSE_OVERLAY_KEY, universe_bytes)
             .map_err(|error| StorageError::Invalid {
                 path: path.clone(),
                 message: error.to_string(),
@@ -5956,6 +6105,88 @@ mod tests {
         }
         STRUCTURAL_PUBLISH_FAILPOINT.store(0, Ordering::Relaxed);
         *STRUCTURAL_FAILPOINT_PATH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn an_overlay_in_the_previous_universe_layout_is_declined_not_misread() {
+        // Overlays written before the per-path universe delta stored `meta/universe`. Decoding
+        // those bytes as the new type would misread the lists, so the reader must decline the
+        // chain -- the caller then republishes a fresh base -- instead of answering from it.
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+        let staged = store
+            .stage_structural_pack_base(StructuralPackBase {
+                snapshot_id: base.id.stable_key(),
+                universe: ResolutionUniverse::default(),
+                reverse: ReverseShardSet {
+                    format_version: ReverseShardSet::FORMAT_VERSION,
+                    resolver_fingerprint: String::new(),
+                    shard_bits: 0,
+                    shards: BTreeMap::new(),
+                },
+                graph: IncrementalGraphState::default(),
+            })
+            .unwrap();
+        store.attach_structural_pack_base(staged).unwrap();
+        let mut next = base;
+        next.id.content_state = "revision-1".into();
+        let mut universe = ResolutionUniverseOverlay::default();
+        universe.files.insert("changed.ts".into(), true);
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &next,
+                    &BTreeSet::from(["changed.ts".to_owned()]),
+                    Some((&IncrementalGraphOverlay::default(), &universe, &reverse)),
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(store.open_structural_reader().unwrap().is_some());
+
+        // Rewrite the overlay with its universe record under the previous key.
+        let chain = store
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .structural_packs
+            .unwrap();
+        let overlay_path = dir.path().join(&chain.overlays[0]);
+        let reader = GenerationPackReader::open(&overlay_path).unwrap();
+        let records: Vec<(String, Vec<u8>)> = reader
+            .keys()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|key| {
+                let bytes = reader.read(&key, u64::MAX).unwrap().unwrap();
+                let key = if key == UNIVERSE_OVERLAY_KEY {
+                    "meta/universe".to_owned()
+                } else {
+                    key
+                };
+                (key, bytes)
+            })
+            .collect();
+        drop(reader);
+        let mut writer = StreamingGenerationPackWriter::new(&overlay_path).unwrap();
+        for (key, bytes) in records {
+            writer.add(key, bytes).unwrap();
+        }
+        writer.publish().unwrap();
+        store.clear_manifest_cache();
+
+        assert!(store.open_structural_reader().unwrap().is_none());
     }
 
     #[test]

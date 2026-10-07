@@ -36,6 +36,22 @@ pub struct Health {
     pub version: &'static str,
 }
 
+static MEMORY_RELEASE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// How this process hands freed heap back to the operating system. The binary that chooses
+/// the global allocator registers it (mimalloc keeps everything a sync allocated committed
+/// until the next allocation pressure, which an idle daemon never produces); long-lived
+/// servers call [`release_memory`] after each publication. Without a hook it is a no-op.
+pub fn set_memory_release_hook(hook: fn()) {
+    let _ = MEMORY_RELEASE_HOOK.set(hook);
+}
+
+pub(crate) fn release_memory() {
+    if let Some(hook) = MEMORY_RELEASE_HOOK.get() {
+        hook();
+    }
+}
+
 pub fn health() -> Health {
     Health {
         name: "ravel",

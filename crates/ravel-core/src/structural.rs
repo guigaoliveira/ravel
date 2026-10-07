@@ -183,12 +183,23 @@ impl FileContribution {
         contribution
             .symbol_definitions
             .extend(artifact.symbols.iter().map(|symbol| symbol.name.clone()));
-        contribution.symbol_references.extend(
-            artifact
-                .symbol_refs
-                .iter()
-                .map(|reference| reference.to.clone()),
-        );
+        for reference in &artifact.symbol_refs {
+            contribution.symbol_references.insert(reference.to.clone());
+            // A member reference (`z.ZodString`, `this.svc.charge`) resolves through each of its
+            // segments: the head through the file's own bindings and namespaces, the members
+            // through the target module's exports or, failing that, the workspace-wide
+            // definitions of that bare name. A change to any of those names can change the
+            // edge, so the file must be found under each one.
+            if reference.to.contains('.') {
+                contribution.symbol_references.extend(
+                    reference
+                        .to
+                        .split('.')
+                        .filter(|segment| !segment.is_empty() && *segment != "this")
+                        .map(str::to_owned),
+                );
+            }
+        }
         contribution
     }
 }
@@ -224,6 +235,44 @@ mod tests {
             index
                 .affected_files(["src/future.ts"], std::iter::empty())
                 .contains("src/caller.ts")
+        );
+    }
+
+    #[test]
+    fn a_member_reference_registers_the_file_under_each_segment() {
+        // `z.ZodString` in a type position resolves through `z` and then through the bare name
+        // `ZodString`; renaming that interface must reach this file even though it never
+        // imports it directly.
+        let root = tempfile::tempdir().unwrap();
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            "src/test.ts".into(),
+            artifact(
+                "src/test.ts",
+                "import * as z from './index';\nexport const s: z.ZodString = z.string();\n",
+            ),
+        );
+        artifacts.insert(
+            "src/index.ts".into(),
+            artifact("src/index.ts", "export * from './schemas';\n"),
+        );
+        artifacts.insert(
+            "src/schemas.ts".into(),
+            artifact(
+                "src/schemas.ts",
+                "export interface ZodString { kind: 'string' }\nexport function string(): ZodString { return { kind: 'string' }; }\n",
+            ),
+        );
+        let index =
+            StructuralReverseIndex::build(root.path(), &artifacts, &ResolverConfig::default());
+        let contribution = &index.files["src/test.ts"];
+        assert!(contribution.symbol_references.contains("z.ZodString"));
+        assert!(contribution.symbol_references.contains("ZodString"));
+        assert!(contribution.symbol_references.contains("z"));
+        assert!(
+            index
+                .affected_files(std::iter::empty(), ["ZodString"])
+                .contains("src/test.ts")
         );
     }
 

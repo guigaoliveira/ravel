@@ -2,7 +2,7 @@ use crate::{
     analysis::{self, CiReport, CycleInfo, HubEntry, ImpactReport, PackageInfo},
     config::{Config, Flags},
     graph::{GraphIndex, QueryLimits, QueryPage},
-    incremental_graph::{IncrementalGraphOverlay, IncrementalGraphState, OwnedEdge},
+    incremental_graph::{IncrementalGraphOverlay, OwnedEdge},
     model::{INDEX_SCHEMA_VERSION, IndexSnapshot, SnapshotId},
     policy::{PolicyFinding, Suppressions, validate_snapshot},
     resolver::{
@@ -802,6 +802,131 @@ fn public_resolution_contract_changed(
         (None, None) => false,
         _ => true,
     }
+}
+
+/// What changed in a file's public contract, for deciding which importers to re-resolve.
+struct ContractChange {
+    /// Exported names whose declaration or export binding differs between the two versions.
+    names: BTreeSet<String>,
+    /// Every name visible through the file may resolve differently: the file appeared or
+    /// disappeared, or a star re-export changed.
+    all: bool,
+}
+
+/// An importer's resolution depends on the file through its bindings: a named import or
+/// re-export depends on that one name, a namespace import on every name. Nothing else about
+/// the file reaches the importer, so when only some names changed, an importer that binds
+/// none of them resolves exactly as before. (`resolve_exported_symbol` looks up one name at a
+/// time; the module edge itself depends only on the file's existence.)
+fn changed_export_names(
+    old: Option<&crate::model::FileArtifact>,
+    new: Option<&crate::model::FileArtifact>,
+) -> ContractChange {
+    fn symbol_keys(artifact: &crate::model::FileArtifact) -> BTreeMap<String, String> {
+        artifact
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.exported)
+            .map(|symbol| {
+                (
+                    format!(
+                        "{}\0{}\0{}\0{}",
+                        symbol.id, symbol.name, symbol.qualified_name, symbol.kind
+                    ),
+                    symbol.name.clone(),
+                )
+            })
+            .collect()
+    }
+    fn export_keys(
+        artifact: &crate::model::FileArtifact,
+    ) -> BTreeMap<String, (String, String, bool)> {
+        artifact
+            .exports
+            .iter()
+            .flat_map(|export| {
+                export.bindings.iter().map(move |binding| {
+                    (
+                        format!(
+                            "{:?}\0{}\0{}\0{:?}\0{}",
+                            export.specifier,
+                            binding.local,
+                            binding.exported,
+                            binding.kind,
+                            binding.type_only
+                        ),
+                        (
+                            binding.local.clone(),
+                            binding.exported.clone(),
+                            binding.kind == crate::model::ExportBindingKind::Star,
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+    let (Some(old), Some(new)) = (old, new) else {
+        let names = old
+            .into_iter()
+            .chain(new)
+            .flat_map(|artifact| {
+                symbol_keys(artifact).into_values().chain(
+                    export_keys(artifact)
+                        .into_values()
+                        .flat_map(|(local, exported, _)| [local, exported]),
+                )
+            })
+            .collect();
+        return ContractChange { names, all: true };
+    };
+    let mut change = ContractChange {
+        names: BTreeSet::new(),
+        all: false,
+    };
+    let (old_symbols, new_symbols) = (symbol_keys(old), symbol_keys(new));
+    for (key, name) in old_symbols.iter().chain(&new_symbols) {
+        if old_symbols.get(key) != new_symbols.get(key) {
+            change.names.insert(name.clone());
+        }
+    }
+    let (old_exports, new_exports) = (export_keys(old), export_keys(new));
+    for (key, (local, exported, star)) in old_exports.iter().chain(&new_exports) {
+        if old_exports.get(key) != new_exports.get(key) {
+            change.all |= *star;
+            change.names.insert(local.clone());
+            change.names.insert(exported.clone());
+        }
+    }
+    change
+}
+
+/// Whether `artifact` binds any of `names` from some module, or binds a whole namespace. A
+/// file that does neither cannot resolve differently after those names changed in a file it
+/// imports; see [`changed_export_names`].
+fn imports_depend_on_names(
+    artifact: &crate::model::FileArtifact,
+    names: &BTreeSet<String>,
+) -> bool {
+    use crate::model::{ExportBindingKind, ImportBindingKind};
+    let imports = artifact.imports.iter().flat_map(|import| &import.bindings);
+    if imports.clone().any(|binding| match binding.kind {
+        ImportBindingKind::Namespace | ImportBindingKind::ImportEquals => true,
+        ImportBindingKind::Default => names.contains("default"),
+        ImportBindingKind::Named => names.contains(&binding.imported),
+    }) {
+        return true;
+    }
+    artifact
+        .exports
+        .iter()
+        .filter(|export| export.specifier.is_some())
+        .flat_map(|export| &export.bindings)
+        .any(|binding| {
+            !matches!(
+                binding.kind,
+                ExportBindingKind::Star | ExportBindingKind::Namespace
+            ) && names.contains(&binding.local)
+        })
 }
 
 /// Shared, cloneable workspace engine with in-memory snapshot and graph caching.
@@ -1876,22 +2001,17 @@ impl WorkspaceEngine {
 
         let changed_paths: BTreeSet<_> = changes.iter().map(|(path, ..)| path.clone()).collect();
         let mut changed_symbols = BTreeSet::new();
-        let mut contract_changed_paths = BTreeSet::new();
+        // Path -> whether every importer must be re-resolved, or only those binding a changed name.
+        let mut contract_changed_paths: BTreeMap<String, bool> = BTreeMap::new();
         for (path, old, new) in &changes {
             if public_resolution_contract_changed(old.as_ref(), new.as_ref()) {
-                contract_changed_paths.insert(path.clone());
-                changed_symbols.extend(
-                    old.iter()
-                        .flat_map(|artifact| artifact.symbols.iter())
-                        .chain(new.iter().flat_map(|artifact| artifact.symbols.iter()))
-                        .filter(|symbol| symbol.exported)
-                        .map(|symbol| symbol.name.clone()),
-                );
+                let change = changed_export_names(old.as_ref(), new.as_ref());
+                contract_changed_paths.insert(path.clone(), change.all);
+                changed_symbols.extend(change.names);
             }
         }
         let overlay_start = std::time::Instant::now();
         let universe_overlay = ResolutionUniverseOverlay::from_artifact_changes(
-            reader.as_ref(),
             changes
                 .iter()
                 .map(|(_, old, new)| (old.as_ref(), new.as_ref())),
@@ -1899,19 +2019,55 @@ impl WorkspaceEngine {
         crate::timing::stage("delta.universe_overlay", overlay_start, String::new);
         let universe = OverlayResolutionLookup::new(reader.as_ref(), &universe_overlay);
         let affected_start = std::time::Instant::now();
+        // Importers consulted here are opened once and reused for the subset below.
+        let opened_artifacts: std::cell::RefCell<
+            BTreeMap<String, Option<crate::model::FileArtifact>>,
+        > = std::cell::RefCell::new(BTreeMap::new());
+        let mut open_failed = false;
+        let mut skipped_importers = 0usize;
         let mut affected = reader.affected_files(
-            contract_changed_paths.iter().map(String::as_str),
+            contract_changed_paths
+                .iter()
+                .map(|(path, all)| (path.as_str(), *all)),
             changed_symbols.iter().map(String::as_str),
+            |importer| {
+                if changed_paths.contains(importer) {
+                    return true;
+                }
+                let mut opened = opened_artifacts.borrow_mut();
+                let artifact = match opened.entry(importer.to_owned()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        match storage.open_artifact(importer) {
+                            Ok(artifact) => entry.insert(artifact),
+                            Err(_) => {
+                                open_failed = true;
+                                return true;
+                            }
+                        }
+                    }
+                };
+                let depends = artifact
+                    .as_ref()
+                    .is_none_or(|artifact| imports_depend_on_names(artifact, &changed_symbols));
+                skipped_importers += usize::from(!depends);
+                depends
+            },
         );
         affected.extend(changed_paths.iter().cloned());
         crate::timing::stage("delta.affected_files", affected_start, || {
             format!(
-                "affected={} changed_symbols={} contract_changed={}",
+                "affected={} importers_skipped={} changed_symbols={} contract_changed={}",
                 affected.len(),
+                skipped_importers,
                 changed_symbols.len(),
                 contract_changed_paths.len()
             )
         });
+        if open_failed {
+            return Ok(None);
+        }
+        let mut opened_artifacts = opened_artifacts.into_inner();
 
         let changed_artifacts: BTreeMap<_, _> = changes
             .iter()
@@ -1925,7 +2081,10 @@ impl WorkspaceEngine {
                     continue;
                 };
                 (*new).clone()
-            } else if let Some(artifact) = storage.open_artifact(path)? {
+            } else if let Some(artifact) = match opened_artifacts.remove(path) {
+                Some(opened) => opened,
+                None => storage.open_artifact(path)?,
+            } {
                 artifact
             } else {
                 return Ok(None);
@@ -1944,7 +2103,7 @@ impl WorkspaceEngine {
         crate::timing::stage("delta.resolve_subset", resolve_start, || {
             format!("subset={} traces={}", subset.len(), traces.len())
         });
-        let graph_updates: BTreeMap<_, _> = affected
+        let mut graph_updates: BTreeMap<_, _> = affected
             .iter()
             .map(|path| {
                 (
@@ -1960,22 +2119,6 @@ impl WorkspaceEngine {
                 )
             })
             .collect();
-        let graph_start = std::time::Instant::now();
-        let mut graph = reader.graph_for_updates(&graph_updates);
-        crate::timing::stage("delta.graph_for_updates", graph_start, || {
-            format!("updates={}", graph_updates.len())
-        });
-        let graph_edges_before = graph.edge_count();
-        let replace_start = std::time::Instant::now();
-        let graph_overlay = graph.replace_owned_files(graph_updates);
-        crate::timing::stage("delta.graph_replace", replace_start, || {
-            format!(
-                "upserts={} edge_counts={}",
-                graph_overlay.file_upserts.len(),
-                graph_overlay.edge_counts.len()
-            )
-        });
-        let graph_edges_after = graph.edge_count();
         let mut trace_cursor = 0usize;
         let mut reverse_updates = BTreeMap::new();
         for path in &affected {
@@ -1994,9 +2137,39 @@ impl WorkspaceEngine {
             });
             reverse_updates.insert(path.clone(), contribution);
         }
+        // Re-resolving an importer of the edited file nearly always reproduces its edges and
+        // contribution exactly. Replacing a file's state with an identical copy changes nothing
+        // in the graph or the reverse index, but carrying it through did: for an edit to a widely
+        // imported file the identical copies were most of the overlay's bytes, of the publish
+        // time, and of what every reader that applied the overlay kept in memory.
+        let unchanged_start = std::time::Instant::now();
+        let unchanged =
+            reader.unchanged_file_updates(&graph_updates, &reverse_updates, &changed_paths);
+        for path in &unchanged {
+            graph_updates.remove(path);
+            reverse_updates.remove(path);
+        }
+        crate::timing::stage("delta.unchanged_files", unchanged_start, || {
+            format!("unchanged={} kept={}", unchanged.len(), graph_updates.len())
+        });
+        let graph_start = std::time::Instant::now();
+        let mut graph = reader.graph_for_updates(&graph_updates);
+        crate::timing::stage("delta.graph_for_updates", graph_start, || {
+            format!("updates={}", graph_updates.len())
+        });
+        let graph_edges_before = graph.edge_count();
+        let replace_start = std::time::Instant::now();
+        let graph_overlay = graph.replace_owned_files(graph_updates);
+        crate::timing::stage("delta.graph_replace", replace_start, || {
+            format!(
+                "upserts={} edge_counts={}",
+                graph_overlay.file_upserts.len(),
+                graph_overlay.edge_counts.len()
+            )
+        });
+        let graph_edges_after = graph.edge_count();
         let reverse_start = std::time::Instant::now();
-        let mut reverse = reader.reverse_for_updates(&reverse_updates);
-        let reverse_overlay = reverse.replace_files(reverse_updates);
+        let reverse_overlay = reader.reverse_overlay_for_updates(reverse_updates);
         crate::timing::stage("delta.reverse", reverse_start, String::new);
 
         let Some(old_stats) = storage.open_stats()? else {
@@ -2110,6 +2283,18 @@ impl WorkspaceEngine {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
+            // A name the new version still declares has at least one definer, so only the names
+            // that left the edited files need the universe asked. Asking for every old name
+            // decoded one full universe shard per name -- for a class with a handful of methods
+            // named like thousands of others, most of the sync's time.
+            let kept_names: BTreeSet<&str> = changes
+                .iter()
+                .flat_map(|(_, _, new)| {
+                    new.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| symbol.name.as_str())
+                })
+                .collect();
             let removed_names = changes
                 .iter()
                 .flat_map(|(_, old, _)| {
@@ -2117,6 +2302,7 @@ impl WorkspaceEngine {
                         .flat_map(|artifact| artifact.symbols.iter())
                         .map(|symbol| symbol.name.clone())
                 })
+                .filter(|name| !kept_names.contains(name.as_str()))
                 .filter(|name| universe.symbol_definer_count(name) == 0)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -2176,12 +2362,28 @@ impl WorkspaceEngine {
                 owned
                     .apply_published_delta(&graph_overlay, &universe_overlay, &reverse_overlay)
                     .then_some(())?;
+                owned.trim_decoded_caches();
                 Some((generation, Arc::new(owned)))
             });
         }
         crate::timing::stage("delta.advance_reader", advance_start, String::new);
+        // Advance the resident query graph the same way, by applying the overlay just published
+        // -- exactly what `open_graph` does with the chain on disk, one step later. Dropping it
+        // made the first query after every sync rebuild the whole graph from the archive, and
+        // held old and new graph in memory while it did. If a query still holds the Arc, it is
+        // dropped and the next query reopens it.
+        let graph_start = std::time::Instant::now();
+        {
+            let mut cache_slot = self.inner.graph_cache.lock().unwrap();
+            *cache_slot = cache_slot.take().and_then(|cached| {
+                let mut graph = Arc::try_unwrap(cached).ok()?;
+                graph.apply_incremental_overlay(&graph_overlay, &generation, stats.edges);
+                graph.finish_incremental_overlays();
+                Some(Arc::new(graph))
+            });
+        }
+        crate::timing::stage("delta.advance_graph", graph_start, String::new);
         *self.inner.snapshot_cache.lock().unwrap() = None;
-        *self.inner.graph_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
         *self.inner.file_hashes_cache.lock().unwrap() = None;
         if search_overlay.is_some() {
@@ -2409,11 +2611,8 @@ impl WorkspaceEngine {
             let stage_start = std::time::Instant::now();
             stager.stage_reverse(reverse)?;
             crate::timing::stage("index.stage_reverse", stage_start, String::new);
-            let graph_start = std::time::Instant::now();
-            let graph = IncrementalGraphState::from_edges(&resolved_edges);
-            crate::timing::stage("index.graph_from_edges", graph_start, String::new);
             let stage_start = std::time::Instant::now();
-            let graph_staged = stager.stage_graph(graph);
+            let graph_staged = stager.stage_graph_edges(&resolved_edges);
             crate::timing::stage("index.stage_graph", stage_start, String::new);
             graph_staged?;
             (resolved_edges, Some(stager))
@@ -3988,9 +4187,20 @@ impl WorkspaceEngine {
             let graph = self.graph()?;
             analysis::hubs(&graph, top_k)
         };
-        let meta = self.symbol_meta()?;
-        let mut enriched = analysis::enrich_hubs(raw, meta.as_deref(), kind_filter);
-        enriched.truncate(limit.max(1));
+        let limit = limit.max(1);
+        let mut raw = raw;
+        if kind_filter.is_none() {
+            // Without a filter, enrichment neither reorders nor drops entries, so only the ones
+            // returned need annotating.
+            raw.truncate(limit);
+        }
+        // Look each hub up by id instead of materializing metadata for every symbol: the packed
+        // backend resolves an id to the same entry (the widest span among definitions sharing it)
+        // that the materialized dictionary's id map kept.
+        let meta = self.symbol_meta_runtime()?;
+        let mut enriched =
+            analysis::enrich_hubs_with(raw, |id| meta.as_ref()?.get_by_id(id), kind_filter);
+        enriched.truncate(limit);
         Ok(enriched)
     }
 
@@ -4346,6 +4556,138 @@ mod resident_sync_tests {
                 .unwrap()
                 .iter()
                 .any(|relation| relation["kind"] == "Calls")
+        );
+    }
+
+    #[test]
+    fn an_importer_whose_edges_did_not_change_stays_out_of_the_overlay() {
+        // Adding an export to `service.ts` changes its public contract, so `consumer.ts` is
+        // re-resolved. Its edges come out identical, and the overlay must not carry them: for a
+        // widely imported file those identical copies were the overlay's bulk.
+        let (_root, engine, service) = fixture();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const other = () => 1;\n",
+        )
+        .unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+
+        let manifest = engine.storage().read_manifest().unwrap().unwrap();
+        let chain = manifest.structural_packs.unwrap();
+        assert_eq!(chain.overlays.len(), 1);
+        let records = engine
+            .storage()
+            .read_structural_overlay_records(&chain.overlays[0])
+            .unwrap();
+        assert_eq!(
+            records.graph.file_upserts.keys().collect::<Vec<_>>(),
+            vec!["service.ts"]
+        );
+        assert!(records.graph.file_tombstones.is_empty());
+        // The answers are those of a rebuilt index: the consumer still calls `answer`.
+        let context = engine.context("answer", 10).unwrap();
+        assert!(
+            context["relations"]["incoming"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relation| relation["kind"] == "Calls")
+        );
+        assert_eq!(engine.stats().unwrap().edges, 3);
+    }
+
+    #[test]
+    fn the_resident_graph_advanced_in_place_answers_like_a_cold_open() {
+        let (root, engine, service) = fixture();
+        // Warm the graph before the edit so the sync has a resident graph to advance.
+        let before = engine.context("answer", 10).unwrap();
+        assert!(
+            before["relations"]["incoming"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty())
+        );
+        std::fs::write(
+            root.path().join("other.ts"),
+            "import { answer } from './service';\nexport const twice = () => answer() * 2;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const extra = 1;\n",
+        )
+        .unwrap();
+        engine
+            .sync_resident(Some(&[service.clone(), root.path().join("other.ts")]))
+            .unwrap();
+        let warm = engine.context("answer", 10).unwrap();
+        let cold = WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .context("answer", 10)
+            .unwrap();
+        assert_eq!(warm, cold);
+        // Both callers, including the one added by the sync, are visible through the resident graph.
+        assert_eq!(warm["n_callers"], 2, "{warm}");
+        assert_eq!(warm["relations"]["incoming_by_kind"]["Calls"], 2, "{warm}");
+        for node in ["twice", "value"] {
+            assert_eq!(
+                engine.reference_sites(node, false, 50, 0).unwrap(),
+                WorkspaceEngine::load(root.path(), &Flags::default())
+                    .unwrap()
+                    .reference_sites(node, false, 50, 0)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn file_existence_answers_from_its_own_record_match_the_full_shard() {
+        use crate::resolver::ResolutionLookup;
+        let (root, engine, _service) = fixture();
+        let probe = |engine: &WorkspaceEngine, expected: &[(&str, bool)]| {
+            let reader = engine.storage().open_structural_reader().unwrap().unwrap();
+            assert!(reader.records_universe_files());
+            for (path, present) in expected {
+                assert_eq!(reader.contains_file(path), *present, "{path}");
+                assert_eq!(
+                    reader.contains_file(path),
+                    reader.universe_shard(path).files.contains(*path),
+                    "{path}"
+                );
+            }
+        };
+        probe(
+            &engine,
+            &[
+                ("service.ts", true),
+                ("consumer.ts", true),
+                ("other.ts", false),
+            ],
+        );
+        // A file appears and one disappears through an overlay; both the resident reader and a
+        // cold one must see it in the file record.
+        std::fs::write(
+            root.path().join("other.ts"),
+            "import { answer } from './service';\nexport const twice = () => answer() * 2;\n",
+        )
+        .unwrap();
+        std::fs::remove_file(root.path().join("consumer.ts")).unwrap();
+        engine
+            .sync_resident(Some(&[
+                root.path().join("other.ts"),
+                root.path().join("consumer.ts"),
+            ]))
+            .unwrap();
+        let expected = [
+            ("service.ts", true),
+            ("consumer.ts", false),
+            ("other.ts", true),
+        ];
+        probe(&engine, &expected);
+        probe(
+            &WorkspaceEngine::load(root.path(), &Flags::default()).unwrap(),
+            &expected,
         );
     }
 

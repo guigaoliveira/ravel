@@ -526,6 +526,7 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         engine.record_update_error("watch sync", &error.to_string());
                     }
                 }
+                crate::release_memory();
             }
         });
 }
@@ -907,21 +908,26 @@ async fn reference_sites_tool(
     let limit = request.limit.unwrap_or(50).max(1);
     let cursor = request.cursor.unwrap_or(0);
     // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
-    // `rollup: "directory-ish"` looks like the grouping was applied and came out flat.
-    let rollup = match request.rollup.as_deref() {
-        None => None,
-        Some(value) => Some(crate::engine::RollupMode::parse(value).ok_or_else(|| {
-            tool_error(format!(
-                "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
-            ))
-        })?),
-    };
-    let options = crate::engine::RelationOptions {
-        scope: request.scope.as_deref(),
-        rollup,
-    };
-    let engine = mcp.engine(request.root).map_err(tool_error)?;
-    json_reply(engine.reference_sites_with(&request.node, reverse, limit, cursor, options))
+    // `rollup: "directory-ish"` looks like the grouping was applied and came out flat. The daemon
+    // checks it too; checking here first keeps the refusal off the wire.
+    if let Some(value) = request.rollup.as_deref()
+        && crate::engine::RollupMode::parse(value).is_none()
+    {
+        return Err(error_json(format!(
+            "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
+        )));
+    }
+    json_reply(mcp.call_daemon(
+        request.root.as_deref(),
+        crate::daemon::DaemonOperation::ReferenceSites {
+            node: request.node,
+            reverse,
+            limit,
+            cursor,
+            scope: request.scope,
+            rollup: request.rollup,
+        },
+    ))
 }
 
 async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> ToolReply {
