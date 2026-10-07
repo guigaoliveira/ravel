@@ -1513,6 +1513,28 @@ impl StructuralPackReader {
         )
     }
 
+    /// Drop any decoded-shard cache that outgrew its budget. The caches are a sync's working
+    /// set: the universe, reverse and graph shards its lookups touched, kept so the lookups that
+    /// follow in the same sync hit. Kept across syncs they grew with every file a session edited
+    /// (a hub's membership sets alone run to megabytes), while the hot few shards a session keeps
+    /// touching are worth their re-decode. The file sets are small and stay.
+    pub(crate) fn trim_decoded_caches(&self) {
+        const MAX_RESIDENT_SHARDS: usize = 16;
+        fn trim<K, V>(cache: &mut BTreeMap<K, V>) {
+            if cache.len() > MAX_RESIDENT_SHARDS {
+                cache.clear();
+            }
+        }
+        trim(&mut self.universe_cache.write().unwrap());
+        trim(&mut self.reverse_files_cache.lock().unwrap());
+        for cache in &self.reverse_membership_caches {
+            trim(&mut cache.lock().unwrap());
+        }
+        trim(&mut self.graph_file_cache.lock().unwrap());
+        trim(&mut self.graph_edge_cache.lock().unwrap());
+        trim(&mut self.graph_adj_cache.lock().unwrap());
+    }
+
     /// The paths in `graph_updates` whose new edge set and reverse contribution equal what the
     /// current generation already records for them, so applying their update would change
     /// nothing. The edited files themselves (`always_keep`) are never reported: their artifact

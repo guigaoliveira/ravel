@@ -2349,6 +2349,7 @@ impl WorkspaceEngine {
                 owned
                     .apply_published_delta(&graph_overlay, &universe_overlay, &reverse_overlay)
                     .then_some(())?;
+                owned.trim_decoded_caches();
                 Some((generation, Arc::new(owned)))
             });
         }

@@ -954,14 +954,14 @@ fn handle_connection(
         }
         DaemonOperation::Shutdown => Ok(serde_json::json!({ "shutdown": true })),
     };
-    let published = matches!(operation_kind, OperationKind::Sync);
     match response {
         Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
         Err(error) => write_frame(stream, &WireResponse::Error(error.to_string()))?,
     }
-    if published {
-        // After the reply is on the wire: a sync's working set is freed by now, and the
-        // collection must not add to the latency the agent sees.
+    if matches!(operation_kind, OperationKind::Sync | OperationKind::Query) {
+        // After the reply is on the wire, so the collection never adds to the latency the agent
+        // sees. A sync's working set is freed by now; so is a query's -- and a query for a name
+        // with tens of thousands of definitions allocates tens of megabytes to answer.
         crate::release_memory();
     }
     if shutdown {
@@ -975,6 +975,7 @@ fn handle_connection(
 #[derive(PartialEq, Eq)]
 enum OperationKind {
     Sync,
+    Query,
     Other,
 }
 
@@ -982,6 +983,7 @@ impl OperationKind {
     fn of(operation: &DaemonOperation) -> Self {
         match operation {
             DaemonOperation::Sync { .. } => Self::Sync,
+            DaemonOperation::Context { .. } | DaemonOperation::ReferenceSites { .. } => Self::Query,
             _ => Self::Other,
         }
     }
