@@ -844,11 +844,11 @@ pub(crate) struct StagedStructuralPack {
     name: String,
 }
 
-struct StructuralOverlayRecords {
-    weight: u64,
-    graph: IncrementalGraphOverlay,
-    universe: ResolutionUniverseOverlay,
-    reverse: ReverseOverlaySet,
+pub(crate) struct StructuralOverlayRecords {
+    pub(crate) weight: u64,
+    pub(crate) graph: IncrementalGraphOverlay,
+    pub(crate) universe: ResolutionUniverseOverlay,
+    pub(crate) reverse: ReverseOverlaySet,
 }
 
 pub(crate) struct ResidentStructuralDelta<'a> {
@@ -1506,6 +1506,51 @@ impl StructuralPackReader {
             &previous,
             updates,
         )
+    }
+
+    /// The paths in `graph_updates` whose new edge set and reverse contribution equal what the
+    /// current generation already records for them, so applying their update would change
+    /// nothing. The edited files themselves (`always_keep`) are never reported: their artifact
+    /// changed even when their edges did not.
+    pub(crate) fn unchanged_file_updates(
+        &self,
+        graph_updates: &BTreeMap<String, Option<BTreeSet<OwnedEdge>>>,
+        reverse_updates: &BTreeMap<String, Option<FileContribution>>,
+        always_keep: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        if self.graph_format_version != IncrementalGraphState::FORMAT_VERSION {
+            return BTreeSet::new();
+        }
+        let candidates: Vec<&String> = graph_updates
+            .keys()
+            .filter(|path| !always_keep.contains(*path))
+            .collect();
+        self.prefetch_graph_file_shards(
+            candidates
+                .iter()
+                .map(|path| graph_shard_id(path, self.graph_file_bits)),
+        );
+        self.prefetch_reverse_files_shards(
+            candidates
+                .iter()
+                .map(|path| reverse_shard_id(path, self.reverse_shard_bits)),
+        );
+        candidates
+            .into_iter()
+            .filter(|path| {
+                let (Some(Some(new_edges)), Some(Some(new_contribution))) =
+                    (graph_updates.get(*path), reverse_updates.get(*path))
+                else {
+                    return false;
+                };
+                let files = self.graph_file_shard(graph_shard_id(path, self.graph_file_bits));
+                let contributions =
+                    self.reverse_files_shard(reverse_shard_id(path, self.reverse_shard_bits));
+                files.by_file.get(path.as_str()) == Some(new_edges)
+                    && contributions.get(path.as_str()) == Some(new_contribution)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Build a partial [`IncrementalGraphState`] holding only what `replace_owned_files` will
@@ -2788,7 +2833,7 @@ impl FileSnapshotStorage {
         *self.manifest_cache.lock().unwrap() = None;
     }
 
-    fn read_structural_overlay_records(
+    pub(crate) fn read_structural_overlay_records(
         &self,
         name: &str,
     ) -> Result<StructuralOverlayRecords, StorageError> {

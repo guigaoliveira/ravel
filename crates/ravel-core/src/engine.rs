@@ -1943,7 +1943,7 @@ impl WorkspaceEngine {
         crate::timing::stage("delta.resolve_subset", resolve_start, || {
             format!("subset={} traces={}", subset.len(), traces.len())
         });
-        let graph_updates: BTreeMap<_, _> = affected
+        let mut graph_updates: BTreeMap<_, _> = affected
             .iter()
             .map(|path| {
                 (
@@ -1959,22 +1959,6 @@ impl WorkspaceEngine {
                 )
             })
             .collect();
-        let graph_start = std::time::Instant::now();
-        let mut graph = reader.graph_for_updates(&graph_updates);
-        crate::timing::stage("delta.graph_for_updates", graph_start, || {
-            format!("updates={}", graph_updates.len())
-        });
-        let graph_edges_before = graph.edge_count();
-        let replace_start = std::time::Instant::now();
-        let graph_overlay = graph.replace_owned_files(graph_updates);
-        crate::timing::stage("delta.graph_replace", replace_start, || {
-            format!(
-                "upserts={} edge_counts={}",
-                graph_overlay.file_upserts.len(),
-                graph_overlay.edge_counts.len()
-            )
-        });
-        let graph_edges_after = graph.edge_count();
         let mut trace_cursor = 0usize;
         let mut reverse_updates = BTreeMap::new();
         for path in &affected {
@@ -1993,6 +1977,37 @@ impl WorkspaceEngine {
             });
             reverse_updates.insert(path.clone(), contribution);
         }
+        // Re-resolving an importer of the edited file nearly always reproduces its edges and
+        // contribution exactly. Replacing a file's state with an identical copy changes nothing
+        // in the graph or the reverse index, but carrying it through did: for an edit to a widely
+        // imported file the identical copies were most of the overlay's bytes, of the publish
+        // time, and of what every reader that applied the overlay kept in memory.
+        let unchanged_start = std::time::Instant::now();
+        let unchanged =
+            reader.unchanged_file_updates(&graph_updates, &reverse_updates, &changed_paths);
+        for path in &unchanged {
+            graph_updates.remove(path);
+            reverse_updates.remove(path);
+        }
+        crate::timing::stage("delta.unchanged_files", unchanged_start, || {
+            format!("unchanged={} kept={}", unchanged.len(), graph_updates.len())
+        });
+        let graph_start = std::time::Instant::now();
+        let mut graph = reader.graph_for_updates(&graph_updates);
+        crate::timing::stage("delta.graph_for_updates", graph_start, || {
+            format!("updates={}", graph_updates.len())
+        });
+        let graph_edges_before = graph.edge_count();
+        let replace_start = std::time::Instant::now();
+        let graph_overlay = graph.replace_owned_files(graph_updates);
+        crate::timing::stage("delta.graph_replace", replace_start, || {
+            format!(
+                "upserts={} edge_counts={}",
+                graph_overlay.file_upserts.len(),
+                graph_overlay.edge_counts.len()
+            )
+        });
+        let graph_edges_after = graph.edge_count();
         let reverse_start = std::time::Instant::now();
         let reverse_overlay = reader.reverse_overlay_for_updates(reverse_updates);
         crate::timing::stage("delta.reverse", reverse_start, String::new);
@@ -4353,6 +4368,45 @@ mod resident_sync_tests {
                 .iter()
                 .any(|relation| relation["kind"] == "Calls")
         );
+    }
+
+    #[test]
+    fn an_importer_whose_edges_did_not_change_stays_out_of_the_overlay() {
+        // Adding an export to `service.ts` changes its public contract, so `consumer.ts` is
+        // re-resolved. Its edges come out identical, and the overlay must not carry them: for a
+        // widely imported file those identical copies were the overlay's bulk.
+        let (_root, engine, service) = fixture();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const other = () => 1;\n",
+        )
+        .unwrap();
+        engine
+            .sync_resident(Some(std::slice::from_ref(&service)))
+            .unwrap();
+
+        let manifest = engine.storage().read_manifest().unwrap().unwrap();
+        let chain = manifest.structural_packs.unwrap();
+        assert_eq!(chain.overlays.len(), 1);
+        let records = engine
+            .storage()
+            .read_structural_overlay_records(&chain.overlays[0])
+            .unwrap();
+        assert_eq!(
+            records.graph.file_upserts.keys().collect::<Vec<_>>(),
+            vec!["service.ts"]
+        );
+        assert!(records.graph.file_tombstones.is_empty());
+        // The answers are those of a rebuilt index: the consumer still calls `answer`.
+        let context = engine.context("answer", 10).unwrap();
+        assert!(
+            context["relations"]["incoming"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relation| relation["kind"] == "Calls")
+        );
+        assert_eq!(engine.stats().unwrap().edges, 3);
     }
 
     #[test]
