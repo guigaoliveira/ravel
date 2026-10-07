@@ -547,10 +547,34 @@ fn decode_directory(
     Ok(entries)
 }
 
+thread_local! {
+    // One zstd context per thread, reused for every record. `zstd::bulk::{compress, decompress}`
+    // create and free a context per call, and a full index compresses tens of thousands of shards:
+    // each call allocated (and the kernel zeroed) a fresh workspace. `compress2` starts a new frame
+    // from the stored parameters every time, so a reused context writes the same bytes.
+    static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+    static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Expand a compressed record, rejecting a length that disagrees with the directory.
 fn decompress_record(bytes: &[u8], plain_len: u64, path: &Path) -> Result<Vec<u8>, PackError> {
-    let plain =
-        zstd::bulk::decompress(bytes, plain_len as usize).map_err(|source| PackError::Io {
+    let plain = DECOMPRESSOR
+        .with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let decompressor = match slot.as_mut() {
+                Some(decompressor) => decompressor,
+                None => slot.insert(zstd::bulk::Decompressor::new()?),
+            };
+            let result = decompressor.decompress(bytes, plain_len as usize);
+            if result.is_err() {
+                // Never carry a context out of a failed frame into the next record.
+                *slot = None;
+            }
+            result
+        })
+        .map_err(|source| PackError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -564,11 +588,30 @@ fn decompress_record(bytes: &[u8], plain_len: u64, path: &Path) -> Result<Vec<u8
 }
 
 /// zstd a record, reporting the pack path on failure.
+///
+/// The result is trimmed to its length: `Compressor::compress` sizes its buffer for the worst case
+/// (slightly over the plain size) and staging holds thousands of compressed records at once, so the
+/// unused tails added up to roughly the uncompressed size of everything staged.
 pub(crate) fn compress_record(plain: &[u8], path: &Path) -> Result<Vec<u8>, PackError> {
-    zstd::bulk::compress(plain, COMPRESSION_LEVEL).map_err(|source| PackError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    COMPRESSOR
+        .with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let compressor = match slot.as_mut() {
+                Some(compressor) => compressor,
+                None => slot.insert(zstd::bulk::Compressor::new(COMPRESSION_LEVEL)?),
+            };
+            let result = compressor.compress(plain);
+            if result.is_err() {
+                *slot = None;
+            }
+            let mut compressed = result?;
+            compressed.shrink_to_fit();
+            Ok(compressed)
+        })
+        .map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn padding_for(position: u64, alignment: u64) -> u64 {
