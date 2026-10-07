@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-10-07
+
+The process that matters in an agent session is the shared daemon: it answers
+`explore` and `callers_of` and absorbs every edit, and it stays up for hours. This
+release measured one such session end to end (an MCP client driving `status`,
+`explore`, `callers_of`, four structural edits with `sync`, then queries again) and
+fixed what it found. Every answer is unchanged, and three were wrong before (see
+Fixed). Each change's own before/after is in its commit message; the session
+harness is `scripts/mcp_session_bench.py`, which also checks every warm daemon
+answer against a cold `ravel context` on the same tree.
+
+Measured against 1.16.0 on 3,591 files of real npm sources (effect, rxjs, typeorm,
+zod) and on a 20,040-file synthetic monorepo, 4 cores:
+
+| | real npm | 20k synthetic |
+|---|---|---|
+| structural `sync` through the daemon (one-line export added to a hub file) | 1,167–1,854 ms → 113–156 ms | 650 ms first, then 136–196 ms → 83 ms first, then 43–113 ms |
+| first `explore` after such a sync | 176–308 ms → 42–69 ms | 110–163 ms → 64–81 ms |
+| first `callers_of` of the session | 69 ms → 1.4 ms | 141 ms → 1.4 ms |
+| daemon RSS after the four syncs, idle | 715 MB → 136 MB | 558 MB → 256 MB |
+| MCP stdio process RSS | 134 MB → 16 MB | 133 MB → 5 MB |
+| overlay written per one-line hub edit | 21.1 MB → 59 KB | |
+| `.ravel/` after seven agent-style syncs | 167 MB → 104 MB | |
+
+Full `index` time, CPU and peak RSS are unchanged within noise on both corpora; the
+cold CLI commands are as in 1.16.0.
+
+**One slower sync after upgrading, then nothing.** A file's contribution to the
+dependency index now records more (see Fixed), so the resolver fingerprint moves
+and the first structural sync on an index built by 1.16.0 republishes a full base
+instead of appending an overlay — the cost of one `ravel index`, once. The schema
+version does not move and no command needs to be rerun by hand. A full index
+written by 1.17.0 is not byte-identical to 1.16.0's (the reverse section holds the
+extra keys); every answer is identical.
+
+### Fixed
+- **A file created since the last commit was invisible to `ravel sync` and to the
+  auto-sync before every query** until it was committed or its path was passed by
+  hand; `callers_of` on a symbol defined in it answered "nothing in the index is
+  named this". `sync.include_untracked` now defaults to true. The default existed for
+  speed, so the cost was measured first: `git status` with untracked files costs the
+  same 20 ms on the real corpus, 37 → 57 ms on 20k tracked files, 11 → 62 ms with all
+  20k untracked. Emit leftovers are still filtered; set it back to false on a tree with
+  thousands of un-ignored build outputs.
+- **Prefix search after a sync came back short of `limit`**, and `context` reported a
+  `matches_total` one short — the discrepancy 1.16.0 recorded as known. The dictionary
+  and the search overlay both list the names an edited file kept, and the duplicates
+  were removed only after the cut. `search parse --kind prefix --limit 50` returns
+  50 again.
+- **A member reference such as `z.ZodString` was registered in the dependency index
+  under `z.ZodString` only**, though it resolves through `z` and then through the bare
+  name `ZodString`. Renaming that interface would have left the file's `TypeOf` edge
+  in place. It was masked in 1.16.0 by the over-wide re-resolution below and surfaced
+  the moment that was narrowed (an eleven-edit sequence against a fresh index caught
+  it as one edge too many). A contribution now records every segment of a member
+  reference.
+
+### Changed — structural sync
+- **Importers whose edges did not change stay out of the overlay.** An export added to
+  a widely imported file re-resolved 86 files, 85 of which produced exactly the edges
+  they had; all 86 were written as full upserts: 21 MB per one-line edit, then
+  compacted on every sync, re-applied by every reader of the next generation, and
+  held resident. A file is now compared against the current generation first.
+- **Only files that bind a changed export are re-resolved.** Every exported name of
+  the edited file counted as changed, so every file defining or referring to
+  `parse`, `safeParse`, … was re-resolved for a new, unrelated export. The changed
+  set is now the declarations and export bindings whose identity differs, and an
+  importer is re-resolved only when it binds one of those names or a namespace; a
+  file that appears, disappears or changes a star re-export still re-resolves all its
+  importers. Affected files 86 → 2.
+
+### Changed — daemon
+- **A sync's memory goes back to the operating system once the reply is sent.** The
+  allocator kept the pages a sync touched committed until the next allocation
+  pressure, which an idle daemon never produces; its own statistics showed committed
+  memory equal to the session's peak at exit (725 MB on the real corpus).
+- **The resident query graph is advanced in place** by the overlay just published,
+  the way `open_graph` applies the chain on disk, instead of being dropped and rebuilt
+  from the archive by the first query after every sync.
+- **The resident reader's decoded shards are bounded.** It kept every universe, reverse
+  and graph shard a sync decoded for the rest of the session -- 130 universe shards after
+  one sync on the synthetic monorepo -- and the daemon now also collects after a query,
+  since a `context` for a name with twenty thousand definitions allocates tens of
+  megabytes to answer.
+- **Two sync lookups stopped decoding whole universe shards.** A module-resolution probe
+  (`x.ts`, `x.tsx`, `x/index.ts`, … for each import) decoded the entire shard its path
+  hashes to -- definitions and exports included -- to check one file set; the file sets
+  now have a small record of their own (`universe-files/`, with a marker so an index
+  from an earlier build still syncs through the full shard). And the search overlay asked
+  the universe about every name the edited file used to declare; only the names that
+  left the file need asking. Synthetic monorepo: structural delta 230 → 38 ms.
+- **`callers_of` and `calls_from` are served by the daemon.** They opened a second
+  engine, graph and file watcher inside the MCP stdio process; it now never opens the
+  index itself in the primary tool mode. The daemon protocol's minor version records
+  the new operation; the endpoint is version-scoped, so no older daemon can be asked.
+
+### Known
+- The daemon's idle RSS on the 20k-file synthetic monorepo is 256 MB after a session
+  that queried names with twenty thousand definitions: about 100 MB is the resident
+  query graph (382k nodes, 698k edges, one `Arc<str>` per node), the rest the search and
+  symbol-metadata runtimes and allocator slack. A more compact resident graph is the
+  next lever; not taken here.
+- A query issued while the tree has uncommitted edits spends ~25 ms in `git status`
+  (`sync.discovery_cache_ms` reuses the answer for 50 ms). Trusting the daemon's watcher
+  instead would hide an edit for its debounce window from the auto-sync, so it stays.
+
 ## [1.16.0] - 2026-10-07
 
 Less CPU and memory everywhere a workspace has names that many files share, which
@@ -72,7 +178,7 @@ real npm sources (effect, rxjs, typeorm, zod), 4 cores, against 1.15.0:
   into one `Vec` per node per table — about two million allocations — before reading
   a single neighbor.
 
-### Known — present in 1.15.0, unchanged here
+### Known — present in 1.15.0, unchanged here (fixed in 1.17.0)
 - After a structural sync, `search --kind terms` can return low-score hits a fresh
   index would not, and `context` can report a `matches_total` one higher. Found while
   verifying this release; incremental answers match 1.15.0's exactly, so it is not

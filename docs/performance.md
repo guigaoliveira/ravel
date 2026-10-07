@@ -43,6 +43,9 @@ Record results under `reports/perf-*.md` when changing performance-sensitive
 code. Treat timings as machine- and project-dependent rather than universal
 guarantees. `scripts/gen_corpus.py` builds a reproducible synthetic monorepo and
 `scripts/perf_bench.py` measures wall time, CPU and peak RSS per command.
+`scripts/mcp_session_bench.py` drives `ravel mcp` the way an agent does (status,
+explore, callers_of, edits with sync) and samples the RSS of the stdio server and
+the shared daemon after each step — the processes that live for a whole session.
 
 ## Config knobs that affect latency
 
