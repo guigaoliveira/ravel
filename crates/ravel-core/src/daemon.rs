@@ -190,7 +190,7 @@ fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
     Ok(directory)
 }
 
-fn runtime_base() -> io::Result<PathBuf> {
+pub(crate) fn runtime_base() -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(path));
@@ -669,11 +669,23 @@ impl Drop for ConnectionGuard<'_> {
 }
 
 fn try_reserve(counter: &AtomicUsize, limit: usize) -> bool {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < limit).then_some(current + 1)
-        })
-        .is_ok()
+    // Spelled out: stable now deprecates `fetch_update` for `try_update`, which CI's
+    // `-D warnings` turns into a build failure, and `try_update` is newer than the 1.85 MSRV.
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 struct RequestGuard<'a>(&'a DaemonState);

@@ -5794,6 +5794,12 @@ mod agent_context_tests {
         // A read failure is not a deletion: dropping the file makes a permissions problem look like
         // one, with the symbol gone, the count down, and nothing saying why.
         std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&dep).is_ok() {
+            // Root — the default in many container and agent sandboxes — reads it anyway: there is
+            // no read failure to observe, so there is nothing for this test to prove here.
+            std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
         let synced = engine.sync(Some(std::slice::from_ref(&dep))).unwrap();
         std::fs::set_permissions(&dep, std::fs::Permissions::from_mode(0o644)).unwrap();
 

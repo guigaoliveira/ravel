@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-07
+
+This release is about the two harnesses most MCP sessions run in — Claude Code and
+Codex — and the places where the wiring, not the graph, decided whether an agent
+used Ravel.
+
+### Fixed — Codex asked before every query
+- **MCP tools carry annotations.** None had any, and Codex's default `auto`
+  approval mode treats a tool without annotations as destructive and open-world,
+  so every `explore`, `callers_of` and `status` call waited on a prompt: the cheap
+  way to answer a question was the one that interrupted the user. Queries are now
+  `readOnlyHint: true`, `sync` is `destructiveHint: false`, and all are
+  `openWorldHint: false` — what Ravel actually does (it writes only its own index
+  under `.ravel/` and never leaves the machine), and exactly what Codex needs to
+  run them unprompted. Titles are included for client UIs.
+- **Failed calls set `isError`.** An unknown `rollup`, an unreachable daemon or a
+  missing workspace came back as an ordinary result whose body happened to be
+  `{"error": …}`. Clients pass the flag to the model (Codex reports the call as
+  failed), so a failure now reads as one. The body is unchanged.
+- **The handshake names Ravel.** `serverInfo` said `rmcp 2.2.0` — the MCP library —
+  and that is what client UIs and logs showed for the server. It is now `ravel`
+  with the binary version.
+
+### Fixed — reinstalling undid what you configured
+- **`ravel install` keeps the keys you added to the `ravel` entry.** Re-running it
+  after an upgrade replaced the entry wholesale, so an `env` block carrying
+  `RAVEL_MCP_TOOLS=all` — the documented way to get the full surface — vanished
+  silently, along with timeouts, allow-lists and per-tool approvals. JSON configs
+  (Claude Code, Cursor, Gemini, Windsurf, VS Code, OpenCode) now merge: `command`,
+  `args` and `type` are refreshed and everything else stays. Codex's
+  `[mcp_servers.ravel]` is rewritten from the parsed table, nested `env` and
+  `tools` tables included; the rest of `config.toml` is left byte-for-byte, though
+  comments inside the `ravel` table itself do not survive.
+- **Project configs no longer pin one machine's binary.** `--location local`
+  wrote the installer's absolute path into `.mcp.json`, `.codex/config.toml` and
+  the other project files — the files meant to be committed — so the config
+  failed for every teammate. They now launch `ravel` from PATH when this machine
+  resolves it that way (`ravel.exe` on Windows, where clients spawn without a
+  shell and npm's `ravel.cmd` would not resolve). Otherwise the absolute path is
+  kept and the report says why. Global configs still name the absolute binary.
+- **No more `.mcp.json.ravel.lock` in your repository.** The lock that serializes
+  concurrent installs sat beside each config, which for a project install meant a
+  stray file one `git add -A` from being committed. It now lives in Ravel's
+  private runtime directory, and the old sidecar is removed on the next install.
+  Uninstalling from a config that does not exist no longer creates its directory
+  (`.codex/`, `.vscode/`, `.cursor/`) either.
+- **A fresh Claude Code asked permission for every Ravel call.** The
+  `mcp__ravel__*` allow rule was added to `~/.claude/settings.json` only when the
+  file already existed, and Claude Code creates it only once the user changes a
+  setting — so on a new machine the rule was never written. It is now written
+  whenever `~/.claude/` exists (Claude Code is installed); where it does not, the
+  installer still seeds nothing for an agent that is not there.
+- **`$CODEX_HOME` is honoured.** Codex reads its config from there; install wrote
+  to `~/.codex` regardless and left a relocated Codex unwired.
+- **A global install no longer leaves `AGENTS.md` in your home directory.** The
+  README runs `ravel install` before `cd` into a project, so the instruction block
+  landed wherever the shell happened to be. It is now created only in a directory
+  that is a project (`.git`, `package.json`, `tsconfig.json`, `jsconfig.json`) or
+  with `--location local`; a file that already has the block is still refreshed.
+
+### Added — a skill, so the guidance reaches every repository
+- `ravel install` writes a `ravel` Agent Skill for Claude Code
+  (`~/.claude/skills/ravel/`, or `.claude/skills/ravel/` with `--location local`)
+  and Codex (`~/.agents/skills/ravel/`, or `.agents/skills/ravel/`). The
+  instruction block only ever lands in the one project install ran in; a skill's
+  description is in the agent's context in every project, and its body loads only
+  when a question matches it. It maps each question to the MCP tool and the CLI
+  command, and its `allowed-tools` pre-approves the read-only `ravel` CLI calls in
+  Claude Code while it is active (Codex ignores the field). `ravel uninstall`
+  removes it; a `ravel` skill you wrote yourself is never overwritten or removed.
+  `--no-instructions` skips it.
+- `--print-config claude|codex` also prints the `claude mcp add` /
+  `codex mcp add` equivalent.
+
+### Added — the install says what it found, and what it would break
+- **`ravel install` warns when Claude Code has `ravel` in both scopes.** The user
+  config and the project `.mcp.json` are both read, and the same server name
+  with different commands is reported by `claude mcp list` as a conflict at
+  every check, with the project entry winning. A global install followed by a
+  project one produces exactly that, so the report now says so and names the
+  `claude mcp remove ravel -s user|project` that resolves it.
+- **`ravel doctor` reports what is wired.** Per agent, `wired` says whether the
+  global and project MCP configs carry a `ravel` entry and whether the skill is
+  present — "detected" only ever said the agent was on the machine.
+
+### Changed
+- `ravel setup` is a deprecated, hidden alias for
+  `ravel install --location local` (`--claude` adds `--target claude`). It wrote
+  an unmarked snippet `uninstall` could not strip, and `--claude` left a
+  `.ravel/mcp.example.json` pointing at the old `ravel mcp` spelling; it now
+  writes the same marked block as `install`. `--force` is accepted and ignored:
+  the block is always refreshed.
+- Re-running install over a `ravel` entry that was a remote server drops its
+  `url` and `headers` instead of leaving a stdio entry that also names a URL.
+- Tool descriptions lost their `PRIMARY` prefixes and the parts the server
+  instructions already state; `root`, `query` and `limit` gained descriptions;
+  `$schema` and `format: "uint"` were dropped from input schemas. Bytes the model
+  sees for the five primary tools: 4503 -> 4535, with every parameter now
+  described.
+- Server instructions say when to pass `root` and that Ravel never edits source.
+- The README, install docs, `AGENTS.md`, CLI help, `cheatsheet` and `setup` still
+  described three primary tools and `ravel mcp`; they now list the five and
+  `serve --mcp`, and the cheatsheet leads with `callers-of`.
+
 ## [1.17.0] - 2026-10-07
 
 The process that matters in an agent session is the shared daemon: it answers

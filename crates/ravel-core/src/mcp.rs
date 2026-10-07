@@ -8,7 +8,7 @@ use crate::{analysis, engine::WorkspaceEngine, graph::QueryLimits, search::Searc
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -61,16 +61,19 @@ impl McpToolMode {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RootRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SyncRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
     /// Explicit edited paths. Relative paths are resolved from the workspace root.
     pub paths: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceSitesRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
     /// Symbol name, qualified name, or id. A bare name is resolved.
     pub node: String,
@@ -105,8 +108,11 @@ pub struct SearchRequest {
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ExploreRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
+    /// Name, qualified name, candidate id, or natural-language terms.
     pub query: String,
+    /// Sites per direction (default 10, max 50).
     pub limit: Option<usize>,
     /// Ask for the full payload — every similar spelling and the blast-radius
     /// sample. Off by default: the concise response carries the resolved symbol,
@@ -241,10 +247,13 @@ impl RavelMcp {
     }
 
     fn with_mode_and_root(mode: McpToolMode, default_root: Option<PathBuf>) -> Self {
-        let tool_router = match mode {
+        let mut tool_router = match mode {
             McpToolMode::Primary => Self::tool_router_primary(),
             McpToolMode::All => Self::tool_router_primary() + Self::tool_router_extended(),
         };
+        for route in tool_router.map.values_mut() {
+            compact_input_schema(&mut route.attr);
+        }
         Self {
             tool_router,
             engines: Arc::new(Mutex::new(HashMap::new())),
@@ -392,6 +401,22 @@ fn should_respawn_after(error: &crate::daemon::DaemonCallError) -> bool {
     match error {
         crate::daemon::DaemonCallError::Transport(_) => true,
         crate::daemon::DaemonCallError::Remote(message) => message.contains("shutting down"),
+    }
+}
+
+/// Drop schema keys a model gains nothing from. Clients hand `inputSchema` to the model as
+/// written, so every byte here is paid again in each session: `$schema` restates the dialect MCP
+/// already defaults to, and `format: "uint"` is a schemars annotation no validator acts on.
+fn compact_input_schema(tool: &mut rmcp::model::Tool) {
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    schema.remove("$schema");
+    if let Some(serde_json::Value::Object(properties)) = schema.get_mut("properties") {
+        for property in properties
+            .values_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            property.remove("format");
+        }
     }
 }
 
@@ -549,82 +574,109 @@ fn acquire_watcher_leadership(
 }
 
 // ── Primary tools (default) — fewer tools = less schema overhead ────────────
+//
+// Every tool is annotated: `readOnlyHint` lets a client's permission layer treat the queries as
+// the lookups they are (they only maintain Ravel's own index under `.ravel/`, never a source
+// file), and `openWorldHint: false` says nothing leaves the machine. Failures come back with
+// `isError` set, so the model is told the call failed instead of receiving an ordinary-looking
+// `{"error": …}` result it may read as an answer.
 
 #[tool_router(router = tool_router_primary, vis = "pub")]
 impl RavelMcp {
     #[tool(
-        description = "PRIMARY (one call → answers). Exact/qualified symbol or natural-term search, selected source, typed caller/callee sites, and bounded impact. Ambiguous names return candidates instead of guessing."
+        description = "Resolve a name, qualified name, or natural-language terms to a symbol and \
+                       return, in one call, its source excerpt, caller/callee sites (file:line) \
+                       and impact count. Ambiguous names return candidates instead of a guess.",
+        annotations(
+            title = "Explore symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> String {
+    async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(10).max(1);
-        match self.call_daemon(
+        json_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Context {
                 query: request.query.clone(),
                 limit,
                 detail: request.detail.unwrap_or(false),
             },
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 
     #[tool(
-        description = "PRIMARY. Every place that references this symbol, with the file and line \
-                       of each one, the referring symbol, the edge kind, and whether the \
-                       reference is type-only. Resolved edges: never a match inside a comment or \
-                       string, never a same-named symbol from an unrelated file. This is the \
-                       \"what breaks if I change this\" answer, and it is enough to judge each \
-                       site without opening the files first — which is what makes it cheaper \
-                       than grepping a name and reading every hit. Accepts a bare name, a \
-                       qualified name, or an id. Reflects uncommitted edits. Page with \
-                       limit/cursor; `total` and `by_kind` are exact."
+        description = "Every reference to a symbol — the \"what breaks if I change it\" answer. \
+                       Each site has file, line, referring symbol, edge kind and a type-only \
+                       flag, so sites can be judged without opening files. Resolved edges: never \
+                       a comment/string match or a same-named symbol from an unrelated file. \
+                       Accepts a name, qualified name, or id; reflects uncommitted edits. Paged: \
+                       `total` and `by_kind` are exact; pass `next_cursor` as `cursor` for more.",
+        annotations(
+            title = "Callers of symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn callers_of(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+    async fn callers_of(
+        &self,
+        Parameters(request): Parameters<ReferenceSitesRequest>,
+    ) -> ToolReply {
         reference_sites_tool(self, request, true).await
     }
 
     #[tool(
-        description = "PRIMARY. What this symbol references — same shape and guarantees as \
-                       callers_of, in the other direction."
+        description = "What a symbol references — same site shape and guarantees as callers_of, \
+                       in the forward direction.",
+        annotations(
+            title = "Calls from symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn calls_from(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+    async fn calls_from(
+        &self,
+        Parameters(request): Parameters<ReferenceSitesRequest>,
+    ) -> ToolReply {
         reference_sites_tool(self, request, false).await
     }
 
     #[tool(
-        description = "PRIMARY: Index status — is this workspace indexed, how much of it is \
-                       covered, and are there source files the indexer does not support. Check \
-                       at session start before relying on the other tools."
+        description = "Whether this workspace is indexed and how much of it the index covers. \
+                       Call once at session start; when `hint` says Ravel does not cover this \
+                       code, use text search.",
+        annotations(title = "Index status", read_only_hint = true, open_world_hint = false)
     )]
-    async fn status(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.call_daemon(
+    async fn status(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        json_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Status,
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 
     #[tool(
-        description = "PRIMARY: Incremental reindex. Pass edited paths for immediate, reliable sync; otherwise discovers Git-dirty files."
+        description = "Re-index after edits. Pass edited `paths` for an immediate, exact update \
+                       (untracked files included); without paths, re-scans Git-dirty files. \
+                       Writes only Ravel's index (.ravel/), never source.",
+        annotations(
+            title = "Sync index",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn sync(&self, Parameters(request): Parameters<SyncRequest>) -> String {
+    async fn sync(&self, Parameters(request): Parameters<SyncRequest>) -> ToolReply {
         let paths = request
             .paths
             .unwrap_or_default()
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        match self.call_daemon(
+        json_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Sync { paths },
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 }
 
@@ -632,8 +684,11 @@ impl RavelMcp {
 
 #[tool_router(router = tool_router_extended, vis = "pub")]
 impl RavelMcp {
-    #[tool(description = "Search symbols (kind: exact|prefix|fuzzy|regex|terms)")]
-    async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> String {
+    #[tool(
+        description = "Search symbols (kind: exact|prefix|fuzzy|regex|terms)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> ToolReply {
         let kind = match request.kind.as_deref() {
             Some("prefix") => SearchKind::Prefix,
             Some("fuzzy") => SearchKind::Fuzzy,
@@ -642,25 +697,27 @@ impl RavelMcp {
             _ => SearchKind::Exact,
         };
         let limit = request.limit.unwrap_or(20).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.search(&request.query, kind, limit) {
-                Ok(hits) => serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.search(&request.query, kind, limit))
     }
 
     #[tool(
-        description = "Transitive reach: every file that can be reached from this symbol by                        following edges, or that can reach it with reverse=true. This is a walk                        over the whole graph and answers \"how far does this spread\" — for the                        places that actually reference the symbol, with lines, use callers_of."
+        description = "Transitive reach: every file that can be reached from this symbol by \
+                       following edges, or that can reach it with reverse=true. This is a walk \
+                       over the whole graph and answers \"how far does this spread\" — for the \
+                       places that actually reference the symbol, with lines, use callers_of.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn reachable(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+    async fn reachable(&self, Parameters(request): Parameters<QueryRequest>) -> ToolReply {
         let reverse = request.reverse.unwrap_or(false);
         query_tool(self, request, reverse).await
     }
 
-    #[tool(description = "Blast radius + risk scores for a symbol")]
-    async fn impact_analysis(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+    #[tool(
+        description = "Blast radius + risk scores for a symbol",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn impact_analysis(&self, Parameters(request): Parameters<QueryRequest>) -> ToolReply {
         let mut limits = QueryLimits::default();
         if let Some(depth) = request.depth {
             limits.depth = depth;
@@ -668,218 +725,178 @@ impl RavelMcp {
         if let Some(nodes) = request.nodes {
             limits.nodes = nodes;
         }
-        match self.engine(request.root) {
-            Ok(engine) => match engine.impact_risk(&request.node, &limits) {
-                Ok(page) => serde_json::to_string(&page).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.impact_risk(&request.node, &limits))
     }
 
-    #[tool(description = "Graph stats (files/edges/snapshot_id)")]
-    async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.stats() {
-                Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Graph stats (files/edges/snapshot_id)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.stats())
     }
 
-    #[tool(description = "List packages with language and path metadata")]
-    async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.storage().open_file_list() {
-                Ok(Some(files)) => {
-                    let packages =
-                        analysis::list_packages_from_paths(files.paths.iter().map(String::as_str));
-                    serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
-                }
-                Ok(None) => match engine.list_packages() {
-                    Ok(packages) => {
-                        serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
-                    }
-                    Err(error) => error_json(error.to_string()),
-                },
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Get detailed information about a symbol")]
-    async fn node_detail(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.node_detail(&request.symbol) {
-                Ok(Some(sym)) => serde_json::to_string(&sym).unwrap_or_else(|_| "{}".into()),
-                Ok(None) => error_json(format!("symbol '{}' not found", request.symbol)),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "List files belonging to a package (by path prefix)")]
-    async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> String {
-        let limit = request.limit.unwrap_or(50).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.storage().open_file_list() {
-                Ok(Some(files)) => {
-                    serde_json::to_string(&files.in_package_limit(&request.name, limit))
-                        .unwrap_or_else(|_| "[]".into())
-                }
-                Ok(None) => match engine.files_in_package(&request.name) {
-                    Ok(files) => {
-                        serde_json::to_string(&files.into_iter().take(limit).collect::<Vec<_>>())
-                            .unwrap_or_else(|_| "[]".into())
-                    }
-                    Err(error) => error_json(error.to_string()),
-                },
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Package import cycles (SCC), largest first")]
-    async fn cycles(&self, Parameters(request): Parameters<LimitRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.cycles(request.package.as_deref()) {
-                Ok(c) => serde_json::to_string(&c).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Most depended-upon symbols; optional kind filter")]
-    async fn hubs(&self, Parameters(request): Parameters<LimitRequest>) -> String {
-        let limit = request.limit.unwrap_or(20).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.hubs(limit, request.kind.as_deref()) {
-                Ok(h) => serde_json::to_string(&h).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Symbols/files with no reverse dependencies")]
-    async fn orphans(&self, Parameters(request): Parameters<LimitRequest>) -> String {
-        let limit = request.limit.unwrap_or(100).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.orphans(limit) {
-                Ok(o) => serde_json::to_string(&o).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Impact of files changed between git refs")]
-    async fn diff_impact(&self, Parameters(request): Parameters<DiffImpactRequest>) -> String {
-        let limits = QueryLimits {
-            depth: request.depth.unwrap_or(16),
-            ..Default::default()
-        };
-        match self.engine(request.root) {
-            Ok(engine) => match engine.diff_impact(&request.from, request.to.as_deref(), &limits) {
-                Ok(r) => serde_json::to_string(&r).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "CI quality gate: cycles + policy findings")]
-    async fn ci_check(&self, Parameters(request): Parameters<CiRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.ci(
-                request.strict.unwrap_or(false),
-                request.cycle_threshold.unwrap_or(2),
-            ) {
-                Ok(r) => serde_json::to_string(&r).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Export package dependency graph as GraphViz DOT")]
-    async fn export_dot(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.export_dot() {
-                Ok(dot) => serde_json::json!({"format":"dot","content":dot}).to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+    #[tool(
+        description = "List packages with language and path metadata",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.storage().open_file_list().map_err(tool_error)? {
+            Some(files) => json_ok(&analysis::list_packages_from_paths(
+                files.paths.iter().map(String::as_str),
+            )),
+            None => json_reply(engine.list_packages()),
         }
     }
 
     #[tool(
-        description = "Validate index integrity (dangling edges, unresolved relative imports, declared boundary rules)"
+        description = "Get detailed information about a symbol",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.validate() {
-                // Bounded page + complete per-code counts: raw findings run to
-                // megabytes on big monorepos.
-                Ok(f) => serde_json::to_string(&crate::analysis::policy_report(f, 100))
-                    .unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+    async fn node_detail(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.node_detail(&request.symbol).map_err(tool_error)? {
+            Some(symbol) => json_ok(&symbol),
+            None => Err(tool_error(format!("symbol '{}' not found", request.symbol))),
         }
     }
 
-    #[tool(description = "Files that co-change with a path in recent git history")]
-    async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.cochanged(
-                &request.file,
-                request.commits.unwrap_or(100),
-                request.min_cooccurrence.unwrap_or(2),
-            ) {
-                Ok(e) => serde_json::to_string(&e).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+    #[tool(
+        description = "List files belonging to a package (by path prefix)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> ToolReply {
+        let limit = request.limit.unwrap_or(50).max(1);
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.storage().open_file_list().map_err(tool_error)? {
+            Some(files) => json_ok(&files.in_package_limit(&request.name, limit)),
+            None => {
+                let files = engine.files_in_package(&request.name).map_err(tool_error)?;
+                json_ok(&files.into_iter().take(limit).collect::<Vec<_>>())
+            }
         }
     }
 
-    #[tool(description = "Architecture boundary violations (ravel.boundaries.toml)")]
-    async fn boundaries(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.boundaries() {
-                Ok(f) => serde_json::to_string(&f).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Package import cycles (SCC), largest first",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn cycles(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.cycles(request.package.as_deref()))
     }
 
-    #[tool(description = "Schema summary: counts by node/edge kind")]
-    async fn describe_schema(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.describe_schema() {
-                Ok(v) => v.to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Most depended-upon symbols; optional kind filter",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn hubs(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
+        let limit = request.limit.unwrap_or(20).max(1);
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.hubs(limit, request.kind.as_deref()))
     }
 
-    #[tool(description = "Related test files for a source path using common naming patterns")]
-    async fn related_tests(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.related_tests(&request.symbol) {
-                Ok(p) => serde_json::to_string(&p).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Symbols/files with no reverse dependencies",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn orphans(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
+        let limit = request.limit.unwrap_or(100).max(1);
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.orphans(limit))
+    }
+
+    #[tool(
+        description = "Impact of files changed between git refs",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn diff_impact(&self, Parameters(request): Parameters<DiffImpactRequest>) -> ToolReply {
+        let limits = QueryLimits {
+            depth: request.depth.unwrap_or(16),
+            ..Default::default()
+        };
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.diff_impact(&request.from, request.to.as_deref(), &limits))
+    }
+
+    #[tool(
+        description = "CI quality gate: cycles + policy findings",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn ci_check(&self, Parameters(request): Parameters<CiRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.ci(
+            request.strict.unwrap_or(false),
+            request.cycle_threshold.unwrap_or(2),
+        ))
+    }
+
+    #[tool(
+        description = "Export package dependency graph as GraphViz DOT",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn export_dot(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        let dot = engine.export_dot().map_err(tool_error)?;
+        json_ok(&serde_json::json!({"format":"dot","content":dot}))
+    }
+
+    #[tool(
+        description = "Validate index integrity (dangling edges, unresolved relative imports, declared boundary rules)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        // Bounded page + complete per-code counts: raw findings run to
+        // megabytes on big monorepos.
+        let findings = engine.validate().map_err(tool_error)?;
+        json_ok(&crate::analysis::policy_report(findings, 100))
+    }
+
+    #[tool(
+        description = "Files that co-change with a path in recent git history",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.cochanged(
+            &request.file,
+            request.commits.unwrap_or(100),
+            request.min_cooccurrence.unwrap_or(2),
+        ))
+    }
+
+    #[tool(
+        description = "Architecture boundary violations (ravel.boundaries.toml)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn boundaries(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.boundaries())
+    }
+
+    #[tool(
+        description = "Schema summary: counts by node/edge kind",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn describe_schema(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.describe_schema())
+    }
+
+    #[tool(
+        description = "Related test files for a source path using common naming patterns",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn related_tests(
+        &self,
+        Parameters(request): Parameters<SymbolDetailRequest>,
+    ) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.related_tests(&request.symbol))
     }
 }
 
@@ -887,7 +904,7 @@ async fn reference_sites_tool(
     mcp: &RavelMcp,
     request: ReferenceSitesRequest,
     reverse: bool,
-) -> String {
+) -> ToolReply {
     let limit = request.limit.unwrap_or(50).max(1);
     let cursor = request.cursor.unwrap_or(0);
     // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
@@ -896,11 +913,11 @@ async fn reference_sites_tool(
     if let Some(value) = request.rollup.as_deref()
         && crate::engine::RollupMode::parse(value).is_none()
     {
-        return error_json(format!(
+        return Err(error_json(format!(
             "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
-        ));
+        )));
     }
-    match mcp.call_daemon(
+    json_reply(mcp.call_daemon(
         request.root.as_deref(),
         crate::daemon::DaemonOperation::ReferenceSites {
             node: request.node,
@@ -910,13 +927,10 @@ async fn reference_sites_tool(
             scope: request.scope,
             rollup: request.rollup,
         },
-    ) {
-        Ok(value) => value.to_string(),
-        Err(error) => error_json(error),
-    }
+    ))
 }
 
-async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> String {
+async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> ToolReply {
     let mut limits = QueryLimits::default();
     if let Some(depth) = request.depth {
         limits.depth = depth;
@@ -924,13 +938,8 @@ async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> Str
     if let Some(nodes) = request.nodes {
         limits.nodes = nodes;
     }
-    match mcp.engine(request.root) {
-        Ok(engine) => match engine.query(&request.node, reverse, &limits, None) {
-            Ok(page) => serde_json::to_string(&page).unwrap_or_else(|_| "{}".into()),
-            Err(error) => error_json(error.to_string()),
-        },
-        Err(error) => error_json(error.to_string()),
-    }
+    let engine = mcp.engine(request.root).map_err(tool_error)?;
+    json_reply(engine.query(&request.node, reverse, &limits, None))
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -943,8 +952,11 @@ impl ServerHandler for RavelMcp {
             }
             McpToolMode::All => "all tools",
         };
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            format!(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            // Without this the handshake names the MCP library ("rmcp 2.x"), which is what client
+            // UIs and logs then show for the server.
+            .with_server_info(Implementation::new("ravel", crate::VERSION).with_title("Ravel"))
+            .with_instructions(format!(
                 "Ravel answers relational questions about TypeScript/JavaScript code from a \
                  resolved graph. Mode: {mode}.\n\
                  \n\
@@ -960,19 +972,20 @@ impl ServerHandler for RavelMcp {
                  - \"where does this literal text appear\" → grep/ripgrep. That is not a graph \
                  question and Ravel has no advantage there.\n\
                  \n\
-                 Answers include uncommitted edits: each call auto-syncs Git-dirty files against \
-                 a tracked git-dirty discovery first, so results match the working tree, not the last \
-                 commit. Pass edited paths to sync for immediate certainty after a write.\n\
+                 Answers include uncommitted edits: each call first syncs the files Git reports \
+                 as changed, so results match the working tree, not the last commit. Pass \
+                 edited paths to sync for immediate certainty after a write.\n\
                  \n\
                  Call status once at session start. It reports how much of the workspace is \
                  actually indexed — a repo whose sources Ravel does not parse can be \"indexed\" \
                  and still answer nothing, and status says so rather than looking healthy.\n\
                  \n\
                  Relation and impact results are pages with exact totals; follow next_cursor \
-                 rather than assuming a page is the whole answer.\n\
+                 rather than assuming a page is the whole answer. Every tool takes an optional \
+                 absolute `root`; pass it when the code you are asking about is not in the \
+                 server's default workspace. Ravel never edits source files.\n\
                  CLI equivalents: `ravel callers-of X`, `ravel explore X`, `ravel impact X --risk`."
-            ),
-        )
+            ))
     }
 }
 
@@ -990,6 +1003,22 @@ pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+/// A tool's answer. `Ok` is the JSON payload; `Err` is a `{"error": …}` body that rmcp sends
+/// with `isError: true`.
+type ToolReply = Result<String, String>;
+
+fn json_ok(value: &impl serde::Serialize) -> ToolReply {
+    serde_json::to_string(value).map_err(tool_error)
+}
+
+fn json_reply<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> ToolReply {
+    json_ok(&result.map_err(tool_error)?)
+}
+
+fn tool_error(error: impl std::fmt::Display) -> String {
+    error_json(error.to_string())
 }
 
 fn error_json(message: String) -> String {
