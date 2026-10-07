@@ -1081,6 +1081,17 @@ impl SearchIndex {
                 overlay.snapshot_id.clone(),
             ));
             hits.extend(added.search(query, kind, expanded_limit)?);
+            // A name the edited file kept is listed by both the dictionary and the overlay.
+            // `finish_hits` removes duplicates only after truncating, so each one cost a slot
+            // and a prefix search after a sync came back short of `limit`.
+            hits.sort_by(|left, right| {
+                left.value
+                    .cmp(&right.value)
+                    .then_with(|| left.definition_id.cmp(&right.definition_id))
+            });
+            hits.dedup_by(|left, right| {
+                left.value == right.value && left.definition_id == right.definition_id
+            });
         }
         finish_hits(hits, limit)
     }
@@ -1362,6 +1373,24 @@ fn levenshtein_at_most(a: &[char], b: &str, max_dist: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_name_kept_by_an_edited_file_does_not_cost_a_prefix_search_slot() {
+        // After a sync, the dictionary and the overlay both list the names the edited file kept.
+        let dict =
+            SymbolDict::from_names((0..6).map(|i| format!("parse{i}")).collect(), "snap".into());
+        let index =
+            SearchIndex::from_parts(dict, None).with_term_overlays(vec![SearchTermOverlay {
+                snapshot_id: "snap".into(),
+                removed_ids: Vec::new(),
+                added_names: vec!["parse0".into(), "parse1".into(), "parse2".into()],
+                removed_names: Vec::new(),
+                documents: Vec::new(),
+            }]);
+        let hits = index.search("parse", SearchKind::Prefix, 5).unwrap();
+        let values: Vec<_> = hits.iter().map(|hit| hit.value.as_str()).collect();
+        assert_eq!(values, ["parse0", "parse1", "parse2", "parse3", "parse4"]);
+    }
     use super::*;
     use crate::{
         model::{FileArtifact, IndexSnapshot, SnapshotId, Span, Symbol},
