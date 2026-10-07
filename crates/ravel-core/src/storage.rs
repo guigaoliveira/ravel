@@ -4,7 +4,7 @@ use crate::{
     generation_pack::{GenerationPackReader, StreamingGenerationPackWriter},
     graph::{CompactGraph, FlatCompactGraph, GraphIndex},
     incremental_graph::{
-        GraphAdjShard, GraphEdgeShard, GraphFileShard, IncrementalGraphOverlay,
+        GraphAdjShard, GraphEdgeShard, GraphFileShard, GraphSectionShards, IncrementalGraphOverlay,
         IncrementalGraphState, OwnedEdge, digest_shard_id, graph_shard_id, owned_edge_digest,
     },
     model::{
@@ -659,6 +659,7 @@ impl StructuralPackStager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn stage_graph(&mut self, graph: IncrementalGraphState) -> Result<(), StorageError> {
         let mark = std::time::Instant::now();
         let graph = graph
@@ -668,6 +669,27 @@ impl StructuralPackStager {
                 message: "invalid graph shard layout".into(),
             })?;
         crate::timing::stage("stage_graph.section_shards", mark, String::new);
+        self.stage_graph_sections(graph)
+    }
+
+    /// Stage the graph base for a full index directly from the resolved edges; see
+    /// [`GraphSectionShards::from_edges`] for why no `IncrementalGraphState` is built.
+    pub(crate) fn stage_graph_edges(
+        &mut self,
+        edges: &[crate::model::Edge],
+    ) -> Result<(), StorageError> {
+        let mark = std::time::Instant::now();
+        let graph =
+            GraphSectionShards::from_edges(edges, GRAPH_FILE_BITS, GRAPH_EDGE_BITS, GRAPH_ADJ_BITS)
+                .ok_or_else(|| StorageError::Invalid {
+                    path: self.path.clone(),
+                    message: "invalid graph shard layout".into(),
+                })?;
+        crate::timing::stage("stage_graph.section_shards", mark, String::new);
+        self.stage_graph_sections(graph)
+    }
+
+    fn stage_graph_sections(&mut self, graph: GraphSectionShards) -> Result<(), StorageError> {
         self.add_meta(
             "meta/graph2",
             &(

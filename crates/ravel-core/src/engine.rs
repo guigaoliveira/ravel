@@ -2,7 +2,7 @@ use crate::{
     analysis::{self, CiReport, CycleInfo, HubEntry, ImpactReport, PackageInfo},
     config::{Config, Flags},
     graph::{GraphIndex, QueryLimits, QueryPage},
-    incremental_graph::{IncrementalGraphOverlay, IncrementalGraphState, OwnedEdge},
+    incremental_graph::{IncrementalGraphOverlay, OwnedEdge},
     model::{INDEX_SCHEMA_VERSION, IndexSnapshot, SnapshotId},
     policy::{PolicyFinding, Suppressions, validate_snapshot},
     resolver::{
@@ -2409,11 +2409,8 @@ impl WorkspaceEngine {
             let stage_start = std::time::Instant::now();
             stager.stage_reverse(reverse)?;
             crate::timing::stage("index.stage_reverse", stage_start, String::new);
-            let graph_start = std::time::Instant::now();
-            let graph = IncrementalGraphState::from_edges(&resolved_edges);
-            crate::timing::stage("index.graph_from_edges", graph_start, String::new);
             let stage_start = std::time::Instant::now();
-            let graph_staged = stager.stage_graph(graph);
+            let graph_staged = stager.stage_graph_edges(&resolved_edges);
             crate::timing::stage("index.stage_graph", stage_start, String::new);
             graph_staged?;
             (resolved_edges, Some(stager))
