@@ -190,7 +190,7 @@ fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
     Ok(directory)
 }
 
-fn runtime_base() -> io::Result<PathBuf> {
+pub(crate) fn runtime_base() -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(path));

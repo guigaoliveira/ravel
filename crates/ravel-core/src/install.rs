@@ -4,28 +4,46 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     process::Command,
 };
 
+/// Serializes concurrent `ravel install` / `uninstall` runs on one config file.
+///
+/// The lock lives in Ravel's private runtime directory, keyed by the config's path. It used to sit
+/// beside the config, which for a project install meant a stray `.mcp.json.ravel.lock` in the
+/// user's repository, one `git add -A` away from being committed. The config itself cannot be the
+/// lock: it is replaced by rename, so a second writer would open, and lock, a different file.
 fn lock_config(path: &Path) -> anyhow::Result<File> {
     use fs4::fs_std::FileExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("config"))
-        .to_os_string();
-    name.push(".ravel.lock");
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("config"));
+    // Canonical, so `./.mcp.json` and `/abs/repo/.mcp.json` take the same lock.
+    let key = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(file_name);
+    let directory = crate::daemon::runtime_base()
+        .unwrap_or_else(|_| env::temp_dir())
+        .join("ravel")
+        .join("config-locks");
+    fs::create_dir_all(&directory)?;
+    let digest = blake3::hash(key.to_string_lossy().as_bytes()).to_hex();
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(parent.join(name))?;
+        .open(directory.join(format!("{}.lock", &digest[..32])))?;
     file.lock_exclusive()?;
+    // The sidecar 1.15 and earlier left next to the config.
+    let mut legacy = file_name.to_os_string();
+    legacy.push(".ravel.lock");
+    let _ = fs::remove_file(parent.join(legacy));
     Ok(file)
 }
 
@@ -174,6 +192,50 @@ pub fn resolve_ravel_bin() -> PathBuf {
         .ok()
         .and_then(|p| p.canonicalize().ok())
         .unwrap_or_else(|| PathBuf::from("ravel"))
+}
+
+/// The command a config written at `location` should launch Ravel with.
+///
+/// A global config belongs to one user on one machine, so it names this binary's absolute path and
+/// does not depend on whatever PATH a GUI-launched agent inherits. A project config (`.mcp.json`,
+/// `.codex/config.toml`, …) exists to be committed and shared, and an absolute path from one
+/// machine fails on every other — so it names `ravel` from PATH whenever this machine resolves it
+/// that way, which is also what a teammate's install provides.
+pub fn launch_command(location: InstallLocation, ravel_bin: &Path) -> PathBuf {
+    match location {
+        InstallLocation::Local if on_path(MCP_SERVER_NAME, env::var_os("PATH").as_deref()) => {
+            PathBuf::from(MCP_SERVER_NAME)
+        }
+        _ => ravel_bin.to_path_buf(),
+    }
+}
+
+/// Whether `name` resolves to an executable through `path` the way an MCP client spawning it would.
+/// On Windows only `.exe` counts: clients spawn without a shell, so npm's `ravel.cmd` shim does not
+/// resolve from a bare `ravel`.
+fn on_path(name: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    env::split_paths(path).any(|directory| is_executable(&directory.join(&file)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Detect which agents look installed (binary on PATH and/or config dir present).
@@ -609,7 +671,7 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
         write_project_instructions(opts, &mut actions)?;
     }
 
-    let next_steps = vec![
+    let mut next_steps = vec![
         "Restart your agent(s) so MCP reloads.".into(),
         format!(
             "In each project: cd <repo> && {} index",
@@ -620,6 +682,14 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
             opts.ravel_bin.display()
         ),
     ];
+    if opts.location == InstallLocation::Local && opts.ravel_bin.is_absolute() {
+        next_steps.push(format!(
+            "`ravel` is not on PATH here, so the project config launches {} — a path that only \
+             exists on this machine. Put `ravel` on PATH and re-run `ravel install --location \
+             local` before committing it.",
+            opts.ravel_bin.display()
+        ));
+    }
 
     Ok(InstallReport {
         ravel_bin: opts.ravel_bin.display().to_string(),
@@ -1801,6 +1871,58 @@ b = 2
         fs::create_dir(dir.path().join(".git")).unwrap();
         write_project_instructions(&opts, &mut Vec::new()).unwrap();
         assert!(dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn project_configs_launch_ravel_from_path_only_when_it_resolves() {
+        let dir = tempdir().unwrap();
+        let binary = dir
+            .path()
+            .join(if cfg!(windows) { "ravel.exe" } else { "ravel" });
+        fs::write(&binary, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                !on_path("ravel", Some(dir.path().as_os_str())),
+                "a file that cannot be executed does not resolve"
+            );
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(on_path("ravel", Some(dir.path().as_os_str())));
+        assert!(!on_path(
+            "ravel",
+            Some(tempdir().unwrap().path().as_os_str())
+        ));
+        assert!(!on_path("ravel", None));
+        assert_eq!(
+            launch_command(InstallLocation::Global, Path::new("/abs/ravel")),
+            PathBuf::from("/abs/ravel"),
+            "a global config always names the absolute binary"
+        );
+    }
+
+    #[test]
+    fn config_locks_stay_out_of_the_project() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        // The sidecar older releases left beside the config is cleaned up, not recreated.
+        fs::write(dir.path().join(".mcp.json.ravel.lock"), "").unwrap();
+        upsert_json_mcp_servers(&path, Path::new("ravel"), true).unwrap();
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![std::ffi::OsString::from(".mcp.json")]);
+
+        let mut actions = Vec::new();
+        let missing = dir.path().join(".codex").join("config.toml");
+        remove_json_mcp_key(AgentKind::Codex, &missing, &mut actions, "mcpServers").unwrap();
+        assert!(
+            !dir.path().join(".codex").exists(),
+            "uninstalling from a config that is not there must not create its directory"
+        );
     }
 
     #[test]

@@ -450,7 +450,8 @@ skip_sibling_emit = true
                     .ok_or_else(|| anyhow::anyhow!("unknown agent for --print-config"))?;
                 let loc = ravel_core::install::InstallLocation::parse(&location)
                     .map_err(anyhow::Error::msg)?;
-                print!("{}", ravel_core::install::print_config(kind, &bin, loc));
+                let command = ravel_core::install::launch_command(loc, &bin);
+                print!("{}", ravel_core::install::print_config(kind, &command, loc));
             } else {
                 let targets = ravel_core::install::AgentKind::parse_csv(&target)
                     .map_err(anyhow::Error::msg)?;
@@ -460,7 +461,7 @@ skip_sibling_emit = true
                     targets,
                     location: loc,
                     project_root: root.clone(),
-                    ravel_bin: bin,
+                    ravel_bin: ravel_core::install::launch_command(loc, &bin),
                     write_instructions: !no_instructions,
                     claude_permissions: !no_permissions,
                 };

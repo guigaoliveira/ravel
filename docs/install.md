@@ -104,6 +104,12 @@ MCP always launches:
 
 so agents don’t depend on PATH quirks. Project root is the agent’s cwd (`--root` optional).
 
+Project configs (`--location local`) are meant to be committed, and an absolute path
+from one machine breaks on every other, so they launch plain `ravel` whenever it
+is on your PATH (on Windows, `ravel.exe`). When it is not, the absolute path is
+used and the install report says so — put `ravel` on PATH and re-run before
+committing.
+
 Re-running `ravel install` (after an upgrade or a move) refreshes the command and
 arguments and keeps everything else you added to the `ravel` entry: `env`,
 timeouts, tool allow-lists, per-tool approvals.

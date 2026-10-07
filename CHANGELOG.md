@@ -38,6 +38,19 @@ used Ravel.
   `[mcp_servers.ravel]` is rewritten from the parsed table, nested `env` and
   `tools` tables included; the rest of `config.toml` is left byte-for-byte, though
   comments inside the `ravel` table itself do not survive.
+- **Project configs no longer pin one machine's binary.** `--location local`
+  wrote the installer's absolute path into `.mcp.json`, `.codex/config.toml` and
+  the other project files — the files meant to be committed — so the config
+  failed for every teammate. They now launch `ravel` from PATH when this machine
+  resolves it that way (`ravel.exe` on Windows, where clients spawn without a
+  shell and npm's `ravel.cmd` would not resolve). Otherwise the absolute path is
+  kept and the report says why. Global configs still name the absolute binary.
+- **No more `.mcp.json.ravel.lock` in your repository.** The lock that serializes
+  concurrent installs sat beside each config, which for a project install meant a
+  stray file one `git add -A` from being committed. It now lives in Ravel's
+  private runtime directory, and the old sidecar is removed on the next install.
+  Uninstalling from a config that does not exist no longer creates its directory
+  (`.codex/`, `.vscode/`, `.cursor/`) either.
 - **`$CODEX_HOME` is honoured.** Codex reads its config from there; install wrote
   to `~/.codex` regardless and left a relocated Codex unwired.
 - **A global install no longer leaves `AGENTS.md` in your home directory.** The
