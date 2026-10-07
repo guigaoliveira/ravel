@@ -125,6 +125,20 @@ removed. `--no-instructions` skips both.
 `ravel install --print-config claude` and `--print-config codex` also print the
 equivalent `claude mcp add` / `codex mcp add` one-liner.
 
+Claude Code specifics:
+
+- A global install adds `mcp__ravel__*` to the `permissions.allow` list in
+  `~/.claude/settings.json`, creating the file when Claude Code has not written
+  one yet, so Ravel's tools run without a prompt per call. `--no-permissions`
+  skips it. Project installs do not touch permissions: a
+  `.claude/settings.local.json` created by anything other than Claude Code is
+  not kept out of git automatically.
+- Claude Code reads both the user config and the project `.mcp.json`. When both
+  name a `ravel` server with different commands — a global install followed by a
+  project one does exactly that — `claude mcp list` reports a scope conflict and
+  the project entry wins. The install report warns about it and names the
+  `claude mcp remove` that resolves it; keep one scope per machine.
+
 ### Uninstall agents
 
 ```bash
@@ -159,8 +173,12 @@ For a persistent CLI-only daemon, use `ravel daemon start|status|stop`.
 
 ```bash
 ravel doctor
-# → index health + detected agents + binary path
+# → index health + detected agents + what is wired, per agent
 ```
+
+For each agent, `wired` says whether the global and project MCP configs carry a
+`ravel` entry and whether the skill is present — the question to ask first when
+an agent never reaches for the graph.
 
 ## MCP primary tools (token tax)
 

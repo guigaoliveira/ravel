@@ -543,7 +543,7 @@ fn agent_skill() -> String {
     format!(
         r#"---
 name: ravel
-description: Answers relational questions about TypeScript/JavaScript code — who calls or depends on a symbol, what it calls, what breaks if it changes — from a local resolved code graph, with the file and line of every site. Use instead of grepping a name and reading each hit when the question is about callers, dependencies, or change impact in a TS/JS repository.
+description: Answers relational questions about TypeScript/JavaScript code from a local resolved code graph — who calls, references, imports or depends on a symbol, what it calls, what breaks if it changes (blast radius / impact), with the file and line of every site. Use instead of grepping a name and reading each hit when the question is about callers, usages, dependencies, or change impact in a TS/JS repository.
 allowed-tools: Bash(ravel status *) Bash(ravel explore *) Bash(ravel context *) Bash(ravel callers-of *) Bash(ravel calls-from *) Bash(ravel search *) Bash(ravel impact *) Bash(ravel sync *)
 ---
 {SKILL_MANAGED_MARKER}
@@ -845,9 +845,9 @@ fn claude_local_path(opts: &InstallOptions) -> PathBuf {
 }
 
 fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => claude_global_path(),
-        InstallLocation::Local => claude_local_path(opts),
+    let (path, other_scope) = match opts.location {
+        InstallLocation::Global => (claude_global_path(), claude_local_path(opts)),
+        InstallLocation::Local => (claude_local_path(opts), claude_global_path()),
     };
     upsert_json_mcp_servers(&path, &opts.ravel_bin, true)?;
     actions.push(InstallAction {
@@ -856,6 +856,14 @@ fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
         action: "wrote_mcp".into(),
         detail: "mcpServers.ravel".into(),
     });
+    if let Some(detail) = claude_scope_conflict(&other_scope, &opts.ravel_bin) {
+        actions.push(InstallAction {
+            agent: "claude".into(),
+            path: other_scope.display().to_string(),
+            action: "warn".into(),
+            detail,
+        });
+    }
 
     if opts.claude_permissions && opts.location == InstallLocation::Global {
         let settings = home_dir().join(".claude").join("settings.json");
@@ -878,6 +886,33 @@ fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
     Ok(())
 }
 
+/// Claude Code reads both the user config and the project `.mcp.json`. The same server name in
+/// both with different commands is reported as a conflict at every `claude mcp list` — which is
+/// exactly what a global install followed by a project one produces, since the project entry
+/// launches `ravel` from PATH and the global one names the absolute binary.
+fn claude_scope_conflict(other_scope: &Path, command: &Path) -> Option<String> {
+    let text = fs::read_to_string(other_scope).ok()?;
+    let root: Value = serde_json::from_str(&text).ok()?;
+    let existing = root
+        .get("mcpServers")?
+        .get(MCP_SERVER_NAME)?
+        .get("command")?;
+    if existing.as_str() == Some(command.to_string_lossy().as_ref()) {
+        return None;
+    }
+    Some(format!(
+        "{} also defines a `ravel` server, launched as {}. Claude Code flags the two scopes as \
+         different endpoints; the project entry wins. Keep one: `claude mcp remove ravel -s {}`.",
+        other_scope.display(),
+        existing,
+        if other_scope.file_name() == Some(OsStr::new(".mcp.json")) {
+            "project"
+        } else {
+            "user"
+        }
+    ))
+}
+
 fn uninstall_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
     let path = match opts.location {
         InstallLocation::Global => claude_global_path(),
@@ -887,15 +922,21 @@ fn uninstall_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
 }
 
 fn ensure_claude_allowlist(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        // Don't create settings.json from scratch (user may not want defaults).
+    // Claude Code creates this file itself only when the user changes an option, so a fresh
+    // install usually has none — and then every ravel call asked for permission. Creating it
+    // with the one rule is safe (there are no defaults to pre-empt). Its directory, however, is
+    // the sign Claude Code is actually installed: without it, this would seed a config for an
+    // agent that is not there.
+    let installed = path.parent().is_some_and(Path::is_dir);
+    if !installed {
         return Ok(());
     }
     let _lock = lock_config(path)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = fs::read_to_string(path)?;
+    let text = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        "{}".to_owned()
+    };
     let mut root: Value = serde_json::from_str(&text)?;
     // Guard every downcast: a settings.json that parses to a non-object (`[]`, scalar), or
     // whose `permissions`/`allow` are the wrong JSON type, must not panic — coerce instead.
@@ -996,6 +1037,9 @@ fn merge_server_entry(existing: Option<&Value>, fresh: Value) -> Value {
     match (existing.and_then(Value::as_object), fresh) {
         (Some(existing), Value::Object(fresh)) => {
             let mut merged = existing.clone();
+            // A remote entry's keys would leave a stdio entry that also names a URL.
+            merged.remove("url");
+            merged.remove("headers");
             merged.extend(fresh);
             Value::Object(merged)
         }
@@ -1213,11 +1257,15 @@ fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
     out
 }
 
-fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
+fn opencode_config_path(opts: &InstallOptions) -> PathBuf {
+    match opts.location {
         InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
         InstallLocation::Local => opts.project_root.join("opencode.json"),
-    };
+    }
+}
+
+fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+    let path = opencode_config_path(opts);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1262,10 +1310,7 @@ fn uninstall_opencode(
     opts: &InstallOptions,
     actions: &mut Vec<InstallAction>,
 ) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
-        InstallLocation::Local => opts.project_root.join("opencode.json"),
-    };
+    let path = opencode_config_path(opts);
     let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
@@ -1300,25 +1345,17 @@ fn uninstall_opencode(
     Ok(())
 }
 
-fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    // Prefer project-local .vscode/mcp.json (works in VS Code Copilot).
-    let path = match opts.location {
+fn vscode_config_path(opts: &InstallOptions) -> PathBuf {
+    match opts.location {
+        // Project-local .vscode/mcp.json works in VS Code Copilot.
         InstallLocation::Local => opts.project_root.join(".vscode").join("mcp.json"),
-        InstallLocation::Global => {
-            // User-level path varies; still write project if root is given, else user Code config.
-            if cfg!(target_os = "macos") {
-                home_dir()
-                    .join("Library")
-                    .join("Application Support")
-                    .join("Code")
-                    .join("User")
-                    .join("mcp.json")
-            } else {
-                // Linux + Windows user MCP path via config dir.
-                dirs_config().join("Code").join("User").join("mcp.json")
-            }
-        }
-    };
+        // `dirs_config()` is Application Support on macOS, so the user path is one expression.
+        InstallLocation::Global => dirs_config().join("Code").join("User").join("mcp.json"),
+    }
+}
+
+fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+    let path = vscode_config_path(opts);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1368,10 +1405,7 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
 }
 
 fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Local => opts.project_root.join(".vscode").join("mcp.json"),
-        InstallLocation::Global => dirs_config().join("Code").join("User").join("mcp.json"),
-    };
+    let path = vscode_config_path(opts);
     let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
@@ -1556,10 +1590,72 @@ fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// List detection + suggested install without writing.
+/// The MCP config file `ravel install` writes for an agent at a location, when it has one.
+fn mcp_config_path(kind: AgentKind, opts: &InstallOptions) -> Option<PathBuf> {
+    Some(match (kind, opts.location) {
+        (AgentKind::Claude, InstallLocation::Global) => claude_global_path(),
+        (AgentKind::Claude, InstallLocation::Local) => claude_local_path(opts),
+        (AgentKind::Cursor, _) => cursor_mcp_path(opts),
+        (AgentKind::Codex, _) => codex_config_path(opts),
+        (AgentKind::OpenCode, _) => opencode_config_path(opts),
+        (AgentKind::Gemini, _) => gemini_settings_path(opts),
+        (AgentKind::Windsurf, InstallLocation::Global) => windsurf_mcp_path(),
+        (AgentKind::VsCode, _) => vscode_config_path(opts),
+        (AgentKind::Windsurf, InstallLocation::Local) | (AgentKind::Grok, _) => return None,
+    })
+}
+
+/// Whether a config file carries a `ravel` server entry, in whichever shape its agent uses.
+fn config_has_ravel(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    if path.extension() == Some(OsStr::new("toml")) {
+        return text.parse::<toml::Table>().is_ok_and(|table| {
+            table
+                .get("mcp_servers")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|servers| servers.contains_key(MCP_SERVER_NAME))
+        });
+    }
+    serde_json::from_str::<Value>(&text).is_ok_and(|root| {
+        ["mcpServers", "servers", "mcp"].iter().any(|key| {
+            root.get(key)
+                .and_then(|servers| servers.get(MCP_SERVER_NAME))
+                .is_some()
+        })
+    })
+}
+
+/// List detection + what is wired, without writing.
+///
+/// "Detected" says an agent is on this machine; `wired` says whether this install reaches it —
+/// the question a user with a silent agent actually has.
 pub fn doctor_agents(project_root: &Path) -> Value {
     let detected: Vec<_> = detect_agents().iter().map(|a| a.id()).collect();
     let bin = resolve_ravel_bin();
+    let probe = |location| InstallOptions {
+        targets: Vec::new(),
+        location,
+        project_root: project_root.to_path_buf(),
+        ravel_bin: bin.clone(),
+        write_instructions: false,
+        claude_permissions: false,
+    };
+    let (global, local) = (
+        probe(InstallLocation::Global),
+        probe(InstallLocation::Local),
+    );
+    let wired = |kind: AgentKind| {
+        let mcp = |opts: &InstallOptions| mcp_config_path(kind, opts).map(|p| config_has_ravel(&p));
+        let skill = |opts: &InstallOptions| skill_path(kind, opts).map(|p| p.exists());
+        json!({
+            "mcp_global": mcp(&global),
+            "mcp_local": mcp(&local),
+            "skill_global": skill(&global),
+            "skill_local": skill(&local),
+        })
+    };
     json!({
         "ravel_bin": bin.display().to_string(),
         "project": project_root.display().to_string(),
@@ -1569,6 +1665,7 @@ pub fn doctor_agents(project_root: &Path) -> Value {
                 "id": a.id(),
                 "label": a.label(),
                 "detected": agent_looks_installed(*a),
+                "wired": wired(*a),
             })
         }).collect::<Vec<_>>(),
         "hint": "ravel install   # wire MCP into detected agents",
@@ -1923,6 +2020,94 @@ b = 2
             !dir.path().join(".codex").exists(),
             "uninstalling from a config that is not there must not create its directory"
         );
+    }
+
+    #[test]
+    fn claude_allowlist_is_created_only_where_claude_is_installed() {
+        let dir = tempdir().unwrap();
+        let absent = dir.path().join("nowhere").join("settings.json");
+        ensure_claude_allowlist(&absent).unwrap();
+        assert!(
+            !absent.exists(),
+            "no ~/.claude: Claude Code is not installed here"
+        );
+
+        fs::create_dir(dir.path().join(".claude")).unwrap();
+        let settings = dir.path().join(".claude").join("settings.json");
+        ensure_claude_allowlist(&settings).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v, json!({"permissions": {"allow": ["mcp__ravel__*"]}}));
+
+        // Idempotent, and additive on a file with other rules.
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["Read"]},"model":"x"}"#,
+        )
+        .unwrap();
+        ensure_claude_allowlist(&settings).unwrap();
+        ensure_claude_allowlist(&settings).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["allow"], json!(["Read", "mcp__ravel__*"]));
+        assert_eq!(v["model"], "x");
+    }
+
+    #[test]
+    fn claude_scope_conflict_is_reported_only_when_commands_differ() {
+        let dir = tempdir().unwrap();
+        let user = dir.path().join(".claude.json");
+        assert!(claude_scope_conflict(&user, Path::new("ravel")).is_none());
+        fs::write(
+            &user,
+            r#"{"mcpServers":{"ravel":{"command":"/abs/ravel","args":["serve","--mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(claude_scope_conflict(&user, Path::new("/abs/ravel")).is_none());
+        let warning = claude_scope_conflict(&user, Path::new("ravel")).unwrap();
+        assert!(
+            warning.contains("claude mcp remove ravel -s user"),
+            "{warning}"
+        );
+        let project = dir.path().join(".mcp.json");
+        fs::write(&project, r#"{"mcpServers":{"ravel":{"command":"ravel"}}}"#).unwrap();
+        let warning = claude_scope_conflict(&project, Path::new("/abs/ravel")).unwrap();
+        assert!(warning.contains("-s project"), "{warning}");
+    }
+
+    #[test]
+    fn merging_over_a_remote_entry_leaves_no_url_behind() {
+        let existing = json!({"type":"http","url":"https://x","headers":{"a":"b"},"env":{"K":"v"}});
+        let merged = merge_server_entry(Some(&existing), mcp_stdio_entry(Path::new("ravel")));
+        assert_eq!(merged["type"], "stdio");
+        assert_eq!(merged["env"]["K"], "v");
+        assert!(merged.get("url").is_none() && merged.get("headers").is_none());
+    }
+
+    #[test]
+    fn doctor_reports_what_each_config_shape_actually_wires() {
+        let dir = tempdir().unwrap();
+        let json = dir.path().join("mcp.json");
+        let toml = dir.path().join("config.toml");
+        assert!(!config_has_ravel(&json), "missing file");
+        fs::write(&json, r#"{"servers":{"ravel":{}}}"#).unwrap();
+        assert!(config_has_ravel(&json));
+        fs::write(&json, r#"{"mcpServers":{"other":{}}}"#).unwrap();
+        assert!(!config_has_ravel(&json));
+        fs::write(&toml, "[mcp_servers.ravel]\ncommand = \"ravel\"\n").unwrap();
+        assert!(config_has_ravel(&toml));
+        fs::write(&toml, "[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
+        assert!(!config_has_ravel(&toml));
+
+        let opts = local_opts(dir.path(), vec![AgentKind::Claude]);
+        install_agents(&opts).unwrap();
+        let report = doctor_agents(dir.path());
+        let claude = report["supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "claude")
+            .unwrap();
+        assert_eq!(claude["wired"]["mcp_local"], true);
+        assert_eq!(claude["wired"]["skill_local"], true);
     }
 
     #[test]

@@ -51,6 +51,12 @@ used Ravel.
   private runtime directory, and the old sidecar is removed on the next install.
   Uninstalling from a config that does not exist no longer creates its directory
   (`.codex/`, `.vscode/`, `.cursor/`) either.
+- **A fresh Claude Code asked permission for every Ravel call.** The
+  `mcp__ravel__*` allow rule was added to `~/.claude/settings.json` only when the
+  file already existed, and Claude Code creates it only once the user changes a
+  setting — so on a new machine the rule was never written. It is now written
+  whenever `~/.claude/` exists (Claude Code is installed); where it does not, the
+  installer still seeds nothing for an agent that is not there.
 - **`$CODEX_HOME` is honoured.** Codex reads its config from there; install wrote
   to `~/.codex` regardless and left a relocated Codex unwired.
 - **A global install no longer leaves `AGENTS.md` in your home directory.** The
@@ -73,7 +79,26 @@ used Ravel.
 - `--print-config claude|codex` also prints the `claude mcp add` /
   `codex mcp add` equivalent.
 
+### Added — the install says what it found, and what it would break
+- **`ravel install` warns when Claude Code has `ravel` in both scopes.** The user
+  config and the project `.mcp.json` are both read, and the same server name
+  with different commands is reported by `claude mcp list` as a conflict at
+  every check, with the project entry winning. A global install followed by a
+  project one produces exactly that, so the report now says so and names the
+  `claude mcp remove ravel -s user|project` that resolves it.
+- **`ravel doctor` reports what is wired.** Per agent, `wired` says whether the
+  global and project MCP configs carry a `ravel` entry and whether the skill is
+  present — "detected" only ever said the agent was on the machine.
+
 ### Changed
+- `ravel setup` is a deprecated, hidden alias for
+  `ravel install --location local` (`--claude` adds `--target claude`). It wrote
+  an unmarked snippet `uninstall` could not strip, and `--claude` left a
+  `.ravel/mcp.example.json` pointing at the old `ravel mcp` spelling; it now
+  writes the same marked block as `install`. `--force` is accepted and ignored:
+  the block is always refreshed.
+- Re-running install over a `ravel` entry that was a remote server drops its
+  `url` and `headers` instead of leaving a stdio entry that also names a URL.
 - Tool descriptions lost their `PRIMARY` prefixes and the parts the server
   instructions already state; `root`, `query` and `limit` gained descriptions;
   `$schema` and `format: "uint"` were dropped from input schemas. Bytes the model

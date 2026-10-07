@@ -63,12 +63,16 @@ enum Command {
         #[arg(long)]
         detail: bool,
     },
-    /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
-    /// Prefer `ravel install` for multi-agent MCP wiring.
+    /// Deprecated: `ravel install --location local` (add `--target claude` for `--claude`).
+    ///
+    /// Writes the same marked AGENTS.md / CLAUDE.md block as `install`, so `uninstall` can strip it.
+    #[command(hide = true)]
     Setup {
+        /// Also write the project `.mcp.json` for Claude Code.
         #[arg(long)]
         claude: bool,
-        #[arg(long)]
+        /// Accepted for compatibility; the marked block is always refreshed.
+        #[arg(long, hide = true)]
         force: bool,
     },
     /// Wire Ravel MCP into coding agents (Claude, Cursor, Codex, OpenCode, Gemini, …)
@@ -428,10 +432,26 @@ skip_sibling_emit = true
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
         }
-        Some(Command::Setup { claude, force }) => {
-            write_agent_setup(&root, claude, force)?;
-            println!("agent setup written under {}", root.display());
-            println!("tip: run `ravel install` to wire MCP into Claude/Cursor/Codex/…");
+        Some(Command::Setup { claude, force: _ }) => {
+            let loc = ravel_core::install::InstallLocation::Local;
+            let opts = ravel_core::install::InstallOptions {
+                targets: if claude {
+                    vec![ravel_core::install::AgentKind::Claude]
+                } else {
+                    Vec::new()
+                },
+                location: loc,
+                project_root: root.clone(),
+                ravel_bin: ravel_core::install::launch_command(
+                    loc,
+                    &ravel_core::install::resolve_ravel_bin(),
+                ),
+                write_instructions: true,
+                claude_permissions: false,
+            };
+            let report = ravel_core::install::install_agents(&opts)?;
+            emit_json(&report, pretty)?;
+            eprintln!("note: `ravel setup` is deprecated; use `ravel install --location local`");
         }
         Some(Command::Install {
             target,
@@ -880,67 +900,5 @@ fn emit_json(value: &impl serde::Serialize, pretty: bool) -> anyhow::Result<()> 
         serde_json::to_writer(&mut out, value)?;
     }
     out.write_all(b"\n")?;
-    Ok(())
-}
-
-fn write_agent_setup(root: &std::path::Path, claude: bool, force: bool) -> anyhow::Result<()> {
-    let agents = root.join("AGENTS.md");
-    let snippet = r#"
-## Ravel (code graph — prefer over grep/Read)
-
-```bash
-ravel --root . callers-of SYMBOL  # every reference, with file and line
-ravel --root . explore SYMBOL     # ONE call: search + callers + impact
-ravel --root . sync               # after edits (auto on explore)
-ravel --root . serve --mcp        # persistent MCP (stays fresh)
-```
-
-5 primary MCP tools (explore, callers_of, calls_from, status, sync) — schema overhead minimal.
-Full surface: `RAVEL_MCP_TOOLS=all`. Ravel does not write source files.
-"#;
-    if force || !agents.exists() {
-        if agents.exists() && force {
-            let mut existing = std::fs::read_to_string(&agents)?;
-            if !existing.contains("Ravel (code graph") {
-                existing.push_str(snippet);
-                std::fs::write(&agents, existing)?;
-            }
-        } else {
-            std::fs::write(&agents, format!("# Agent notes\n{snippet}"))?;
-        }
-    } else {
-        let mut existing = std::fs::read_to_string(&agents)?;
-        if !existing.contains("Ravel (code graph") {
-            existing.push_str(snippet);
-            std::fs::write(&agents, existing)?;
-        }
-    }
-    if claude {
-        let claude_md = root.join("CLAUDE.md");
-        let block = "\n## Ravel\n\nUse `ravel --root . context <symbol>` before multi-file exploration. Run `ravel sync` after edits. Prefer ravel over raw grep for callers/impact/search.\n";
-        if claude_md.exists() {
-            let mut t = std::fs::read_to_string(&claude_md)?;
-            if !t.contains("## Ravel") {
-                t.push_str(block);
-                std::fs::write(&claude_md, t)?;
-            }
-        } else {
-            std::fs::write(&claude_md, format!("# Project\n{block}"))?;
-        }
-        let mcp_example = root.join(".ravel").join("mcp.example.json");
-        std::fs::create_dir_all(mcp_example.parent().unwrap())?;
-        std::fs::write(
-            mcp_example,
-            serde_json::json!({
-                "mcpServers": {
-                    "ravel": {
-                        "command": "ravel",
-                        "args": ["--root", root.display().to_string(), "mcp"]
-                    }
-                }
-            })
-            .to_string(),
-        )?;
-    }
     Ok(())
 }
