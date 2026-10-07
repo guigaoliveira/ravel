@@ -170,6 +170,83 @@ impl MembershipOverlay {
     }
 }
 
+impl ReverseOverlaySet {
+    /// The overlay that replacing `updates` publishes, computed from the updated files' previous
+    /// contributions alone.
+    ///
+    /// A file belongs to key `K`'s membership set exactly when its own contribution contains `K`, so
+    /// each key's change is fully determined by that file's old and new contribution: no membership
+    /// set has to be read. `ReverseShardSet::replace_files` loads every touched set -- for a name
+    /// such as `get`, the thousands of files defining it -- only to choose between a full upsert and
+    /// a delta. This always emits the delta (`removed` empties a key the same way a tombstone does),
+    /// which applies to the same state and is never larger than the edit.
+    pub fn from_file_updates(
+        resolver_fingerprint: String,
+        shard_bits: u8,
+        previous: &BTreeMap<String, FileContribution>,
+        updates: BTreeMap<String, Option<FileContribution>>,
+    ) -> Self {
+        let mut overlays: BTreeMap<u16, ReverseShardOverlay> = BTreeMap::new();
+        let mut touched = TouchedMembership::default();
+        for (path, replacement) in updates {
+            if let Some(old) = previous.get(&path) {
+                touched.record(&path, old, false);
+            }
+            let files = &mut overlays
+                .entry(shard_id(&path, shard_bits))
+                .or_default()
+                .files;
+            match replacement {
+                Some(new) => {
+                    touched.record(&path, &new, true);
+                    files.tombstones.remove(&path);
+                    files.upserts.insert(path, new);
+                }
+                None => {
+                    files.upserts.remove(&path);
+                    files.tombstones.insert(path);
+                }
+            }
+        }
+        let TouchedMembership {
+            module_importers,
+            basename_importers,
+            symbol_definers,
+            symbol_referrers,
+        } = touched;
+        type Section = (
+            BTreeMap<String, MemberDelta>,
+            fn(&mut ReverseShardOverlay) -> &mut MembershipOverlay,
+        );
+        let sections: [Section; 4] = [
+            (module_importers, |overlay| &mut overlay.module_importers),
+            (basename_importers, |overlay| {
+                &mut overlay.basename_importers
+            }),
+            (symbol_definers, |overlay| &mut overlay.symbol_definers),
+            (symbol_referrers, |overlay| &mut overlay.symbol_referrers),
+        ];
+        for (keys, field) in sections {
+            for (key, delta) in keys {
+                let overlay = field(overlays.entry(shard_id(&key, shard_bits)).or_default());
+                if !delta.added.is_empty() {
+                    overlay.added.insert(key.clone(), delta.added);
+                }
+                if !delta.removed.is_empty() {
+                    overlay.removed.insert(key, delta.removed);
+                }
+            }
+        }
+        overlays.retain(|_, overlay| !overlay.is_empty());
+        Self {
+            format_version: Self::FORMAT_VERSION,
+            resolver_fingerprint,
+            shard_bits,
+            shards: overlays,
+        }
+    }
+}
+
 impl ReverseShardSet {
     pub const FORMAT_VERSION: u32 = 1;
 
@@ -527,6 +604,22 @@ struct TouchedMembership {
     symbol_referrers: BTreeMap<String, MemberDelta>,
 }
 
+impl TouchedMembership {
+    /// Record `path` joining (`insert`) or leaving every key its contribution names.
+    fn record(&mut self, path: &str, contribution: &FileContribution, insert: bool) {
+        for (keys, touched) in [
+            (&contribution.module_candidates, &mut self.module_importers),
+            (&contribution.bare_specifiers, &mut self.basename_importers),
+            (&contribution.symbol_definitions, &mut self.symbol_definers),
+            (&contribution.symbol_references, &mut self.symbol_referrers),
+        ] {
+            for key in keys {
+                touched.entry(key.clone()).or_default().record(path, insert);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct MemberDelta {
     added: BTreeSet<String>,
@@ -822,6 +915,115 @@ mod tests {
             .flat_map(|shard| shard.basename_importers.upserts.values())
             .all(|set| set.len() <= 2);
         assert!(no_hub_upsert, "hub sets must not be serialized in full");
+    }
+
+    #[test]
+    fn overlays_from_contributions_alone_reach_the_replace_files_state() {
+        let root = tempdir().unwrap();
+        let old_index = hub_index(root.path(), 20, "old");
+        let next_index = hub_index(root.path(), 20, "new");
+        let base = ReverseShardSet::from_index(&old_index, 4).unwrap();
+        let cases: Vec<BTreeMap<String, Option<FileContribution>>> = vec![
+            // A replacement that keeps most keys (the hub) and changes one.
+            BTreeMap::from([(
+                "src/extra.ts".to_owned(),
+                Some(next_index.files["src/extra.ts"].clone()),
+            )]),
+            // A deletion, an addition, and an unchanged replacement in one batch.
+            BTreeMap::from([
+                ("src/imp3.ts".to_owned(), None),
+                (
+                    "src/new.ts".to_owned(),
+                    Some(old_index.files["src/imp0.ts"].clone()),
+                ),
+                (
+                    "src/imp5.ts".to_owned(),
+                    Some(old_index.files["src/imp5.ts"].clone()),
+                ),
+            ]),
+            // Deleting every importer empties the hub keys entirely.
+            old_index
+                .files
+                .keys()
+                .map(|path| (path.clone(), None))
+                .collect(),
+        ];
+        for updates in cases {
+            let mut expected = base.clone();
+            expected.replace_files(updates.clone());
+            let previous: BTreeMap<String, FileContribution> = updates
+                .keys()
+                .filter_map(|path| Some((path.clone(), old_index.files.get(path)?.clone())))
+                .collect();
+            let overlay = ReverseOverlaySet::from_file_updates(
+                base.resolver_fingerprint.clone(),
+                base.shard_bits,
+                &previous,
+                updates,
+            );
+            let mut applied = base.clone();
+            applied.apply(&overlay).unwrap();
+            assert_eq!(applied, expected);
+            // Never larger than the edit: no full membership sets are written.
+            assert!(overlay.shards.values().all(|shard| {
+                shard.module_importers.upserts.is_empty()
+                    && shard.basename_importers.upserts.is_empty()
+                    && shard.symbol_definers.upserts.is_empty()
+                    && shard.symbol_referrers.upserts.is_empty()
+            }));
+        }
+
+        // A chain can mix encodings: an overlay written by the size-adaptive path, then one built
+        // from contributions. Their composition must equal applying them in order.
+        let first_update = BTreeMap::from([(
+            "src/extra.ts".to_owned(),
+            Some(next_index.files["src/extra.ts"].clone()),
+        )]);
+        let mut sequential = base.clone();
+        let earlier = sequential.replace_files(first_update);
+        let second_update = BTreeMap::from([
+            ("src/imp3.ts".to_owned(), None),
+            (
+                "src/extra.ts".to_owned(),
+                Some(old_index.files["src/extra.ts"].clone()),
+            ),
+        ]);
+        let previous: BTreeMap<String, FileContribution> = second_update
+            .keys()
+            .filter_map(|path| {
+                let id = shard_id(path, sequential.shard_bits);
+                Some((
+                    path.clone(),
+                    sequential.shards.get(&id)?.files.get(path)?.clone(),
+                ))
+            })
+            .collect();
+        let later = ReverseOverlaySet::from_file_updates(
+            base.resolver_fingerprint.clone(),
+            base.shard_bits,
+            &previous,
+            second_update.clone(),
+        );
+        sequential.replace_files(second_update);
+        let mut merged = earlier;
+        for (id, newer) in later.shards {
+            let older = merged.shards.entry(id).or_default();
+            older.module_importers.compose(newer.module_importers);
+            older.basename_importers.compose(newer.basename_importers);
+            older.symbol_definers.compose(newer.symbol_definers);
+            older.symbol_referrers.compose(newer.symbol_referrers);
+            for key in newer.files.tombstones {
+                older.files.upserts.remove(&key);
+                older.files.tombstones.insert(key);
+            }
+            for (key, value) in newer.files.upserts {
+                older.files.tombstones.remove(&key);
+                older.files.upserts.insert(key, value);
+            }
+        }
+        let mut folded = base;
+        folded.apply(&merged).unwrap();
+        assert_eq!(folded, sequential);
     }
 
     #[test]

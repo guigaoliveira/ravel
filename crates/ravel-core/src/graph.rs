@@ -116,6 +116,7 @@ impl FlatCompactGraph {
         (offsets, values)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_compact(compact: CompactGraph) -> Self {
         let (forward_offsets, forward_values) = Self::flatten(compact.forward);
         let (reverse_offsets, reverse_values) = Self::flatten(compact.reverse);
@@ -132,6 +133,31 @@ impl FlatCompactGraph {
             reverse_values,
             edge_count: compact.edge_count,
             relations: compact.relations,
+            forward_relation_offsets,
+            forward_relation_values,
+            reverse_relation_offsets,
+            reverse_relation_values,
+        }
+    }
+
+    /// The archived form of `graph`, equal to `from_compact(graph.to_compact())` without expanding
+    /// every adjacency table into per-node rows and flattening it straight back.
+    pub(crate) fn from_index(graph: &GraphIndex) -> Self {
+        let (forward_offsets, forward_values) = graph.forward.to_flat();
+        let (reverse_offsets, reverse_values) = graph.reverse.to_flat();
+        let (forward_relation_offsets, forward_relation_values) =
+            graph.forward_relation_ids.to_flat();
+        let (reverse_relation_offsets, reverse_relation_values) =
+            graph.reverse_relation_ids.to_flat();
+        Self {
+            snapshot_id: graph.snapshot_id.clone(),
+            nodes: graph.nodes.iter().map(ToString::to_string).collect(),
+            forward_offsets,
+            forward_values,
+            reverse_offsets,
+            reverse_values,
+            edge_count: graph.edge_count as u32,
+            relations: graph.relations.clone(),
             forward_relation_offsets,
             forward_relation_values,
             reverse_relation_offsets,
@@ -180,12 +206,127 @@ pub struct RelationView {
 pub struct CompactGraphRef<'a> {
     pub snapshot_id: &'a str,
     pub nodes: Vec<&'a str>,
-    pub forward: &'a [Vec<u32>],
-    pub reverse: &'a [Vec<u32>],
+    pub forward: &'a Adjacency,
+    pub reverse: &'a Adjacency,
     pub edge_count: u32,
     pub relations: &'a [CompactRelation],
-    pub forward_relation_ids: &'a [Vec<u32>],
-    pub reverse_relation_ids: &'a [Vec<u32>],
+    pub forward_relation_ids: &'a Adjacency,
+    pub reverse_relation_ids: &'a Adjacency,
+}
+
+/// Per-node `u32` lists (neighbors or relation ids) in one flat allocation:
+/// list `id` is `values[offsets[id]..offsets[id + 1]]`.
+///
+/// The index used to hold `Vec<Vec<u32>>` per table, and a cold load expanded the archived flat
+/// arrays back into one heap allocation per node per table -- four tables, half a million nodes on
+/// a 20k-file workspace -- before answering a single query. Lists rewritten by incremental overlays,
+/// and nodes interned after the base was built, live in `patched`; reads check it only when it is
+/// not empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adjacency {
+    offsets: Vec<u32>,
+    values: Vec<u32>,
+    patched: FxHashMap<u32, Vec<u32>>,
+    len: usize,
+}
+
+impl Default for Adjacency {
+    fn default() -> Self {
+        Self::from_flat(vec![0], Vec::new())
+    }
+}
+
+impl Adjacency {
+    fn from_flat(offsets: Vec<u32>, values: Vec<u32>) -> Self {
+        debug_assert!(!offsets.is_empty());
+        let len = offsets.len().saturating_sub(1);
+        Self {
+            offsets,
+            values,
+            patched: FxHashMap::default(),
+            len,
+        }
+    }
+
+    fn from_rows(rows: Vec<Vec<u32>>) -> Self {
+        let (offsets, values) = FlatCompactGraph::flatten(rows);
+        Self::from_flat(offsets, values)
+    }
+
+    fn get(&self, id: usize) -> Option<&[u32]> {
+        if id >= self.len {
+            return None;
+        }
+        if !self.patched.is_empty()
+            && let Some(list) = self.patched.get(&(id as u32))
+        {
+            return Some(list);
+        }
+        if id + 1 < self.offsets.len() {
+            Some(&self.values[self.offsets[id] as usize..self.offsets[id + 1] as usize])
+        } else {
+            // Interned after the base was built and never given a list.
+            Some(&[])
+        }
+    }
+
+    fn list(&self, id: usize) -> &[u32] {
+        self.get(id).unwrap_or(&[])
+    }
+
+    fn push_empty(&mut self) {
+        self.len += 1;
+    }
+
+    fn set(&mut self, id: usize, list: Vec<u32>) {
+        debug_assert!(id < self.len);
+        self.patched.insert(id as u32, list);
+    }
+
+    /// The list for `id`, copied out of the flat arrays on first write.
+    fn get_mut(&mut self, id: usize) -> &mut Vec<u32> {
+        debug_assert!(id < self.len);
+        if !self.patched.contains_key(&(id as u32)) {
+            let base = self.list(id).to_vec();
+            self.patched.insert(id as u32, base);
+        }
+        self.patched.get_mut(&(id as u32)).expect("inserted above")
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u32]> {
+        (0..self.len).map(|id| self.list(id))
+    }
+
+    fn to_rows(&self) -> Vec<Vec<u32>> {
+        self.iter().map(<[u32]>::to_vec).collect()
+    }
+
+    /// Flat arrays for the archived graph, copied as-is when nothing was patched.
+    fn to_flat(&self) -> (Vec<u32>, Vec<u32>) {
+        if self.patched.is_empty() && self.offsets.len() == self.len + 1 {
+            return (self.offsets.clone(), self.values.clone());
+        }
+        let mut offsets = Vec::with_capacity(self.len + 1);
+        let mut values = Vec::new();
+        offsets.push(0);
+        for list in self.iter() {
+            values.extend_from_slice(list);
+            offsets.push(values.len() as u32);
+        }
+        (offsets, values)
+    }
+}
+
+/// Serialized exactly as the `Vec<Vec<u32>>` it replaces, so bincode sidecars keep their bytes.
+impl serde::Serialize for Adjacency {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len))?;
+        for list in self.iter() {
+            seq.serialize_element(list)?;
+        }
+        seq.end()
+    }
 }
 
 #[derive(Debug)]
@@ -193,12 +334,12 @@ pub struct GraphIndex {
     nodes: Vec<Arc<str>>,
     /// Maps node name → index into `nodes` / adjacency vectors.
     node_index: FxHashMap<Arc<str>, u32>,
-    forward: Vec<Vec<u32>>,
-    reverse: Vec<Vec<u32>>,
+    forward: Adjacency,
+    reverse: Adjacency,
     edge_count: usize,
     relations: Vec<CompactRelation>,
-    forward_relation_ids: Vec<Vec<u32>>,
-    reverse_relation_ids: Vec<Vec<u32>>,
+    forward_relation_ids: Adjacency,
+    reverse_relation_ids: Adjacency,
     relation_file_overlays: BTreeMap<String, Option<BTreeSet<Arc<OwnedEdge>>>>,
     relation_overlay_nodes: BTreeSet<String>,
     overlay_forward_relations: BTreeMap<String, Vec<Arc<OwnedEdge>>>,
@@ -335,12 +476,12 @@ impl GraphIndex {
         Self {
             nodes,
             node_index,
-            forward,
-            reverse,
+            forward: Adjacency::from_rows(forward),
+            reverse: Adjacency::from_rows(reverse),
             edge_count,
             relations,
-            forward_relation_ids,
-            reverse_relation_ids,
+            forward_relation_ids: Adjacency::from_rows(forward_relation_ids),
+            reverse_relation_ids: Adjacency::from_rows(reverse_relation_ids),
             relation_file_overlays: BTreeMap::new(),
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
@@ -364,12 +505,12 @@ impl GraphIndex {
         Self {
             nodes,
             node_index,
-            forward: compact.forward,
-            reverse: compact.reverse,
+            forward: Adjacency::from_rows(compact.forward),
+            reverse: Adjacency::from_rows(compact.reverse),
             edge_count,
             relations: compact.relations,
-            forward_relation_ids: compact.forward_relation_ids,
-            reverse_relation_ids: compact.reverse_relation_ids,
+            forward_relation_ids: Adjacency::from_rows(compact.forward_relation_ids),
+            reverse_relation_ids: Adjacency::from_rows(compact.reverse_relation_ids),
             relation_file_overlays: BTreeMap::new(),
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
@@ -389,16 +530,14 @@ impl GraphIndex {
     /// keeps the expansion — the index traverses `Vec<Vec<u32>>` — and drops the two
     /// intermediate copies.
     pub(crate) fn from_archived_flat(archived: &ArchivedFlatCompactGraph) -> Self {
-        fn expand(offsets: &[rkyv::rend::u32_le], values: &[rkyv::rend::u32_le]) -> Vec<Vec<u32>> {
-            offsets
-                .windows(2)
-                .map(|window| {
-                    values[window[0].to_native() as usize..window[1].to_native() as usize]
-                        .iter()
-                        .map(|value| value.to_native())
-                        .collect()
-                })
-                .collect()
+        fn expand(offsets: &[rkyv::rend::u32_le], values: &[rkyv::rend::u32_le]) -> Adjacency {
+            let native = |values: &[rkyv::rend::u32_le]| -> Vec<u32> {
+                values.iter().map(|value| value.to_native()).collect()
+            };
+            if offsets.is_empty() {
+                return Adjacency::default();
+            }
+            Adjacency::from_flat(native(offsets), native(values))
         }
         let node_count = archived.nodes.len();
         let nodes: Vec<Arc<str>> = archived
@@ -447,12 +586,12 @@ impl GraphIndex {
         CompactGraph {
             snapshot_id: self.snapshot_id.clone(),
             nodes: self.nodes.iter().map(ToString::to_string).collect(),
-            forward: self.forward.clone(),
-            reverse: self.reverse.clone(),
+            forward: self.forward.to_rows(),
+            reverse: self.reverse.to_rows(),
             edge_count: self.edge_count as u32,
             relations: self.relations.clone(),
-            forward_relation_ids: self.forward_relation_ids.clone(),
-            reverse_relation_ids: self.reverse_relation_ids.clone(),
+            forward_relation_ids: self.forward_relation_ids.to_rows(),
+            reverse_relation_ids: self.reverse_relation_ids.to_rows(),
         }
     }
 
@@ -545,7 +684,7 @@ impl GraphIndex {
             items.truncate(limit);
             return (items, total);
         }
-        let total = relation_ids.map_or(0, Vec::len);
+        let total = relation_ids.map_or(0, <[u32]>::len);
         let items = relation_ids
             .into_iter()
             .flatten()
@@ -656,18 +795,20 @@ impl GraphIndex {
             let id = self.intern_node(node);
             touched_ids.insert(id);
             if let Some(neighbors) = overlay.forward_refcounts.get(node) {
-                self.forward[id as usize] = neighbors
+                let list = neighbors
                     .iter()
                     .flat_map(|neighbors| neighbors.keys())
                     .map(|neighbor| self.intern_node(neighbor))
                     .collect();
+                self.forward.set(id as usize, list);
             }
             if let Some(neighbors) = overlay.reverse_refcounts.get(node) {
-                self.reverse[id as usize] = neighbors
+                let list = neighbors
                     .iter()
                     .flat_map(|neighbors| neighbors.keys())
                     .map(|neighbor| self.intern_node(neighbor))
                     .collect();
+                self.reverse.set(id as usize, list);
             }
         }
         for (changes, forward) in [
@@ -682,9 +823,9 @@ impl GraphIndex {
                     .map(|(neighbor, count)| (self.intern_node(neighbor), count.is_some()))
                     .collect();
                 let list = if forward {
-                    &mut self.forward[id as usize]
+                    self.forward.get_mut(id as usize)
                 } else {
-                    &mut self.reverse[id as usize]
+                    self.reverse.get_mut(id as usize)
                 };
                 // One pass per node instead of a scan per change. Scanning the
                 // adjacency for every changed neighbor is O(changes × degree), and a
@@ -709,7 +850,9 @@ impl GraphIndex {
             }
         }
         for id in touched_ids {
-            if self.forward[id as usize].is_empty() && self.reverse[id as usize].is_empty() {
+            if self.forward.list(id as usize).is_empty()
+                && self.reverse.list(id as usize).is_empty()
+            {
                 self.inactive_nodes.insert(id);
             } else {
                 self.inactive_nodes.remove(&id);
@@ -745,10 +888,10 @@ impl GraphIndex {
         let name: Arc<str> = Arc::from(name);
         self.nodes.push(Arc::clone(&name));
         self.node_index.insert(name, id);
-        self.forward.push(Vec::new());
-        self.reverse.push(Vec::new());
-        self.forward_relation_ids.push(Vec::new());
-        self.reverse_relation_ids.push(Vec::new());
+        self.forward.push_empty();
+        self.reverse.push_empty();
+        self.forward_relation_ids.push_empty();
+        self.reverse_relation_ids.push_empty();
         id
     }
 
@@ -911,14 +1054,14 @@ impl GraphIndex {
     pub fn in_degree(&self, name: &str) -> usize {
         self.node_index
             .get(name)
-            .map(|&i| self.reverse.get(i as usize).map(Vec::len).unwrap_or(0))
+            .map(|&i| self.reverse.list(i as usize).len())
             .unwrap_or(0)
     }
 
     pub fn out_degree(&self, name: &str) -> usize {
         self.node_index
             .get(name)
-            .map(|&i| self.forward.get(i as usize).map(Vec::len).unwrap_or(0))
+            .map(|&i| self.forward.list(i as usize).len())
             .unwrap_or(0)
     }
 
@@ -959,30 +1102,27 @@ impl GraphIndex {
 
     /// In-degree lookup when the caller already has the compact node ID.
     pub fn in_degree_id(&self, id: u32) -> usize {
-        self.reverse.get(id as usize).map(Vec::len).unwrap_or(0)
+        self.reverse.list(id as usize).len()
     }
 
     /// Out-degree lookup when the caller already has the compact node ID.
     pub fn out_degree_id(&self, id: u32) -> usize {
-        self.forward.get(id as usize).map(Vec::len).unwrap_or(0)
+        self.forward.list(id as usize).len()
     }
 
     /// Reverse adjacency lookup by node ID (zero-alloc — no hash lookup).
     pub fn neighbor_ids_reverse_id(&self, id: u32) -> &[u32] {
-        self.reverse
-            .get(id as usize)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.reverse.list(id as usize)
     }
 
-    fn neighbor_ids<'a>(&'a self, name: &str, adj: &'a [Vec<u32>]) -> &'a [u32] {
+    fn neighbor_ids<'a>(&'a self, name: &str, adj: &'a Adjacency) -> &'a [u32] {
         let Some(&idx) = self.node_index.get(name) else {
             return &[];
         };
-        adj.get(idx as usize).map(Vec::as_slice).unwrap_or(&[])
+        adj.list(idx as usize)
     }
 
-    fn neighbors(&self, name: &str, adj: &[Vec<u32>]) -> Vec<String> {
+    fn neighbors(&self, name: &str, adj: &Adjacency) -> Vec<String> {
         self.neighbor_ids(name, adj)
             .iter()
             .map(|&i| self.nodes[i as usize].to_string())
@@ -1036,7 +1176,7 @@ impl GraphIndex {
     fn walk_internal(
         &self,
         node: &str,
-        graph: &[Vec<u32>],
+        graph: &Adjacency,
         limits: &QueryLimits,
         cancel: Option<&Arc<AtomicBool>>,
         capture_depths: bool,
@@ -1223,6 +1363,35 @@ mod tests {
         })
     }
 
+    #[test]
+    fn flat_adjacency_reads_writes_and_serializes_like_nested_lists() {
+        let rows = vec![vec![2, 1], vec![], vec![0, 0, 3], vec![]];
+        let mut adjacency = Adjacency::from_rows(rows.clone());
+        assert_eq!(adjacency.to_rows(), rows);
+        assert_eq!(
+            bincode::serialize(&adjacency).unwrap(),
+            bincode::serialize(&rows).unwrap(),
+            "sidecars written from the flat form keep the nested wire layout"
+        );
+        assert_eq!(adjacency.get(4), None);
+        assert_eq!(adjacency.list(9), &[] as &[u32]);
+
+        // Overlay edits: replace one list, extend another in place, intern two new nodes.
+        adjacency.set(0, vec![3]);
+        adjacency.get_mut(2).push(1);
+        adjacency.push_empty();
+        adjacency.push_empty();
+        adjacency.get_mut(5).push(0);
+        let expected = vec![vec![3], vec![], vec![0, 0, 3, 1], vec![], vec![], vec![0]];
+        assert_eq!(adjacency.to_rows(), expected);
+        assert_eq!(
+            bincode::serialize(&adjacency).unwrap(),
+            bincode::serialize(&expected).unwrap()
+        );
+        assert_eq!(adjacency.to_flat(), FlatCompactGraph::flatten(expected));
+        assert_eq!(Adjacency::default().to_rows(), Vec::<Vec<u32>>::new());
+    }
+
     /// The cold load builds the index straight from the archived record. That path
     /// replaced a deserialize-then-expand chain, and a subtle mistake in it would not
     /// fail loudly — every query would simply answer from a wrong adjacency. So pin it
@@ -1239,6 +1408,7 @@ mod tests {
         let built = GraphIndex::from_edges(&edges, "snap".into());
         let compact = built.to_compact();
         let flat = FlatCompactGraph::from_compact(compact.clone());
+        assert_eq!(FlatCompactGraph::from_index(&built), flat);
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat).unwrap();
         let archived =
             rkyv::access::<ArchivedFlatCompactGraph, rkyv::rancor::Error>(&bytes).unwrap();

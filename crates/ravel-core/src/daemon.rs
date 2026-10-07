@@ -20,7 +20,7 @@ use std::{
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 /// Defensive protocol ceiling. Callers may choose a lower bound when reading untrusted peers.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
@@ -304,6 +304,18 @@ pub enum DaemonOperation {
     },
     Sync {
         paths: Vec<PathBuf>,
+    },
+    /// `callers_of` / `calls_from`. Served here so the MCP process does not open a second
+    /// engine, graph and watcher for the same workspace next to the daemon's.
+    ReferenceSites {
+        node: String,
+        reverse: bool,
+        limit: usize,
+        cursor: usize,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        rollup: Option<String>,
     },
     Lease,
     PromotePersistent,
@@ -814,6 +826,7 @@ fn spawn_daemon_watcher(
                 if let Err(error) = result {
                     engine.record_update_error("daemon watch update", &error.to_string());
                 }
+                crate::release_memory();
             }
         });
 }
@@ -886,6 +899,7 @@ fn handle_connection(
         return Ok(false);
     }
     let shutdown = matches!(operation, DaemonOperation::Shutdown);
+    let operation_kind = OperationKind::of(&operation);
     let request_guard = RequestGuard::new(state);
     let response: Result<Value, String> = match operation {
         DaemonOperation::Status => engine.status().map_err(|error| error.to_string()),
@@ -900,6 +914,39 @@ fn handle_connection(
             .sync_resident((!paths.is_empty()).then_some(paths.as_slice()))
             .map_err(|error| error.to_string())
             .and_then(|stats| serde_json::to_value(stats).map_err(|error| error.to_string())),
+        DaemonOperation::ReferenceSites {
+            node,
+            reverse,
+            limit,
+            cursor,
+            scope,
+            rollup,
+        } => {
+            let rollup = match rollup.as_deref() {
+                None => Ok(None),
+                Some(value) => crate::engine::RollupMode::parse(value)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
+                        )
+                    }),
+            };
+            rollup.and_then(|rollup| {
+                engine
+                    .reference_sites_with(
+                        &node,
+                        reverse,
+                        limit,
+                        cursor,
+                        crate::engine::RelationOptions {
+                            scope: scope.as_deref(),
+                            rollup,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            })
+        }
         DaemonOperation::Lease => unreachable!(),
         DaemonOperation::PromotePersistent => {
             state.persistent.store(true, Ordering::Release);
@@ -911,12 +958,35 @@ fn handle_connection(
         Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
         Err(error) => write_frame(stream, &WireResponse::Error(error.to_string()))?,
     }
+    if matches!(operation_kind, OperationKind::Sync | OperationKind::Query) {
+        // After the reply is on the wire, so the collection never adds to the latency the agent
+        // sees. A sync's working set is freed by now; so is a query's -- and a query for a name
+        // with tens of thousands of definitions allocates tens of megabytes to answer.
+        crate::release_memory();
+    }
     if shutdown {
         state.shutdown.store(true, Ordering::Release);
         drop(request_guard);
         wake_if_drained(state);
     }
     Ok(shutdown)
+}
+
+#[derive(PartialEq, Eq)]
+enum OperationKind {
+    Sync,
+    Query,
+    Other,
+}
+
+impl OperationKind {
+    fn of(operation: &DaemonOperation) -> Self {
+        match operation {
+            DaemonOperation::Sync { .. } => Self::Sync,
+            DaemonOperation::Context { .. } | DaemonOperation::ReferenceSites { .. } => Self::Query,
+            _ => Self::Other,
+        }
+    }
 }
 
 struct LeaseGuard<'a>(&'a DaemonState);

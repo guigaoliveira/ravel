@@ -130,7 +130,14 @@ pub struct ModuleExport {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ResolutionUniverseOverlay {
     pub files: BTreeMap<String, bool>,
-    pub symbol_definitions: BTreeMap<String, Option<Vec<SymbolDefinition>>>,
+    /// `name -> path -> every definition of name in path` after the change; an empty list means
+    /// the path no longer defines the name. Each entry replaces that path's run of the name's
+    /// sorted list and leaves every other path's run alone.
+    ///
+    /// The overlay used to carry each touched name's whole workspace-wide list. One edit to a file
+    /// declaring `get` or `execute` then serialized, compacted, and re-read every other definition
+    /// of that name -- 78MB for a one-line change in a 20k-file workspace.
+    pub symbol_definitions: BTreeMap<String, BTreeMap<String, Vec<SymbolDefinition>>>,
     pub module_exports: BTreeMap<String, Option<Vec<ModuleExport>>>,
 }
 
@@ -180,6 +187,85 @@ pub trait ResolutionLookup: Sync {
     fn symbol_definer_count(&self, name: &str) -> u32;
     fn symbol_definitions(&self, name: &str) -> LookupSlice<'_, SymbolDefinition>;
     fn module_exports(&self, path: &str) -> LookupSlice<'_, ModuleExport>;
+    /// Definitions of `name` declared in `path`. Nearly every reference asks this question, and a
+    /// name such as `get` or `execute` can have tens of thousands of definitions workspace-wide;
+    /// answering it from the full list cost O(definers) per reference (and a full clone of the
+    /// list on lookups that own their result).
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        definitions_in_path(&self.symbol_definitions(name), path).to_vec()
+    }
+}
+
+/// The contiguous run of `path` in a name's definition list.
+///
+/// Every list is kept sorted by `(path, span, qualified_name)`: `ResolutionUniverse::build` sorts
+/// it, `replace_artifact` inserts at the sorted position, and overlays replace whole per-path runs
+/// with runs sorted the same way (`apply_definition_deltas`). A binary search therefore returns
+/// exactly what a linear filter on `path` returned, in the same order.
+pub(crate) fn definitions_in_path<'a>(
+    definitions: &'a [SymbolDefinition],
+    path: &str,
+) -> &'a [SymbolDefinition] {
+    debug_assert!(
+        definitions
+            .windows(2)
+            .all(|pair| pair[0].path.as_str() <= pair[1].path.as_str()),
+        "definition lists must stay sorted by path"
+    );
+    let range = path_run(definitions, path);
+    &definitions[range]
+}
+
+fn path_run(definitions: &[SymbolDefinition], path: &str) -> std::ops::Range<usize> {
+    let start = definitions.partition_point(|definition| definition.path.as_str() < path);
+    let len = definitions[start..].partition_point(|definition| definition.path == path);
+    start..start + len
+}
+
+/// Replace each path's run of a name's sorted list with the overlay's run for that path.
+pub(crate) fn apply_definition_deltas(
+    definitions: &mut Vec<SymbolDefinition>,
+    deltas: &BTreeMap<String, Vec<SymbolDefinition>>,
+) {
+    for (path, replacement) in deltas {
+        let run = path_run(definitions, path);
+        definitions.splice(run, replacement.iter().cloned());
+    }
+}
+
+/// Apply an overlay's per-path definition runs to name-keyed lists, dropping names left empty.
+pub(crate) fn apply_definition_overlay(
+    lists: &mut BTreeMap<String, Vec<SymbolDefinition>>,
+    overlay: &BTreeMap<String, BTreeMap<String, Vec<SymbolDefinition>>>,
+) {
+    for (name, deltas) in overlay {
+        let definitions = match lists.get_mut(name) {
+            Some(definitions) => definitions,
+            None => lists.entry(name.clone()).or_default(),
+        };
+        apply_definition_deltas(definitions, deltas);
+        if definitions.is_empty() {
+            lists.remove(name);
+        }
+    }
+}
+
+/// A file's definitions grouped by name, each run in the order the universe keeps it.
+fn definitions_by_name(artifact: &FileArtifact) -> BTreeMap<&str, Vec<SymbolDefinition>> {
+    let mut by_name: BTreeMap<&str, Vec<SymbolDefinition>> = BTreeMap::new();
+    for symbol in &artifact.symbols {
+        by_name
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(SymbolDefinition::from_symbol(artifact, symbol));
+    }
+    for run in by_name.values_mut() {
+        // Same stable comparator as `ResolutionUniverse::build`; the path is constant here.
+        run.sort_by(|left, right| {
+            (left.span, &left.qualified_name).cmp(&(right.span, &right.qualified_name))
+        });
+    }
+    by_name
 }
 
 pub struct OverlayResolutionLookup<'a> {
@@ -207,17 +293,25 @@ impl ResolutionLookup for OverlayResolutionLookup<'_> {
     }
 
     fn symbol_definer_count(&self, name: &str) -> u32 {
-        match self.overlay.symbol_definitions.get(name) {
-            Some(Some(definitions)) => u32::try_from(definitions.len()).unwrap_or(u32::MAX),
-            Some(None) => 0,
-            None => self.base.symbol_definer_count(name),
-        }
+        let base = self.base.symbol_definer_count(name);
+        let Some(deltas) = self.overlay.symbol_definitions.get(name) else {
+            return base;
+        };
+        let replaced: u64 = deltas
+            .keys()
+            .map(|path| self.base.symbol_definitions_in_file(name, path).len() as u64)
+            .sum();
+        let added: u64 = deltas.values().map(|run| run.len() as u64).sum();
+        u32::try_from((u64::from(base) + added).saturating_sub(replaced)).unwrap_or(u32::MAX)
     }
 
     fn symbol_definitions(&self, name: &str) -> LookupSlice<'_, SymbolDefinition> {
         match self.overlay.symbol_definitions.get(name) {
-            Some(Some(value)) => LookupSlice::Borrowed(value),
-            Some(None) => LookupSlice::Borrowed(&[]),
+            Some(deltas) => {
+                let mut definitions = self.base.symbol_definitions(name).into_owned();
+                apply_definition_deltas(&mut definitions, deltas);
+                LookupSlice::Owned(definitions)
+            }
             None => self.base.symbol_definitions(name),
         }
     }
@@ -229,25 +323,37 @@ impl ResolutionLookup for OverlayResolutionLookup<'_> {
             None => self.base.module_exports(path),
         }
     }
+
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        match self
+            .overlay
+            .symbol_definitions
+            .get(name)
+            .and_then(|deltas| deltas.get(path))
+        {
+            Some(run) => run.clone(),
+            None => self.base.symbol_definitions_in_file(name, path),
+        }
+    }
 }
 
 impl ResolutionUniverseOverlay {
+    /// The overlay a set of file changes produces. Only the changed files' own runs are recorded,
+    /// so no base is consulted: the result is the same whatever else defines the names.
     pub fn from_artifact_changes<'a>(
-        base: &dyn ResolutionLookup,
         changes: impl IntoIterator<Item = (Option<&'a FileArtifact>, Option<&'a FileArtifact>)>,
     ) -> Self {
         let mut overlay = Self::default();
-        let mut old_ids: BTreeMap<String, FxHashSet<String>> = BTreeMap::new();
-        let mut new_definitions: BTreeMap<String, Vec<SymbolDefinition>> = BTreeMap::new();
         for (old, new) in changes {
             if let Some(old) = old {
                 overlay.files.insert(old.path.clone(), false);
                 overlay.module_exports.insert(old.path.clone(), None);
                 for symbol in &old.symbols {
-                    old_ids
+                    overlay
+                        .symbol_definitions
                         .entry(symbol.name.clone())
                         .or_default()
-                        .insert(symbol.id.clone());
+                        .insert(old.path.clone(), Vec::new());
                 }
             }
             if let Some(new) = new {
@@ -255,37 +361,29 @@ impl ResolutionUniverseOverlay {
                 overlay
                     .module_exports
                     .insert(new.path.clone(), Some(module_exports(new)));
-                for symbol in &new.symbols {
-                    new_definitions
-                        .entry(symbol.name.clone())
+                for (name, run) in definitions_by_name(new) {
+                    overlay
+                        .symbol_definitions
+                        .entry(name.to_owned())
                         .or_default()
-                        .push(SymbolDefinition::from_symbol(new, symbol));
+                        .insert(new.path.clone(), run);
                 }
             }
         }
-        let names: BTreeSet<_> = old_ids
-            .keys()
-            .chain(new_definitions.keys())
-            .cloned()
-            .collect();
-        for name in names {
-            let mut definitions = base.symbol_definitions(&name).into_owned();
-            if let Some(ids) = old_ids.get(&name) {
-                definitions.retain(|definition| !ids.contains(&definition.id));
-            }
-            definitions.extend(new_definitions.remove(&name).unwrap_or_default());
-            definitions.sort_by(|left, right| {
-                (&left.path, left.span, &left.qualified_name).cmp(&(
-                    &right.path,
-                    right.span,
-                    &right.qualified_name,
-                ))
-            });
-            overlay
-                .symbol_definitions
-                .insert(name, (!definitions.is_empty()).then_some(definitions));
-        }
         overlay
+    }
+
+    /// Fold a newer overlay into this one. Every entry is an absolute per-key state, so the newer
+    /// side wins key by key -- for definitions, per `(name, path)`.
+    pub(crate) fn compose(&mut self, newer: Self) {
+        self.files.extend(newer.files);
+        for (name, deltas) in newer.symbol_definitions {
+            self.symbol_definitions
+                .entry(name)
+                .or_default()
+                .extend(deltas);
+        }
+        self.module_exports.extend(newer.module_exports);
     }
 }
 
@@ -422,16 +520,24 @@ impl ResolutionUniverse {
             )
             .collect();
         self.replace_artifact(old, new);
-        for path in paths {
+        for path in &paths {
             overlay
                 .files
-                .insert(path.clone(), self.files.contains(&path));
+                .insert(path.clone(), self.files.contains(path));
         }
         for symbol in symbols {
-            overlay.symbol_definitions.insert(
-                symbol.clone(),
-                self.symbol_definitions.get(&symbol).cloned(),
-            );
+            let definitions = self
+                .symbol_definitions
+                .get(&symbol)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let deltas = overlay.symbol_definitions.entry(symbol).or_default();
+            for path in &paths {
+                deltas.insert(
+                    path.clone(),
+                    definitions_in_path(definitions, path).to_vec(),
+                );
+            }
         }
         for path in old
             .into_iter()
@@ -452,7 +558,7 @@ impl ResolutionUniverse {
                 self.files.remove(path);
             }
         }
-        apply_optional_map(&mut self.symbol_definitions, &overlay.symbol_definitions);
+        apply_definition_overlay(&mut self.symbol_definitions, &overlay.symbol_definitions);
         apply_optional_map(&mut self.module_exports, &overlay.module_exports);
     }
 
@@ -639,12 +745,7 @@ fn definitions_in_file(
     file: &str,
     name: &str,
 ) -> Vec<SymbolDefinition> {
-    universe
-        .symbol_definitions(name)
-        .iter()
-        .filter(|definition| definition.path == file)
-        .cloned()
-        .collect()
+    universe.symbol_definitions_in_file(name, file)
 }
 
 /// TypeScript overloads, accessors, and declaration merging may produce several syntax nodes for
@@ -718,12 +819,8 @@ fn find_qualified_definition_for(
     required: RequiredNamespace,
 ) -> Option<SymbolDefinition> {
     let leaf = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
-    let matches: Vec<_> = universe
-        .symbol_definitions(leaf)
-        .iter()
-        .filter(|definition| definition.path == path && definition.qualified_name == qualified_name)
-        .cloned()
-        .collect();
+    let mut matches = universe.symbol_definitions_in_file(leaf, path);
+    matches.retain(|definition| definition.qualified_name == qualified_name);
     one_logical_definition_for(matches, required)
 }
 
@@ -1146,7 +1243,9 @@ pub fn resolve_subset_with_structural_data(
 
 pub fn resolver_fingerprint(config: &ResolverConfig) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ravel-resolver-v2\0");
+    // v3: a file's contribution also records each segment of a member reference, so an index
+    // built before that must take the rebuild tier once rather than trust its referrer sets.
+    hasher.update(b"ravel-resolver-v3\0");
     if let Ok(bytes) = bincode::serialize(config) {
         hasher.update(&bytes);
     }
@@ -2713,6 +2812,121 @@ class Child extends Base implements Shape {
                 && edge.to == "src/b.ts"
                 && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         }));
+    }
+
+    fn universe_of(files: &[(&str, &str)]) -> (BTreeMap<String, FileArtifact>, ResolutionUniverse) {
+        let artifacts: BTreeMap<String, FileArtifact> = files
+            .iter()
+            .map(|(path, source)| ((*path).to_owned(), parse_source(path, source.as_bytes())))
+            .collect();
+        let universe = ResolutionUniverse::build(&artifacts, &ResolverConfig::default());
+        (artifacts, universe)
+    }
+
+    #[test]
+    fn per_path_universe_overlays_reproduce_a_rebuilt_universe() {
+        // `run` is defined in every file, so each edit touches a name other files also define --
+        // exactly what the per-path overlay must leave alone.
+        let before = [
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}",
+            ),
+            (
+                "b.ts",
+                "export class B { run() {} }\nexport const shared = 1;",
+            ),
+            ("c.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (old_artifacts, base) = universe_of(&before);
+        let first = [
+            // `run` gains a second definition in a.ts and `shared` moves here from b.ts.
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}\nexport const shared = 2;\nfunction run3() {}",
+            ),
+            ("b.ts", "export class B { run() {} }"),
+            ("c.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (first_artifacts, first_universe) = universe_of(&first);
+        let second = [
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}\nexport const shared = 2;\nfunction run3() {}",
+            ),
+            ("b.ts", "export class B { run() {} }"),
+            // c.ts is deleted and d.ts added with the same names.
+            ("d.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (second_artifacts, second_universe) = universe_of(&second);
+
+        let first_overlay = ResolutionUniverseOverlay::from_artifact_changes(
+            ["a.ts", "b.ts"]
+                .into_iter()
+                .map(|path| (old_artifacts.get(path), first_artifacts.get(path))),
+        );
+        let second_overlay = ResolutionUniverseOverlay::from_artifact_changes(
+            ["c.ts", "d.ts"]
+                .into_iter()
+                .map(|path| (first_artifacts.get(path), second_artifacts.get(path))),
+        );
+
+        let mut applied = base.clone();
+        applied.apply_overlay(&first_overlay);
+        assert_eq!(applied, first_universe);
+        applied.apply_overlay(&second_overlay);
+        assert_eq!(applied, second_universe);
+
+        // Composition is what overlay-chain compaction stores.
+        let mut composed = first_overlay.clone();
+        composed.compose(second_overlay.clone());
+        let mut applied = base.clone();
+        applied.apply_overlay(&composed);
+        assert_eq!(applied, second_universe);
+
+        // A lookup over an unapplied overlay answers what the rebuilt universe answers.
+        let lookup = OverlayResolutionLookup::new(&first_universe, &second_overlay);
+        for name in ["run", "run2", "run3", "shared", "A", "C", "missing"] {
+            assert_eq!(
+                lookup.symbol_definer_count(name),
+                second_universe.symbol_definer_count(name),
+                "{name}"
+            );
+            assert_eq!(
+                lookup.symbol_definitions(name).to_vec(),
+                second_universe.symbol_definitions(name).to_vec(),
+                "{name}"
+            );
+            for path in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+                assert_eq!(
+                    lookup.symbol_definitions_in_file(name, path),
+                    second_universe.symbol_definitions_in_file(name, path),
+                    "{name} in {path}"
+                );
+            }
+        }
+
+        // The overlay carries only the edited files' runs, not other files' definitions.
+        assert!(
+            first_overlay.symbol_definitions["run"]
+                .keys()
+                .eq(["a.ts", "b.ts"])
+        );
+
+        // And recording replacements on an owned universe yields the same overlay content.
+        let mut owned = base;
+        let mut recorded = ResolutionUniverseOverlay::default();
+        for path in ["a.ts", "b.ts"] {
+            owned.replace_artifact_with_overlay(
+                old_artifacts.get(path),
+                first_artifacts.get(path),
+                &mut recorded,
+            );
+        }
+        assert_eq!(owned, first_universe);
+        let mut replayed = universe_of(&before).1;
+        replayed.apply_overlay(&recorded);
+        assert_eq!(replayed, first_universe);
     }
 
     #[test]

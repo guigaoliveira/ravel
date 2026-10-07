@@ -355,23 +355,36 @@ pub fn hubs_from_graph(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
 
 /// Attach kind/path from symbol meta and optionally filter by kind substring (e.g. `class`, `injectable`).
 pub fn enrich_hubs(
-    mut hubs: Vec<HubEntry>,
+    hubs: Vec<HubEntry>,
     symbols: Option<&SymbolMetaDict>,
     kind_filter: Option<&str>,
 ) -> Vec<HubEntry> {
-    if let Some(meta) = symbols {
-        let by_id: FxHashMap<&str, &crate::model::SymbolMeta> = meta
-            .entries
+    let by_id: Option<FxHashMap<&str, &crate::model::SymbolMeta>> = symbols.map(|meta| {
+        meta.entries
             .iter()
             .chain(meta.duplicates.iter())
             .map(|e| (e.id.as_str(), e))
-            .collect();
-        for h in &mut hubs {
-            if let Some(m) = by_id.get(h.name.as_str()) {
-                h.name = m.qualified_name.clone();
-                h.kind = Some(m.kind.to_string());
-                h.path = Some(m.path.clone());
-            }
+            .collect()
+    });
+    enrich_hubs_with(
+        hubs,
+        |id| by_id.as_ref()?.get(id).map(|meta| (*meta).clone()),
+        kind_filter,
+    )
+}
+
+/// [`enrich_hubs`] against a per-id lookup, so a caller holding an indexed symbol store can annotate
+/// the hubs it returns without materializing metadata for every symbol in the workspace.
+pub fn enrich_hubs_with(
+    mut hubs: Vec<HubEntry>,
+    mut lookup: impl FnMut(&str) -> Option<crate::model::SymbolMeta>,
+    kind_filter: Option<&str>,
+) -> Vec<HubEntry> {
+    for h in &mut hubs {
+        if let Some(m) = lookup(h.name.as_str()) {
+            h.name = m.qualified_name;
+            h.kind = Some(m.kind.to_string());
+            h.path = Some(m.path);
         }
     }
     if let Some(kf) = kind_filter {

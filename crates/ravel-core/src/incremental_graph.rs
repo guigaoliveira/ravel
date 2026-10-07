@@ -493,6 +493,111 @@ impl IncrementalGraphState {
     }
 }
 
+impl GraphSectionShards {
+    /// Shard a full index's edges straight into the persisted section layout.
+    ///
+    /// Produces exactly `IncrementalGraphState::from_edges(edges).into_section_shards(..)` (a test
+    /// pins it) without the intermediate state, whose `edge_refcounts` held a second owned copy of
+    /// every edge only to be reduced to a 128-bit digest when sharded. That copy and its B-tree set
+    /// the full-index RSS peak.
+    ///
+    /// Identical edges always land in the same file set, because the owning path is a field of the
+    /// edge. So the per-file set insert is the exact "first time this edge is seen" test the
+    /// refcount map provided, and the rare repeats are counted on the side.
+    pub fn from_edges(edges: &[Edge], file_bits: u8, edge_bits: u8, adj_bits: u8) -> Option<Self> {
+        use rayon::prelude::*;
+        if file_bits > 16 || edge_bits > 16 || adj_bits > 16 {
+            return None;
+        }
+        let mut by_file: BTreeMap<String, BTreeSet<OwnedEdge>> = BTreeMap::new();
+        let mut forward: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        let mut reverse: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        // Extra occurrences beyond the first, per distinct edge. Resolution deduplicates, so this
+        // normally stays empty.
+        let mut repeats: BTreeMap<OwnedEdge, u32> = BTreeMap::new();
+        for edge in edges {
+            let path = edge.source_path.as_deref().unwrap_or(&edge.from);
+            let owned = OwnedEdge::from(edge);
+            let set = match by_file.get_mut(path) {
+                Some(set) => set,
+                None => by_file.entry(path.to_owned()).or_default(),
+            };
+            if set.contains(&owned) {
+                *repeats.entry(owned).or_default() += 1;
+                continue;
+            }
+            set.insert(owned);
+            add_neighbor(&mut forward, &edge.from, &edge.to);
+            add_neighbor(&mut reverse, &edge.to, &edge.from);
+        }
+
+        let mut out = Self {
+            format_version: IncrementalGraphState::FORMAT_VERSION,
+            file_bits,
+            edge_bits,
+            adj_bits,
+            ..Self::default()
+        };
+        // Digesting means serializing and hashing every edge: the only per-item CPU work here,
+        // so it fans out across files. Placement stays sequential on 128-bit keys.
+        let digested: Option<Vec<Vec<(u128, u32)>>> = by_file
+            .par_iter()
+            .map(|(_, set)| {
+                set.iter()
+                    .map(|edge| {
+                        let count = 1 + repeats.get(edge).copied().unwrap_or(0);
+                        Some((owned_edge_digest(edge)?, count))
+                    })
+                    .collect()
+            })
+            .collect();
+        for (digest, count) in digested?.into_iter().flatten() {
+            out.edges
+                .entry(digest_shard_id(digest, edge_bits))
+                .or_default()
+                .edge_refcounts
+                .insert(digest, count);
+        }
+        drop(repeats);
+        for (key, value) in by_file {
+            out.files
+                .entry(graph_shard_id(&key, file_bits))
+                .or_default()
+                .by_file
+                .insert(key, value);
+        }
+        for (key, value) in forward {
+            out.adjacency
+                .entry(graph_shard_id(&key, adj_bits))
+                .or_default()
+                .forward_refcounts
+                .insert(key, value);
+        }
+        for (key, value) in reverse {
+            out.adjacency
+                .entry(graph_shard_id(&key, adj_bits))
+                .or_default()
+                .reverse_refcounts
+                .insert(key, value);
+        }
+        Some(out)
+    }
+}
+
+/// `map[node][neighbor] += 1`, allocating the keys only when they are new.
+fn add_neighbor(map: &mut BTreeMap<String, BTreeMap<String, u32>>, node: &str, neighbor: &str) {
+    let neighbors = match map.get_mut(node) {
+        Some(neighbors) => neighbors,
+        None => map.entry(node.to_owned()).or_default(),
+    };
+    match neighbors.get_mut(neighbor) {
+        Some(count) => *count += 1,
+        None => {
+            neighbors.insert(neighbor.to_owned(), 1);
+        }
+    }
+}
+
 impl IncrementalGraphShardSet {
     pub fn into_state(self) -> Option<IncrementalGraphState> {
         if self.format_version != IncrementalGraphState::FORMAT_VERSION || self.shard_bits > 16 {
@@ -747,5 +852,37 @@ mod tests {
             IncrementalGraphState::from_owned_by_file(state.by_file.clone()),
             state
         );
+    }
+
+    #[test]
+    fn direct_section_shards_match_the_state_they_replace() {
+        // Exact duplicates (refcount 2), an edge owned through `from` (no source path), a node with
+        // several neighbors, and enough files for the shard bits to spread them.
+        let mut edges = vec![
+            synth_edge("a.ts", "t.ts", Some("a.ts")),
+            synth_edge("a.ts", "t.ts", Some("a.ts")),
+            synth_edge("a.ts", "t.ts", Some("other.ts")),
+            synth_edge("b.ts", "t.ts", Some("b.ts")),
+            synth_edge("a.ts", "c.ts", None),
+            synth_edge("a.ts", "c.ts", None),
+        ];
+        for i in 0..64 {
+            edges.push(synth_edge(
+                &format!("f{i}.ts"),
+                &format!("t{}.ts", i % 3),
+                Some(&format!("f{i}.ts")),
+            ));
+        }
+        for bits in [0u8, 2, 4, 12] {
+            let expected = IncrementalGraphState::from_edges(&edges)
+                .into_section_shards(bits, bits, bits)
+                .unwrap();
+            assert_eq!(
+                GraphSectionShards::from_edges(&edges, bits, bits, bits).unwrap(),
+                expected,
+                "bits {bits}"
+            );
+        }
+        assert!(GraphSectionShards::from_edges(&edges, 17, 4, 4).is_none());
     }
 }

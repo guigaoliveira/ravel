@@ -304,6 +304,11 @@ impl From<SearchMode> for SearchKind {
 }
 
 fn main() -> anyhow::Result<()> {
+    // mimalloc keeps the pages a sync touched committed until allocation pressure returns,
+    // and an idle daemon produces none: its RSS stayed at the sync's peak for the whole
+    // session. Collecting after each publication hands that memory back.
+    #[cfg(not(target_env = "musl"))]
+    ravel_core::set_memory_release_hook(|| unsafe { libmimalloc_sys::mi_collect(true) });
     if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::fmt()
             .with_target(false)
@@ -342,7 +347,7 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false
+include_untracked = true
 discovery_cache_ms = 50
 skip_sibling_emit = true
 "#,

@@ -76,7 +76,7 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false  # default fast path (tracked only); true = slower
+include_untracked = true   # new files reach auto-sync; false skips the untracked listing
 skip_sibling_emit = true
 discovery_cache_ms = 50    # reuse near-simultaneous warm MCP discovery
 queue_max_ticket_bytes = 1048576

@@ -13,7 +13,7 @@ cheaper than a full rebuild.
 | Mechanism | Role |
 |-----------|------|
 | Sidecars (`stats`, `graph`, `symbols`, `hubs`, artifact locator) | Avoid loading the full snapshot for common reads and changed-path hash checks |
-| `sync.include_untracked = false` (default) | No multi-thousand untracked walks |
+| `sync.include_untracked` | Untracked files are listed (default): +20 ms per discovery on 20k files; off if a tree carries thousands of un-ignored build outputs |
 | Hash sidecar no-op | Dirty paths with same content → no republish |
 | `status` never spawns `git status` | Session start stays cheap |
 | Git optional (`mode = auto`) | No git → zero discovery cost |
@@ -41,7 +41,11 @@ done
 
 Record results under `reports/perf-*.md` when changing performance-sensitive
 code. Treat timings as machine- and project-dependent rather than universal
-guarantees.
+guarantees. `scripts/gen_corpus.py` builds a reproducible synthetic monorepo and
+`scripts/perf_bench.py` measures wall time, CPU and peak RSS per command.
+`scripts/mcp_session_bench.py` drives `ravel mcp` the way an agent does (status,
+explore, callers_of, edits with sync) and samples the RSS of the stdio server and
+the shared daemon after each step — the processes that live for a whole session.
 
 ## Config knobs that affect latency
 
@@ -49,7 +53,7 @@ guarantees.
 [sync]
 mode = "auto"              # none | auto | git
 auto = true
-include_untracked = false  # set true only if you need new-file auto-sync without watch
+include_untracked = true   # set false on trees with thousands of un-ignored build outputs
 ```
 
 Without git: MCP watches requested roots automatically. For CLI-only workflows,
