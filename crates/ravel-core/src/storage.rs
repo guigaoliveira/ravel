@@ -1621,6 +1621,16 @@ impl ResolutionLookup for StructuralPackReader {
                 .unwrap_or_default(),
         )
     }
+
+    /// Slice the cached shard in place: going through `symbol_definitions` cloned the name's whole
+    /// workspace-wide list on every reference, only to keep the handful declared in `path`.
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        self.universe_shard(name)
+            .symbol_definitions
+            .get(name)
+            .map(|definitions| crate::resolver::definitions_in_path(definitions, path).to_vec())
+            .unwrap_or_default()
+    }
 }
 
 fn read_pack_value_from_reader<T: serde::de::DeserializeOwned>(

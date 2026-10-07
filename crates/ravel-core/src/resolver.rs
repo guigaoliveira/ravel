@@ -180,6 +180,34 @@ pub trait ResolutionLookup: Sync {
     fn symbol_definer_count(&self, name: &str) -> u32;
     fn symbol_definitions(&self, name: &str) -> LookupSlice<'_, SymbolDefinition>;
     fn module_exports(&self, path: &str) -> LookupSlice<'_, ModuleExport>;
+    /// Definitions of `name` declared in `path`. Nearly every reference asks this question, and a
+    /// name such as `get` or `execute` can have tens of thousands of definitions workspace-wide;
+    /// answering it from the full list cost O(definers) per reference (and a full clone of the
+    /// list on lookups that own their result).
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        definitions_in_path(&self.symbol_definitions(name), path).to_vec()
+    }
+}
+
+/// The contiguous run of `path` in a name's definition list.
+///
+/// Every list is kept sorted by `(path, span, qualified_name)`: `ResolutionUniverse::build` sorts
+/// it, `replace_artifact` inserts at the sorted position, and overlays store whole sorted lists. A
+/// binary search therefore returns exactly what a linear filter on `path` returned, in the same
+/// order.
+pub(crate) fn definitions_in_path<'a>(
+    definitions: &'a [SymbolDefinition],
+    path: &str,
+) -> &'a [SymbolDefinition] {
+    debug_assert!(
+        definitions
+            .windows(2)
+            .all(|pair| pair[0].path.as_str() <= pair[1].path.as_str()),
+        "definition lists must stay sorted by path"
+    );
+    let start = definitions.partition_point(|definition| definition.path.as_str() < path);
+    let len = definitions[start..].partition_point(|definition| definition.path == path);
+    &definitions[start..start + len]
 }
 
 pub struct OverlayResolutionLookup<'a> {
@@ -227,6 +255,14 @@ impl ResolutionLookup for OverlayResolutionLookup<'_> {
             Some(Some(value)) => LookupSlice::Borrowed(value),
             Some(None) => LookupSlice::Borrowed(&[]),
             None => self.base.module_exports(path),
+        }
+    }
+
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        match self.overlay.symbol_definitions.get(name) {
+            Some(Some(value)) => definitions_in_path(value, path).to_vec(),
+            Some(None) => Vec::new(),
+            None => self.base.symbol_definitions_in_file(name, path),
         }
     }
 }
@@ -639,12 +675,7 @@ fn definitions_in_file(
     file: &str,
     name: &str,
 ) -> Vec<SymbolDefinition> {
-    universe
-        .symbol_definitions(name)
-        .iter()
-        .filter(|definition| definition.path == file)
-        .cloned()
-        .collect()
+    universe.symbol_definitions_in_file(name, file)
 }
 
 /// TypeScript overloads, accessors, and declaration merging may produce several syntax nodes for
@@ -718,12 +749,8 @@ fn find_qualified_definition_for(
     required: RequiredNamespace,
 ) -> Option<SymbolDefinition> {
     let leaf = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
-    let matches: Vec<_> = universe
-        .symbol_definitions(leaf)
-        .iter()
-        .filter(|definition| definition.path == path && definition.qualified_name == qualified_name)
-        .cloned()
-        .collect();
+    let mut matches = universe.symbol_definitions_in_file(leaf, path);
+    matches.retain(|definition| definition.qualified_name == qualified_name);
     one_logical_definition_for(matches, required)
 }
 
