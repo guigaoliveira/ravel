@@ -21,6 +21,7 @@ Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel ins
 | Session start | `ravel cheatsheet` then `status` |
 | After save/edit/delete | MCP watches automatically; CLI: `ravel sync path/to/file.ts` |
 | Understand a symbol | **`ravel context PaymentService`** (one call) |
+| Who calls it / what breaks | **`ravel callers-of PaymentService`** (file + line per site) |
 | Full rebuild (rare) | `ravel index` |
 | Live CLI-only session | `ravel watch` (incrementally syncs source changes) |
 
@@ -30,7 +31,7 @@ Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel ins
 2. Only if needed: `search`, `query --reverse`, `impact`, `cycles`, `hubs`, `endpoints`
 3. **Edit with the agent’s own editor** — ravel does not write source files
 4. JSON is **compact by default** (`--pretty` only for humans)
-5. MCP advertises **3 primary tools** only — `RAVEL_MCP_TOOLS=all` if you need CI/export/hubs via MCP
+5. MCP advertises **5 primary tools** only (`explore`, `callers_of`, `calls_from`, `status`, `sync`) — `RAVEL_MCP_TOOLS=all` if you need CI/export/hubs via MCP
 
 Avoid: multi-hop Grep/Glob/Read to rediscover imports.
 

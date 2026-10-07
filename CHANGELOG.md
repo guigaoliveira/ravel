@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This release is about the two harnesses most MCP sessions run in — Claude Code and
+Codex — and the places where the wiring, not the graph, decided whether an agent
+used Ravel.
+
+### Fixed — Codex asked before every query
+- **MCP tools carry annotations.** None had any, and Codex's default `auto`
+  approval mode treats a tool without annotations as destructive and open-world,
+  so every `explore`, `callers_of` and `status` call waited on a prompt: the cheap
+  way to answer a question was the one that interrupted the user. Queries are now
+  `readOnlyHint: true`, `sync` is `destructiveHint: false`, and all are
+  `openWorldHint: false` — what Ravel actually does (it writes only its own index
+  under `.ravel/` and never leaves the machine), and exactly what Codex needs to
+  run them unprompted. Titles are included for client UIs.
+- **Failed calls set `isError`.** An unknown `rollup`, an unreachable daemon or a
+  missing workspace came back as an ordinary result whose body happened to be
+  `{"error": …}`. Clients pass the flag to the model (Codex reports the call as
+  failed), so a failure now reads as one. The body is unchanged.
+- **The handshake names Ravel.** `serverInfo` said `rmcp 2.2.0` — the MCP library —
+  and that is what client UIs and logs showed for the server. It is now `ravel`
+  with the binary version.
+
+### Fixed — reinstalling undid what you configured
+- **`ravel install` keeps the keys you added to the `ravel` entry.** Re-running it
+  after an upgrade replaced the entry wholesale, so an `env` block carrying
+  `RAVEL_MCP_TOOLS=all` — the documented way to get the full surface — vanished
+  silently, along with timeouts, allow-lists and per-tool approvals. JSON configs
+  (Claude Code, Cursor, Gemini, Windsurf, VS Code, OpenCode) now merge: `command`,
+  `args` and `type` are refreshed and everything else stays. Codex's
+  `[mcp_servers.ravel]` is rewritten from the parsed table, nested `env` and
+  `tools` tables included; the rest of `config.toml` is left byte-for-byte, though
+  comments inside the `ravel` table itself do not survive.
+- **`$CODEX_HOME` is honoured.** Codex reads its config from there; install wrote
+  to `~/.codex` regardless and left a relocated Codex unwired.
+- **A global install no longer leaves `AGENTS.md` in your home directory.** The
+  README runs `ravel install` before `cd` into a project, so the instruction block
+  landed wherever the shell happened to be. It is now created only in a directory
+  that is a project (`.git`, `package.json`, `tsconfig.json`, `jsconfig.json`) or
+  with `--location local`; a file that already has the block is still refreshed.
+
+### Added — a skill, so the guidance reaches every repository
+- `ravel install` writes a `ravel` Agent Skill for Claude Code
+  (`~/.claude/skills/ravel/`, or `.claude/skills/ravel/` with `--location local`)
+  and Codex (`~/.agents/skills/ravel/`, or `.agents/skills/ravel/`). The
+  instruction block only ever lands in the one project install ran in; a skill's
+  description is in the agent's context in every project, and its body loads only
+  when a question matches it. It maps each question to the MCP tool and the CLI
+  command, and its `allowed-tools` pre-approves the read-only `ravel` CLI calls in
+  Claude Code while it is active (Codex ignores the field). `ravel uninstall`
+  removes it; a `ravel` skill you wrote yourself is never overwritten or removed.
+  `--no-instructions` skips it.
+- `--print-config claude|codex` also prints the `claude mcp add` /
+  `codex mcp add` equivalent.
+
+### Changed
+- Tool descriptions lost their `PRIMARY` prefixes and the parts the server
+  instructions already state; `root`, `query` and `limit` gained descriptions;
+  `$schema` and `format: "uint"` were dropped from input schemas. Bytes the model
+  sees for the five primary tools: 4503 -> 4535, with every parameter now
+  described.
+- Server instructions say when to pass `root` and that Ravel never edits source.
+- The README, install docs, `AGENTS.md`, CLI help, `cheatsheet` and `setup` still
+  described three primary tools and `ravel mcp`; they now list the five and
+  `serve --mcp`, and the cheatsheet leads with `callers-of`.
+
 ## [1.15.0] - 2026-08-01
 
 ### Removed — a diagnostic that was wrong more often than right

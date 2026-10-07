@@ -87,9 +87,9 @@ What it writes:
 
 | Agent | Global config | Local config | Instructions |
 |-------|---------------|--------------|--------------|
-| Claude Code | `~/.claude.json` `mcpServers` | `.mcp.json` | `CLAUDE.md` / `AGENTS.md` |
+| Claude Code | `~/.claude.json` `mcpServers` | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` (local: `.claude/skills/ravel/`) |
 | Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if `.cursor/` exists |
-| Codex | `~/.codex/config.toml` | `.codex/config.toml` | `AGENTS.md` |
+| Codex | `$CODEX_HOME/config.toml` (default `~/.codex`) | `.codex/config.toml` (trusted projects) | `AGENTS.md`; skill in `~/.agents/skills/ravel/` (local: `.agents/skills/ravel/`) |
 | OpenCode | `~/.config/opencode/opencode.json` | `opencode.json` | `AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` | `GEMINI.md` if present |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | — | — |
@@ -99,10 +99,25 @@ What it writes:
 MCP always launches:
 
 ```text
-<absolute-path-to-ravel> mcp
+<absolute-path-to-ravel> serve --mcp
 ```
 
 so agents don’t depend on PATH quirks. Project root is the agent’s cwd (`--root` optional).
+
+Re-running `ravel install` (after an upgrade or a move) refreshes the command and
+arguments and keeps everything else you added to the `ravel` entry: `env`,
+timeouts, tool allow-lists, per-tool approvals.
+
+The `AGENTS.md` block is written into the directory you run the installer from
+only when it is a project (it has `.git`, `package.json`, `tsconfig.json` or
+`jsconfig.json`) or when you pass `--location local`; a global install run from
+your home directory no longer leaves an `AGENTS.md` there. The skill covers every
+other repository. Files that already carry the block are refreshed. A skill
+directory you wrote yourself under the name `ravel` is never overwritten or
+removed. `--no-instructions` skips both.
+
+`ravel install --print-config claude` and `--print-config codex` also print the
+equivalent `claude mcp add` / `codex mcp add` one-liner.
 
 ### Uninstall agents
 
@@ -143,13 +158,27 @@ ravel doctor
 
 ## MCP primary tools (token tax)
 
-Default MCP exposes **3 tools** (`explore`, `status`, `sync`). Full set:
+Default MCP exposes **5 tools** (`explore`, `callers_of`, `calls_from`,
+`status`, `sync`). Full set:
 
 ```bash
-RAVEL_MCP_TOOLS=all ravel mcp
+RAVEL_MCP_TOOLS=all ravel serve --mcp
 ```
 
-Or set that env in the agent’s MCP config `env` block.
+Or set that env in the agent’s MCP config `env` block. Codex starts MCP servers
+with a cleaned environment, so a `RAVEL_*` variable exported in your shell does
+not reach Ravel there; put it in the config instead:
+
+```toml
+[mcp_servers.ravel.env]
+RAVEL_MCP_TOOLS = "all"
+```
+
+Tools carry MCP annotations: `readOnlyHint: true` on every query and
+`destructiveHint: false` on `sync`, all with `openWorldHint: false`. Codex's
+default `auto` approval mode asks before any tool without those hints. Failed
+calls set `isError`, so the model is told the call failed instead of reading an
+error body as an answer.
 
 ## Multi-OS notes
 

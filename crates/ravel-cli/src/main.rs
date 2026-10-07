@@ -90,7 +90,7 @@ enum Command {
         /// Print MCP snippet for one agent and exit (no writes)
         #[arg(long, value_name = "AGENT")]
         print_config: Option<String>,
-        /// Skip AGENTS.md / CLAUDE.md instruction markers
+        /// Skip instruction files: AGENTS.md / CLAUDE.md markers and the `ravel` agent skill
         #[arg(long)]
         no_instructions: bool,
         /// Skip Claude mcp__ravel__* allowlist tweak
@@ -253,7 +253,8 @@ enum Command {
     /// ~150-token agent map (session start)
     Cheatsheet,
     /// Long-lived MCP stdio server with per-root file watching.
-    /// Default: primary tools only (explore, status, sync). Set RAVEL_MCP_TOOLS=all for full.
+    /// Default: primary tools only (explore, callers_of, calls_from, status, sync).
+    /// Set RAVEL_MCP_TOOLS=all for full.
     Mcp,
     /// Manage the shared daemon for this workspace.
     Daemon {
@@ -780,7 +781,8 @@ skip_sibling_emit = true
             }
             // Persistent MCP server with per-root file watching and Git freshness checks.
             // Staleness info is embedded in explore response via auto_synced field.
-            // Primary tools: explore, status, sync. Set RAVEL_MCP_TOOLS=all for full.
+            // Primary tools: explore, callers_of, calls_from, status, sync. Set RAVEL_MCP_TOOLS=all
+            // for full.
             eprintln!(
                 "ravel serve --mcp (persistent per-root watch; explore checks Git freshness)"
             );
@@ -853,13 +855,16 @@ fn ensure_daemon(
 
 fn ravel_cheatsheet() -> &'static str {
     r#"# ravel (token-cheap code graph)
+callers-of X → every reference to X with file:line (what breaks if X changes)
+calls-from X → what X references
 explore Q    → exact/qualified symbol or natural terms + source + relations (ONE call)
-sync         → reindex dirty files (auto on explore)
-serve --mcp  → persistent server (per-root watch, 3 primary tools)
+status       → indexed? how much of this repo (session start)
+sync [PATHS] → reindex edited files (queries auto-sync git-dirty files)
 search Q --kind prefix | query N --reverse | impact N --risk
-status | cycles | hubs --limit 10 | orphans --limit 10
+cycles | hubs --limit 10 | orphans --limit 10
+serve --mcp  → MCP server (5 primary tools; RAVEL_MCP_TOOLS=all for every tool)
 JSON compact default; --pretty humans only
-Edit with agent editor — ravel maps blast radius
+Edit with agent editor — ravel never writes source
 "#
 }
 
@@ -883,12 +888,13 @@ fn write_agent_setup(root: &std::path::Path, claude: bool, force: bool) -> anyho
 ## Ravel (code graph — prefer over grep/Read)
 
 ```bash
-ravel --root . explore SYMBOL  # ONE call: search + callers + impact
-ravel --root . sync            # after edits (auto on explore)
-ravel --root . serve --mcp     # persistent MCP (stays fresh)
+ravel --root . callers-of SYMBOL  # every reference, with file and line
+ravel --root . explore SYMBOL     # ONE call: search + callers + impact
+ravel --root . sync               # after edits (auto on explore)
+ravel --root . serve --mcp        # persistent MCP (stays fresh)
 ```
 
-3 primary MCP tools (explore, status, sync) — schema overhead minimal.
+5 primary MCP tools (explore, callers_of, calls_from, status, sync) — schema overhead minimal.
 Full surface: `RAVEL_MCP_TOOLS=all`. Ravel does not write source files.
 "#;
     if force || !agents.exists() {

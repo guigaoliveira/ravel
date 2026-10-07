@@ -51,7 +51,9 @@ ravel context PaymentService
 ```
 
 `ravel install` detects Claude Code, Cursor, Codex, OpenCode, Gemini, Windsurf,
-VS Code, and Grok. Restart agents that were already running.
+VS Code, and Grok. For Claude Code and Codex it also installs a `ravel` agent
+skill, so the agent knows when to reach for the graph in every repository, not
+only the one you ran the installer in. Restart agents that were already running.
 
 ## Use
 
@@ -99,7 +101,10 @@ conservatively unresolved rather than producing guessed edges.
 ## MCP
 
 `ravel install` configures MCP automatically. Ravel exposes only
-`explore`, `status`, and `sync` by default to reduce tool-schema overhead.
+`explore`, `callers_of`, `calls_from`, `status`, and `sync` by default to reduce
+tool-schema overhead. Every tool is annotated read-only except `sync` (which
+writes only `.ravel/`), so clients that gate on annotations — Codex's default
+approval mode among them — run queries without a prompt each time.
 Multiple agents and processes may share the same indexed root: updates are
 serialized and published atomically, so readers keep the last complete index.
 MCP clients for the same root share one transient local daemon, watcher, warm
