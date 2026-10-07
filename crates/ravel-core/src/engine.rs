@@ -2283,6 +2283,18 @@ impl WorkspaceEngine {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
+            // A name the new version still declares has at least one definer, so only the names
+            // that left the edited files need the universe asked. Asking for every old name
+            // decoded one full universe shard per name -- for a class with a handful of methods
+            // named like thousands of others, most of the sync's time.
+            let kept_names: BTreeSet<&str> = changes
+                .iter()
+                .flat_map(|(_, _, new)| {
+                    new.iter()
+                        .flat_map(|artifact| artifact.symbols.iter())
+                        .map(|symbol| symbol.name.as_str())
+                })
+                .collect();
             let removed_names = changes
                 .iter()
                 .flat_map(|(_, old, _)| {
@@ -2290,6 +2302,7 @@ impl WorkspaceEngine {
                         .flat_map(|artifact| artifact.symbols.iter())
                         .map(|symbol| symbol.name.clone())
                 })
+                .filter(|name| !kept_names.contains(name.as_str()))
                 .filter(|name| universe.symbol_definer_count(name) == 0)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -4626,6 +4639,56 @@ mod resident_sync_tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn file_existence_answers_from_its_own_record_match_the_full_shard() {
+        use crate::resolver::ResolutionLookup;
+        let (root, engine, _service) = fixture();
+        let probe = |engine: &WorkspaceEngine, expected: &[(&str, bool)]| {
+            let reader = engine.storage().open_structural_reader().unwrap().unwrap();
+            assert!(reader.records_universe_files());
+            for (path, present) in expected {
+                assert_eq!(reader.contains_file(path), *present, "{path}");
+                assert_eq!(
+                    reader.contains_file(path),
+                    reader.universe_shard(path).files.contains(*path),
+                    "{path}"
+                );
+            }
+        };
+        probe(
+            &engine,
+            &[
+                ("service.ts", true),
+                ("consumer.ts", true),
+                ("other.ts", false),
+            ],
+        );
+        // A file appears and one disappears through an overlay; both the resident reader and a
+        // cold one must see it in the file record.
+        std::fs::write(
+            root.path().join("other.ts"),
+            "import { answer } from './service';\nexport const twice = () => answer() * 2;\n",
+        )
+        .unwrap();
+        std::fs::remove_file(root.path().join("consumer.ts")).unwrap();
+        engine
+            .sync_resident(Some(&[
+                root.path().join("other.ts"),
+                root.path().join("consumer.ts"),
+            ]))
+            .unwrap();
+        let expected = [
+            ("service.ts", true),
+            ("consumer.ts", false),
+            ("other.ts", true),
+        ];
+        probe(&engine, &expected);
+        probe(
+            &WorkspaceEngine::load(root.path(), &Flags::default()).unwrap(),
+            &expected,
+        );
     }
 
     #[test]

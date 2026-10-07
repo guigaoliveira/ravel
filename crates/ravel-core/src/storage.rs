@@ -624,7 +624,20 @@ impl StructuralPackStager {
                 universe.shard_bits,
             ),
         )?;
-        add_shards_parallel(&mut self.writer, &self.path, "universe/", universe.shards)
+        // The resolver probes a dozen candidate paths per import (`x.ts`, `x.tsx`, `x/index.ts`,
+        // ...), and each probe decoded the whole universe shard its path hashes to -- symbol
+        // definitions and module exports included -- to check one set. A one-file sync on a
+        // 20k-file workspace read 130 of 256 shards that way. The file sets get a record of
+        // their own; `meta/universe-files` tells a reader they are complete for this pack.
+        let files: BTreeMap<u16, BTreeSet<String>> = universe
+            .shards
+            .iter()
+            .filter(|(_, shard)| !shard.files.is_empty())
+            .map(|(id, shard)| (*id, shard.files.clone()))
+            .collect();
+        add_shards_parallel(&mut self.writer, &self.path, "universe/", universe.shards)?;
+        self.add_meta("meta/universe-files", &universe.shard_bits)?;
+        add_shards_parallel(&mut self.writer, &self.path, "universe-files/", files)
     }
 
     pub(crate) fn stage_reverse(&mut self, reverse: ReverseShardSet) -> Result<(), StorageError> {
@@ -747,6 +760,10 @@ pub(crate) struct StructuralPackReader {
     /// for each import lookup, and warm syncs are all hits — shared read locks keep the hot
     /// path concurrent while the rare miss takes the write lock to insert.
     universe_cache: RwLock<BTreeMap<u16, Arc<ResolutionUniverseShard>>>,
+    /// Whether the base pack carries `universe-files/` records (see `stage_universe`). Without
+    /// them a file probe decodes the full shard, as before.
+    universe_files_recorded: bool,
+    universe_files_cache: Mutex<BTreeMap<u16, Arc<BTreeSet<String>>>>,
     reverse_files_cache: Mutex<BTreeMap<u16, Arc<BTreeMap<String, FileContribution>>>>,
     /// One cache per membership section, indexed by [`ReverseSection`].
     reverse_membership_caches: [ReverseMembershipCache; 4],
@@ -896,7 +913,7 @@ impl StructuralPackReader {
         }
     }
 
-    fn universe_shard(&self, key: &str) -> Arc<ResolutionUniverseShard> {
+    pub(crate) fn universe_shard(&self, key: &str) -> Arc<ResolutionUniverseShard> {
         let id = resolution_shard_id(key, self.universe_shard_bits);
         if let Some(shard) = self.universe_cache.read().unwrap().get(&id).cloned() {
             return shard;
@@ -915,6 +932,33 @@ impl StructuralPackReader {
             .unwrap()
             .insert(id, Arc::clone(&shard));
         shard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn records_universe_files(&self) -> bool {
+        self.universe_files_recorded
+    }
+
+    /// The file set of universe shard `id`, from its own record with the overlays' file deltas
+    /// applied. Only called when the pack records file sets.
+    fn universe_files_shard(&self, id: u16) -> Arc<BTreeSet<String>> {
+        if let Some(files) = self.universe_files_cache.lock().unwrap().get(&id).cloned() {
+            return files;
+        }
+        let mut files: BTreeSet<String> = self
+            .read_base(&format!("universe-files/{id:04x}"))
+            .unwrap_or_default();
+        for overlays in &self.universe_overlays {
+            if let Some(overlay) = overlays.get(&id) {
+                apply_universe_file_overlay(&mut files, overlay);
+            }
+        }
+        let files = Arc::new(files);
+        self.universe_files_cache
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&files));
+        files
     }
 
     fn reverse_files_shard(&self, id: u16) -> Arc<BTreeMap<String, FileContribution>> {
@@ -1038,6 +1082,14 @@ impl StructuralPackReader {
             for (id, shard) in cache.iter_mut() {
                 if let Some(overlay) = universe_split.get(id) {
                     apply_universe_overlay_to_shard(Arc::make_mut(shard), overlay);
+                }
+            }
+        }
+        {
+            let mut cache = self.universe_files_cache.lock().unwrap();
+            for (id, files) in cache.iter_mut() {
+                if let Some(overlay) = universe_split.get(id) {
+                    apply_universe_file_overlay(Arc::make_mut(files), overlay);
                 }
             }
         }
@@ -1663,6 +1715,11 @@ impl ResolutionLookup for StructuralPackReader {
     }
 
     fn contains_file(&self, path: &str) -> bool {
+        if self.universe_files_recorded {
+            return self
+                .universe_files_shard(resolution_shard_id(path, self.universe_shard_bits))
+                .contains(path);
+        }
         self.universe_shard(path).files.contains(path)
     }
 
@@ -2016,17 +2073,21 @@ fn apply_adjacency_changes(
     }
 }
 
+fn apply_universe_file_overlay(files: &mut BTreeSet<String>, overlay: &ResolutionUniverseOverlay) {
+    for (path, present) in &overlay.files {
+        if *present {
+            files.insert(path.clone());
+        } else {
+            files.remove(path);
+        }
+    }
+}
+
 fn apply_universe_overlay_to_shard(
     shard: &mut ResolutionUniverseShard,
     overlay: &ResolutionUniverseOverlay,
 ) {
-    for (path, present) in &overlay.files {
-        if *present {
-            shard.files.insert(path.clone());
-        } else {
-            shard.files.remove(path);
-        }
-    }
+    apply_universe_file_overlay(&mut shard.files, overlay);
     crate::resolver::apply_definition_overlay(
         &mut shard.symbol_definitions,
         &overlay.symbol_definitions,
@@ -2657,6 +2718,9 @@ impl FileSnapshotStorage {
         else {
             return Ok(None);
         };
+        let universe_files_recorded =
+            read_pack_value_from_reader::<u8>(&mut base_reader, &base, "meta/universe-files", 64)?
+                .is_some_and(|bits| bits == universe_shard_bits);
         let Some((_reverse_format_version, reverse_fingerprint, reverse_shard_bits)) =
             read_pack_value_from_reader::<(u32, String, u8)>(
                 &mut base_reader,
@@ -2752,6 +2816,8 @@ impl FileSnapshotStorage {
             reverse_overlays,
             graph_overlays,
             universe_cache: RwLock::new(BTreeMap::new()),
+            universe_files_recorded,
+            universe_files_cache: Mutex::new(BTreeMap::new()),
             reverse_files_cache: Mutex::new(BTreeMap::new()),
             reverse_membership_caches: Default::default(),
             graph_file_cache: Mutex::new(BTreeMap::new()),
