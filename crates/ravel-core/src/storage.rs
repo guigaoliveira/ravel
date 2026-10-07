@@ -531,7 +531,7 @@ impl StructuralPackStager {
         let graph = GraphIndex::from_snapshot(snapshot);
         crate::timing::stage("stage_snapshot.graph_from_snapshot", mark, String::new);
         mark = std::time::Instant::now();
-        let flat_graph = FlatCompactGraph::from_compact(graph.to_compact());
+        let flat_graph = FlatCompactGraph::from_index(&graph);
         let graph_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&flat_graph).map_err(|error| {
             StorageError::Invalid {
                 path: self.path.clone(),
