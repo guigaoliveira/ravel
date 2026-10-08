@@ -372,20 +372,22 @@ impl RavelMcp {
             .remove(root.to_string_lossy().as_ref());
     }
 
+    /// The daemon's answer as the JSON text it serialized: a tool result is that text, so it is
+    /// never parsed into a `Value` and written out again.
     fn call_daemon(
         &self,
         root: Option<&str>,
         operation: crate::daemon::DaemonOperation,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<String, String> {
         let client = self.daemon_client(root)?;
-        match client.client.call(operation.clone()) {
-            Ok(value) => Ok(value),
+        match client.client.call_text(operation.clone()) {
+            Ok(text) => Ok(text),
             Err(error) if should_respawn_after(&error) => {
                 self.forget_daemon(root);
                 let retry = self.daemon_client(root)?;
                 retry
                     .client
-                    .call(operation)
+                    .call_text(operation)
                     .map_err(|error| error.to_string())
             }
             Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
@@ -595,7 +597,7 @@ impl RavelMcp {
     )]
     async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(10).max(1);
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Context {
                 query: request.query.clone(),
@@ -648,7 +650,7 @@ impl RavelMcp {
         annotations(title = "Index status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Status,
         ))
@@ -673,7 +675,7 @@ impl RavelMcp {
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Sync { paths },
         ))
@@ -917,7 +919,7 @@ async fn reference_sites_tool(
             "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
         )));
     }
-    json_reply(mcp.call_daemon(
+    daemon_reply(mcp.call_daemon(
         request.root.as_deref(),
         crate::daemon::DaemonOperation::ReferenceSites {
             node: request.node,
@@ -1015,6 +1017,11 @@ fn json_ok(value: &impl serde::Serialize) -> ToolReply {
 
 fn json_reply<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> ToolReply {
     json_ok(&result.map_err(tool_error)?)
+}
+
+/// A daemon answer is JSON text already, so it goes out as it came in.
+fn daemon_reply(result: Result<String, String>) -> ToolReply {
+    result.map_err(tool_error)
 }
 
 fn tool_error(error: impl std::fmt::Display) -> String {

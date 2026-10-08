@@ -349,9 +349,7 @@ impl DaemonClient {
     }
 
     pub fn call(&self, operation: DaemonOperation) -> Result<Value, DaemonCallError> {
-        let mut stream = self.connect_and_handshake()?;
-        write_frame(&mut stream, &WireRequest::Operation(operation))
-            .map_err(DaemonCallError::Transport)?;
+        let mut stream = self.send(operation)?;
         match read_frame::<WireResponse>(&mut stream).map_err(DaemonCallError::Transport)? {
             WireResponse::Value(value) => Ok(value),
             WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
@@ -359,6 +357,23 @@ impl DaemonClient {
                 "unexpected daemon hello",
             ))),
         }
+    }
+
+    /// [`call`](Self::call) for a caller that only forwards the answer: the reply's JSON text,
+    /// exactly as the daemon serialized it, without building a `Value` and writing it out again.
+    pub fn call_text(&self, operation: DaemonOperation) -> Result<String, DaemonCallError> {
+        let mut stream = self.send(operation)?;
+        read_reply_text(&mut stream)
+    }
+
+    fn send(
+        &self,
+        operation: DaemonOperation,
+    ) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
+        let mut stream = self.connect_and_handshake()?;
+        write_frame(&mut stream, &WireRequest::Operation(operation))
+            .map_err(DaemonCallError::Transport)?;
+        Ok(stream)
     }
 
     pub fn acquire_lease(&self) -> Result<DaemonClientLease, DaemonCallError> {
@@ -1059,6 +1074,12 @@ pub fn read_frame_with_limit<T: DeserializeOwned>(
     reader: &mut impl Read,
     max_bytes: usize,
 ) -> io::Result<T> {
+    let payload = read_frame_bytes(reader, max_bytes)?;
+    serde_json::from_slice(&payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn read_frame_bytes(reader: &mut impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header) as usize;
@@ -1070,8 +1091,42 @@ pub fn read_frame_with_limit<T: DeserializeOwned>(
     }
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(payload)
+}
+
+fn read_reply_text(reader: &mut impl Read) -> Result<String, DaemonCallError> {
+    let payload = read_frame_bytes(reader, MAX_FRAME_BYTES).map_err(DaemonCallError::Transport)?;
+    reply_text(payload)
+}
+
+/// The JSON of a `WireResponse::Value` frame, unparsed. A caller that only forwards the answer
+/// gains nothing from a `Value` tree: building it allocates for every node, and writing it out
+/// again reproduces the bytes that were just read. The daemon is this binary's own server (the
+/// endpoint is version-scoped), so the envelope is known: serde writes the variant as
+/// `{"Value":<json>}`. Anything else is decoded the ordinary way.
+fn reply_text(mut payload: Vec<u8>) -> Result<String, DaemonCallError> {
+    const VALUE_TAG: &[u8] = br#"{"Value":"#;
+    let invalid = |error: &dyn std::error::Error| {
+        DaemonCallError::Transport(io::Error::new(
+            io::ErrorKind::InvalidData,
+            error.to_string(),
+        ))
+    };
+    if payload.len() > VALUE_TAG.len() + 1
+        && payload.starts_with(VALUE_TAG)
+        && payload.last() == Some(&b'}')
+    {
+        payload.pop();
+        payload.drain(..VALUE_TAG.len());
+        return String::from_utf8(payload).map_err(|error| invalid(&error));
+    }
+    match serde_json::from_slice::<WireResponse>(&payload).map_err(|error| invalid(&error))? {
+        WireResponse::Value(value) => Ok(value.to_string()),
+        WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
+        WireResponse::Hello(_) => Err(DaemonCallError::Transport(invalid_protocol(
+            "unexpected daemon hello",
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1304,53 @@ mod tests {
             read_frame::<serde_json::Value>(&mut wire.as_slice()).unwrap(),
             value
         );
+    }
+
+    fn payload_of(response: &WireResponse) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, response).unwrap();
+        wire.split_off(4)
+    }
+
+    #[test]
+    fn a_value_reply_is_forwarded_exactly_as_serialized() {
+        for value in [
+            serde_json::json!({ "b": [1, 2.5, null], "a": "x}\"y{", "n": { "k": true } }),
+            serde_json::json!([]),
+            serde_json::json!(42),
+            serde_json::json!("}"),
+            serde_json::json!(null),
+        ] {
+            let text = reply_text(payload_of(&WireResponse::Value(value.clone()))).unwrap();
+            assert_eq!(text, serde_json::to_string(&value).unwrap());
+        }
+    }
+
+    #[test]
+    fn error_and_hello_replies_are_not_mistaken_for_values() {
+        match reply_text(payload_of(&WireResponse::Error("no such symbol".into()))) {
+            Err(DaemonCallError::Remote(message)) => assert_eq!(message, "no such symbol"),
+            other => panic!("expected a remote error, got {other:?}"),
+        }
+        let identity = RootIdentity::discover(tempdir().unwrap().path()).unwrap();
+        let hello = WireResponse::Hello(ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_version: crate::VERSION.to_owned(),
+            root: identity,
+        });
+        assert!(matches!(
+            reply_text(payload_of(&hello)),
+            Err(DaemonCallError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn a_reply_spelled_differently_is_still_decoded() {
+        let text = reply_text(br#"{ "Value" : { "a" : 1 } }"#.to_vec()).unwrap();
+        assert_eq!(text, r#"{"a":1}"#);
+        assert!(reply_text(br#"{"Value":"#.to_vec()).is_err());
+        assert!(reply_text(b"not json".to_vec()).is_err());
     }
 
     #[test]
