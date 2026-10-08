@@ -17,7 +17,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -168,6 +168,8 @@ pub struct RavelMcp {
     max_cached_roots: usize,
     mode: McpToolMode,
     default_root: Option<PathBuf>,
+    /// `default_root` with its symlinks resolved, once that has worked.
+    resolved_default_root: OnceLock<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -262,6 +264,7 @@ impl RavelMcp {
             max_cached_roots: max_cached_roots_from_env(),
             mode,
             default_root,
+            resolved_default_root: OnceLock::new(),
         }
     }
 
@@ -312,15 +315,29 @@ impl RavelMcp {
         })
     }
 
+    /// The workspace a call is about, with symlinks resolved. Resolving costs a `readlink` per path
+    /// component, so the server's default root -- the one nearly every call names -- is resolved
+    /// once rather than on every call.
+    fn call_root(&self, root: Option<&str>) -> Option<PathBuf> {
+        let resolve = |path: PathBuf| path.canonicalize().unwrap_or(path);
+        match (root, &self.default_root) {
+            (Some(root), _) => Some(resolve(PathBuf::from(root))),
+            (None, Some(default)) => Some(match self.resolved_default_root.get() {
+                Some(resolved) => resolved.clone(),
+                // Only a success is remembered: a root that does not exist yet may later.
+                None => match default.canonicalize() {
+                    Ok(resolved) => self.resolved_default_root.get_or_init(|| resolved).clone(),
+                    Err(_) => default.clone(),
+                },
+            }),
+            (None, None) => std::env::current_dir().ok().map(resolve),
+        }
+    }
+
     fn daemon_client(&self, root: Option<&str>) -> Result<DaemonUse, String> {
-        let base = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| {
-                "no workspace root: pass `root` or start the server inside one".to_owned()
-            })?;
-        let root = base.canonicalize().unwrap_or(base);
+        let root = self.call_root(root).ok_or_else(|| {
+            "no workspace root: pass `root` or start the server inside one".to_owned()
+        })?;
         let key = root.to_string_lossy().into_owned();
         let mut daemons = self.daemons.lock().unwrap();
         let tick = self.next_cache_tick();
@@ -358,14 +375,9 @@ impl RavelMcp {
     }
 
     fn forget_daemon(&self, root: Option<&str>) {
-        let Some(base) = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-        else {
+        let Some(root) = self.call_root(root) else {
             return;
         };
-        let root = base.canonicalize().unwrap_or(base);
         self.daemons
             .lock()
             .unwrap()
@@ -1065,6 +1077,39 @@ mod tests {
         let root = PathBuf::from("/tmp/ravel-mcp-root");
         let m = RavelMcp::with_root(root.clone());
         assert_eq!(m.default_root, Some(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_default_root_is_resolved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let server = RavelMcp::with_root(link.clone());
+        let resolved = real.canonicalize().unwrap();
+
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // Resolved once: the link can go and the answer does not change, because nothing asks
+        // the filesystem again.
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // A root named in the call is resolved every time.
+        assert_eq!(
+            server.call_root(Some(real.to_str().unwrap())),
+            Some(resolved)
+        );
+    }
+
+    #[test]
+    fn a_default_root_that_does_not_resolve_yet_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = dir.path().join("later");
+        let server = RavelMcp::with_root(later.clone());
+        assert_eq!(server.call_root(None), Some(later.clone()));
+        std::fs::create_dir(&later).unwrap();
+        assert_eq!(server.call_root(None), Some(later.canonicalize().unwrap()));
     }
 
     #[test]
