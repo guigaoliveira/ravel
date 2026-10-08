@@ -5694,6 +5694,102 @@ mod agent_context_tests {
         );
     }
 
+    /// Pages are slices of one sequence, whether the node is untouched or an incremental sync put it
+    /// behind an overlay (where each page used to rebuild and sort every site). Walking the cursor must
+    /// reproduce a single large page, and the totals every page repeats must keep adding up.
+    #[test]
+    fn pages_walked_by_cursor_reproduce_one_large_page_before_and_after_a_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src/callers")).unwrap();
+        std::fs::write(
+            root.join("src/hub.ts"),
+            "export function hub(x: number) { return x; }\n",
+        )
+        .unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                root.join(format!("src/callers/c{i}.ts")),
+                format!(
+                    "import {{ hub }} from '../hub';\nexport function c{i}() {{ hub(1); return hub(2); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let walk = |engine: &WorkspaceEngine, page_size: usize| -> (Vec<serde_json::Value>, u64) {
+            let (mut sites, mut cursor) = (Vec::new(), 0usize);
+            loop {
+                let page = engine
+                    .reference_sites("hub", true, page_size, cursor)
+                    .unwrap();
+                let total = page["total"].as_u64().unwrap();
+                sites.extend(page["sites"].as_array().unwrap().iter().cloned());
+                match page["next_cursor"].as_str() {
+                    Some(next) => cursor = next.parse().unwrap(),
+                    None => return (sites, total),
+                }
+            }
+        };
+        let check = |engine: &WorkspaceEngine, expected_total: u64| {
+            let (whole, total) = walk(engine, 1000);
+            assert_eq!(total, expected_total);
+            assert_eq!(whole.len() as u64, total);
+            for page_size in [1, 7, 50] {
+                let (paged, paged_total) = walk(engine, page_size);
+                assert_eq!(paged_total, total);
+                assert_eq!(paged, whole, "page size {page_size}");
+            }
+            let first = engine.reference_sites("hub", true, 5, 0).unwrap();
+            let by_kind: u64 = first["by_kind"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|count| count.as_u64().unwrap())
+                .sum();
+            assert_eq!(by_kind, total, "kind counts must cover every site");
+            let rollup = engine
+                .reference_sites_with(
+                    "hub",
+                    true,
+                    5,
+                    0,
+                    RelationOptions {
+                        scope: None,
+                        rollup: Some(RollupMode::Dir { depth: 2 }),
+                    },
+                )
+                .unwrap();
+            assert_eq!(rollup["grouped_sites"].as_u64().unwrap(), total);
+        };
+        // 60 imports plus 120 calls.
+        check(&engine, 180);
+
+        // An edit the index absorbs as an overlay: one caller gains a call and another loses its import.
+        std::fs::write(
+            root.join("src/callers/c3.ts"),
+            "import { hub } from '../hub';\nexport function c3() { hub(1); hub(2); return hub(3); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/callers/c4.ts"),
+            "export function c4() { return 4; }\n",
+        )
+        .unwrap();
+        engine
+            .sync(Some(&[
+                root.join("src/callers/c3.ts"),
+                root.join("src/callers/c4.ts"),
+            ]))
+            .unwrap();
+        check(&engine, 180 + 1 - 3);
+        // And a process that has never seen the earlier state agrees.
+        let cold = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        check(&cold, 180 + 1 - 3);
+    }
+
     #[test]
     fn a_workspace_of_unparsed_components_does_not_certify_its_zeros() {
         // `.vue`, `.svelte` and `.astro` contain TypeScript and import TS symbols. Leaving them out of
