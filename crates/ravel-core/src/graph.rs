@@ -852,46 +852,11 @@ impl GraphIndex {
     /// Incoming plus outgoing relation count of one node: the sum of the totals
     /// `direct_relations_limit` reports, without building the relations.
     ///
-    /// A node an incremental overlay touched has no precomputed list to measure, and asking
-    /// `direct_relations_limit` for a limit of zero still materialized and sorted every relation
-    /// of it just to count them -- for a hub that is one allocation per reference.
+    /// Asking `direct_relations_limit` for a limit of zero still turns every site of a page into
+    /// an owned view; `direct_relations` counts a node's sites -- an overlaid one's included --
+    /// without building any of them.
     pub fn direct_degree(&self, node: &str) -> usize {
-        let Some(&node_id) = self.node_index.get(node) else {
-            return 0;
-        };
-        let overlaid = self.relation_overlay_nodes.contains(node);
-        [true, false]
-            .into_iter()
-            .map(|reverse| {
-                let relation_ids = if reverse {
-                    self.reverse_relation_ids.get(node_id as usize)
-                } else {
-                    self.forward_relation_ids.get(node_id as usize)
-                };
-                if !overlaid {
-                    return relation_ids.map_or(0, <[u32]>::len);
-                }
-                let base = relation_ids
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|relation_id| self.relations.get(*relation_id as usize))
-                    .filter(|relation| {
-                        relation
-                            .source_path
-                            .and_then(|id| self.nodes.get(id as usize))
-                            .is_none_or(|path| {
-                                !self.relation_file_overlays.contains_key(path.as_ref())
-                            })
-                    })
-                    .count();
-                let overlay = if reverse {
-                    self.overlay_reverse_relations.get(node)
-                } else {
-                    self.overlay_forward_relations.get(node)
-                };
-                base + overlay.map_or(0, Vec::len)
-            })
-            .sum()
+        self.direct_relations(node, true).1 + self.direct_relations(node, false).1
     }
 
     /// Complete per-kind edge counts for one node. Bounded by the number of

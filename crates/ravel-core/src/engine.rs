@@ -1117,9 +1117,9 @@ impl WorkspaceEngine {
         })
     }
 
-    /// Start loading, on background threads, what a relation query (`context`, `callers_of`,
-    /// `calls_from`) is certain to ask for: the graph and the component-source count that
-    /// `degradation` reads.
+    /// Start loading, on background threads, what a relation query (`callers_of`, `calls_from`)
+    /// is certain to ask for: the graph and the component-source count that `degradation` reads.
+    /// `context` starts its own loads, the symbol metadata and searches included.
     ///
     /// A one-shot query spends its first stretch waiting for the auto-sync's `git status`, a child
     /// process the caller only waits on, and only then loads the graph and walks the tree one after
@@ -1129,7 +1129,10 @@ impl WorkspaceEngine {
     /// in the daemon, so a prefetch can cost work but cannot serve stale data. The loaders hold
     /// their cache lock while loading, so the query that follows waits for the result instead of
     /// repeating it.
-    pub fn prefetch_for_relations(&self) {
+    ///
+    /// `degradation` is false for a query whose answer never reports it (a rollup): the walk would
+    /// then be work nothing reads.
+    pub fn prefetch_for_relations(&self, degradation: bool) {
         let loads: [fn(&WorkspaceEngine); 2] = [
             |engine| {
                 let _ = engine.graph();
@@ -1138,7 +1141,8 @@ impl WorkspaceEngine {
                 let _ = engine.component_sources_cached();
             },
         ];
-        for load in loads {
+        for load in &loads[..if degradation { 2 } else { 1 }] {
+            let load = *load;
             let engine = self.clone();
             // A failed spawn only forgoes the head start.
             let _ = std::thread::Builder::new()
@@ -2949,22 +2953,24 @@ impl WorkspaceEngine {
             .all(|key| degradation[key].as_u64() == Some(0))
     }
 
-    /// Starts the coverage walk behind `degradation` on its own thread, for a process that has
-    /// not run it yet.
+    /// Starts the component-source walk behind `degradation` on its own thread, for a process
+    /// that has not run it yet.
     ///
     /// A fresh process -- every CLI call -- walks up to 20,000 directory entries to fill that
     /// cache, which came after the searches on the critical path although it needs nothing from
     /// them or from the sync. Started first, it overlaps the `git status` the sync waits on and
     /// the cold index loads. A resident engine already holds the answer and spawns nothing.
     fn prefetch_coverage_probe(&self) -> Option<std::thread::JoinHandle<()>> {
-        if self.inner.unsupported_sources.lock().unwrap().is_some() {
+        if self.inner.component_sources.lock().unwrap().is_some()
+            || self.inner.unsupported_sources.lock().unwrap().is_some()
+        {
             return None;
         }
         let engine = self.clone();
         std::thread::Builder::new()
             .name("ravel-coverage".into())
             .spawn(move || {
-                let _ = engine.unsupported_sources_cached();
+                let _ = engine.component_sources_cached();
             })
             .ok()
     }
@@ -5170,7 +5176,7 @@ mod resident_sync_tests {
         let mut previous = None;
         for round in 0..12 {
             let reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
-            reader.prefetch_for_relations();
+            reader.prefetch_for_relations(true);
             std::fs::write(
                 &service,
                 format!(
