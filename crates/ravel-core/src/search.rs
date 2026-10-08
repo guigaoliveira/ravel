@@ -779,6 +779,195 @@ fn search_archived_terms(
     if let Some(hits) = intersection_top_hits(index, tokens.len(), &lists, excluded_ids, limit) {
         return hits;
     }
+    let entries = merged_term_entries(index, tokens.len(), &lists)
+        .unwrap_or_else(|| hashed_term_entries(index, tokens.len(), &lists));
+    crate::timing::note("terms.postings", || {
+        let scanned: usize = lists
+            .iter()
+            .map(|&token_index| index.term_postings[token_index].len())
+            .sum();
+        format!(
+            "tokens={} scanned={scanned} scored={} limit={limit}",
+            tokens.len(),
+            entries.len()
+        )
+    });
+    top_term_documents(index, entries, excluded_ids, limit)
+}
+
+/// A scored candidate that has not been looked up yet: `(score_micros, document_index)`.
+/// Scores top out at 950_000, so they fit a `u32`, and eight bytes per candidate keeps a
+/// six-figure candidate set cheap to hold and to partition.
+type TermEntry = (u32, u32);
+
+/// Most posting lists the merge folds together; a longer query accumulates through the hash map.
+const MAX_MERGED_LISTS: usize = 8;
+
+/// Scores every document in the union of `lists` without a hash map and without touching the
+/// documents themselves, in ascending document order.
+///
+/// Posting lists are ascending by document index, so lists can be merged by walking them side by
+/// side. A common token like "service" matches six figures of definitions: accumulating them in a
+/// hash map and then reading each one's name and id out of the archive was most of what a query on
+/// such a word cost.
+///
+/// Returns `None` when the lists cannot be merged — too many of them, or one that is not strictly
+/// ascending in a malformed archive — and the caller falls back to `hashed_term_entries`.
+fn merged_term_entries(
+    index: &ArchivedTermIndex,
+    query_len: usize,
+    lists: &[usize],
+) -> Option<Vec<TermEntry>> {
+    if lists.len() > MAX_MERGED_LISTS {
+        return None;
+    }
+    let documents = index.documents.len();
+    let postings: Vec<&[ArchivedTermPosting]> = lists
+        .iter()
+        .map(|&token_index| index.term_postings[token_index].as_slice())
+        .collect();
+    // A document found through one token alone scores by which fields that token hit, so score
+    // each of the sixteen field combinations once instead of once per document.
+    let mut by_fields = [0u32; 16];
+    for (fields, score) in by_fields.iter_mut().enumerate() {
+        let mut counts = [0u64; 5];
+        accumulate_posting(&mut counts, fields as u8);
+        *score = score_term_counts(query_len, counts).unwrap_or(0) as u32;
+    }
+    if let [only] = postings.as_slice() {
+        let mut entries = Vec::with_capacity(only.len());
+        let mut previous: Option<u32> = None;
+        for posting in only.iter() {
+            let document_index = posting.document_index.to_native();
+            if previous.is_some_and(|before| document_index <= before) {
+                return None;
+            }
+            previous = Some(document_index);
+            // Archived postings skip the `is_well_formed` gate (only structural rkyv
+            // validation runs), so bound-check before indexing an mmap slice.
+            if (document_index as usize) < documents {
+                entries.push((by_fields[usize::from(posting.fields & 0xf)], document_index));
+            }
+        }
+        return Some(entries);
+    }
+    // The longest list holds most of the documents. Merge the others into a short side table of
+    // counts, then walk the long list once: a document the side table lacks is found through the
+    // long list alone and scores straight from `by_fields`, with no cursor bookkeeping. Merging
+    // all the lists with one cursor each cost about ten times as much per document.
+    let longest = postings
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, list)| list.len())?
+        .0;
+    let side = merge_posting_counts(&postings, longest)?;
+    let long = postings[longest];
+    let mut entries = Vec::with_capacity(long.len() + side.len());
+    let mut at = 0usize;
+    let mut previous: Option<u32> = None;
+    for (document_index, mut counts) in side {
+        while let Some(posting) = long.get(at) {
+            let before = posting.document_index.to_native();
+            if before >= document_index {
+                break;
+            }
+            if previous.is_some_and(|last| before <= last) {
+                return None;
+            }
+            previous = Some(before);
+            if (before as usize) < documents {
+                entries.push((by_fields[usize::from(posting.fields & 0xf)], before));
+            }
+            at += 1;
+        }
+        if let Some(posting) = long.get(at)
+            && posting.document_index.to_native() == document_index
+        {
+            if previous.is_some_and(|last| document_index <= last) {
+                return None;
+            }
+            previous = Some(document_index);
+            bump_counts(&mut counts, posting.fields);
+            at += 1;
+        }
+        if (document_index as usize) < documents {
+            let wide = counts.map(u64::from);
+            entries.push((
+                score_term_counts(query_len, wide).unwrap_or(0) as u32,
+                document_index,
+            ));
+        }
+    }
+    for posting in &long[at..] {
+        let after = posting.document_index.to_native();
+        if previous.is_some_and(|last| after <= last) {
+            return None;
+        }
+        previous = Some(after);
+        if (after as usize) < documents {
+            entries.push((by_fields[usize::from(posting.fields & 0xf)], after));
+        }
+    }
+    Some(entries)
+}
+
+/// `accumulate_posting` for the small per-document counts of the merge's side table.
+fn bump_counts(counts: &mut [u8; 5], fields: u8) {
+    counts[0] += 1;
+    counts[1] += u8::from(fields & 1 != 0);
+    counts[2] += u8::from(fields & 2 != 0);
+    counts[3] += u8::from(fields & 4 != 0);
+    counts[4] += u8::from(fields & 8 != 0);
+}
+
+/// Every document of the posting lists other than `skip`, ascending, with the counts those lists
+/// give it. `None` when one of them is not strictly ascending.
+///
+/// Lists are folded in shortest first, so the table stays small while the long ones arrive.
+fn merge_posting_counts(
+    postings: &[&[ArchivedTermPosting]],
+    skip: usize,
+) -> Option<Vec<(u32, [u8; 5])>> {
+    let mut lists: Vec<&[ArchivedTermPosting]> = postings
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != skip)
+        .map(|(_, list)| *list)
+        .collect();
+    lists.sort_by_key(|list| list.len());
+    let mut table: Vec<(u32, [u8; 5])> = Vec::new();
+    for list in lists {
+        let mut merged = Vec::with_capacity(table.len() + list.len());
+        let mut previous: Option<u32> = None;
+        let mut tabled = table.iter().copied().peekable();
+        for posting in list {
+            let document_index = posting.document_index.to_native();
+            if previous.is_some_and(|before| document_index <= before) {
+                return None;
+            }
+            previous = Some(document_index);
+            // Documents the table has that this list skips go through unchanged.
+            while let Some(entry) = tabled.next_if(|entry| entry.0 < document_index) {
+                merged.push(entry);
+            }
+            let mut counts = tabled
+                .next_if(|entry| entry.0 == document_index)
+                .map_or([0u8; 5], |entry| entry.1);
+            bump_counts(&mut counts, posting.fields);
+            merged.push((document_index, counts));
+        }
+        merged.extend(tabled);
+        table = merged;
+    }
+    Some(table)
+}
+
+/// The order-agnostic form of `merged_term_entries`: one hash map entry per document.
+fn hashed_term_entries(
+    index: &ArchivedTermIndex,
+    query_len: usize,
+    lists: &[usize],
+) -> Vec<TermEntry> {
     let scanned: usize = lists
         .iter()
         .map(|&token_index| index.term_postings[token_index].len())
@@ -787,7 +976,7 @@ fn search_archived_terms(
     // known before accumulating.
     let mut candidates: FxHashMap<u32, [u64; 5]> =
         FxHashMap::with_capacity_and_hasher(scanned, rustc_hash::FxBuildHasher);
-    for token_index in lists {
+    for &token_index in lists {
         for posting in index.term_postings[token_index].iter() {
             accumulate_posting(
                 candidates
@@ -797,35 +986,133 @@ fn search_archived_terms(
             );
         }
     }
-    // Score into borrowed keys: a common token like "service" matches six
-    // figures of definitions, and all but `limit` of them are discarded. Owning
-    // their names up front was three heap allocations per discarded candidate.
-    let mut scored: Vec<ScoredTerm<'_>> = Vec::with_capacity(candidates.len());
-    for (document_index, counts) in candidates {
-        // Archived postings skip the `is_well_formed` gate (only structural
-        // rkyv validation runs), so bound-check before indexing an mmap slice.
-        let Some(document) = index.documents.get(document_index as usize) else {
-            continue;
-        };
-        if excluded_ids.contains(document.id.as_str()) {
-            continue;
-        }
-        if let Some(score_micros) = score_term_counts(tokens.len(), counts) {
-            scored.push(ScoredTerm {
-                score_micros,
-                name: document.name.as_str(),
-                id: document.id.as_str(),
-            });
+    let documents = index.documents.len();
+    candidates
+        .into_iter()
+        .filter(|(document_index, _)| (*document_index as usize) < documents)
+        .filter_map(|(document_index, counts)| {
+            score_term_counts(query_len, counts).map(|score| (score as u32, document_index))
+        })
+        .collect()
+}
+
+/// The name and id of a candidate, borrowed from the archive. `entry` must have been
+/// bound-checked against `documents` when it was collected.
+fn term_entry_keys(index: &ArchivedTermIndex, entry: TermEntry) -> (&str, &str) {
+    let document = &index.documents[entry.1 as usize];
+    (document.name.as_str(), document.id.as_str())
+}
+
+/// The `want` best candidates under (score descending, name, id) — the order `top_term_hits`
+/// selects by, which is a total order because ids are unique — in no particular order.
+///
+/// Almost every candidate loses on score alone, so scores are compared as integers and the
+/// strings of only the documents that tie on the cut-off score are ever read: a common token
+/// leaves thousands of identically scored definitions, and ordering all of them by name and id
+/// was the larger half of what such a query cost.
+fn select_top_entries(
+    index: &ArchivedTermIndex,
+    entries: Vec<TermEntry>,
+    want: usize,
+) -> Vec<TermEntry> {
+    if want == 0 {
+        return Vec::new();
+    }
+    if entries.len() <= want {
+        return entries;
+    }
+    let cutoff = kth_best_score(&entries, want);
+    let mut chosen: Vec<TermEntry> = Vec::with_capacity(want);
+    let mut tied: Vec<TermEntry> = Vec::new();
+    for entry in entries {
+        match entry.0.cmp(&cutoff) {
+            std::cmp::Ordering::Greater => chosen.push(entry),
+            std::cmp::Ordering::Equal => tied.push(entry),
+            std::cmp::Ordering::Less => {}
         }
     }
-    crate::timing::note("terms.postings", || {
-        format!(
-            "tokens={} scanned={scanned} scored={} limit={limit}",
-            tokens.len(),
-            scored.len()
-        )
-    });
-    top_term_hits(scored, limit)
+    // Fewer than `want` candidates beat the cut-off and at least `want` reach it.
+    let need = want - chosen.len();
+    if tied.len() > need {
+        // Documents are stored sorted by (name, id) and candidates are collected in document
+        // order, so the first `need` tied candidates are normally already the smallest. That is
+        // checked rather than assumed, so an archive in any other order still gets the exact
+        // selection, and it is checked without holding the names of a six-figure tie.
+        let mut previous = term_entry_keys(index, tied[0]);
+        let in_order = tied[1..].iter().all(|&entry| {
+            let keys = term_entry_keys(index, entry);
+            let ordered = previous <= keys;
+            previous = keys;
+            ordered
+        });
+        if in_order {
+            tied.truncate(need);
+        } else {
+            let mut keyed: Vec<(&str, &str, TermEntry)> = tied
+                .into_iter()
+                .map(|entry| {
+                    let (name, id) = term_entry_keys(index, entry);
+                    (name, id, entry)
+                })
+                .collect();
+            keyed.select_nth_unstable_by(need, |left, right| {
+                left.0.cmp(right.0).then_with(|| left.1.cmp(right.1))
+            });
+            keyed.truncate(need);
+            tied = keyed.into_iter().map(|(_, _, entry)| entry).collect();
+        }
+    }
+    chosen.extend(tied);
+    chosen
+}
+
+/// The `k`-th highest score among `entries` (`1 <= k <= entries.len()`).
+fn kth_best_score(entries: &[TermEntry], k: usize) -> u32 {
+    let mut scores: Vec<u32> = entries.iter().map(|entry| entry.0).collect();
+    *scores
+        .select_nth_unstable_by(k - 1, |left, right| right.cmp(left))
+        .1
+}
+
+/// The best `limit` candidates that no overlay shadows, as owned hits.
+///
+/// Shadowed documents are dropped after selection rather than before it: reading every
+/// candidate's id to test it against `excluded_ids` costs as much as the scan itself, while at
+/// most `excluded_ids.len()` of the best candidates can be shadowed, so selecting that many extra
+/// leaves `limit` survivors.
+fn top_term_documents(
+    index: &ArchivedTermIndex,
+    entries: Vec<TermEntry>,
+    excluded_ids: &BTreeSet<String>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let hit = |(score, name, id): (u32, &str, &str)| SearchHit {
+        value: name.to_owned(),
+        definition_id: Some(id.to_owned()),
+        score_micros: u64::from(score),
+        reason: Some("term-coverage".into()),
+    };
+    let want = limit.saturating_add(excluded_ids.len());
+    let selected = select_top_entries(index, entries, want);
+    let mut keyed: Vec<(u32, &str, &str)> = selected
+        .into_iter()
+        .map(|entry| {
+            let (name, id) = term_entry_keys(index, entry);
+            (entry.0, name, id)
+        })
+        .filter(|(_, _, id)| !excluded_ids.contains(*id))
+        .collect();
+    if !excluded_ids.is_empty() {
+        // Which `limit` survive depends on the order, so it only matters once something is dropped.
+        keyed.sort_unstable_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(right.1))
+                .then_with(|| left.2.cmp(right.2))
+        });
+    }
+    keyed.into_iter().take(limit).map(hit).collect()
 }
 
 /// Highest score any document matching exactly `matched` of the query's tokens can
@@ -845,6 +1132,33 @@ fn terms_upper_bound(query_len: usize, matched: usize) -> u64 {
         .min(950_000)
 }
 
+/// The first position at or after `from` in `list` whose document index is `target` or later
+/// (`list.len()` when there is none). Gallops forward from `from` and then bisects, so a cursor
+/// that jumps across a common token's six-figure list costs a few dozen probes instead of one per
+/// skipped posting.
+fn first_at_or_after(list: &[ArchivedTermPosting], from: usize, target: u32) -> usize {
+    let before = |posting: &ArchivedTermPosting| posting.document_index.to_native() < target;
+    if from >= list.len() || !before(&list[from]) {
+        return from;
+    }
+    // `list[low]` is before the target; `high` is the first probe that is not (or the end).
+    let mut low = from;
+    let mut step = 1usize;
+    let high = loop {
+        let probe = low.saturating_add(step);
+        if probe >= list.len() {
+            break list.len();
+        }
+        if before(&list[probe]) {
+            low = probe;
+            step = step.saturating_mul(2);
+        } else {
+            break probe;
+        }
+    };
+    low + 1 + list[low + 1..high].partition_point(before)
+}
+
 /// Answer a multi-token query from the documents containing its rarest token.
 ///
 /// Every posting list is ascending by document index, so one forward pass with a
@@ -857,8 +1171,8 @@ fn terms_upper_bound(query_len: usize, matched: usize) -> u64 {
 /// Returns `None` when that cannot be shown — a single-token query, too few
 /// candidates to establish the k-th score, or a ceiling the candidates do not
 /// clear — and the caller falls back to the full scan.
-fn intersection_top_hits<'index>(
-    index: &'index ArchivedTermIndex,
+fn intersection_top_hits(
+    index: &ArchivedTermIndex,
     query_len: usize,
     lists: &[usize],
     excluded_ids: &BTreeSet<String>,
@@ -880,18 +1194,15 @@ fn intersection_top_hits<'index>(
         .filter(|(at, _)| *at != driver_at)
         .map(|(_, &token_index)| &index.term_postings[token_index])
         .collect();
+    let documents = index.documents.len();
     let mut cursors = vec![0usize; others.len()];
-    let mut scored: Vec<ScoredTerm<'index>> = Vec::new();
+    let mut entries: Vec<TermEntry> = Vec::with_capacity(driver.len());
     for posting in driver.iter() {
         let document_index = posting.document_index.to_native();
         let mut counts = [0u64; 5];
         accumulate_posting(&mut counts, posting.fields);
         for (other, cursor) in others.iter().zip(cursors.iter_mut()) {
-            while *cursor < other.len()
-                && other[*cursor].document_index.to_native() < document_index
-            {
-                *cursor += 1;
-            }
+            *cursor = first_at_or_after(other, *cursor, document_index);
             if *cursor < other.len() && other[*cursor].document_index.to_native() == document_index
             {
                 accumulate_posting(&mut counts, other[*cursor].fields);
@@ -899,26 +1210,27 @@ fn intersection_top_hits<'index>(
         }
         // Archived postings skip the `is_well_formed` gate, so bound-check before
         // indexing an mmap slice.
-        let Some(document) = index.documents.get(document_index as usize) else {
-            continue;
-        };
-        if excluded_ids.contains(document.id.as_str()) {
+        if (document_index as usize) >= documents {
             continue;
         }
         if let Some(score_micros) = score_term_counts(query_len, counts) {
-            scored.push(ScoredTerm {
-                score_micros,
-                name: document.name.as_str(),
-                id: document.id.as_str(),
-            });
+            entries.push((score_micros as u32, document_index));
         }
     }
-    if scored.len() < limit {
+    if entries.len() < limit {
+        return None;
+    }
+    // Shadowed documents can only lower the k-th score, so a cut-off at or under the ceiling
+    // rules this path out before a single name or id is read.
+    if u64::from(kth_best_score(&entries, limit)) <= ceiling {
         return None;
     }
     let scanned = driver.len() + others.iter().map(|other| other.len()).sum::<usize>();
-    let candidates = scored.len();
-    let hits = top_term_hits(scored, limit);
+    let candidates = entries.len();
+    let hits = top_term_documents(index, entries, excluded_ids, limit);
+    if hits.len() < limit {
+        return None;
+    }
     // Strictly above the ceiling: an equal score could still outrank the k-th by
     // the name/id tie-break that `finish_hits` applies.
     let kth = hits.iter().map(|hit| hit.score_micros).min()?;
@@ -1871,6 +2183,337 @@ mod tests {
                 full > partial_ceiling,
                 "query_len={query_len}: full {full} must exceed partial {partial_ceiling}"
             );
+        }
+    }
+
+    /// Deterministic xorshift so a failing seed reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// A term index over `document_count` synthetic definitions. Few distinct names, tokens and
+    /// field combinations, so almost every query ties heavily on score and on name.
+    fn synthetic_term_index(
+        rng: &mut Rng,
+        document_count: usize,
+        vocabulary: &[String],
+        keep_documents_sorted: bool,
+    ) -> TermIndex {
+        let names = ["alpha", "beta", "gamma", "delta", "alpha2", "Alpha"];
+        let mut documents: Vec<TermDocument> = (0..document_count)
+            .map(|n| {
+                let name = names[rng.below(names.len())];
+                TermDocument {
+                    id: format!("symbol://pkg{}/f{n}.ts#kind:{name}", rng.below(5)),
+                    name: name.to_owned(),
+                }
+            })
+            .collect();
+        if keep_documents_sorted {
+            documents.sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        }
+        let mut postings: Vec<Vec<TermPosting>> = vec![Vec::new(); vocabulary.len()];
+        for document_index in 0..document_count {
+            for list in postings.iter_mut() {
+                // Skewed so some tokens are common and some rare.
+                if rng.below(100) < 8 + 6 * (list.len() % 7).min(5) + rng.below(20) {
+                    list.push(TermPosting {
+                        document_index: document_index as u32,
+                        fields: (1 + rng.below(15)) as u8,
+                    });
+                }
+            }
+        }
+        // Dictionary order: the vocabulary is sorted by construction.
+        TermIndex {
+            format_version: TermIndex::FORMAT_VERSION,
+            snapshot_id: "synthetic".into(),
+            documents,
+            term_tokens: vocabulary.to_vec(),
+            term_postings: postings,
+        }
+    }
+
+    /// The scoring and selection exactly as the hash-map implementation did it: accumulate every
+    /// posting, drop shadowed and out-of-range documents, order by (score desc, name, id), cut.
+    fn reference_term_hits(
+        index: &ArchivedTermIndex,
+        tokens: &[String],
+        excluded_ids: &BTreeSet<String>,
+        limit: usize,
+    ) -> Vec<(u64, String, String)> {
+        let mut candidates: std::collections::HashMap<u32, [u64; 5]> = Default::default();
+        for token in tokens {
+            if let Ok(at) = index
+                .term_tokens
+                .binary_search_by(|candidate| candidate.as_str().cmp(token))
+            {
+                for posting in index.term_postings[at].iter() {
+                    accumulate_posting(
+                        candidates
+                            .entry(posting.document_index.to_native())
+                            .or_default(),
+                        posting.fields,
+                    );
+                }
+            }
+        }
+        let mut scored: Vec<(u64, String, String)> = candidates
+            .into_iter()
+            .filter_map(|(document_index, counts)| {
+                let document = index.documents.get(document_index as usize)?;
+                if excluded_ids.contains(document.id.as_str()) {
+                    return None;
+                }
+                let score = score_term_counts(tokens.len(), counts)?;
+                Some((score, document.name.to_string(), document.id.to_string()))
+            })
+            .collect();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        scored.truncate(limit);
+        scored
+    }
+
+    fn summarize(hits: Vec<SearchHit>) -> Vec<(u64, String, String)> {
+        let mut rows: Vec<_> = hits
+            .into_iter()
+            .map(|hit| {
+                assert_eq!(hit.reason.as_deref(), Some("term-coverage"));
+                (hit.score_micros, hit.value, hit.definition_id.unwrap())
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        rows
+    }
+
+    /// The cursor merge, the integer-first selection and the shadowed-document handling must pick
+    /// exactly the documents the hash-map scan picked, in every shape of archive: documents in
+    /// storage order and out of it, a malformed posting list, and queries wider than the merge.
+    #[test]
+    fn term_search_selects_exactly_what_a_full_scan_would() {
+        let vocabulary: Vec<String> = ["ab", "bc", "cd", "de", "ef", "fg", "gh", "hi", "ij", "jk"]
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut compared = 0usize;
+        let mut pruned = 0usize;
+        let mut shadowed = 0usize;
+        for trial in 0..160 {
+            let document_count = [0, 1, 7, 60, 300, 900][trial % 6];
+            let keep_documents_sorted = trial % 4 != 3;
+            let mut term_index =
+                synthetic_term_index(&mut rng, document_count, &vocabulary, keep_documents_sorted);
+            match trial % 8 {
+                // A posting list that repeats a document: only the order-agnostic path counts it
+                // the way the hash map always did.
+                5 => {
+                    if let Some(list) = term_index.term_postings.iter_mut().find(|l| l.len() > 2) {
+                        let repeated = list[1];
+                        list.insert(1, repeated);
+                    }
+                }
+                // Postings that point past the document table.
+                6 => {
+                    if let Some(list) = term_index.term_postings.first_mut() {
+                        list.push(TermPosting {
+                            document_index: document_count as u32 + 3,
+                            fields: 15,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).unwrap();
+            let archived = rkyv::access::<ArchivedTermIndex, rkyv::rancor::Error>(&bytes).unwrap();
+            for _ in 0..24 {
+                // 1..=10 tokens, some absent from the dictionary, some repeated draws.
+                let width = 1 + rng.below(if trial % 5 == 0 { 10 } else { 4 });
+                let mut tokens: Vec<String> = (0..width)
+                    .map(|_| {
+                        if rng.below(10) == 0 {
+                            format!("zz{}", rng.below(3))
+                        } else {
+                            vocabulary[rng.below(vocabulary.len())].clone()
+                        }
+                    })
+                    .collect();
+                tokens.sort();
+                tokens.dedup();
+                let limit = [1, 2, 5, 10, 40, 128, 400][rng.below(7)];
+                let mut excluded: BTreeSet<String> = BTreeSet::new();
+                if rng.below(3) == 0 && !term_index.documents.is_empty() {
+                    for _ in 0..rng.below(1 + document_count.min(60)) {
+                        let pick = rng.below(term_index.documents.len());
+                        excluded.insert(term_index.documents[pick].id.clone());
+                    }
+                }
+                let expected = reference_term_hits(archived, &tokens, &excluded, limit);
+                let lists: Vec<usize> = tokens
+                    .iter()
+                    .filter_map(|token| {
+                        archived
+                            .term_tokens
+                            .binary_search_by(|candidate| candidate.as_str().cmp(token))
+                            .ok()
+                    })
+                    .collect();
+                let describe = || {
+                    format!(
+                        "trial {trial} tokens={tokens:?} limit={limit} excluded={}",
+                        excluded.len()
+                    )
+                };
+                // The order-agnostic collection is exact for any archive.
+                let hashed = hashed_term_entries(archived, tokens.len(), &lists);
+                assert_eq!(
+                    summarize(top_term_documents(archived, hashed, &excluded, limit)),
+                    expected,
+                    "hashed {}",
+                    describe()
+                );
+                let ascending = lists.iter().all(|&at| {
+                    archived.term_postings[at]
+                        .as_slice()
+                        .windows(2)
+                        .all(|pair| {
+                            pair[0].document_index.to_native() < pair[1].document_index.to_native()
+                        })
+                });
+                if ascending {
+                    let actual =
+                        summarize(search_archived_terms(archived, &tokens, &excluded, limit));
+                    assert_eq!(actual, expected, "{}", describe());
+                    compared += 1;
+                    if intersection_top_hits(archived, tokens.len(), &lists, &excluded, limit)
+                        .is_some()
+                    {
+                        pruned += 1;
+                    }
+                    if !excluded.is_empty() {
+                        shadowed += 1;
+                    }
+                } else {
+                    // A list that repeats a document cannot be merged.
+                    assert!(
+                        merged_term_entries(archived, tokens.len(), &lists).is_none(),
+                        "{}",
+                        describe()
+                    );
+                }
+            }
+        }
+        assert!(compared > 3000);
+        // Both the pruned answer and the full scan, and shadowed documents, were really covered.
+        assert!(pruned > 200, "pruned path ran {pruned} times");
+        assert!(
+            compared - pruned > 1000,
+            "full scan ran {} times",
+            compared - pruned
+        );
+        assert!(shadowed > 500, "shadowed documents in {shadowed} queries");
+    }
+
+    #[test]
+    fn galloping_cursor_lands_where_a_linear_scan_would() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for length in [0usize, 1, 2, 3, 7, 64, 500, 5000] {
+            let mut next = 0u32;
+            let postings: Vec<TermPosting> = (0..length)
+                .map(|_| {
+                    next += 1 + rng.below(4) as u32;
+                    TermPosting {
+                        document_index: next,
+                        fields: 1,
+                    }
+                })
+                .collect();
+            let term_index = TermIndex {
+                format_version: TermIndex::FORMAT_VERSION,
+                snapshot_id: "synthetic".into(),
+                documents: Vec::new(),
+                term_tokens: vec!["tok".to_owned()],
+                term_postings: vec![postings],
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).unwrap();
+            let archived = rkyv::access::<ArchivedTermIndex, rkyv::rancor::Error>(&bytes).unwrap();
+            let list = archived.term_postings[0].as_slice();
+            for _ in 0..400 {
+                let from = rng.below(length + 2);
+                let target = rng.below(next as usize + 8) as u32;
+                let expected = (from..list.len())
+                    .find(|&at| list[at].document_index.to_native() >= target)
+                    .unwrap_or(list.len().max(from));
+                assert_eq!(
+                    first_at_or_after(list, from, target),
+                    expected,
+                    "length {length} from {from} target {target}"
+                );
+            }
+        }
+    }
+
+    /// Documents stored out of (name, id) order must still yield the exact selection among
+    /// candidates that tie on score: the shortcut of taking the first ones in storage order is
+    /// only taken when the order is verified.
+    #[test]
+    fn tie_selection_is_exact_when_documents_are_not_stored_in_name_order() {
+        let names = ["delta", "alpha", "charlie", "bravo", "alpha", "echo"];
+        let term_index = TermIndex {
+            format_version: TermIndex::FORMAT_VERSION,
+            snapshot_id: "synthetic".into(),
+            documents: names
+                .iter()
+                .enumerate()
+                .map(|(n, name)| TermDocument {
+                    id: format!("id{n}"),
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+            term_tokens: vec!["tok".to_owned()],
+            term_postings: vec![
+                (0..names.len() as u32)
+                    .map(|document_index| TermPosting {
+                        document_index,
+                        fields: 1,
+                    })
+                    .collect(),
+            ],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&term_index).unwrap();
+        let archived = rkyv::access::<ArchivedTermIndex, rkyv::rancor::Error>(&bytes).unwrap();
+        let tokens = vec!["tok".to_owned()];
+        for limit in 1..=names.len() + 1 {
+            let hits = search_archived_terms(archived, &tokens, &BTreeSet::new(), limit);
+            let mut got: Vec<_> = hits.iter().map(|hit| hit.value.as_str()).collect();
+            got.sort_unstable();
+            let mut sorted = names.to_vec();
+            sorted.sort_unstable();
+            sorted.truncate(limit);
+            assert_eq!(got, sorted, "limit {limit}");
         }
     }
 }
