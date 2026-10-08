@@ -2116,6 +2116,44 @@ struct ArtifactIndex {
     state: [u8; 32],
 }
 
+/// Layer one delta over an artifact index: its tombstones remove entries and its entries replace
+/// them. With `digest`, also folds the change into a content digest kept the way the publishers
+/// keep `Manifest::artifact_state`: the XOR of a digest of every live (path, source hash).
+fn apply_artifact_delta(
+    index: &mut ArtifactIndex,
+    delta: ArtifactIndex,
+    mut digest: Option<&mut [u8; 32]>,
+) {
+    for tombstone in delta.tombstones {
+        let removed = index.entries.remove(&tombstone);
+        if let (Some(digest), Some(old)) = (digest.as_deref_mut(), removed) {
+            FileSnapshotStorage::xor_state(
+                digest,
+                FileSnapshotStorage::artifact_digest(&tombstone, &old.source_hash),
+            );
+        }
+        index.tombstones.insert(tombstone);
+    }
+    for (path, location) in delta.entries {
+        index.tombstones.remove(&path);
+        if let Some(digest) = digest.as_deref_mut() {
+            if let Some(old) = index.entries.get(&path) {
+                FileSnapshotStorage::xor_state(
+                    digest,
+                    FileSnapshotStorage::artifact_digest(&path, &old.source_hash),
+                );
+            }
+            FileSnapshotStorage::xor_state(
+                digest,
+                FileSnapshotStorage::artifact_digest(&path, &location.source_hash),
+            );
+        }
+        index.entries.insert(path, location);
+    }
+    index.overrides.extend(delta.overrides);
+    index.state = delta.state;
+}
+
 pub trait SnapshotStorage {
     fn publish(&self, snapshot: &IndexSnapshot) -> Result<(), StorageError>;
     fn open_current(&self) -> Result<Option<IndexSnapshot>, StorageError>;
@@ -2136,11 +2174,36 @@ pub struct FileSnapshotStorage {
     /// Those refs are content-addressed, so a matching key means identical bytes.
     /// Per-path lookups used to decode the whole index — tens of thousands of
     /// entries — once for every path asked about.
-    artifact_index_cache: Mutex<Option<CachedArtifactIndex>>,
+    artifact_index_cache: Arc<Mutex<Option<CachedArtifactIndex>>>,
+    /// The cache above is shared with other handles ([`SharedArtifactIndex`]).
+    shares_artifact_index: bool,
+    /// Whole-index decodes this handle's cache has had to do (for tests).
+    #[cfg(test)]
+    full_index_decodes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Index component ref, the delta refs applied over it, and the decoded result.
 type CachedArtifactIndex = (String, Vec<String>, Option<Arc<ArtifactIndex>>);
+
+/// A decoded artifact index that outlives the storage handle it was decoded through.
+///
+/// Handles are made per operation, so an index memoized in one died with it and a long-lived
+/// engine decoded the whole thing -- tens of thousands of entries -- for every sync and again for
+/// every dirty-path comparison. Handles that share a slot start from the index the last one left,
+/// and bring it up to date with only the deltas published since.
+#[derive(Debug, Clone, Default)]
+pub struct SharedArtifactIndex {
+    slot: Arc<Mutex<Option<CachedArtifactIndex>>>,
+    #[cfg(test)]
+    full_decodes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SharedArtifactIndex {
+    #[cfg(test)]
+    pub(crate) fn full_decodes(&self) -> u64 {
+        self.full_decodes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 pub(crate) struct PackedSymbolMeta {
     pub(crate) reader: Arc<GenerationPackReader>,
@@ -2156,7 +2219,10 @@ impl Clone for FileSnapshotStorage {
             retention: self.retention,
             manifest_cache: Mutex::new(None),
             pack_readers: Mutex::new(std::collections::HashMap::new()),
-            artifact_index_cache: Mutex::new(None),
+            artifact_index_cache: Arc::new(Mutex::new(None)),
+            shares_artifact_index: false,
+            #[cfg(test)]
+            full_index_decodes: Arc::default(),
         }
     }
 }
@@ -2179,9 +2245,24 @@ impl FileSnapshotStorage {
             root: root.as_ref().to_path_buf(),
             retention: retention.max(1),
             pack_readers: Mutex::new(std::collections::HashMap::new()),
-            artifact_index_cache: Mutex::new(None),
+            artifact_index_cache: Arc::new(Mutex::new(None)),
+            shares_artifact_index: false,
+            #[cfg(test)]
+            full_index_decodes: Arc::default(),
             manifest_cache: Mutex::new(None),
         }
+    }
+
+    /// Memoize the decoded artifact index in `shared`, where the next handle will find it, instead
+    /// of in this handle alone.
+    pub fn with_shared_artifact_index(mut self, shared: &SharedArtifactIndex) -> Self {
+        self.artifact_index_cache = Arc::clone(&shared.slot);
+        self.shares_artifact_index = true;
+        #[cfg(test)]
+        {
+            self.full_index_decodes = Arc::clone(&shared.full_decodes);
+        }
+        self
     }
 
     fn acquire_generation_read_guard(
@@ -3305,13 +3386,35 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.artifact_index.as_ref() else {
             return Ok(None);
         };
-        if let Some((cached_name, cached_deltas, cached)) =
-            self.artifact_index_cache.lock().unwrap().as_ref()
-            && cached_name == name
-            && *cached_deltas == manifest.artifact_deltas
+        let carried = {
+            let mut slot = self.artifact_index_cache.lock().unwrap();
+            match slot.as_ref() {
+                Some((cached_name, cached_deltas, cached))
+                    if cached_name == name && *cached_deltas == manifest.artifact_deltas =>
+                {
+                    return Ok(cached.clone());
+                }
+                // Emptied while it is brought up to date, so that a lone owner changes it in
+                // place instead of copying it.
+                Some((cached_name, _, Some(_))) if cached_name == name => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, applied, Some(mut cached))) = carried
+            && let Some(expected) = manifest.artifact_state
+            && let Some(index) =
+                self.carry_artifact_index_forward(manifest, &applied, &mut cached, expected)?
         {
-            return Ok(cached.clone());
+            *self.artifact_index_cache.lock().unwrap() = Some((
+                name.clone(),
+                manifest.artifact_deltas.clone(),
+                Some(Arc::clone(&index)),
+            ));
+            return Ok(Some(index));
         }
+        #[cfg(test)]
+        self.full_index_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let index = self.read_artifact_index(manifest)?.map(Arc::new);
         *self.artifact_index_cache.lock().unwrap() = Some((
             name.clone(),
@@ -3319,6 +3422,47 @@ impl FileSnapshotStorage {
             index.clone(),
         ));
         Ok(index)
+    }
+
+    /// The index `manifest` describes, made from an older one decoded earlier by layering over it
+    /// the deltas the two manifests do not share. Sync merges its newest deltas into one rather
+    /// than only appending, and a merged delta says everything the ones it replaced said, so layering
+    /// it over an index that already holds them is harmless -- provided `manifest` is a later
+    /// generation of the same index. That is checked rather than assumed: the content digest the
+    /// layering arrives at has to be the one the manifest recorded, or `None` sends the caller to a
+    /// full decode.
+    fn carry_artifact_index_forward(
+        &self,
+        manifest: &Manifest,
+        applied: &[String],
+        cached: &mut Arc<ArtifactIndex>,
+        expected: [u8; 32],
+    ) -> Result<Option<Arc<ArtifactIndex>>, StorageError> {
+        let shared = applied
+            .iter()
+            .zip(&manifest.artifact_deltas)
+            .take_while(|(left, right)| left == right)
+            .count();
+        // Nothing new to layer means the manifest is the same generation or an earlier one.
+        if shared == manifest.artifact_deltas.len() {
+            return Ok(None);
+        }
+        let index = Arc::make_mut(cached);
+        let mut state = index.state;
+        for delta_name in &manifest.artifact_deltas[shared..] {
+            let delta = self.read_artifact_delta(delta_name)?;
+            apply_artifact_delta(index, delta, Some(&mut state));
+        }
+        Ok((state == expected).then(|| Arc::clone(cached)))
+    }
+
+    fn read_artifact_delta(&self, delta_name: &str) -> Result<ArtifactIndex, StorageError> {
+        let delta_path = self.root.join(self.component_ref_path(delta_name));
+        let bytes = self.read_component_ref(delta_name, MAX_COMPONENT_BYTES)?;
+        bincode::deserialize(&bytes).map_err(|source| StorageError::Bincode {
+            path: delta_path,
+            source,
+        })
     }
 
     fn read_artifact_index(
@@ -3333,23 +3477,8 @@ impl FileSnapshotStorage {
         let mut index: ArtifactIndex = bincode::deserialize(&bytes)
             .map_err(|source| StorageError::Bincode { path, source })?;
         for delta_name in &manifest.artifact_deltas {
-            let delta_path = self.root.join(self.component_ref_path(delta_name));
-            let bytes = self.read_component_ref(delta_name, MAX_COMPONENT_BYTES)?;
-            let delta: ArtifactIndex =
-                bincode::deserialize(&bytes).map_err(|source| StorageError::Bincode {
-                    path: delta_path,
-                    source,
-                })?;
-            for tombstone in delta.tombstones {
-                index.entries.remove(&tombstone);
-                index.tombstones.insert(tombstone);
-            }
-            for (path, location) in delta.entries {
-                index.tombstones.remove(&path);
-                index.entries.insert(path, location);
-            }
-            index.overrides.extend(delta.overrides);
-            index.state = delta.state;
+            let delta = self.read_artifact_delta(delta_name)?;
+            apply_artifact_delta(&mut index, delta, None);
         }
         Ok(Some(index))
     }
@@ -5137,12 +5266,26 @@ impl FileSnapshotStorage {
             return Ok(None);
         };
         self.ensure_supported_schema(&manifest)?;
-        if let Some(index) = self.read_artifact_index(&manifest)? {
-            let (paths, hashes): (Vec<_>, Vec<_>) = index
-                .entries
-                .into_iter()
-                .map(|(path, location)| (path, location.source_hash))
-                .unzip();
+        // A handle that shares its decoded index leaves it for the next one, so it copies out of it
+        // rather than taking it apart.
+        let entries = if self.shares_artifact_index {
+            self.cached_artifact_index(&manifest)?.map(|index| {
+                index
+                    .entries
+                    .iter()
+                    .map(|(path, location)| (path.clone(), location.source_hash.clone()))
+                    .unzip::<_, _, Vec<_>, Vec<_>>()
+            })
+        } else {
+            self.read_artifact_index(&manifest)?.map(|index| {
+                index
+                    .entries
+                    .into_iter()
+                    .map(|(path, location)| (path, location.source_hash))
+                    .unzip::<_, _, Vec<_>, Vec<_>>()
+            })
+        };
+        if let Some((paths, hashes)) = entries {
             return Ok(Some(FileHashIndex {
                 format_version: FileHashIndex::FORMAT_VERSION,
                 snapshot_id: manifest.snapshot_id.stable_key(),
@@ -6540,6 +6683,93 @@ mod tests {
         );
         assert_eq!(artifact.source_hash, expected.source_hash);
         assert_eq!(store.open_current().unwrap().unwrap().files.len(), 1);
+    }
+
+    /// A handle that shares its decoded index with the ones before it answers for every generation
+    /// exactly as a full decode would, including across the merging of deltas, and does not decode
+    /// the whole index again to do it.
+    #[test]
+    fn a_shared_artifact_index_follows_the_generations_without_decoding_again() {
+        let dir = tempdir().unwrap();
+        let writer = FileSnapshotStorage::new(dir.path());
+        writer.publish(&snapshot_with_files(16)).unwrap();
+        let shared = SharedArtifactIndex::default();
+        let sharing = || FileSnapshotStorage::new(dir.path()).with_shared_artifact_index(&shared);
+        let from_scratch = || FileSnapshotStorage::new(dir.path());
+
+        let mut earlier = Vec::new();
+        for revision in 1..=70 {
+            publish_body_edit(&writer, &format!("src/file-{}.ts", revision % 16), revision);
+            let manifest = writer.read_manifest().unwrap().unwrap();
+            let carried = sharing().cached_artifact_index(&manifest).unwrap().unwrap();
+            let decoded = from_scratch()
+                .read_artifact_index(&manifest)
+                .unwrap()
+                .unwrap();
+            assert_eq!(*carried, decoded, "revision {revision}");
+            earlier.push(manifest);
+        }
+        assert_eq!(
+            shared.full_decodes(),
+            1,
+            "only the first handle should have decoded the index"
+        );
+
+        // A reader still on an earlier generation is not handed the newer index.
+        // Newest first: the generation just before the one the index belongs to shares all but one
+        // delta with it, and layering that delta over a newer index would give a wrong answer.
+        for manifest in earlier[earlier.len() - 3..earlier.len() - 1].iter().rev() {
+            let carried = sharing().cached_artifact_index(manifest).unwrap().unwrap();
+            let decoded = from_scratch()
+                .read_artifact_index(manifest)
+                .unwrap()
+                .unwrap();
+            assert_eq!(*carried, decoded);
+        }
+    }
+
+    #[test]
+    fn layering_deltas_keeps_the_digest_of_the_live_entries() {
+        let entry = |tag: u8| ArtifactLocation {
+            store: None,
+            offset: u64::from(tag),
+            len: 1,
+            source_hash: format!("hash-{tag}"),
+            bytes_read: 1,
+            parse_error: false,
+        };
+        let digest_of = |index: &ArtifactIndex| {
+            let mut state = [0u8; 32];
+            for (path, location) in &index.entries {
+                FileSnapshotStorage::xor_state(
+                    &mut state,
+                    FileSnapshotStorage::artifact_digest(path, &location.source_hash),
+                );
+            }
+            state
+        };
+        let delta = |entries: &[(&str, u8)], tombstones: &[&str]| ArtifactIndex {
+            store: String::new(),
+            entries: entries
+                .iter()
+                .map(|(path, tag)| ((*path).to_owned(), entry(*tag)))
+                .collect(),
+            overrides: entries.iter().map(|(path, _)| (*path).to_owned()).collect(),
+            tombstones: tombstones.iter().map(|path| (*path).to_owned()).collect(),
+            state: [0; 32],
+        };
+        let mut index = delta(&[("a", 1), ("b", 2), ("c", 3)], &[]);
+        let mut digest = digest_of(&index);
+        for step in [
+            delta(&[("a", 4)], &[]),
+            delta(&[("d", 5)], &["b"]),
+            delta(&[("b", 6), ("a", 1)], &["c"]),
+            delta(&[], &["a", "d", "missing"]),
+            delta(&[("a", 7), ("c", 3)], &[]),
+        ] {
+            apply_artifact_delta(&mut index, step, Some(&mut digest));
+            assert_eq!(digest, digest_of(&index));
+        }
     }
 
     #[test]

@@ -139,6 +139,8 @@ struct EngineInner {
     watch_gate: Mutex<Option<Arc<crate::watch::WatchGate>>>,
     /// Dirty checks the watcher answered without asking git.
     quiet_checks: AtomicU64,
+    /// The decoded artifact index, left for the next storage handle (see [`Self::storage`]).
+    artifact_index: crate::storage::SharedArtifactIndex,
 }
 
 /// A whole-tree listing of dirty sources, remembered for a few milliseconds.
@@ -1130,6 +1132,7 @@ impl WorkspaceEngine {
                 maintenance_scheduled: AtomicBool::new(false),
                 watch_gate: Mutex::new(None),
                 quiet_checks: AtomicU64::new(0),
+                artifact_index: crate::storage::SharedArtifactIndex::default(),
             }),
         })
     }
@@ -1209,11 +1212,15 @@ impl WorkspaceEngine {
         *cache = Some((fingerprint, identity.clone()));
         identity
     }
+    /// A storage handle for the workspace. Handles are cheap and made per operation, but they all
+    /// leave the decoded artifact index in one place: a long-lived engine decodes it once and then
+    /// only layers on what each sync publishes.
     pub fn storage(&self) -> FileSnapshotStorage {
         FileSnapshotStorage::with_retention(
             self.root.join(&self.config.storage.home),
             self.config.storage.retention,
         )
+        .with_shared_artifact_index(&self.inner.artifact_index)
     }
     pub fn index(&self) -> Result<IndexStats, EngineError> {
         let _guard = self.inner.update_lock.lock().unwrap();
@@ -7611,6 +7618,130 @@ mod agent_context_tests {
         assert_eq!(
             context["candidates"][0]["path"],
             "apps/users/onboarding/service.ts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_artifact_index_tests {
+    use super::*;
+
+    /// A handle that has never seen another: the answer to compare the engine's own handles with.
+    fn from_scratch(engine: &WorkspaceEngine) -> FileSnapshotStorage {
+        FileSnapshotStorage::with_retention(
+            engine.root.join(&engine.config.storage.home),
+            engine.config.storage.retention,
+        )
+    }
+
+    /// The engine's handles leave the decoded artifact index for the next one. Over a long run of
+    /// edits, creations, deletions and renames (content-only and structural, one path and several)
+    /// they must still agree with a handle that decodes it afresh, and almost never decode it again.
+    #[test]
+    fn handles_that_share_the_artifact_index_agree_with_one_that_decodes_it_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut live: Vec<String> = Vec::new();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..30 {
+            let name = format!("src/m{index}.ts");
+            std::fs::write(
+                root.join(&name),
+                format!("export function fn{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+            live.push(name);
+        }
+        let engine = WorkspaceEngine::load(&root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let append = |root: &Path, name: &str, text: &str| {
+            let mut contents = std::fs::read_to_string(root.join(name)).unwrap();
+            contents.push_str(text);
+            std::fs::write(root.join(name), contents).unwrap();
+        };
+        let syncs = 80;
+        for round in 0..syncs {
+            let mut touched = Vec::new();
+            match next(6) {
+                0 => {
+                    let name = live[next(live.len())].clone();
+                    append(&root, &name, &format!("// edit {round}\n"));
+                    touched.push(name);
+                }
+                1 => {
+                    let name = live[next(live.len())].clone();
+                    append(
+                        &root,
+                        &name,
+                        &format!("export function added{round}() {{ return 1; }}\n"),
+                    );
+                    touched.push(name);
+                }
+                2 => {
+                    let name = format!("src/n{round}.ts");
+                    std::fs::write(
+                        root.join(&name),
+                        format!(
+                            "import {{ fn0 }} from './m0';\nexport function made{round}() {{ return fn0(); }}\n"
+                        ),
+                    )
+                    .unwrap();
+                    live.push(name.clone());
+                    touched.push(name);
+                }
+                3 if live.len() > 5 => {
+                    let name = live.remove(next(live.len()));
+                    std::fs::remove_file(root.join(&name)).unwrap();
+                    touched.push(name);
+                }
+                4 if live.len() > 5 => {
+                    let from = live.remove(next(live.len()));
+                    let to = format!("src/r{round}.ts");
+                    std::fs::rename(root.join(&from), root.join(&to)).unwrap();
+                    live.push(to.clone());
+                    touched.extend([from, to]);
+                }
+                _ => {
+                    for part in 0..3 {
+                        let name = live[next(live.len())].clone();
+                        append(
+                            &root,
+                            &name,
+                            &format!("export const batch{round}_{part} = 1;\n"),
+                        );
+                        touched.push(name);
+                    }
+                }
+            }
+            let paths: Vec<PathBuf> = touched.iter().map(|name| root.join(name)).collect();
+            engine.sync(Some(&paths)).unwrap();
+
+            let shared = engine.storage().open_file_hashes().unwrap().unwrap();
+            let fresh = from_scratch(&engine).open_file_hashes().unwrap().unwrap();
+            assert_eq!(shared, fresh, "the hash index diverged after round {round}");
+            for name in &touched {
+                let shared = engine.storage().open_artifact(name).unwrap();
+                let fresh = from_scratch(&engine).open_artifact(name).unwrap();
+                assert_eq!(
+                    shared.map(|artifact| artifact.source_hash),
+                    fresh.map(|artifact| artifact.source_hash),
+                    "{name} diverged after round {round}"
+                );
+            }
+        }
+        // Once to begin with, and again only if a compaction replaces the base index.
+        assert!(
+            engine.inner.artifact_index.full_decodes() <= 3,
+            "the index was decoded in full {} times over {syncs} syncs",
+            engine.inner.artifact_index.full_decodes()
         );
     }
 }
