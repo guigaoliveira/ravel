@@ -1023,7 +1023,8 @@ impl WorkspaceEngine {
     }
 
     /// Start loading, on background threads, what a relation query (`context`, `callers_of`,
-    /// `calls_from`) is certain to ask for: the graph and the coverage probe.
+    /// `calls_from`) is certain to ask for: the graph and the component-source count that
+    /// `degradation` reads.
     ///
     /// A one-shot query spends its first stretch waiting for the auto-sync's `git status`, a child
     /// process the caller only waits on, and only then loads the graph and walks the tree one after
@@ -1039,7 +1040,7 @@ impl WorkspaceEngine {
                 let _ = engine.graph();
             },
             |engine| {
-                let _ = engine.unsupported_sources_cached();
+                let _ = engine.component_sources_cached();
             },
         ];
         for load in loads {
