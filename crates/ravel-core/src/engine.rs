@@ -3148,6 +3148,16 @@ impl WorkspaceEngine {
         let mark = std::time::Instant::now();
         let (disk_bytes, generations) = Self::index_footprint(&home);
         crate::timing::stage("status.footprint", mark, String::new);
+        // The stats already count the files that carry a diagnostic. Naming them means decoding
+        // the whole artifact index, so a workspace where that count is zero -- nearly all of them
+        // -- does not pay for it on every call.
+        let mark = std::time::Instant::now();
+        let diagnostics = if stats.as_ref().is_some_and(|stats| stats.parse_errors == 0) {
+            Vec::new()
+        } else {
+            self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT)
+        };
+        crate::timing::stage("status.diagnostics", mark, String::new);
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,
@@ -3180,7 +3190,7 @@ impl WorkspaceEngine {
                 "walk_truncated": walk_truncated,
             },
             "binary_version": crate::VERSION,
-            "diagnostics": self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT),
+            "diagnostics": diagnostics,
             "config_problems": config_problems
                 .iter()
                 .map(|problem| {
@@ -6638,6 +6648,46 @@ mod agent_context_tests {
             synced.parse_errors, 1,
             "with the reason attached: {synced:?}"
         );
+    }
+
+    #[test]
+    fn status_names_the_files_with_diagnostics_only_while_there_are_any() {
+        // `status` skips decoding the artifact index when the stats say no file carries a
+        // diagnostic. That shortcut must not hide one that appears, nor linger once it is gone.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let grown = root.path().join("src/grown.ts");
+        let small = "export function growThing() { return 1; }\n";
+        std::fs::write(&grown, small).unwrap();
+        std::fs::write(
+            root.path().join("src/other.ts"),
+            "export const other = 1;\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let diagnostics = |engine: &WorkspaceEngine| {
+            engine.status().unwrap()["diagnostics"]
+                .as_array()
+                .cloned()
+                .unwrap()
+        };
+        assert!(diagnostics(&engine).is_empty());
+
+        let limit = engine.config.parser.max_file_size_kb.saturating_mul(1024) as usize;
+        let mut oversized = small.to_owned();
+        while oversized.len() <= limit {
+            oversized.push_str("// pad pad pad pad pad pad pad pad\n");
+        }
+        std::fs::write(&grown, &oversized).unwrap();
+        engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
+        let named = diagnostics(&engine);
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0]["path"], "src/grown.ts");
+
+        std::fs::write(&grown, small).unwrap();
+        engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
+        assert!(diagnostics(&engine).is_empty());
     }
 
     #[test]
