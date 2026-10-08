@@ -30,7 +30,10 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 const WATCH_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long to wait between looks at a daemon that is starting: short at first, because a daemon
+/// that is going to answer does so within a few milliseconds, then up to this ceiling.
 const DAEMON_READY_POLL: Duration = Duration::from_millis(20);
+const DAEMON_READY_POLL_FIRST: Duration = Duration::from_millis(1);
 const DEFAULT_DAEMON_MIN_CONNECTIONS: usize = 8;
 const DEFAULT_DAEMON_CONNECTIONS_PER_CPU: usize = 4;
 const DEFAULT_DAEMON_MAX_LEASES: usize = 32;
@@ -514,6 +517,7 @@ pub fn ensure_running(
         .spawn()
         .map_err(DaemonCallError::Transport)?;
     let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
+    let mut poll = DAEMON_READY_POLL_FIRST;
     while std::time::Instant::now() < deadline {
         if transient {
             if let Ok(lease) = client.acquire_lease() {
@@ -536,7 +540,8 @@ pub fn ensure_running(
         {
             // Another process may have won singleton startup; keep polling its endpoint.
         }
-        std::thread::sleep(DAEMON_READY_POLL);
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(DAEMON_READY_POLL);
     }
     Err(DaemonCallError::Transport(io::Error::new(
         io::ErrorKind::TimedOut,
