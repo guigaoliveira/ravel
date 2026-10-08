@@ -85,6 +85,12 @@ type CoverageProbe = (
     Arc<(BTreeMap<String, usize>, usize, bool)>,
 );
 
+/// Long enough that a burst of tool calls walks once, short enough that a
+/// workspace gaining a new language is noticed within the same session.
+const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Entries a coverage walk visits before it stops and says it was cut short.
+const COVERAGE_WALK_BUDGET: usize = 20_000;
+
 #[derive(Debug)]
 struct EngineInner {
     snapshot_cache: Mutex<Option<Arc<IndexSnapshot>>>,
@@ -104,6 +110,9 @@ struct EngineInner {
     /// files exist on disk, which has nothing to do with which index generation is
     /// published, so invalidating it on publish re-walked for no reason.
     unsupported_sources: Mutex<Option<CoverageProbe>>,
+    /// The one number of that walk `degradation` reads -- how many component-format sources it saw --
+    /// under the same TTL, so answering a relation query does not run the full probe.
+    component_sources: Mutex<Option<(std::time::Instant, usize)>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -999,6 +1008,7 @@ impl WorkspaceEngine {
                 symbol_meta_cache: Mutex::new(None),
                 file_hashes_cache: Mutex::new(None),
                 unsupported_sources: Mutex::new(None),
+                component_sources: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 worktree_identity: Mutex::new(None),
                 config_hash,
@@ -2796,11 +2806,7 @@ impl WorkspaceEngine {
         // Only the formats that carry TypeScript. A Python build script or a vendored `.h` does not
         // reference TS symbols, so counting them made every query on any polyglot repo report its
         // zeros as unreliable forever -- destroying the signal in the opposite direction.
-        let probe = self.unsupported_sources_cached();
-        let hidden_references = crate::config::COMPONENT_SOURCE_EXTENSIONS
-            .iter()
-            .filter_map(|extension| probe.0.get(*extension))
-            .sum::<usize>();
+        let hidden_references = self.component_sources_cached();
         serde_json::json!({
             "config_problems": config_problems,
             "unparsed_files": unparsed_files,
@@ -3580,9 +3586,6 @@ impl WorkspaceEngine {
     /// Counts, how many indexable sources the same walk saw, and whether the budget cut it short.
     /// All three come from one pass so the warning compares like with like.
     fn unsupported_sources_cached(&self) -> Arc<(BTreeMap<String, usize>, usize, bool)> {
-        /// Long enough that a burst of tool calls walks once, short enough that a
-        /// workspace gaining a new language is noticed within the same session.
-        const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
         let mut cache = self.inner.unsupported_sources.lock().unwrap();
         if let Some((walked_at, counts)) = cache.as_ref()
             && walked_at.elapsed() < COVERAGE_TTL
@@ -3591,10 +3594,36 @@ impl WorkspaceEngine {
         }
         let counts = Arc::new(crate::config::unsupported_source_counts(
             &self.config,
-            20_000,
+            COVERAGE_WALK_BUDGET,
         ));
         *cache = Some((std::time::Instant::now(), Arc::clone(&counts)));
         counts
+    }
+
+    /// How many component-format sources (`.vue`, `.svelte`, `.astro`) the coverage walk sees, which
+    /// is all `degradation` reads of it. A fresh full probe already holds the number; otherwise this
+    /// walks without classifying every other file, and keeps the result for the same TTL.
+    fn component_sources_cached(&self) -> usize {
+        let from_full_probe = |counts: &BTreeMap<String, usize>| -> usize {
+            crate::config::COMPONENT_SOURCE_EXTENSIONS
+                .iter()
+                .filter_map(|extension| counts.get(*extension))
+                .sum()
+        };
+        if let Some((walked_at, counts)) = self.inner.unsupported_sources.lock().unwrap().as_ref()
+            && walked_at.elapsed() < COVERAGE_TTL
+        {
+            return from_full_probe(&counts.0);
+        }
+        let mut cache = self.inner.component_sources.lock().unwrap();
+        if let Some((walked_at, count)) = cache.as_ref()
+            && walked_at.elapsed() < COVERAGE_TTL
+        {
+            return *count;
+        }
+        let count = crate::config::component_source_count(&self.config, COVERAGE_WALK_BUDGET);
+        *cache = Some((std::time::Instant::now(), count));
+        count
     }
 
     /// Hash sidecar for the current generation. Cached because auto-sync consults

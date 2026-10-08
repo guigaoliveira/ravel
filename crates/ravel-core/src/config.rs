@@ -684,24 +684,12 @@ pub fn unsupported_source_counts(
         "rs", "py", "go", "java", "kt", "rb", "php", "cs", "swift", "c", "cc", "cpp", "h", "hpp",
         "scala", "ex", "exs", "dart", "lua", "zig",
     ];
-    let root = &config.project.root;
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .git_ignore(config.ignore.gitignore)
-        .git_global(false)
-        .git_exclude(config.ignore.gitignore)
-        .follow_links(false);
-    let custom = root.join(".ravelignore");
-    if custom.is_file() {
-        builder.add_ignore(custom);
-    }
     let effective = effective_extensions(config);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut supported_seen = 0usize;
     let mut truncated = false;
     let mut seen = 0usize;
-    for entry in builder.build().flatten() {
+    for entry in coverage_walk(config).flatten() {
         seen += 1;
         if seen > budget {
             truncated = true;
@@ -726,6 +714,54 @@ pub fn unsupported_source_counts(
         }
     }
     (counts, supported_seen, truncated)
+}
+
+/// The walk behind the coverage probes: hidden files included, gitignore honoured, links not followed.
+fn coverage_walk(config: &Config) -> ignore::Walk {
+    let root = &config.project.root;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(config.ignore.gitignore)
+        .git_global(false)
+        .git_exclude(config.ignore.gitignore)
+        .follow_links(false);
+    let custom = root.join(".ravelignore");
+    if custom.is_file() {
+        builder.add_ignore(custom);
+    }
+    builder.build()
+}
+
+/// How many [`COMPONENT_SOURCE_EXTENSIONS`] files [`unsupported_source_counts`] counts, from the same
+/// walk and the same budget but without classifying everything else.
+///
+/// An empty relation answer is only unreliable when such files exist, and that is all the
+/// answer-health check reads. The full probe decides for every file whether it sits under a noise
+/// directory -- by far the dearest step of a walk that otherwise only reads names -- to count
+/// extensions nobody asked about. Here the check runs for the few files that could change the count.
+pub fn component_source_count(config: &Config, budget: usize) -> usize {
+    let mut count = 0usize;
+    let mut seen = 0usize;
+    for entry in coverage_walk(config).flatten() {
+        seen += 1;
+        if seen > budget {
+            break;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| COMPONENT_SOURCE_EXTENSIONS.contains(&extension))
+            && !config.is_noise(path)
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Gitignore rules live at every level, not just the workspace root: `apps/web/.gitignore` holding
@@ -997,6 +1033,50 @@ mod tests {
                 "missing {expected}"
             );
         }
+    }
+
+    /// The answer-health check reads only the component-format counts of the coverage probe, and now
+    /// asks for just those. The number must stay what the full probe reports, including where
+    /// the walk's budget cuts it short and for the files that are not counted (noise directories,
+    /// other extensions, extension case).
+    #[test]
+    fn component_source_count_equals_the_full_probes_component_counts() {
+        let dir = tempdir().unwrap();
+        for (path, body) in [
+            ("src/a.ts", "export {}"),
+            ("src/b.vue", "<template/>"),
+            ("src/c.svelte", "<script/>"),
+            ("src/deep/er/d.astro", "---"),
+            ("pages/e.astro", "---"),
+            ("docs/f.VUE", "<template/>"),
+            ("lib/g.py", "pass"),
+            ("node_modules/pkg/h.vue", "<template/>"),
+            ("dist/i.astro", "---"),
+            (".hidden/j.vue", "<template/>"),
+            ("ignored/k.vue", "<template/>"),
+            ("l.svelte", "<script/>"),
+        ] {
+            let full = dir.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, body).unwrap();
+        }
+        fs::write(dir.path().join(".ravelignore"), "ignored/\n").unwrap();
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        for budget in [0, 1, 2, 3, 5, 8, 13, 100] {
+            let (counts, _, _) = unsupported_source_counts(&config, budget);
+            let expected: usize = COMPONENT_SOURCE_EXTENSIONS
+                .iter()
+                .filter_map(|extension| counts.get(*extension))
+                .sum();
+            assert_eq!(
+                component_source_count(&config, budget),
+                expected,
+                "budget {budget}"
+            );
+        }
+        // Not vacuous: the files that count are seen with room to spare.
+        assert_eq!(component_source_count(&config, 100), 6);
     }
 
     #[test]
