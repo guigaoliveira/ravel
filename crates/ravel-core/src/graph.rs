@@ -357,11 +357,172 @@ impl serde::Serialize for Adjacency {
     }
 }
 
+/// Every node name, back to back in one buffer: name `n` is `bytes[ends[n - 1]..ends[n]]`.
+///
+/// The names used to be one `Arc<str>` allocation apiece. A cold load of a 20k-file workspace made
+/// several hundred thousand of them (about 90 instructions and a 16-byte header plus allocator
+/// rounding each, and as many frees whenever the daemon reloads a generation) to answer a query that
+/// reads a handful. Ids are the positions, exactly as before.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct NodeNames {
+    bytes: String,
+    ends: Vec<u32>,
+}
+
+impl NodeNames {
+    fn with_capacity(count: usize, bytes: usize) -> Self {
+        Self {
+            bytes: String::with_capacity(bytes),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn push(&mut self, name: &str) {
+        self.bytes.push_str(name);
+        self.ends
+            .push(u32::try_from(self.bytes.len()).expect("node names fit in 4 GiB"));
+    }
+
+    fn get(&self, id: usize) -> Option<&str> {
+        let end = *self.ends.get(id)? as usize;
+        let start = id
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        self.bytes.get(start..end)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let name = &self.bytes[start..end as usize];
+            start = end as usize;
+            name
+        })
+    }
+}
+
+impl std::ops::Index<usize> for NodeNames {
+    type Output = str;
+
+    fn index(&self, id: usize) -> &str {
+        self.get(id).expect("node id is in range")
+    }
+}
+
+/// Node name → compact id, as open addressing over `(hash tag, id + 1)` pairs.
+///
+/// This was an `FxHashMap<Arc<str>, u32>`: a second fat pointer and an atomic refcount bump per
+/// node, and 24 bytes a slot under hashbrown's 7/8 load limit -- 13MB and about a hundred
+/// instructions per insert for the 380k nodes of a 20k-file workspace, on every cold load. The names
+/// already live in `nodes`, so a slot only needs the id; the upper half of the 64-bit hash rides
+/// along as a tag so a name is dereferenced only when it very probably matches, and the lower half
+/// picks the slot. Slots stay under two-thirds full.
+#[derive(Debug, Default)]
+struct NameIndex {
+    slots: Vec<u64>,
+    /// Distinct names indexed.
+    len: usize,
+}
+
+impl NameIndex {
+    fn with_capacity(nodes: usize) -> Self {
+        Self {
+            slots: vec![0; (nodes.max(8) * 3).div_ceil(2)],
+            len: 0,
+        }
+    }
+
+    fn hash(name: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        name.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Where probing for `hash` begins: the low half of the hash scaled onto the table.
+    fn start(&self, hash: u64) -> usize {
+        ((u64::from(hash as u32) * self.slots.len() as u64) >> 32) as usize
+    }
+
+    fn next(&self, slot: usize) -> usize {
+        if slot + 1 == self.slots.len() {
+            0
+        } else {
+            slot + 1
+        }
+    }
+
+    fn entry(hash: u64, id: u32) -> u64 {
+        (hash >> 32) << 32 | (u64::from(id) + 1)
+    }
+
+    fn get(&self, nodes: &NodeNames, name: &str) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let hash = Self::hash(name);
+        let mut slot = self.start(hash);
+        loop {
+            let entry = self.slots[slot];
+            if entry == 0 {
+                return None;
+            }
+            let id = entry as u32 - 1;
+            if entry >> 32 == hash >> 32 && nodes[id as usize] == *name {
+                return Some(id);
+            }
+            slot = self.next(slot);
+        }
+    }
+
+    /// Index `nodes[id]`. A name that is already indexed moves to the new id, as `HashMap::insert`
+    /// did.
+    fn insert(&mut self, nodes: &NodeNames, id: u32) {
+        if (self.len + 1) * 3 > self.slots.len() * 2 {
+            self.grow(nodes);
+        }
+        let name = &nodes[id as usize];
+        let hash = Self::hash(name);
+        let mut slot = self.start(hash);
+        loop {
+            let entry = self.slots[slot];
+            if entry == 0 {
+                self.slots[slot] = Self::entry(hash, id);
+                self.len += 1;
+                return;
+            }
+            if entry >> 32 == hash >> 32 && nodes[entry as u32 as usize - 1] == *name {
+                self.slots[slot] = Self::entry(hash, id);
+                return;
+            }
+            slot = self.next(slot);
+        }
+    }
+
+    fn grow(&mut self, nodes: &NodeNames) {
+        let old = std::mem::take(&mut self.slots);
+        self.slots = vec![0; old.len() * 3 / 2 + 16];
+        for entry in old.into_iter().filter(|entry| *entry != 0) {
+            let id = entry as u32 - 1;
+            let hash = Self::hash(&nodes[id as usize]);
+            let mut slot = self.start(hash);
+            while self.slots[slot] != 0 {
+                slot = self.next(slot);
+            }
+            self.slots[slot] = Self::entry(hash, id);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GraphIndex {
-    nodes: Vec<Arc<str>>,
+    nodes: NodeNames,
     /// Maps node name → index into `nodes` / adjacency vectors.
-    node_index: FxHashMap<Arc<str>, u32>,
+    node_index: NameIndex,
     forward: Adjacency,
     reverse: Adjacency,
     edge_count: usize,
@@ -388,29 +549,27 @@ impl GraphIndex {
     pub fn from_edges(edges: &[Edge], snapshot_id: String) -> Self {
         // ~2 endpoints per edge; reserve to cut rehash cost.
         let cap = (edges.len().saturating_mul(2) / 3).max(16);
-        let mut node_index: FxHashMap<Arc<str>, u32> =
-            FxHashMap::with_capacity_and_hasher(cap, Default::default());
-        let mut nodes: Vec<Arc<str>> = Vec::with_capacity(cap);
+        let mut node_index = NameIndex::with_capacity(cap);
+        let mut nodes = NodeNames::with_capacity(cap, 0);
         let mut forward: Vec<Vec<u32>> = Vec::with_capacity(cap);
         let mut reverse: Vec<Vec<u32>> = Vec::with_capacity(cap);
         let mut forward_relation_ids: Vec<Vec<u32>> = Vec::with_capacity(cap);
         let mut reverse_relation_ids: Vec<Vec<u32>> = Vec::with_capacity(cap);
 
         let intern = |name: &str,
-                      nodes: &mut Vec<Arc<str>>,
-                      node_index: &mut FxHashMap<Arc<str>, u32>,
+                      nodes: &mut NodeNames,
+                      node_index: &mut NameIndex,
                       forward: &mut Vec<Vec<u32>>,
                       reverse: &mut Vec<Vec<u32>>,
                       forward_relation_ids: &mut Vec<Vec<u32>>,
                       reverse_relation_ids: &mut Vec<Vec<u32>>|
          -> u32 {
-            if let Some(&id) = node_index.get(name) {
+            if let Some(id) = node_index.get(nodes, name) {
                 return id;
             }
             let id = nodes.len() as u32;
-            let name: Arc<str> = Arc::from(name);
-            nodes.push(Arc::clone(&name));
-            node_index.insert(name, id);
+            nodes.push(name);
+            node_index.insert(nodes, id);
             forward.push(Vec::new());
             reverse.push(Vec::new());
             forward_relation_ids.push(Vec::new());
@@ -488,7 +647,6 @@ impl GraphIndex {
                 relation
                     .source_path
                     .and_then(|path| nodes.get(path as usize))
-                    .map(AsRef::as_ref)
                     .unwrap_or(""),
                 relation.span,
                 relation.from,
@@ -527,11 +685,16 @@ impl GraphIndex {
     pub fn from_compact(compact: CompactGraph) -> Self {
         // Pre-size to node count so the cold-load rebuild does not rehash.
         let node_count = compact.nodes.len();
-        let nodes: Vec<Arc<str>> = compact.nodes.into_iter().map(Arc::from).collect();
-        let mut node_index: FxHashMap<Arc<str>, u32> =
-            FxHashMap::with_capacity_and_hasher(node_count, Default::default());
-        for (i, name) in nodes.iter().enumerate() {
-            node_index.insert(Arc::clone(name), i as u32);
+        let mut nodes = NodeNames::with_capacity(
+            node_count,
+            compact.nodes.iter().map(String::len).sum::<usize>(),
+        );
+        for name in &compact.nodes {
+            nodes.push(name);
+        }
+        let mut node_index = NameIndex::with_capacity(node_count);
+        for id in 0..nodes.len() {
+            node_index.insert(&nodes, id as u32);
         }
         let edge_count = compact.edge_count as usize;
         Self {
@@ -573,15 +736,16 @@ impl GraphIndex {
             Adjacency::from_flat(native(offsets), native(values))
         }
         let node_count = archived.nodes.len();
-        let nodes: Vec<Arc<str>> = archived
-            .nodes
-            .iter()
-            .map(|name| Arc::from(name.as_str()))
-            .collect();
-        let mut node_index: FxHashMap<Arc<str>, u32> =
-            FxHashMap::with_capacity_and_hasher(node_count, Default::default());
-        for (index, name) in nodes.iter().enumerate() {
-            node_index.insert(Arc::clone(name), index as u32);
+        let mut nodes = NodeNames::with_capacity(
+            node_count,
+            archived.nodes.iter().map(|name| name.as_str().len()).sum(),
+        );
+        for name in archived.nodes.iter() {
+            nodes.push(name.as_str());
+        }
+        let mut node_index = NameIndex::with_capacity(node_count);
+        for id in 0..nodes.len() {
+            node_index.insert(&nodes, id as u32);
         }
         Self {
             nodes,
@@ -634,7 +798,7 @@ impl GraphIndex {
     pub fn as_compact_ref(&self) -> CompactGraphRef<'_> {
         CompactGraphRef {
             snapshot_id: &self.snapshot_id,
-            nodes: self.nodes.iter().map(AsRef::as_ref).collect(),
+            nodes: self.nodes.iter().collect(),
             forward: &self.forward,
             reverse: &self.reverse,
             edge_count: self.edge_count as u32,
@@ -652,7 +816,7 @@ impl GraphIndex {
     /// has its surviving persisted sites merged with the overlay's, in the order that sorting both
     /// together would give.
     pub fn direct_relations(&self, node: &str, reverse: bool) -> (RelationSites<'_>, usize) {
-        let Some(&node_id) = self.node_index.get(node) else {
+        let Some(node_id) = self.node_index.get(&self.nodes, node) else {
             return (RelationSites::new(self, reverse, &[], None), 0);
         };
         let relation_ids = self.relation_id_list(node_id, reverse);
@@ -696,7 +860,7 @@ impl GraphIndex {
         // One slot per kind: a hub has thousands of relations and a map entry per relation was most
         // of the cost of answering a page of it.
         let mut counts = [0usize; EDGE_KINDS.len()];
-        if let Some(&node_id) = self.node_index.get(node) {
+        if let Some(node_id) = self.node_index.get(&self.nodes, node) {
             let overlaid = self.relation_overlay_nodes.contains(node);
             for relation in self
                 .relation_id_list(node_id, reverse)
@@ -774,8 +938,7 @@ impl GraphIndex {
             kind: &relation.kind,
             source_path: relation
                 .source_path
-                .and_then(|id| self.nodes.get(id as usize))
-                .map(|path| &**path),
+                .and_then(|id| self.nodes.get(id as usize)),
             span: relation.span,
             confidence: match relation.confidence {
                 0 => "resolved",
@@ -895,7 +1058,7 @@ impl GraphIndex {
         self.overlaid_paths = self
             .relation_file_overlays
             .keys()
-            .filter_map(|path| self.node_index.get(path.as_str()).copied())
+            .filter_map(|path| self.node_index.get(&self.nodes, path.as_str()))
             .collect();
         self.overlay_forward_relations.clear();
         self.overlay_reverse_relations.clear();
@@ -912,13 +1075,12 @@ impl GraphIndex {
     }
 
     fn intern_node(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.node_index.get(name) {
+        if let Some(id) = self.node_index.get(&self.nodes, name) {
             return id;
         }
         let id = self.nodes.len() as u32;
-        let name: Arc<str> = Arc::from(name);
-        self.nodes.push(Arc::clone(&name));
-        self.node_index.insert(name, id);
+        self.nodes.push(name);
+        self.node_index.insert(&self.nodes, id);
         self.forward.push_empty();
         self.reverse.push_empty();
         self.forward_relation_ids.push_empty();
@@ -972,7 +1134,7 @@ impl GraphIndex {
     /// monorepo whose top-level buckets all reach each other collapses into
     /// one giant package SCC, while the actionable cycles live between files.
     pub fn file_cycles(&self) -> Vec<Vec<String>> {
-        let node_file: Vec<String> = self.nodes.iter().map(|n| file_name(n)).collect();
+        let node_file: Vec<String> = self.nodes.iter().map(file_name).collect();
         let mut file_graph: DiGraph<String, ()> = DiGraph::new();
         let mut file_nodes: FxHashMap<&str, NodeIndex> = FxHashMap::default();
         let mut seen_edges: rustc_hash::FxHashSet<(NodeIndex, NodeIndex)> =
@@ -1062,8 +1224,8 @@ impl GraphIndex {
 
     pub fn contains_node(&self, name: &str) -> bool {
         self.node_index
-            .get(name)
-            .is_some_and(|id| !self.inactive_nodes.contains(id))
+            .get(&self.nodes, name)
+            .is_some_and(|id| !self.inactive_nodes.contains(&id))
     }
 
     pub fn node_names(&self) -> impl Iterator<Item = &str> {
@@ -1078,21 +1240,21 @@ impl GraphIndex {
     pub fn node_entries(&self) -> impl Iterator<Item = (u32, &str)> {
         self.nodes.iter().enumerate().filter_map(|(id, name)| {
             let id = id as u32;
-            (!self.inactive_nodes.contains(&id)).then_some((id, name.as_ref()))
+            (!self.inactive_nodes.contains(&id)).then_some((id, name))
         })
     }
 
     pub fn in_degree(&self, name: &str) -> usize {
         self.node_index
-            .get(name)
-            .map(|&i| self.reverse.list(i as usize).len())
+            .get(&self.nodes, name)
+            .map(|i| self.reverse.list(i as usize).len())
             .unwrap_or(0)
     }
 
     pub fn out_degree(&self, name: &str) -> usize {
         self.node_index
-            .get(name)
-            .map(|&i| self.forward.list(i as usize).len())
+            .get(&self.nodes, name)
+            .map(|i| self.forward.list(i as usize).len())
             .unwrap_or(0)
     }
 
@@ -1120,14 +1282,13 @@ impl GraphIndex {
     /// Node name → compact ID. Returns `None` if the name is not in the graph.
     pub fn node_id(&self, name: &str) -> Option<u32> {
         self.node_index
-            .get(name)
-            .copied()
+            .get(&self.nodes, name)
             .filter(|id| !self.inactive_nodes.contains(id))
     }
 
     pub fn node_name(&self, id: u32) -> Option<&str> {
         (!self.inactive_nodes.contains(&id))
-            .then(|| self.nodes.get(id as usize).map(AsRef::as_ref))
+            .then(|| self.nodes.get(id as usize))
             .flatten()
     }
 
@@ -1147,7 +1308,7 @@ impl GraphIndex {
     }
 
     fn neighbor_ids<'a>(&'a self, name: &str, adj: &'a Adjacency) -> &'a [u32] {
-        let Some(&idx) = self.node_index.get(name) else {
+        let Some(idx) = self.node_index.get(&self.nodes, name) else {
             return &[];
         };
         adj.list(idx as usize)
@@ -1164,7 +1325,7 @@ impl GraphIndex {
         self.package_graph.get_or_init(|| {
             // Compute each node's package once (O(N)); the old code recomputed
             // `package_name` — a per-call allocation — for every edge endpoint (O(E)).
-            let node_pkg: Vec<String> = self.nodes.iter().map(|n| package_name(n)).collect();
+            let node_pkg: Vec<String> = self.nodes.iter().map(package_name).collect();
             let mut package_graph = DiGraph::new();
             let mut package_nodes: FxHashMap<&str, NodeIndex> = FxHashMap::default();
             let mut seen_edges: rustc_hash::FxHashSet<(NodeIndex, NodeIndex)> =
@@ -1218,9 +1379,9 @@ impl GraphIndex {
         let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
 
         // Unknown node: empty expansion, still a valid bounded page.
-        let Some(&start) = self
+        let Some(start) = self
             .node_index
-            .get(node)
+            .get(&self.nodes, node)
             .filter(|id| !self.inactive_nodes.contains(id))
         else {
             return Ok((
@@ -1595,6 +1756,76 @@ mod tests {
         assert_eq!(Adjacency::default().to_rows(), Vec::<Vec<u32>>::new());
     }
 
+    #[test]
+    fn node_names_in_one_buffer_read_back_as_the_separate_strings_they_replaced() {
+        let originals = [
+            "",
+            "a.ts",
+            "symbol://p/src/é.ts#class:Ünï",
+            "",
+            "日本語/節",
+            "z",
+        ];
+        let mut names = NodeNames::with_capacity(originals.len(), 0);
+        for original in originals {
+            names.push(original);
+        }
+        assert_eq!(names.len(), originals.len());
+        for (id, original) in originals.iter().enumerate() {
+            assert_eq!(names.get(id), Some(*original));
+            assert_eq!(&names[id], *original);
+        }
+        assert_eq!(names.get(originals.len()), None);
+        assert_eq!(names.iter().collect::<Vec<_>>(), originals);
+        assert_eq!(NodeNames::default().iter().count(), 0);
+        assert_eq!(names.clone(), names);
+    }
+
+    /// The node index replaced a hash map and has to answer exactly like one: every name found at
+    /// the id it was given, absent names absent, a repeated name moving to its newest id, and the
+    /// same answers across growth from a table that starts far too small. Names that are prefixes
+    /// of each other and ones differing in one byte are the shape a weak tag check would confuse.
+    #[test]
+    fn node_index_answers_like_the_hash_map_it_replaced() {
+        let mut names = NodeNames::default();
+        let mut expected: std::collections::HashMap<String, u32> = Default::default();
+        let mut index = NameIndex::with_capacity(1);
+        assert_eq!(NameIndex::default().get(&names, "anything"), None);
+        for n in 0..5_000u32 {
+            let name = match n % 4 {
+                0 => format!(
+                    "symbol://packages/p{}/src/f{}.ts#class:Svc{n}",
+                    n % 7,
+                    n % 13
+                ),
+                1 => format!("packages/p{}/src/f{n}", n % 7),
+                2 => format!("{n}"),
+                _ => format!("packages/p{}/src/f{}", n % 7, n - 1),
+            };
+            if let Some(&known) = expected.get(&name) {
+                assert_eq!(index.get(&names, &name), Some(known));
+                continue;
+            }
+            let id = names.len() as u32;
+            names.push(&name);
+            index.insert(&names, id);
+            expected.insert(name, id);
+        }
+        for (name, id) in &expected {
+            assert_eq!(index.get(&names, name), Some(*id), "{name}");
+        }
+        for probe in ["", "symbol://", "packages/p0/src/f0.t", "9999999", "Svc1"] {
+            assert_eq!(index.get(&names, probe), None, "{probe}");
+        }
+
+        // `HashMap::insert` kept the newest id for a name inserted twice.
+        let repeated = names[17].to_string();
+        names.push(&repeated);
+        index.insert(&names, names.len() as u32 - 1);
+        assert_eq!(index.get(&names, &repeated), Some(names.len() as u32 - 1));
+        assert_eq!(index.len, expected.len());
+    }
+
     /// The cold load builds the index straight from the archived record. That path
     /// replaced a deserialize-then-expand chain, and a subtle mistake in it would not
     /// fail loudly — every query would simply answer from a wrong adjacency. So pin it
@@ -1869,7 +2100,7 @@ mod tests {
         reverse: bool,
         limit: usize,
     ) -> (Vec<RelationView>, usize) {
-        let Some(&node_id) = graph.node_index.get(node) else {
+        let Some(node_id) = graph.node_index.get(&graph.nodes, node) else {
             return (Vec::new(), 0);
         };
         let relation_ids = if reverse {
@@ -1897,7 +2128,7 @@ mod tests {
                 relation
                     .source_path
                     .and_then(|id| graph.nodes.get(id as usize))
-                    .is_none_or(|path| !graph.relation_file_overlays.contains_key(path.as_ref()))
+                    .is_none_or(|path| !graph.relation_file_overlays.contains_key(path))
             })
             .map(view)
             .collect::<Vec<_>>();
