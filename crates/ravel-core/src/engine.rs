@@ -1768,7 +1768,10 @@ impl WorkspaceEngine {
                     BTreeMap::new()
                 } else {
                     storage.source_hashes_for_paths(
-                        &missing.iter().map(|(_, rel)| rel.clone()).collect::<Vec<_>>(),
+                        &missing
+                            .iter()
+                            .map(|(_, rel)| rel.clone())
+                            .collect::<Vec<_>>(),
                     )?
                 };
                 let phantom: Vec<&PathBuf> = missing
@@ -1819,26 +1822,22 @@ impl WorkspaceEngine {
         // uncommitted form; remember it so a later revert is not mistaken for "nothing changed".
         // Pruned first, so a path that has since gone back to matching stops being carried.
         {
-            let git_dirty: BTreeSet<String> = self
-                .discover_dirty_sources()
-                .iter()
-                .map(|path| {
-                    path.strip_prefix(&self.root)
-                        .unwrap_or(path.as_path())
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                })
-                .collect();
-            let mut recorded = self.dirty_synced();
             let synced_now: BTreeSet<String> = prepared
                 .iter()
                 .map(|prepared| prepared.relative.clone())
                 .collect();
+            // Only the synced paths matter here, so the question goes to git for those alone.
+            let git_dirty = self.dirty_sources_among(&synced_now);
+            let mut recorded = self.dirty_synced();
+            let carried = recorded.clone();
             recorded.retain(|rel| !synced_now.contains(rel) || git_dirty.contains(rel));
             let still_dirty: BTreeSet<String> =
                 synced_now.intersection(&git_dirty).cloned().collect();
             recorded.extend(still_dirty);
-            self.write_dirty_synced(&recorded);
+            // A record that did not change is already on disk; rewriting it cost two fsyncs.
+            if recorded != carried {
+                self.write_dirty_synced(&recorded);
+            }
         }
         crate::timing::stage("sync.prepare_paths", sync_start, || {
             format!("paths={}", paths.len())
@@ -4578,11 +4577,7 @@ impl WorkspaceEngine {
                 }
             }
         }
-        let discovery = crate::git::DirtyDiscovery {
-            include_untracked: self.config.sync.include_untracked,
-            skip_sibling_emit: self.config.sync.skip_sibling_emit,
-            sibling_emit: self.config.sibling_emit_rules(),
-        };
+        let discovery = self.dirty_discovery();
         let extensions = crate::config::effective_extensions(&self.config);
         let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
             .unwrap_or_default()
@@ -4593,6 +4588,56 @@ impl WorkspaceEngine {
             .collect();
         *self.inner.dirty_cache.lock().unwrap() = Some((std::time::Instant::now(), paths.clone()));
         paths
+    }
+
+    fn dirty_discovery(&self) -> crate::git::DirtyDiscovery {
+        crate::git::DirtyDiscovery {
+            include_untracked: self.config.sync.include_untracked,
+            skip_sibling_emit: self.config.sync.skip_sibling_emit,
+            sibling_emit: self.config.sibling_emit_rules(),
+        }
+    }
+
+    /// The members of `relative` that [`Self::discover_dirty_sources`] would list, found without
+    /// listing the rest of the tree. Asking git about a whole worktree is the most expensive thing
+    /// a sync does (~35 ms on 20k files), and the dirty record only ever asks about the paths it
+    /// just synced.
+    fn dirty_sources_among(&self, relative: &BTreeSet<String>) -> BTreeSet<String> {
+        if relative.is_empty() || !self.config.sync_allows_git() || !self.is_git_repo_cached() {
+            return BTreeSet::new();
+        }
+        let workspace_relative = |path: &Path| {
+            path.strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        // A whole-tree listing from the last few milliseconds answers for any subset of it.
+        {
+            let cache = self.inner.dirty_cache.lock().unwrap();
+            if let Some((at, paths)) = cache.as_ref()
+                && at.elapsed()
+                    < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
+            {
+                return paths
+                    .iter()
+                    .map(|path| workspace_relative(path))
+                    .filter(|path| relative.contains(path))
+                    .collect();
+            }
+        }
+        let extensions = crate::config::effective_extensions(&self.config);
+        let wanted: Vec<String> = relative.iter().cloned().collect();
+        crate::git::changed_paths_among(&self.root, &self.dirty_discovery(), &wanted)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| {
+                self.config.is_source_with_extensions(path, &extensions)
+                    && !self.config.is_noise(path)
+            })
+            .map(|path| workspace_relative(&path))
+            .filter(|path| relative.contains(path))
+            .collect()
     }
 
     /// Fast freshness: dirty discovery (git if present) + hash-sidecar no-op.
@@ -5293,6 +5338,128 @@ mod generation_cache_lock_tests {
         drop(observed);
         worker.join().unwrap();
         assert!(completed_without_reentry.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod dirty_record_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn record(engine: &WorkspaceEngine) -> Vec<String> {
+        engine.dirty_synced().into_iter().collect()
+    }
+
+    /// Three files in a committed repository, indexed.
+    fn fixture() -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(
+                root.path().join(name),
+                format!("export const {} = 1;\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        git(root.path(), &["init", "-q", "."]);
+        git(root.path(), &["add", "-A"]);
+        git(root.path(), &["commit", "-qm", "seed"]);
+        let mut engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        // The record follows what git says now. A listing remembered for a few milliseconds would
+        // make these assertions depend on how fast the test happens to run.
+        engine.config.sync.discovery_cache_ms = 0;
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    fn edit(root: &Path, name: &str, value: u32) {
+        std::fs::write(
+            root.join(name),
+            format!("export const {} = {value};\n", &name[..1]),
+        )
+        .unwrap();
+    }
+
+    /// The record carries exactly the synced paths that are still uncommitted, however many other
+    /// files are dirty: asking git about the synced paths alone must not change what is recorded.
+    #[test]
+    fn the_dirty_record_holds_the_synced_paths_that_differ_from_head() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(
+            record(&engine),
+            ["a.ts"],
+            "b.ts is dirty but was not synced, so it is not recorded"
+        );
+
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert_eq!(record(&engine), ["a.ts", "b.ts"]);
+
+        // A revert followed by a sync of that path stops carrying it; the other stays.
+        git(root, &["checkout", "--", "a.ts"]);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(record(&engine), ["b.ts"]);
+
+        // A sync that touches neither leaves the record alone.
+        engine.sync(Some(&[root.join("c.ts")])).unwrap();
+        assert_eq!(record(&engine), ["b.ts"]);
+
+        // Committing everything makes the next sync of the path drop it.
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "b"]);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert!(record(&engine).is_empty());
+        assert!(!engine.dirty_synced_path().exists());
+    }
+
+    /// An untracked file is dirty in the same sense, and a deleted tracked one too.
+    #[test]
+    fn untracked_and_deleted_paths_are_recorded_while_they_differ_from_head() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        std::fs::write(root.join("fresh.ts"), "export const fresh = 1;\n").unwrap();
+        std::fs::remove_file(root.join("c.ts")).unwrap();
+        engine
+            .sync(Some(&[root.join("fresh.ts"), root.join("c.ts")]))
+            .unwrap();
+        assert_eq!(record(&engine), ["c.ts", "fresh.ts"]);
+    }
+
+    /// A record that did not change is not written again: it costs two fsyncs and the file on
+    /// disk already says the same thing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_dirty_record_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        let path = engine.dirty_synced_path();
+        let written = std::fs::metadata(&path).unwrap().ino();
+
+        // Syncing the same, unchanged file again records the same thing.
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), written);
+        assert_eq!(record(&engine), ["a.ts"]);
+
+        // A different set is written (atomic_write replaces the file).
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), written);
+        assert_eq!(record(&engine), ["a.ts", "b.ts"]);
     }
 }
 
