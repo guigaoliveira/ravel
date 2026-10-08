@@ -1137,38 +1137,30 @@ impl WorkspaceEngine {
         })
     }
 
-    /// Start loading, on background threads, what a relation query (`callers_of`, `calls_from`)
-    /// is certain to ask for: the graph and the component-source count that `degradation` reads.
-    /// `context` starts its own loads, the symbol metadata and searches included.
+    /// Start loading, on a background thread, the graph a relation query (`callers_of`,
+    /// `calls_from`) is certain to ask for. `context` starts its own loads, the symbol metadata and
+    /// searches included.
     ///
     /// A one-shot query spends its first stretch waiting for the auto-sync's `git status`, a child
-    /// process the caller only waits on, and only then loads the graph and walks the tree one after
-    /// the other (about 150ms on a 20k-file workspace, 25 of them the child). Neither depends on
-    /// the answer of git. Should the sync publish a new generation after all, the loader notices
-    /// the changed `CURRENT` and loads again, exactly as it does when another request races a sync
-    /// in the daemon, so a prefetch can cost work but cannot serve stale data. The loaders hold
-    /// their cache lock while loading, so the query that follows waits for the result instead of
-    /// repeating it.
+    /// process the caller only waits on, and only then loads the graph (about 150ms on a 20k-file
+    /// workspace, 25 of them the child). The load does not depend on the answer of git. Should the
+    /// sync publish a new generation after all, the loader notices the changed `CURRENT` and loads
+    /// again, exactly as it does when another request races a sync in the daemon, so a prefetch
+    /// can cost work but cannot serve stale data. The loader holds its cache lock while loading, so
+    /// the query that follows waits for the result instead of repeating it.
     ///
-    /// `degradation` is false for a query whose answer never reports it (a rollup): the walk would
-    /// then be work nothing reads.
-    pub fn prefetch_for_relations(&self, degradation: bool) {
-        let loads: [fn(&WorkspaceEngine); 2] = [
-            |engine| {
+    /// The component-source walk `degradation` reads is left on the critical path. Started here
+    /// too it saved 3-14 ms more, but its thread raised the peak RSS of a 2k-file query by 8 MB
+    /// (+24%), and a name that resolves to candidates -- whose answer never reads it -- paid for
+    /// the whole walk.
+    pub fn prefetch_for_relations(&self) {
+        let engine = self.clone();
+        // A failed spawn only forgoes the head start.
+        let _ = std::thread::Builder::new()
+            .name("ravel-prefetch".into())
+            .spawn(move || {
                 let _ = engine.graph();
-            },
-            |engine| {
-                let _ = engine.component_sources_cached();
-            },
-        ];
-        for load in &loads[..if degradation { 2 } else { 1 }] {
-            let load = *load;
-            let engine = self.clone();
-            // A failed spawn only forgoes the head start.
-            let _ = std::thread::Builder::new()
-                .name("ravel-prefetch".into())
-                .spawn(move || load(&engine));
-        }
+            });
     }
 
     fn is_git_repo_cached(&self) -> bool {
@@ -5328,7 +5320,7 @@ mod resident_sync_tests {
         let mut previous = None;
         for round in 0..12 {
             let reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
-            reader.prefetch_for_relations(true);
+            reader.prefetch_for_relations();
             std::fs::write(
                 &service,
                 format!(

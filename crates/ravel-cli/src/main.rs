@@ -877,7 +877,7 @@ fn reference_sites(
         return Ok(value);
     }
     let engine = load_for_query(root)?;
-    engine.prefetch_for_relations(rollup_mode.is_none());
+    engine.prefetch_for_relations();
     Ok(engine.reference_sites_with(
         node,
         reverse,
