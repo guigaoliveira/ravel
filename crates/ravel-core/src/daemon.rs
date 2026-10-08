@@ -12,7 +12,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -20,7 +20,10 @@ use std::{
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
+/// First minor version whose lease connection also answers query operations (see
+/// [`DaemonClientLease::call_text`]). A client talking to an older daemon connects per call.
+const LEASE_CALLS_MINOR: u16 = 2;
 /// Defensive protocol ceiling. Callers may choose a lower bound when reading untrusted peers.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
@@ -370,18 +373,22 @@ impl DaemonClient {
         &self,
         operation: DaemonOperation,
     ) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
-        let mut stream = self.connect_and_handshake()?;
+        let (mut stream, _) = self.connect_and_handshake()?;
         write_frame(&mut stream, &WireRequest::Operation(operation))
             .map_err(DaemonCallError::Transport)?;
         Ok(stream)
     }
 
     pub fn acquire_lease(&self) -> Result<DaemonClientLease, DaemonCallError> {
-        let mut stream = self.connect_and_handshake()?;
+        let (mut stream, server) = self.connect_and_handshake()?;
         write_frame(&mut stream, &WireRequest::Operation(DaemonOperation::Lease))
             .map_err(DaemonCallError::Transport)?;
         match read_frame::<WireResponse>(&mut stream).map_err(DaemonCallError::Transport)? {
-            WireResponse::Value(_) => Ok(DaemonClientLease { _stream: stream }),
+            WireResponse::Value(_) => Ok(DaemonClientLease {
+                client: self.clone(),
+                stream: Mutex::new(Some(stream)),
+                serves_calls: server.protocol_minor >= LEASE_CALLS_MINOR,
+            }),
             WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
             WireResponse::Hello(_) => Err(DaemonCallError::Transport(invalid_protocol(
                 "unexpected daemon hello",
@@ -389,7 +396,9 @@ impl DaemonClient {
         }
     }
 
-    fn connect_and_handshake(&self) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
+    fn connect_and_handshake(
+        &self,
+    ) -> Result<(interprocess::local_socket::Stream, ServerHello), DaemonCallError> {
         use interprocess::local_socket::prelude::*;
         let mut stream = match &self.layout.endpoint {
             #[cfg(unix)]
@@ -426,7 +435,7 @@ impl DaemonClient {
             };
         validate_handshake(&ClientHello::current(self.root.clone()), &server)
             .map_err(|error| DaemonCallError::Transport(io::Error::other(error)))?;
-        Ok(stream)
+        Ok((stream, server))
     }
 
     pub fn is_ready(&self) -> bool {
@@ -535,9 +544,40 @@ pub fn ensure_running(
     )))
 }
 
+/// Keeps the daemon alive for as long as it is held. When the daemon is new enough it also answers
+/// operations on the connection that holds it, so a session pays for the connect, the thread the
+/// daemon starts per connection and the handshake once, not on every call.
 #[derive(Debug)]
 pub struct DaemonClientLease {
-    _stream: interprocess::local_socket::Stream,
+    client: DaemonClient,
+    /// `None` once a call on it failed: a request or reply may be half-written, so the stream
+    /// cannot carry another. The holder is told, and starts a new lease.
+    stream: Mutex<Option<interprocess::local_socket::Stream>>,
+    serves_calls: bool,
+}
+
+impl DaemonClientLease {
+    /// [`DaemonClient::call_text`] over the lease connection. A daemon that predates operations
+    /// on a lease is asked over an ordinary connection per call, as before.
+    pub fn call_text(&self, operation: DaemonOperation) -> Result<String, DaemonCallError> {
+        if !self.serves_calls {
+            return self.client.call_text(operation);
+        }
+        let mut held = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(stream) = held.as_mut() else {
+            return Err(DaemonCallError::Transport(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the lease connection was lost",
+            )));
+        };
+        let reply = write_frame(stream, &WireRequest::Operation(operation))
+            .map_err(DaemonCallError::Transport)
+            .and_then(|()| read_reply_text(stream));
+        if matches!(reply, Err(DaemonCallError::Transport(_))) {
+            *held = None;
+        }
+        reply
+    }
 }
 
 #[derive(Debug, Error)]
@@ -906,16 +946,9 @@ fn handle_connection(
         )?;
         // An established lease intentionally lives until its peer disconnects.
         set_request_read_timeout(stream, None);
-        let mut byte = [0_u8; 1];
-        let read_result = loop {
-            match stream.read(&mut byte) {
-                Ok(0) => break Ok(()),
-                Ok(_) => continue,
-                Err(error) => break Err(error),
-            }
-        };
+        let served = serve_lease(stream, engine, state);
         drop(lease);
-        read_result?;
+        served?;
         return Ok(false);
     }
     if state.shutdown.load(Ordering::Acquire) && !matches!(operation, DaemonOperation::Shutdown) {
@@ -925,6 +958,63 @@ fn handle_connection(
         )?;
         return Ok(false);
     }
+    serve_operation(stream, engine, state, operation)
+}
+
+/// Hold a lease until its peer hangs up, answering the queries it sends meanwhile.
+///
+/// A session that already keeps a connection open for its lease can send its requests down it,
+/// and then pays for the connect, the thread started for a connection and the handshake once
+/// rather than on every call. Peers that only hold the lease never write, so for them this is
+/// the wait for end of stream it always was.
+fn serve_lease(
+    stream: &mut interprocess::local_socket::Stream,
+    engine: &crate::engine::WorkspaceEngine,
+    state: &DaemonState,
+) -> io::Result<()> {
+    loop {
+        let operation = match read_frame::<WireRequest>(stream) {
+            Ok(WireRequest::Operation(operation)) => operation,
+            Ok(WireRequest::Hello(_)) => {
+                write_frame(stream, &WireResponse::Error("duplicate handshake".into()))?;
+                return Ok(());
+            }
+            // The peer hung up between requests: that is how a lease ends.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        // Lifecycle operations belong to a connection of their own: a lease is not the place to
+        // stop the daemon it keeps alive.
+        if !matches!(
+            operation,
+            DaemonOperation::Status
+                | DaemonOperation::Context { .. }
+                | DaemonOperation::Sync { .. }
+                | DaemonOperation::ReferenceSites { .. }
+        ) {
+            write_frame(
+                stream,
+                &WireResponse::Error("operation is not served on a lease connection".into()),
+            )?;
+            continue;
+        }
+        if state.shutdown.load(Ordering::Acquire) {
+            write_frame(
+                stream,
+                &WireResponse::Error("daemon is shutting down".into()),
+            )?;
+            return Ok(());
+        }
+        serve_operation(stream, engine, state, operation)?;
+    }
+}
+
+fn serve_operation(
+    stream: &mut interprocess::local_socket::Stream,
+    engine: &crate::engine::WorkspaceEngine,
+    state: &DaemonState,
+    operation: DaemonOperation,
+) -> io::Result<bool> {
     let shutdown = matches!(operation, DaemonOperation::Shutdown);
     let operation_kind = OperationKind::of(&operation);
     let request_guard = RequestGuard::new(state);
@@ -1377,5 +1467,122 @@ mod tests {
         assert!(try_reserve(&counter, 2));
         assert!(!try_reserve(&counter, 2));
         assert_eq!(counter.load(Ordering::Acquire), 2);
+    }
+
+    /// A stand-in for a daemon that announces protocol 1.`minor`. Every connection gets a thread:
+    /// it answers the handshake, then either one operation (and hangs up) or, for a lease, waits for
+    /// the peer to hang up -- answering operations meanwhile only when `lease_answers`. Returns the
+    /// client, the number of connections the server has accepted, and the runtime directory that
+    /// must outlive the client.
+    #[cfg(unix)]
+    fn fake_daemon(
+        minor: u16,
+        lease_answers: bool,
+        connections_expected: usize,
+    ) -> (DaemonClient, Arc<AtomicUsize>, tempfile::TempDir) {
+        use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+
+        let runtime = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let root = RootIdentity::discover(workspace.path()).unwrap();
+        let layout = RuntimeLayout::in_directory(runtime.path().into(), &root).unwrap();
+        let LocalEndpoint::Unix(path) = &layout.endpoint;
+        let listener = ListenerOptions::new()
+            .name(path.clone().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server_root = root.clone();
+        std::thread::spawn(move || {
+            for _ in 0..connections_expected {
+                let Ok(mut stream) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let root = server_root.clone();
+                std::thread::spawn(move || {
+                    let _ = read_frame::<WireRequest>(&mut stream).unwrap();
+                    let hello = ServerHello {
+                        protocol_major: PROTOCOL_MAJOR,
+                        protocol_minor: minor,
+                        server_version: crate::VERSION.to_owned(),
+                        root,
+                    };
+                    write_frame(&mut stream, &WireResponse::Hello(hello)).unwrap();
+                    let WireRequest::Operation(operation) =
+                        read_frame::<WireRequest>(&mut stream).unwrap()
+                    else {
+                        return;
+                    };
+                    let answer = |n: usize| WireResponse::Value(serde_json::json!({ "n": n }));
+                    write_frame(&mut stream, &answer(0)).unwrap();
+                    if operation != DaemonOperation::Lease {
+                        return;
+                    }
+                    let mut served = 0;
+                    while lease_answers && read_frame::<WireRequest>(&mut stream).is_ok() {
+                        served += 1;
+                        write_frame(&mut stream, &answer(served)).unwrap();
+                    }
+                    // Hold the lease until the peer hangs up, as the real daemon does.
+                    let mut byte = [0_u8; 1];
+                    while matches!(stream.read(&mut byte), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        (DaemonClient { root, layout }, accepted, runtime)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn calls_ride_the_lease_connection_of_a_daemon_that_answers_on_it() {
+        let (client, accepted, _runtime) = fake_daemon(PROTOCOL_MINOR, true, 1);
+        let lease = client.acquire_lease().unwrap();
+        for expected in 1..=3 {
+            let text = lease.call_text(DaemonOperation::Status).unwrap();
+            assert_eq!(text, format!(r#"{{"n":{expected}}}"#));
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "calls on a lease must not open connections"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lease_on_an_older_daemon_asks_over_a_connection_per_call() {
+        // Protocol 1.1 held a lease but never read requests from it: a request sent down it would
+        // wait forever for an answer.
+        let (client, accepted, _runtime) = fake_daemon(LEASE_CALLS_MINOR - 1, false, 3);
+        let lease = client.acquire_lease().unwrap();
+        // Fail rather than hang if the request is ever sent down the lease.
+        set_request_read_timeout(
+            lease.stream.lock().unwrap().as_ref().unwrap(),
+            Some(Duration::from_secs(5)),
+        );
+        for _ in 0..2 {
+            let text = lease.call_text(DaemonOperation::Status).unwrap();
+            assert_eq!(text, r#"{"n":0}"#);
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_lease_connection_is_reported_not_papered_over() {
+        let (client, accepted, _runtime) = fake_daemon(PROTOCOL_MINOR, true, 1);
+        let lease = client.acquire_lease().unwrap();
+        // Losing the connection (here: dropping it) must reach the caller as a transport error so
+        // that the holder starts a new lease, not be hidden behind a connection per call.
+        *lease.stream.lock().unwrap() = None;
+        match lease.call_text(DaemonOperation::Status) {
+            Err(DaemonCallError::Transport(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected)
+            }
+            other => panic!("expected the lost-connection error, got {other:?}"),
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }

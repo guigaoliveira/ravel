@@ -172,8 +172,8 @@ pub struct RavelMcp {
 
 #[derive(Debug)]
 struct DaemonBinding {
-    client: crate::daemon::DaemonClient,
-    _lease: crate::daemon::DaemonClientLease,
+    /// The session's lease on the daemon; calls travel over its connection.
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     last_used: u64,
 }
@@ -214,7 +214,7 @@ impl Drop for EngineUse {
 }
 
 struct DaemonUse {
-    client: crate::daemon::DaemonClient,
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     cache: Arc<Mutex<HashMap<String, DaemonBinding>>>,
     max_cached_roots: usize,
@@ -328,7 +328,7 @@ impl RavelMcp {
             binding.last_used = tick;
             binding.active.fetch_add(1, Ordering::AcqRel);
             return Ok(DaemonUse {
-                client: binding.client.clone(),
+                lease: binding.lease.clone(),
                 active: binding.active.clone(),
                 cache: self.daemons.clone(),
                 max_cached_roots: self.max_cached_roots,
@@ -337,20 +337,20 @@ impl RavelMcp {
         evict_inactive_daemon(&mut daemons, self.max_cached_roots.saturating_sub(1));
         // Keep the cause. Collapsing it into `None` here is what turned an upgraded-binary
         // situation into "shared daemon could not be started", with no hint of the remedy.
-        let (client, lease) = crate::daemon::ensure_transient(&root)
+        let (_, lease) = crate::daemon::ensure_transient(&root)
             .map_err(|error| format!("shared daemon could not be started: {error}"))?;
+        let lease = Arc::new(lease);
         let active = Arc::new(AtomicUsize::new(1));
         daemons.insert(
             key,
             DaemonBinding {
-                client: client.clone(),
-                _lease: lease,
+                lease: lease.clone(),
                 active: active.clone(),
                 last_used: tick,
             },
         );
         Ok(DaemonUse {
-            client,
+            lease,
             active,
             cache: self.daemons.clone(),
             max_cached_roots: self.max_cached_roots,
@@ -379,14 +379,17 @@ impl RavelMcp {
         root: Option<&str>,
         operation: crate::daemon::DaemonOperation,
     ) -> Result<String, String> {
-        let client = self.daemon_client(root)?;
-        match client.client.call_text(operation.clone()) {
+        let session = self.daemon_client(root)?;
+        match session.lease.call_text(operation.clone()) {
             Ok(text) => Ok(text),
             Err(error) if should_respawn_after(&error) => {
+                // Let go of the old lease before asking for a new one: a daemon that is stopping
+                // exits only once none is held.
+                drop(session);
                 self.forget_daemon(root);
                 let retry = self.daemon_client(root)?;
                 retry
-                    .client
+                    .lease
                     .call_text(operation)
                     .map_err(|error| error.to_string())
             }
