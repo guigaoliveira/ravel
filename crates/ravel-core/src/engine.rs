@@ -1702,6 +1702,10 @@ impl WorkspaceEngine {
         if let Some(paths) = only_paths {
             self.validate_sync_paths(paths)?;
         }
+        // One handle for the whole sync. It memoizes the pack readers and the decoded artifact
+        // index, and a fresh handle per phase made each phase open the pack and decode the whole
+        // index again -- three times for a single edited file.
+        let storage = self.storage();
         let paths: Vec<PathBuf> = match only_paths {
             // Explicit paths are still bounded by what a full index would collect. Accepting a
             // gitignored path here makes the index depend on which command ran last: `sync` adds
@@ -1734,26 +1738,13 @@ impl WorkspaceEngine {
                 // A path that is absent from disk *and* absent from the index is not a deletion --
                 // there is nothing to delete. It is a typo, a wrong cwd, or a relative-vs-absolute
                 // slip, and returning whole-index stats for it reads as "synced, you are up to date".
-                let indexed = self.storage().source_hashes_for_paths(
-                    &kept
-                        .iter()
-                        .map(|path| {
-                            let absolute = if path.is_absolute() {
-                                path.to_path_buf()
-                            } else {
-                                self.root.join(path)
-                            };
-                            absolute
-                                .strip_prefix(&self.root)
-                                .unwrap_or(absolute.as_path())
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                        })
-                        .collect::<Vec<_>>(),
-                )?;
-                let phantom: Vec<&PathBuf> = kept
+                //
+                // Only a path that is gone from disk needs the index to settle that. Asking for
+                // every path decoded the whole artifact index to answer a question about files that
+                // are all there.
+                let missing: Vec<(&PathBuf, String)> = kept
                     .iter()
-                    .filter(|path| {
+                    .filter_map(|path| {
                         // Resolve against the workspace, not the process cwd: callers pass relative
                         // paths (the MCP tool does), and testing those against cwd made a brand new
                         // file look nonexistent.
@@ -1763,17 +1754,29 @@ impl WorkspaceEngine {
                             self.root.join(path)
                         };
                         if absolute.exists() {
-                            return false;
+                            return None;
                         }
                         let rel = absolute
                             .strip_prefix(&self.root)
                             .unwrap_or(absolute.as_path())
                             .to_string_lossy()
                             .replace('\\', "/");
-                        // The map answers for every requested path, with `None` when the index has
-                        // no hash for it -- so presence of the key proves nothing.
-                        indexed.get(&rel).and_then(Option::as_ref).is_none()
+                        Some((path, rel))
                     })
+                    .collect();
+                let indexed = if missing.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    storage.source_hashes_for_paths(
+                        &missing.iter().map(|(_, rel)| rel.clone()).collect::<Vec<_>>(),
+                    )?
+                };
+                let phantom: Vec<&PathBuf> = missing
+                    .iter()
+                    // The map answers for every requested path, with `None` when the index has no
+                    // hash for it -- so presence of the key proves nothing.
+                    .filter(|(_, rel)| indexed.get(rel).and_then(Option::as_ref).is_none())
+                    .map(|(path, _)| *path)
                     .collect();
                 if !phantom.is_empty() && phantom.len() == kept.len() {
                     return Err(EngineError::Unresolved {
@@ -1811,7 +1814,7 @@ impl WorkspaceEngine {
 
         // Read/hash each path once. The prepared bytes are reused below if publication is needed.
         let sync_start = std::time::Instant::now();
-        let (fast_noop, prepared) = self.prepare_paths(&paths)?;
+        let (fast_noop, prepared) = self.prepare_paths(&storage, &paths)?;
         // Any path whose working-tree content differs from HEAD is about to enter the index in that
         // uncommitted form; remember it so a later revert is not mistaken for "nothing changed".
         // Pruned first, so a path that has since gone back to matching stops being carried.
@@ -1841,12 +1844,12 @@ impl WorkspaceEngine {
             format!("paths={}", paths.len())
         });
         if fast_noop {
-            if let Ok(Some(stats)) = self.storage().open_stats() {
+            if let Ok(Some(stats)) = storage.open_stats() {
                 return Ok(stats);
             }
         }
         let delta_start = std::time::Instant::now();
-        if let Some(stats) = self.try_incremental_delta(&prepared)? {
+        if let Some(stats) = self.try_incremental_delta(&storage, &prepared)? {
             crate::timing::stage("sync.structural_delta.total", delta_start, String::new);
             return Ok(stats);
         }
@@ -2077,9 +2080,9 @@ impl WorkspaceEngine {
     /// publishes component overlays; the full snapshot is reconstructed only on explicit demand.
     fn try_incremental_delta(
         &self,
+        storage: &FileSnapshotStorage,
         prepared: &[PreparedPath],
     ) -> Result<Option<IndexStats>, EngineError> {
-        let storage = self.storage();
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         // Loading the previous artifact and re-parsing the new bytes are both
         // per-file work with no shared state; a burst of edits (or a pull) used
@@ -2607,7 +2610,11 @@ impl WorkspaceEngine {
         Some(artifact)
     }
 
-    fn prepare_paths(&self, paths: &[PathBuf]) -> Result<(bool, Vec<PreparedPath>), EngineError> {
+    fn prepare_paths(
+        &self,
+        storage: &FileSnapshotStorage,
+        paths: &[PathBuf],
+    ) -> Result<(bool, Vec<PreparedPath>), EngineError> {
         if paths.is_empty() {
             return Ok((true, Vec::new()));
         }
@@ -2659,7 +2666,6 @@ impl WorkspaceEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         };
-        let storage = self.storage();
         let generation_started = std::time::Instant::now();
         let has_generation = storage.current_generation()?.is_some();
         crate::timing::stage(
