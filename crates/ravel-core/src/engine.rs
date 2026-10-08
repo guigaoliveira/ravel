@@ -1022,6 +1022,35 @@ impl WorkspaceEngine {
         })
     }
 
+    /// Start loading, on background threads, what a relation query (`context`, `callers_of`,
+    /// `calls_from`) is certain to ask for: the graph and the coverage probe.
+    ///
+    /// A one-shot query spends its first stretch waiting for the auto-sync's `git status`, a child
+    /// process the caller only waits on, and only then loads the graph and walks the tree one after
+    /// the other (about 150ms on a 20k-file workspace, 25 of them the child). Neither depends on
+    /// the answer of git. Should the sync publish a new generation after all, the loader notices
+    /// the changed `CURRENT` and loads again, exactly as it does when another request races a sync
+    /// in the daemon, so a prefetch can cost work but cannot serve stale data. The loaders hold
+    /// their cache lock while loading, so the query that follows waits for the result instead of
+    /// repeating it.
+    pub fn prefetch_for_relations(&self) {
+        let loads: [fn(&WorkspaceEngine); 2] = [
+            |engine| {
+                let _ = engine.graph();
+            },
+            |engine| {
+                let _ = engine.unsupported_sources_cached();
+            },
+        ];
+        for load in loads {
+            let engine = self.clone();
+            // A failed spawn only forgoes the head start.
+            let _ = std::thread::Builder::new()
+                .name("ravel-prefetch".into())
+                .spawn(move || load(&engine));
+        }
+    }
+
     fn is_git_repo_cached(&self) -> bool {
         let fingerprint = crate::git::metadata_fingerprint(&self.root);
         self.is_git_repo_cached_for(&fingerprint)
@@ -4927,6 +4956,40 @@ mod resident_sync_tests {
         assert_eq!(chain.base, base);
         assert_eq!(chain.overlays.len(), 1);
         assert_eq!(chain.current_snapshot, current.snapshot_id.stable_key());
+    }
+
+    /// A one-shot reader starts loading the graph while another process publishes. Whatever the
+    /// interleaving, the reader's next answer must describe the generation that is current by then,
+    /// never the one its background load happened to read.
+    #[test]
+    fn a_prefetch_racing_a_publication_never_serves_the_old_generation() {
+        let (root, writer, service) = fixture();
+        let mut previous = None;
+        for round in 0..12 {
+            let reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+            reader.prefetch_for_relations();
+            std::fs::write(
+                &service,
+                format!(
+                    "export const answer = () => 42;\nexport const extra{round} = () => answer();\n"
+                ),
+            )
+            .unwrap();
+            writer.sync(Some(std::slice::from_ref(&service))).unwrap();
+
+            let observed = reader.reference_sites("answer", true, 50, 0).unwrap();
+            let fresh = WorkspaceEngine::load(root.path(), &Flags::default())
+                .unwrap()
+                .reference_sites("answer", true, 50, 0)
+                .unwrap();
+            assert_eq!(observed, fresh, "round {round}");
+            assert_ne!(
+                Some(&observed),
+                previous.as_ref(),
+                "round {round} changed nothing"
+            );
+            previous = Some(observed);
+        }
     }
 }
 

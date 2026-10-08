@@ -435,6 +435,7 @@ skip_sibling_emit = true
                 return Ok(());
             }
             let engine = load_for_query(&root)?;
+            engine.prefetch_for_relations();
             emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
         }
         Some(Command::Setup { claude, force: _ }) => {
@@ -877,6 +878,7 @@ fn reference_sites(
         return Ok(value);
     }
     let engine = load_for_query(root)?;
+    engine.prefetch_for_relations();
     Ok(engine.reference_sites_with(
         node,
         reverse,
