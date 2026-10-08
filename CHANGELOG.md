@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The calls an agent makes every turn got cheaper in CPU and memory, with every
+answer byte-identical to 1.18.0's. Measured on the 20,040-file synthetic corpus
+with `scripts/ab_verify.py`.
+
+### Performance — warm MCP sessions
+- **No whole-worktree `git status` while nothing changed.** A daemon query used to
+  ask git about the whole tree before answering (~36 ms of CPU at 20k files). The
+  daemon's watcher now proves it is caught up (a marker file it must report back)
+  and the check is skipped when it has seen no relevant change since the last full
+  one. The skip stands aside on watcher errors, new directories, ignore-rule edits,
+  non-local filesystems and after 60 s; `RAVEL_WATCH_FASTPATH=0` turns it off. With
+  an agent's think time between calls, median latency fell 91–95% for `explore`,
+  `callers_of`, `calls_from` and `status` (e.g. `callers_of` 28.0 → 1.5 ms).
+- **Calls ride the session's lease connection** instead of a connect, thread and
+  handshake each (daemon protocol minor 2; older daemons still get one connection
+  per call). Replies are forwarded as text, frames are one write, and the watcher
+  no longer subscribes to reads.
+- **Cheaper answers inside the daemon:** `status` −99.8% instructions (it decoded
+  the artifact index to print an empty list), `explore` −59% to −80%,
+  `callers_of`/`calls_from` −67% to −85% per call.
+- **Less memory:** the MCP server plus daemon end a session at 204 MB instead of
+  237 MB (−14%); the daemon's peak RSS fell from 264 MB to 236 MB.
+
+### Performance — one-shot CLI
+- `context` −38% to −46% instructions and −53% to −61% wall time; `callers-of` and
+  `calls-from` −17% to −32% instructions and −41% to −45% wall time; `status` −62%
+  instructions. Peak RSS is 10–21% lower for the relation commands and 48% lower
+  for `status`.
+- `callers-of` and `calls-from` use a running daemon, as `context` already did.
+- Paging, counting and rolling up reference sites no longer copies or sorts every
+  site, so a late page of a hub costs what the first does.
+- `sync` of an unchanged file −49% and of a content-only edit −64% instructions.
+
 ## [1.18.0] - 2026-10-07
 
 This release is about the two harnesses most MCP sessions run in — Claude Code and

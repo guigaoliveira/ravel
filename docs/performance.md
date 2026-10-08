@@ -68,6 +68,10 @@ guarantees. `scripts/gen_corpus.py` builds a reproducible synthetic monorepo and
 `scripts/mcp_session_bench.py` drives `ravel mcp` the way an agent does (status,
 explore, callers_of, edits with sync) and samples the RSS of the stdio server and
 the shared daemon after each step — the processes that live for a whole session.
+`scripts/ab_verify.py` compares two binaries on one corpus: callgrind instructions
+for cold commands, syncs and warm daemon calls (deterministic, so it holds on a busy
+machine where wall time does not), interleaved latency and RSS of MCP sessions, and
+byte-for-byte equality of every answer.
 
 ## Config knobs that affect latency
 
