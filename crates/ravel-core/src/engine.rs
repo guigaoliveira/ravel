@@ -256,12 +256,17 @@ impl SymbolMetaRuntime {
     }
 
     fn shard_id(key: &str, shard_bits: u8) -> u8 {
+        Self::shard_of(blake3::hash(key.as_bytes()).as_bytes(), shard_bits)
+    }
+
+    /// The shard of a key from the digest of that key.
+    fn shard_of(digest: &[u8; 32], shard_bits: u8) -> u8 {
         let mask = if shard_bits == 8 {
             u8::MAX
         } else {
             (1u8 << shard_bits) - 1
         };
-        blake3::hash(key.as_bytes()).as_bytes()[0] & mask
+        digest[0] & mask
     }
 
     /// Ceiling for one symbol-meta shard record, matching the bound the previous
@@ -370,12 +375,47 @@ impl SymbolMetaRuntime {
         &self,
         location: crate::model::SymbolMetaLocation,
     ) -> Option<crate::model::SymbolMeta> {
-        let id = self.with_id_shard(location.shard, |archived| {
+        /// What the archived entry a location points at turned into.
+        enum Located {
+            /// It is the definition `get_by_id` would return, so it was decoded right here.
+            Decoded(crate::model::SymbolMeta),
+            /// Something else may answer for this id (an overlay, or a duplicate stored later).
+            Resolve(String),
+        }
+        let SymbolMetaBackend::Packed(packed) = &self.backend else {
+            return None;
+        };
+        let located = self.with_id_shard(location.shard, |archived| {
             let entry = archived.entries.get(location.index as usize)?;
-            (blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest)
-                .then(|| entry.id.as_str().to_owned())
+            let digest = blake3::hash(entry.id.as_bytes());
+            if digest.as_bytes() != &location.id_digest {
+                return None;
+            }
+            let id = entry.id.as_str();
+            // Resolving the id again would find this same entry -- the last one stored under that
+            // id, in the shard that id hashes to, unless an overlay speaks for it -- after hashing
+            // the id a second time and bisecting the shard for it. Name lookups resolve thousands
+            // of locations, so settle the common case from the entry in hand.
+            let is_the_answer = Self::shard_of(digest.as_bytes(), packed.index.shard_bits)
+                == location.shard
+                && !packed.upserts.contains_key(id)
+                && !packed.removed_ids.contains(id)
+                && archived
+                    .entries
+                    .get(location.index as usize + 1)
+                    .is_none_or(|next| next.id.as_str() != id);
+            if is_the_answer {
+                rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(entry)
+                    .ok()
+                    .map(Located::Decoded)
+            } else {
+                Some(Located::Resolve(id.to_owned()))
+            }
         })??;
-        self.get_by_id(&id)
+        match located {
+            Located::Decoded(meta) => Some(meta),
+            Located::Resolve(id) => self.get_by_id(&id),
+        }
     }
 
     fn get_by_id(&self, id: &str) -> Option<crate::model::SymbolMeta> {
@@ -5400,6 +5440,79 @@ mod agent_context_tests {
             }),
             "expected re-query hint with exact limit, got {warnings:?}"
         );
+    }
+
+    /// A name lookup decodes the entry each location points at. That must be the definition
+    /// resolving the location's id would return, for every kind of id: unique, declared twice in
+    /// one file (the archive keeps the last), and rewritten or removed by a later sync.
+    #[test]
+    fn a_name_lookup_decodes_what_resolving_each_location_would() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("a.ts"),
+            "export function dup(a: string): void;\n\
+             export function dup(a: number): void;\n\
+             export function dup(a: any): void {}\n\
+             export class First { run() { return 1; } }\n\
+             export class Second { run() { return 2; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("b.ts"),
+            "export class Third { run() { return 3; } }\nexport function gone() {}\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let reference = |runtime: &SymbolMetaRuntime,
+                         location: crate::model::SymbolMetaLocation| {
+            let id = runtime.with_id_shard(location.shard, |archived| {
+                let entry = archived.entries.get(location.index as usize)?;
+                (blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest)
+                    .then(|| entry.id.as_str().to_owned())
+            })??;
+            runtime.get_by_id(&id)
+        };
+        let check = |engine: &WorkspaceEngine| {
+            let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+            let mut compared = 0;
+            for name in ["dup", "run", "First", "gone", "added"] {
+                for location in runtime.lookup_locations(false, name) {
+                    assert_eq!(
+                        runtime.get_by_location(location),
+                        reference(&runtime, location),
+                        "{name}"
+                    );
+                    compared += 1;
+                }
+            }
+            compared
+        };
+        assert!(check(&engine) >= 5);
+
+        // b.ts is rewritten (its `run` and `gone` are replaced) and a.ts gains a definition.
+        std::fs::write(
+            root.path().join("b.ts"),
+            "export class Third { run() { return 30; } }\nexport function added() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("a.ts"),
+            "export function dup(a: any): void {}\n\
+             export class First { run() { return 1; } }\n\
+             export class Second { run() { return 2; } }\n\
+             export function added() {}\n",
+        )
+        .unwrap();
+        engine
+            .sync(Some(&[root.path().join("a.ts"), root.path().join("b.ts")]))
+            .unwrap();
+        let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+        assert!(
+            matches!(&runtime.backend, SymbolMetaBackend::Packed(packed) if !packed.upserts.is_empty()),
+            "the sync should have left an overlay to resolve through"
+        );
+        assert!(check(&engine) >= 4);
     }
 
     #[test]
