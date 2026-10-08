@@ -98,20 +98,32 @@ impl PersistentWatcher {
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflowed = overflowed.clone();
-        let mut watcher = notify::recommended_watcher(move |result| {
-            let result = match result {
-                Ok(event) => {
-                    let Some(event) = filter_event(event, &path_is_relevant) else {
-                        return;
-                    };
-                    Ok(event)
+        // Subscribe to changes only. The library default (`EventKindMask::ALL`) also asks the
+        // kernel for every open and read-only close under the tree, which `filter_event` then
+        // throws away -- after this thread has woken up and read them. The daemon is the busiest
+        // reader of its own workspace (each query's `git status`, every file the engine opens), so
+        // on the 20k-file corpus that thread took 1.4-2.3 ms of CPU per query, half or more of the
+        // daemon's total; a `grep -r` over the same tree cost it 131 ms.
+        // A completed write stays: some backends report it only as a close.
+        let config = notify::Config::default()
+            .with_event_kinds(notify::EventKindMask::CORE | notify::EventKindMask::ACCESS_CLOSE);
+        let mut watcher = notify::RecommendedWatcher::new(
+            move |result| {
+                let result = match result {
+                    Ok(event) => {
+                        let Some(event) = filter_event(event, &path_is_relevant) else {
+                            return;
+                        };
+                        Ok(event)
+                    }
+                    Err(error) => Err(error),
+                };
+                if sender.try_send(result).is_err() {
+                    callback_overflowed.store(true, Ordering::Release);
                 }
-                Err(error) => Err(error),
-            };
-            if sender.try_send(result).is_err() {
-                callback_overflowed.store(true, Ordering::Release);
-            }
-        })
+            },
+            config,
+        )
         .map_err(|error| WatchError::Notify(error.to_string()))?;
         watcher
             .watch(root, RecursiveMode::Recursive)
@@ -297,6 +309,55 @@ pub fn reconcile_hash(path: &Path) -> std::io::Result<Option<Hash>> {
 mod tests {
     use super::*;
     use notify::event::CreateKind;
+
+    /// What the kernel was asked for, not what `filter_event` later drops: a read must never wake
+    /// the watcher thread, and a completed write must still reach it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_does_not_subscribe_to_reads() {
+        const IN_CLOSE_WRITE: u32 = 0x08;
+        const IN_CLOSE_NOWRITE: u32 = 0x10;
+        const IN_OPEN: u32 = 0x20;
+        let root = tempfile::tempdir().unwrap();
+        let watcher = PersistentWatcher::new(root.path(), 16).unwrap();
+        let mut masks = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+            let is_inotify = std::fs::read_link(entry.path())
+                .is_ok_and(|target| target.to_string_lossy().contains("inotify"));
+            if !is_inotify {
+                continue;
+            }
+            let info = std::fs::read_to_string(format!(
+                "/proc/self/fdinfo/{}",
+                entry.file_name().to_string_lossy()
+            ))
+            .unwrap_or_default();
+            masks.extend(
+                info.lines()
+                    .filter(|line| line.starts_with("inotify "))
+                    .filter_map(|line| line.split("mask:").nth(1)?.split_whitespace().next())
+                    .filter_map(|hex| u32::from_str_radix(hex, 16).ok()),
+            );
+        }
+        drop(watcher);
+        assert!(
+            !masks.is_empty(),
+            "no inotify watch found for the workspace"
+        );
+        for mask in masks {
+            assert_eq!(
+                mask & (IN_OPEN | IN_CLOSE_NOWRITE),
+                0,
+                "subscribed to reads: mask {mask:#x}"
+            );
+            assert_ne!(
+                mask & IN_CLOSE_WRITE,
+                0,
+                "a completed write must still be reported: mask {mask:#x}"
+            );
+        }
+    }
+
     #[test]
     fn reading_a_file_is_not_a_change_to_it() {
         use notify::event::{AccessKind, AccessMode, ModifyKind};
