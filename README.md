@@ -110,6 +110,8 @@ serialized and published atomically, so readers keep the last complete index.
 MCP clients for the same root share one transient local daemon, watcher, warm
 cache, and writer. The daemon exits after the last MCP session disconnects;
 `ravel daemon start|status|stop` controls a persistent CLI daemon explicitly.
+While a daemon runs for the root, the CLI's `context`, `status`, `sync`,
+`callers-of`, and `calls-from` ask it instead of loading the index themselves.
 
 ```bash
 RAVEL_MCP_TOOLS=all ravel mcp  # expose every analysis tool
