@@ -833,9 +833,11 @@ fn spawn_daemon_watcher(
             // event drags in files `ravel index` deliberately skipped.
             let event_ignore = std::sync::Arc::new(crate::config::IgnoreChain::new(&engine.config));
             let batch_ignore = event_ignore.clone();
-            let watcher = match crate::watch::PersistentWatcher::new_filtered(
+            let cookie_dir = storage_root.clone();
+            let watcher = match crate::watch::PersistentWatcher::new_gated(
                 &root,
                 queue_capacity,
+                &cookie_dir,
                 move |path| {
                     crate::config::watch_event_is_relevant(
                         &watch_config,
@@ -851,6 +853,11 @@ fn spawn_daemon_watcher(
                     return;
                 }
             };
+            // The same watcher that keeps the index current can tell a query that nothing has
+            // changed since the last full check, so the query need not ask git.
+            if let Some(gate) = watcher.gate() {
+                engine.attach_watch_gate(gate);
+            }
             let extensions = crate::config::effective_extensions(&engine.config);
             while !state.shutdown.load(Ordering::Acquire) {
                 let batch = match watcher.next_batch(

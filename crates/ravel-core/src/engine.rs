@@ -123,7 +123,7 @@ struct EngineInner {
     >,
     config_hash: String,
     /// Debounce dirty discovery for concurrent tool calls in the same warm MCP tick.
-    dirty_cache: Mutex<Option<(std::time::Instant, Vec<PathBuf>)>>,
+    dirty_cache: Mutex<Option<DirtyListing>>,
     /// Serialize full and incremental publications from MCP watchers and tool calls.
     update_lock: Mutex<()>,
     /// Most recent background/explicit update failure. Queries may keep serving the last
@@ -134,6 +134,21 @@ struct EngineInner {
     structural_cache: Mutex<Option<(String, Arc<StructuralPackReader>)>>,
     /// Coalesce best-effort generation cleanup outside agent-facing sync latency.
     maintenance_scheduled: AtomicBool,
+    /// The daemon's file watcher, when this engine has one: lets a query learn that nothing changed
+    /// since the last full check without asking git. See [`crate::watch::WatchGate`].
+    watch_gate: Mutex<Option<Arc<crate::watch::WatchGate>>>,
+    /// Dirty checks the watcher answered without asking git.
+    quiet_checks: AtomicU64,
+}
+
+/// A whole-tree listing of dirty sources, remembered for a few milliseconds.
+#[derive(Debug)]
+struct DirtyListing {
+    /// When git was asked. A listing says nothing about edits made after this moment.
+    asked: std::time::Instant,
+    /// When it was remembered, which is what its few milliseconds are counted from.
+    kept: std::time::Instant,
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1113,6 +1128,8 @@ impl WorkspaceEngine {
                 observed_generation: Mutex::new(None),
                 structural_cache: Mutex::new(None),
                 maintenance_scheduled: AtomicBool::new(false),
+                watch_gate: Mutex::new(None),
+                quiet_checks: AtomicU64::new(0),
             }),
         })
     }
@@ -4572,6 +4589,13 @@ impl WorkspaceEngine {
     /// Discover dirty source paths according to `[sync]` config.
     /// Empty when mode=none, no git available, or clean tree. Never requires git to exist.
     pub fn discover_dirty_sources(&self) -> Vec<PathBuf> {
+        self.dirty_listing(None)
+    }
+
+    /// [`Self::discover_dirty_sources`], except that a remembered listing answers only if git was
+    /// asked at or after `not_before`: a caller that has just learned of an edit cannot be handed a
+    /// listing from before it.
+    fn dirty_listing(&self, not_before: Option<std::time::Instant>) -> Vec<PathBuf> {
         // mode=none or auto without .git → empty (caller uses explicit paths / watch).
         if !self.config.sync_allows_git() || !self.is_git_repo_cached() {
             return Vec::new();
@@ -4579,14 +4603,16 @@ impl WorkspaceEngine {
         // Same-tick MCP: reuse dirty list ~50ms (not a perf SLA — avoids double git spawn).
         {
             let cache = self.inner.dirty_cache.lock().unwrap();
-            if let Some((at, paths)) = cache.as_ref() {
-                if at.elapsed()
+            if let Some(listing) = cache.as_ref() {
+                if listing.kept.elapsed()
                     < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
+                    && not_before.is_none_or(|floor| listing.asked >= floor)
                 {
-                    return paths.clone();
+                    return listing.paths.clone();
                 }
             }
         }
+        let asked = std::time::Instant::now();
         let discovery = self.dirty_discovery();
         let extensions = crate::config::effective_extensions(&self.config);
         let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
@@ -4596,7 +4622,11 @@ impl WorkspaceEngine {
                 self.config.is_source_with_extensions(p, &extensions) && !self.config.is_noise(p)
             })
             .collect();
-        *self.inner.dirty_cache.lock().unwrap() = Some((std::time::Instant::now(), paths.clone()));
+        *self.inner.dirty_cache.lock().unwrap() = Some(DirtyListing {
+            asked,
+            kept: std::time::Instant::now(),
+            paths: paths.clone(),
+        });
         paths
     }
 
@@ -4625,11 +4655,12 @@ impl WorkspaceEngine {
         // A whole-tree listing from the last few milliseconds answers for any subset of it.
         {
             let cache = self.inner.dirty_cache.lock().unwrap();
-            if let Some((at, paths)) = cache.as_ref()
-                && at.elapsed()
+            if let Some(listing) = cache.as_ref()
+                && listing.kept.elapsed()
                     < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
             {
-                return paths
+                return listing
+                    .paths
                     .iter()
                     .map(|path| workspace_relative(path))
                     .filter(|path| relative.contains(path))
@@ -4667,12 +4698,65 @@ impl WorkspaceEngine {
         if !self.is_git_repo_cached() || !self.config.sync_allows_git() {
             return Ok(None);
         }
+        // A daemon's file watcher can say that nothing has changed since a full check last found
+        // the index consistent with the tree. That skips asking git about the whole worktree, which
+        // is nearly all of what a clean-tree query costs.
+        let gate = self.inner.watch_gate.lock().unwrap().clone();
+        let probe = gate.as_ref().and_then(|gate| gate.probe());
+        // The index as the probe found it.
+        let generation = probe
+            .as_ref()
+            .and_then(|_| self.storage().current_generation().ok().flatten());
+        if let (Some(gate), Some(probe), Some(generation)) = (&gate, &probe, &generation)
+            && gate.is_quiet(probe, generation)
+        {
+            self.inner.quiet_checks.fetch_add(1, Ordering::Relaxed);
+            crate::timing::note("autosync.quiet", String::new);
+            return Ok(None);
+        }
+        // A check that may be recorded as clean has to look at the tree as the probe found it, not
+        // at a listing remembered from before the edit the probe has just counted.
+        let (synced, consistent) =
+            self.auto_sync_after_discovery(probe.as_ref().map(|probe| probe.started()))?;
+        if consistent && let (Some(gate), Some(probe), Some(found)) = (&gate, &probe, generation) {
+            // What the check vouches for is the index it compared the tree with: the one the probe
+            // found, or the one the sync that made them agree published.
+            let checked = if synced.is_some() {
+                self.storage().current_generation().ok().flatten()
+            } else {
+                Some(found)
+            };
+            if let Some(checked) = checked {
+                gate.mark_clean(probe, checked);
+            }
+        }
+        Ok(synced)
+    }
+
+    /// Dirty checks the watcher answered without asking git (for tests).
+    #[cfg(test)]
+    pub(crate) fn quiet_checks(&self) -> u64 {
+        self.inner.quiet_checks.load(Ordering::Relaxed)
+    }
+
+    /// Hand the engine the daemon's watcher gate. Until then every dirty check asks git.
+    pub(crate) fn attach_watch_gate(&self, gate: Arc<crate::watch::WatchGate>) {
+        *self.inner.watch_gate.lock().unwrap() = Some(gate);
+    }
+
+    /// The git-backed half of [`Self::auto_sync_if_dirty`]. Also says whether the check ran to
+    /// completion with the index consistent with the tree afterwards (nothing was dirty, every
+    /// dirty path matched the index, or the sync that made it so succeeded).
+    fn auto_sync_after_discovery(
+        &self,
+        listed_after: Option<std::time::Instant>,
+    ) -> Result<(Option<IndexStats>, bool), EngineError> {
         // Discover first, load the sidecar second. The sidecar unzips the artifact
         // index into tens of thousands of owned paths and hashes, and on a clean tree
         // there is nothing to compare it against — loading it before knowing whether
         // any path is dirty charged every query for work no query needed.
         let dirty_started = std::time::Instant::now();
-        let mut dirty = self.discover_dirty_sources();
+        let mut dirty = self.dirty_listing(listed_after);
         // A path the index absorbed while it was dirty stays suspect until its content matches what
         // the index holds, even once git calls the tree clean.
         let recorded = self.dirty_synced();
@@ -4697,13 +4781,13 @@ impl WorkspaceEngine {
             format!("paths={}", dirty.len())
         });
         if dirty.is_empty() {
-            return Ok(None);
+            return Ok((None, true));
         }
         // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
         // Prevents accidental full-snapshot open on every search.
         let hashes_started = std::time::Instant::now();
         let Some(hashes) = self.file_hashes_cached()? else {
-            return Ok(None);
+            return Ok((None, false));
         };
         crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
@@ -4753,12 +4837,12 @@ impl WorkspaceEngine {
             }
         }
         if !need_sync {
-            return Ok(None);
+            return Ok((None, true));
         }
         match self.sync(Some(&dirty)) {
-            Ok(s) => Ok(Some(s)),
+            Ok(s) => Ok((Some(s), true)),
             // Keep serving the last complete snapshot; context/status expose the warning.
-            Err(_) => Ok(None),
+            Err(_) => Ok((None, false)),
         }
     }
 
@@ -5348,6 +5432,372 @@ mod generation_cache_lock_tests {
         drop(observed);
         worker.join().unwrap();
         assert!(completed_without_reentry.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod watch_gate_tests {
+    use super::*;
+    use crate::watch::{PersistentWatcher, Timing, WatchGate};
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    struct Watched {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        engine: WorkspaceEngine,
+        gate: Arc<WatchGate>,
+        _watcher: Option<PersistentWatcher>,
+    }
+
+    /// A committed, indexed repository with the daemon's kind of watcher attached to its engine.
+    /// `blind_to` names a file the watcher is made deaf to (a stand-in for a change no backend
+    /// would report). `None` when this machine's temp directory is not a filesystem the gate
+    /// vouches for, in which case there is nothing for these tests to prove.
+    fn watched(
+        reverify: Duration,
+        blind_to: Option<&'static str>,
+        listening: bool,
+    ) -> Option<Watched> {
+        watched_after(reverify, blind_to, listening, |_| {})
+    }
+
+    /// [`watched`], with `before_arming` run on the indexed tree before the watcher exists.
+    fn watched_after(
+        reverify: Duration,
+        blind_to: Option<&'static str>,
+        listening: bool,
+        before_arming: impl FnOnce(&Path),
+    ) -> Option<Watched> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(
+                root.join(name),
+                format!("export function {}0() {{ return 0; }}\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        git(&root, &["init", "-q", "."]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "seed"]);
+        let mut engine = WorkspaceEngine::load(&root, &Flags::default()).unwrap();
+        if !listening {
+            // Without a watcher, a dirty listing remembered for a few milliseconds answers for the
+            // full check and hides the very edits these tests make right after one. With one, the
+            // check is never handed a listing from before the probe.
+            engine.config.sync.discovery_cache_ms = 0;
+        }
+        engine.index().unwrap();
+        before_arming(&root);
+        let storage_root = root.join(&engine.config.storage.home);
+        let timing = if listening {
+            // A healthy backend returns a marker in microseconds; the long deadline is for a
+            // machine so loaded that this test's own threads are starved.
+            Timing {
+                barrier: Duration::from_secs(3),
+                pause: Duration::from_millis(200),
+                reverify,
+                settle: Duration::from_secs(2),
+            }
+        } else {
+            // A watcher that never answers is meant to leave the gate paused for the whole test.
+            Timing {
+                pause: Duration::from_secs(30),
+                reverify,
+                settle: Duration::from_secs(2),
+                ..Timing::default()
+            }
+        };
+        let gate = WatchGate::with_timing(&root, &storage_root, timing);
+        if !gate.is_trusted() {
+            return None;
+        }
+        let watcher = listening.then(|| {
+            let ignore = Arc::new(crate::config::IgnoreChain::new(&engine.config));
+            let config = engine.config.clone();
+            let storage = storage_root.clone();
+            let blind = blind_to.map(|name| root.join(name));
+            PersistentWatcher::new_with_gate(&root, 4_096, gate.clone(), move |path| {
+                blind.as_deref() != Some(path)
+                    && crate::config::watch_event_is_relevant(&config, &ignore, &storage, path)
+            })
+            .unwrap()
+        });
+        engine.attach_watch_gate(gate.clone());
+        Some(Watched {
+            _dir: dir,
+            root,
+            engine,
+            gate,
+            _watcher: watcher,
+        })
+    }
+
+    fn append(root: &Path, name: &str, text: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(name))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn has_symbol(engine: &WorkspaceEngine, name: &str) -> bool {
+        engine
+            .search_raw(name, SearchKind::Exact, 5)
+            .unwrap()
+            .into_iter()
+            .any(|hit| hit.value == name)
+    }
+
+    /// Check until the watcher answers one for the engine. A marker the machine was too busy to
+    /// return in time only costs a full check or two first, never a wrong answer.
+    fn until_quiet(engine: &WorkspaceEngine) {
+        let before = engine.quiet_checks();
+        for _ in 0..10 {
+            assert!(engine.auto_sync_if_dirty().unwrap().is_none());
+            if engine.quiet_checks() > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        panic!("a tree that stays still was never called quiet");
+    }
+
+    /// Every edit is found by the very next check, whether or not the checks in between were
+    /// answered by the watcher, and a tree that stays still stops being asked about.
+    #[test]
+    fn a_quiet_tree_skips_the_dirty_check_and_every_edit_is_still_found() {
+        let Some(w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+        assert_eq!(w.engine.quiet_checks(), 0, "the first check has to look");
+        until_quiet(&w.engine);
+
+        for round in 0..25 {
+            let name = format!("added{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            // No pause, no sync call: the check right after the write must see it.
+            let synced = w.engine.auto_sync_if_dirty().unwrap();
+            assert!(synced.is_some(), "edit {round} was not picked up");
+            assert!(has_symbol(&w.engine, &name), "edit {round} is not indexed");
+            until_quiet(&w.engine);
+        }
+        // Editing a different file, then undoing the edit, is two changes, both found.
+        append(
+            &w.root,
+            "b.ts",
+            "export function transient() { return 1; }\n",
+        );
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "transient"));
+        std::fs::write(w.root.join("b.ts"), "export function b0() { return 0; }\n").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(!has_symbol(&w.engine, "transient"));
+    }
+
+    #[test]
+    fn creations_renames_and_deletions_are_each_found_immediately() {
+        let Some(w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+
+        std::fs::write(w.root.join("n1.ts"), "export function created1() {}\n").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created1"));
+
+        std::fs::create_dir_all(w.root.join("fresh/deeper")).unwrap();
+        std::fs::write(
+            w.root.join("fresh/deeper/n2.ts"),
+            "export function created2() {}\n",
+        )
+        .unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created2"));
+
+        // A second file in the directory created a moment ago: the case a recursive backend can
+        // miss, because the directory's own watch is installed after it is announced.
+        std::fs::write(
+            w.root.join("fresh/deeper/n3.ts"),
+            "export function created3() {}\n",
+        )
+        .unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created3"));
+
+        std::fs::rename(w.root.join("n1.ts"), w.root.join("n1_moved.ts")).unwrap();
+        w.engine.auto_sync_if_dirty().unwrap();
+        assert!(
+            has_symbol(&w.engine, "created1"),
+            "the moved file is indexed"
+        );
+        assert_eq!(
+            w.engine
+                .search_raw("created1", SearchKind::Exact, 5)
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.value == "created1")
+                .count(),
+            1,
+            "and the old path is gone"
+        );
+
+        std::fs::remove_file(w.root.join("c.ts")).unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(!has_symbol(&w.engine, "c0"));
+    }
+
+    /// The bound on the one thing the gate cannot do: a change no event ever reports is found when
+    /// the quiet verdict expires, not never.
+    #[test]
+    fn a_change_the_watcher_never_reports_is_found_when_the_verdict_expires() {
+        let Some(w) = watched(Duration::from_millis(400), Some("b.ts"), true) else {
+            return;
+        };
+        until_quiet(&w.engine);
+
+        append(&w.root, "b.ts", "export function unseen() { return 1; }\n");
+        let started = std::time::Instant::now();
+        let mut found_after = None;
+        while started.elapsed() < Duration::from_secs(3) {
+            if w.engine.auto_sync_if_dirty().unwrap().is_some() {
+                found_after = Some(started.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let found_after = found_after.expect("an unreported change must still be found");
+        assert!(has_symbol(&w.engine, "unseen"));
+        assert!(
+            found_after < Duration::from_millis(400) + Duration::from_millis(1_500),
+            "found only after {found_after:?}"
+        );
+    }
+
+    /// A gate whose watcher does not answer its markers (dead backend, wrong filesystem, anything)
+    /// must cost a few short waits and then nothing, and never change an answer.
+    #[test]
+    fn a_gate_nobody_feeds_pauses_and_every_check_still_looks() {
+        let Some(w) = watched(Duration::from_secs(60), None, false) else {
+            return;
+        };
+        for round in 0..6 {
+            let name = format!("deaf{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            assert!(
+                w.engine.auto_sync_if_dirty().unwrap().is_some(),
+                "edit {round} must be found without any watcher"
+            );
+            assert!(has_symbol(&w.engine, &name));
+            if round >= 3 {
+                let started = std::time::Instant::now();
+                assert!(w.gate.probe().is_none());
+                assert!(
+                    started.elapsed() < Duration::from_millis(25),
+                    "a paused gate must not keep waiting for markers"
+                );
+            }
+        }
+        assert_eq!(w.engine.quiet_checks(), 0);
+    }
+
+    /// The few milliseconds git's answer is remembered for must not leak into the verdict: an edit
+    /// made right after a check is found by the next one, and no mark is taken from a listing that
+    /// predates it. Without that, a window of milliseconds would stretch to the quiet verdict's
+    /// whole life.
+    #[test]
+    fn a_remembered_listing_cannot_hide_an_edit_from_the_verdict() {
+        let Some(mut w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        w.engine.config.sync.discovery_cache_ms = 60_000;
+        until_quiet(&w.engine);
+        for round in 0..10 {
+            let name = format!("early{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            assert!(
+                w.engine.auto_sync_if_dirty().unwrap().is_some(),
+                "edit {round} was hidden by a remembered listing"
+            );
+            assert!(has_symbol(&w.engine, &name));
+            until_quiet(&w.engine);
+        }
+    }
+
+    /// Whatever happened before the watcher was armed is for a full check to find, and the first
+    /// check after arming is one.
+    #[test]
+    fn an_edit_made_before_the_watcher_was_armed_is_found_by_the_first_check() {
+        let Some(w) = watched_after(Duration::from_secs(60), None, true, |root| {
+            append(
+                root,
+                "a.ts",
+                "export function beforeArming() { return 1; }\n",
+            );
+        }) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "beforeArming"));
+        until_quiet(&w.engine);
+    }
+
+    /// The filter in front of the watcher keeps the ignore rules it first read. After a rules file
+    /// changes it may drop edits to files git now lists, so the gate stops speaking for the tree.
+    #[test]
+    fn un_ignoring_a_directory_is_noticed_though_the_watcher_still_filters_by_the_old_rules() {
+        let Some(w) = watched_after(Duration::from_secs(60), None, true, |root| {
+            std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+            std::fs::create_dir_all(root.join("gen")).unwrap();
+            std::fs::write(root.join("gen/x.ts"), "export function generated1() {}\n").unwrap();
+        }) else {
+            return;
+        };
+        // The first event the watcher filters makes it read (and remember) the root's rules.
+        append(&w.root, "a.ts", "export function warm() {}\n");
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        until_quiet(&w.engine);
+        assert!(
+            !has_symbol(&w.engine, "generated1"),
+            "ignored files are not indexed"
+        );
+
+        std::fs::write(w.root.join(".gitignore"), "").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "generated1"));
+
+        append(&w.root, "gen/x.ts", "export function generated2() {}\n");
+        assert!(
+            w.engine.auto_sync_if_dirty().unwrap().is_some(),
+            "an edit to the un-ignored file was filtered out and the gate did not notice"
+        );
+        assert!(has_symbol(&w.engine, "generated2"));
     }
 }
 
