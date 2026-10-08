@@ -587,16 +587,35 @@ fn symbol_id_path(id: &str) -> Option<&str> {
 /// The directory a site lives in, trimmed to `depth` components. The filename is dropped first: a
 /// path shallower than the depth would otherwise put the file itself in the `prefix` field, so a
 /// root-level `util.ts` came back as a "directory" named `util.ts`.
-fn directory_prefix(path: &str, depth: usize) -> String {
+fn directory_prefix(path: &str, depth: usize) -> &str {
     // `src/a.ts` and `./src/a.ts` are the same directory. Without trimming, the second produced a
     // bucket named `.` that reads as the repo root.
-    let path = path.trim_start_matches("./");
-    let components: Vec<&str> = path.split('/').collect();
-    let directories = &components[..components.len().saturating_sub(1)];
-    if directories.is_empty() {
-        return "(repo root)".to_owned();
+    let mut path = path;
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
     }
-    directories[..directories.len().min(depth)].join("/")
+    // The prefix is a slice of the path: it ends where the `depth`-th directory component does, or
+    // at the last one for a path shallower than that. Joining the components back up would copy it
+    // for every site of a rollup that only counts them.
+    let mut end = None;
+    let mut kept = 0;
+    if depth > 0 {
+        for (index, byte) in path.bytes().enumerate() {
+            if byte == b'/' {
+                end = Some(index);
+                kept += 1;
+                if kept == depth {
+                    break;
+                }
+            }
+        }
+    }
+    match end {
+        Some(end) => &path[..end],
+        // A depth of zero keeps no directory at all, but there was one to keep.
+        None if path.contains('/') => "",
+        None => "(repo root)",
+    }
 }
 
 /// Turn the matched definitions into an outcome, honouring `scope` in every case.
@@ -3797,44 +3816,60 @@ impl WorkspaceEngine {
         // three services costs six figures of tokens; this costs a few hundred, and the cost does
         // not grow with the symbol.
         if let Some(RollupMode::Dir { depth }) = options.rollup {
-            let (relations, total) =
-                graph.direct_relations_limit(&resolved, reverse, ROLLUP_MAX_SITES);
-            let covered = relations.len();
+            let (sites, total) = graph.direct_relations(&resolved, reverse);
             // Edges and files answer different questions. Two edges from one file (an import plus an
             // extends) are one place to change, so reporting only the edge count doubles a migration
             // estimate; both are carried.
-            let mut counts: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
-                Default::default();
-            for relation in &relations {
+            //
+            // Paths and prefixes are borrowed from the graph: a rollup visits up to
+            // `ROLLUP_MAX_SITES` sites and only the handful of buckets it ends with are ever shown.
+            let mut slots: FxHashMap<&str, usize> = FxHashMap::default();
+            let mut buckets: Vec<(&str, usize, FxHashSet<&str>)> = Vec::new();
+            // The last grouped path and its bucket: sites of one file are mostly adjacent, and the
+            // next one from the same file only adds an edge.
+            let mut last: Option<(&str, usize)> = None;
+            let mut covered = 0usize;
+            for relation in sites.take(ROLLUP_MAX_SITES) {
+                covered += 1;
                 // Which path answers "where is this concentrated" depends on the direction. For
                 // callers it is where the reference is written. For callees that path is the queried
                 // symbol's own file, identical for every row -- grouping by it collapses the whole
                 // answer into one bucket and erases the very thing being asked about, so the
                 // referenced symbol's own file is used instead.
                 let grouping_path = if reverse {
-                    relation.source_path.as_deref()
+                    relation.source_path
                 } else {
-                    symbol_id_path(&relation.node)
+                    symbol_id_path(relation.node)
                 };
+                if let (Some(path), Some((last_path, slot))) = (grouping_path, last)
+                    && path == last_path
+                {
+                    buckets[slot].1 += 1;
+                    continue;
+                }
                 // A site without a usable path is real -- it just cannot be grouped by one, and
                 // folding it into some arbitrary bucket would misreport where the impact sits.
                 let key = match grouping_path {
                     Some(path) => directory_prefix(path, depth),
-                    None => "(unknown path)".to_owned(),
+                    None => "(unknown path)",
                 };
-                let bucket = counts.entry(key).or_default();
-                bucket.0 += 1;
-                if let Some(path) = grouping_path {
-                    bucket.1.insert(path.to_owned());
-                }
+                let slot = *slots.entry(key).or_insert_with(|| {
+                    buckets.push((key, 0, FxHashSet::default()));
+                    buckets.len() - 1
+                });
+                buckets[slot].1 += 1;
+                last = grouping_path.map(|path| {
+                    buckets[slot].2.insert(path);
+                    (path, slot)
+                });
             }
-            let group_total = counts.len();
-            let mut ranked: Vec<(String, usize, usize)> = counts
+            let group_total = buckets.len();
+            let mut ranked: Vec<(&str, usize, usize)> = buckets
                 .into_iter()
-                .map(|(prefix, (edges, files))| (prefix, edges, files.len()))
+                .map(|(prefix, edges, files)| (prefix, edges, files.len()))
                 .collect();
             // Count first, then name, so equal counts stay in a stable order across calls.
-            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
             let head: Vec<_> = ranked.iter().take(ROLLUP_TOP_GROUPS).cloned().collect();
             let tail: usize = ranked
                 .iter()
@@ -3894,18 +3929,17 @@ impl WorkspaceEngine {
             }
             return Ok(response);
         }
-        // Ask for the page plus everything before it, then slice: relation order is
-        // deterministic, so a cursor is an offset into the same sequence.
-        let end = cursor.saturating_add(limit);
-        let (relations, total) = graph.direct_relations_limit(&resolved, reverse, end);
+        // Relation order is deterministic, so a cursor is an offset into the same sequence; skipping
+        // to it steps over the earlier sites without building them.
+        let (relations, total) = graph.direct_relations(&resolved, reverse);
         let by_kind = graph.direct_relation_kind_counts(&resolved, reverse);
         let sites: Vec<_> = relations
-            .into_iter()
             .skip(cursor)
+            .take(limit)
             .map(|relation| {
                 let related = symbols
                     .as_ref()
-                    .and_then(|symbols| symbols.get_by_id(&relation.node));
+                    .and_then(|symbols| symbols.get_by_id(relation.node));
                 // No `id` field: it is "symbol://" + path + "#" + kind + qualified
                 // name, so emitting it alongside `path` and `symbol` triples the cost
                 // of every site. `symbol` is the chaining key — these tools accept a
@@ -3917,7 +3951,7 @@ impl WorkspaceEngine {
                     "symbol": related
                         .as_ref()
                         .map(|entry| entry.qualified_name.clone())
-                        .unwrap_or_else(|| relation.node.clone()),
+                        .unwrap_or_else(|| relation.node.to_owned()),
                     "kind": relation.kind.as_str(),
                 });
                 if relation.type_only {
@@ -5977,6 +6011,49 @@ mod agent_context_tests {
         );
         // Deeper than the path goes is the whole directory, not padding.
         assert_eq!(directory_prefix("apps/util.ts", 9), "apps");
+    }
+
+    /// The prefix is now a slice of the path rather than its components joined back up. Hold it to the
+    /// join it replaced, including the paths nobody writes on purpose: doubled and leading separators,
+    /// repeated `./`, an empty path, and a depth of zero.
+    #[test]
+    fn a_sliced_directory_prefix_equals_the_joined_one() {
+        fn joined(path: &str, depth: usize) -> String {
+            let path = path.trim_start_matches("./");
+            let components: Vec<&str> = path.split('/').collect();
+            let directories = &components[..components.len().saturating_sub(1)];
+            if directories.is_empty() {
+                return "(repo root)".to_owned();
+            }
+            directories[..directories.len().min(depth)].join("/")
+        }
+        for path in [
+            "",
+            "a",
+            "a.ts",
+            "/",
+            "/a.ts",
+            "/abs/x.ts",
+            "a/",
+            "a//b.ts",
+            "a/b/",
+            "./a.ts",
+            "././a/b.ts",
+            "./",
+            "../a/b.ts",
+            "a/./b/c.ts",
+            "apps/svc/src/a/b/util.ts",
+            "packages/p0/src/feature0/hubuse_1.ts",
+            "dir with space/é/ü.ts",
+        ] {
+            for depth in 0..=7 {
+                assert_eq!(
+                    directory_prefix(path, depth),
+                    joined(path, depth),
+                    "path {path:?} depth {depth}"
+                );
+            }
+        }
     }
 
     #[test]

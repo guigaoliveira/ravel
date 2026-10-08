@@ -200,6 +200,34 @@ pub struct RelationView {
     pub provenance: EdgeProvenance,
 }
 
+/// A reference site that points into the index instead of owning its strings. Walking a symbol's
+/// sites to render one page, or to fold all of them into counts, then costs no allocation per site;
+/// [`RelationRef::to_view`] copies the few that are kept.
+#[derive(Debug, Clone, Copy)]
+pub struct RelationRef<'a> {
+    pub node: &'a str,
+    pub kind: &'a EdgeKind,
+    pub source_path: Option<&'a str>,
+    pub span: Option<Span>,
+    pub confidence: &'static str,
+    pub type_only: bool,
+    pub provenance: &'a EdgeProvenance,
+}
+
+impl RelationRef<'_> {
+    pub fn to_view(&self) -> RelationView {
+        RelationView {
+            node: self.node.to_owned(),
+            kind: self.kind.clone(),
+            source_path: self.source_path.map(str::to_owned),
+            span: self.span,
+            confidence: self.confidence,
+            type_only: self.type_only,
+            provenance: self.provenance.clone(),
+        }
+    }
+}
+
 /// Borrowed, serialize-only mirror of [`CompactGraph`] (identical field order/types → same
 /// bincode/serde wire bytes) that avoids cloning the graph vectors when publishing.
 #[derive(Debug, serde::Serialize)]
@@ -341,6 +369,9 @@ pub struct GraphIndex {
     forward_relation_ids: Adjacency,
     reverse_relation_ids: Adjacency,
     relation_file_overlays: BTreeMap<String, Option<BTreeSet<Arc<OwnedEdge>>>>,
+    /// Node ids of the files in `relation_file_overlays`, so deciding whether a base relation was
+    /// superseded is an integer lookup instead of a string comparison per relation.
+    overlaid_paths: FxHashSet<u32>,
     relation_overlay_nodes: BTreeSet<String>,
     overlay_forward_relations: BTreeMap<String, Vec<Arc<OwnedEdge>>>,
     overlay_reverse_relations: BTreeMap<String, Vec<Arc<OwnedEdge>>>,
@@ -483,6 +514,7 @@ impl GraphIndex {
             forward_relation_ids: Adjacency::from_rows(forward_relation_ids),
             reverse_relation_ids: Adjacency::from_rows(reverse_relation_ids),
             relation_file_overlays: BTreeMap::new(),
+            overlaid_paths: FxHashSet::default(),
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
@@ -512,6 +544,7 @@ impl GraphIndex {
             forward_relation_ids: Adjacency::from_rows(compact.forward_relation_ids),
             reverse_relation_ids: Adjacency::from_rows(compact.reverse_relation_ids),
             relation_file_overlays: BTreeMap::new(),
+            overlaid_paths: FxHashSet::default(),
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
@@ -573,6 +606,7 @@ impl GraphIndex {
                 &archived.reverse_relation_values,
             ),
             relation_file_overlays: BTreeMap::new(),
+            overlaid_paths: FxHashSet::default(),
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
@@ -610,6 +644,32 @@ impl GraphIndex {
         }
     }
 
+    /// Reference sites of `node` in display order, and how many there are.
+    ///
+    /// Nothing is copied -- each [`RelationRef`] points into the node table -- so rendering one page
+    /// (`skip(cursor).take(limit)`) or folding every site into counts allocates nothing per site, and
+    /// reaching a late page does not rebuild the earlier ones. A node an incremental overlay touched
+    /// has its surviving persisted sites merged with the overlay's, in the order that sorting both
+    /// together would give.
+    pub fn direct_relations(&self, node: &str, reverse: bool) -> (RelationSites<'_>, usize) {
+        let Some(&node_id) = self.node_index.get(node) else {
+            return (RelationSites::new(self, reverse, &[], None), 0);
+        };
+        let relation_ids = self.relation_id_list(node_id, reverse);
+        if !self.relation_overlay_nodes.contains(node) {
+            let sites = RelationSites::new(self, reverse, relation_ids, None);
+            return (sites, relation_ids.len());
+        }
+        let added = self.overlay_edges(node, reverse);
+        let surviving = relation_ids
+            .iter()
+            .filter_map(|relation_id| self.relations.get(*relation_id as usize))
+            .filter(|relation| self.survives_overlays(relation))
+            .count();
+        let sites = RelationSites::new(self, reverse, relation_ids, Some(added));
+        (sites, surviving + added.len())
+    }
+
     /// Return at most `limit` detailed sites while reporting the complete relation count.
     /// This keeps high-degree agent queries O(limit) in allocations instead of O(degree).
     pub fn direct_relations_limit(
@@ -618,81 +678,11 @@ impl GraphIndex {
         reverse: bool,
         limit: usize,
     ) -> (Vec<RelationView>, usize) {
-        let Some(&node_id) = self.node_index.get(node) else {
-            return (Vec::new(), 0);
-        };
-        let relation_ids = if reverse {
-            self.reverse_relation_ids.get(node_id as usize)
-        } else {
-            self.forward_relation_ids.get(node_id as usize)
-        };
-        if self.relation_overlay_nodes.contains(node) {
-            let mut items = relation_ids
-                .into_iter()
-                .flatten()
-                .filter_map(|relation_id| self.relations.get(*relation_id as usize))
-                .filter(|relation| {
-                    relation
-                        .source_path
-                        .and_then(|id| self.nodes.get(id as usize))
-                        .is_none_or(|path| !self.relation_file_overlays.contains_key(path.as_ref()))
-                })
-                .map(|relation| self.relation_view(relation, reverse))
-                .collect::<Vec<_>>();
-            let overlay_relations = if reverse {
-                self.overlay_reverse_relations.get(node)
-            } else {
-                self.overlay_forward_relations.get(node)
-            };
-            items.extend(
-                overlay_relations
-                    .into_iter()
-                    .flatten()
-                    .map(|edge| RelationView {
-                        node: if reverse {
-                            edge.from.clone()
-                        } else {
-                            edge.to.clone()
-                        },
-                        kind: edge.kind.clone(),
-                        source_path: edge.source_path.clone(),
-                        span: edge.span,
-                        confidence: match edge.confidence_kind {
-                            0 => "resolved",
-                            1 => "candidate",
-                            _ => "unresolved",
-                        },
-                        type_only: edge.type_only,
-                        provenance: edge.provenance.clone(),
-                    }),
-            );
-            items.sort_unstable_by(|left, right| {
-                (
-                    relation_display_priority(&left.kind),
-                    left.source_path.as_deref().unwrap_or(""),
-                    left.span,
-                    left.node.as_str(),
-                )
-                    .cmp(&(
-                        relation_display_priority(&right.kind),
-                        right.source_path.as_deref().unwrap_or(""),
-                        right.span,
-                        right.node.as_str(),
-                    ))
-            });
-            let total = items.len();
-            items.truncate(limit);
-            return (items, total);
-        }
-        let total = relation_ids.map_or(0, <[u32]>::len);
-        let items = relation_ids
-            .into_iter()
-            .flatten()
-            .take(limit)
-            .filter_map(|relation_id| self.relations.get(*relation_id as usize))
-            .map(|relation| self.relation_view(relation, reverse))
-            .collect();
-        (items, total)
+        let (sites, total) = self.direct_relations(node, reverse);
+        (
+            sites.take(limit).map(|site| site.to_view()).collect(),
+            total,
+        )
     }
 
     /// Complete per-kind edge counts for one node. Bounded by the number of
@@ -703,53 +693,89 @@ impl GraphIndex {
         node: &str,
         reverse: bool,
     ) -> BTreeMap<&'static str, usize> {
-        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-        let Some(&node_id) = self.node_index.get(node) else {
-            return counts;
-        };
-        let relation_ids = if reverse {
-            self.reverse_relation_ids.get(node_id as usize)
-        } else {
-            self.forward_relation_ids.get(node_id as usize)
-        };
-        let overlaid = self.relation_overlay_nodes.contains(node);
-        for relation in relation_ids
-            .into_iter()
-            .flatten()
-            .filter_map(|relation_id| self.relations.get(*relation_id as usize))
-        {
-            if overlaid
-                && relation
-                    .source_path
-                    .and_then(|id| self.nodes.get(id as usize))
-                    .is_some_and(|path| self.relation_file_overlays.contains_key(path.as_ref()))
+        // One slot per kind: a hub has thousands of relations and a map entry per relation was most
+        // of the cost of answering a page of it.
+        let mut counts = [0usize; EDGE_KINDS.len()];
+        if let Some(&node_id) = self.node_index.get(node) {
+            let overlaid = self.relation_overlay_nodes.contains(node);
+            for relation in self
+                .relation_id_list(node_id, reverse)
+                .iter()
+                .filter_map(|relation_id| self.relations.get(*relation_id as usize))
             {
-                continue;
+                if overlaid && !self.survives_overlays(relation) {
+                    continue;
+                }
+                counts[edge_kind_slot(&relation.kind)] += 1;
             }
-            *counts.entry(relation.kind.as_str()).or_default() += 1;
-        }
-        if overlaid {
-            let overlay_relations = if reverse {
-                self.overlay_reverse_relations.get(node)
-            } else {
-                self.overlay_forward_relations.get(node)
-            };
-            for edge in overlay_relations.into_iter().flatten() {
-                *counts.entry(edge.kind.as_str()).or_default() += 1;
+            if overlaid {
+                for edge in self.overlay_edges(node, reverse) {
+                    counts[edge_kind_slot(&edge.kind)] += 1;
+                }
             }
         }
-        counts
+        EDGE_KINDS
+            .iter()
+            .zip(counts)
+            .filter(|(_, count)| *count > 0)
+            .map(|(kind, count)| (kind.as_str(), count))
+            .collect()
     }
 
-    fn relation_view(&self, relation: &CompactRelation, reverse: bool) -> RelationView {
+    fn relation_id_list(&self, node_id: u32, reverse: bool) -> &[u32] {
+        if reverse {
+            self.reverse_relation_ids.list(node_id as usize)
+        } else {
+            self.forward_relation_ids.list(node_id as usize)
+        }
+    }
+
+    /// Sites an overlay added for `node`: the edges of files it rewrote.
+    fn overlay_edges(&self, node: &str, reverse: bool) -> &[Arc<OwnedEdge>] {
+        let by_node = if reverse {
+            &self.overlay_reverse_relations
+        } else {
+            &self.overlay_forward_relations
+        };
+        by_node.get(node).map_or(&[], Vec::as_slice)
+    }
+
+    /// A persisted relation stands unless an overlay rewrote or removed the file it came from.
+    fn survives_overlays(&self, relation: &CompactRelation) -> bool {
+        relation
+            .source_path
+            .is_none_or(|path| !self.overlaid_paths.contains(&path))
+    }
+
+    /// The next persisted site of `ids`, skipping ids that name no relation and -- once an overlay
+    /// touched the node -- relations the overlay superseded.
+    fn next_persisted_site<'a>(
+        &'a self,
+        ids: &mut std::slice::Iter<'a, u32>,
+        reverse: bool,
+        drop_superseded: bool,
+    ) -> Option<RelationRef<'a>> {
+        for &relation_id in ids.by_ref() {
+            let Some(relation) = self.relations.get(relation_id as usize) else {
+                continue;
+            };
+            if drop_superseded && !self.survives_overlays(relation) {
+                continue;
+            }
+            return Some(self.relation_ref(relation, reverse));
+        }
+        None
+    }
+
+    fn relation_ref<'a>(&'a self, relation: &'a CompactRelation, reverse: bool) -> RelationRef<'a> {
         let related = if reverse { relation.from } else { relation.to };
-        RelationView {
-            node: self.nodes[related as usize].to_string(),
-            kind: relation.kind.clone(),
+        RelationRef {
+            node: &self.nodes[related as usize],
+            kind: &relation.kind,
             source_path: relation
                 .source_path
                 .and_then(|id| self.nodes.get(id as usize))
-                .map(ToString::to_string),
+                .map(|path| &**path),
             span: relation.span,
             confidence: match relation.confidence {
                 0 => "resolved",
@@ -757,7 +783,7 @@ impl GraphIndex {
                 _ => "unresolved",
             },
             type_only: relation.type_only,
-            provenance: relation.provenance.clone(),
+            provenance: &relation.provenance,
         }
     }
 
@@ -866,6 +892,11 @@ impl GraphIndex {
 
     /// Build node-local relation lookups once after all persisted overlays have been applied.
     pub(crate) fn finish_incremental_overlays(&mut self) {
+        self.overlaid_paths = self
+            .relation_file_overlays
+            .keys()
+            .filter_map(|path| self.node_index.get(path.as_str()).copied())
+            .collect();
         self.overlay_forward_relations.clear();
         self.overlay_reverse_relations.clear();
         for edge in self.relation_file_overlays.values().flatten().flatten() {
@@ -1297,6 +1328,178 @@ impl GraphIndex {
     }
 }
 
+/// The sites of one node in display order. See [`GraphIndex::direct_relations`].
+pub struct RelationSites<'a> {
+    graph: &'a GraphIndex,
+    reverse: bool,
+    /// Persisted relation ids not yet visited, already in display order.
+    ids: std::slice::Iter<'a, u32>,
+    /// Present only when an incremental overlay touched the node.
+    overlay: Option<OverlayMerge<'a>>,
+}
+
+/// What it takes to put a touched node's sites in display order without sorting all of them: the
+/// persisted ids are already ordered, so only the overlay's own sites are sorted and the two streams
+/// are merged.
+struct OverlayMerge<'a> {
+    edges: &'a [Arc<OwnedEdge>],
+    /// The overlay's sites in display order, built the first time one is needed.
+    added: Option<std::iter::Peekable<std::vec::IntoIter<RelationRef<'a>>>>,
+    /// Persisted sites sharing one position (kind, file, span) in display order, next one last.
+    /// The persisted order breaks such ties by node id and the display order by node name, so each
+    /// run is re-sorted by name.
+    run: Vec<RelationRef<'a>>,
+    /// First persisted site after `run`.
+    ahead: Option<RelationRef<'a>>,
+}
+
+impl<'a> RelationSites<'a> {
+    fn new(
+        graph: &'a GraphIndex,
+        reverse: bool,
+        ids: &'a [u32],
+        added: Option<&'a [Arc<OwnedEdge>]>,
+    ) -> Self {
+        Self {
+            graph,
+            reverse,
+            ids: ids.iter(),
+            overlay: added.map(|edges| OverlayMerge {
+                edges,
+                added: None,
+                run: Vec::new(),
+                ahead: None,
+            }),
+        }
+    }
+}
+
+impl<'a> Iterator for RelationSites<'a> {
+    type Item = RelationRef<'a>;
+
+    fn next(&mut self) -> Option<RelationRef<'a>> {
+        let (graph, reverse) = (self.graph, self.reverse);
+        let Some(merge) = self.overlay.as_mut() else {
+            return graph.next_persisted_site(&mut self.ids, reverse, false);
+        };
+        if merge.run.is_empty() {
+            let first = merge
+                .ahead
+                .take()
+                .or_else(|| graph.next_persisted_site(&mut self.ids, reverse, true));
+            if let Some(first) = first {
+                merge.run.push(first);
+                while let Some(next) = graph.next_persisted_site(&mut self.ids, reverse, true) {
+                    if !same_position(&first, &next) {
+                        merge.ahead = Some(next);
+                        break;
+                    }
+                    merge.run.push(next);
+                }
+                if merge.run.len() > 1 {
+                    merge.run.sort_by(|left, right| left.node.cmp(right.node));
+                    merge.run.reverse();
+                }
+            }
+        }
+        let added = merge.added.get_or_insert_with(|| {
+            let mut sites: Vec<_> = merge
+                .edges
+                .iter()
+                .map(|edge| RelationRef {
+                    node: if reverse { &edge.from } else { &edge.to },
+                    kind: &edge.kind,
+                    source_path: edge.source_path.as_deref(),
+                    span: edge.span,
+                    confidence: match edge.confidence_kind {
+                        0 => "resolved",
+                        1 => "candidate",
+                        _ => "unresolved",
+                    },
+                    type_only: edge.type_only,
+                    provenance: &edge.provenance,
+                })
+                .collect();
+            sites.sort_by(site_order);
+            sites.into_iter().peekable()
+        });
+        match (merge.run.last(), added.peek()) {
+            (Some(persisted), Some(added_site)) => {
+                if site_order(added_site, persisted).is_lt() {
+                    added.next()
+                } else {
+                    merge.run.pop()
+                }
+            }
+            (Some(_), None) => merge.run.pop(),
+            (None, Some(_)) => added.next(),
+            (None, None) => None,
+        }
+    }
+
+    /// Skipping to a late page must not cost a visit per skipped site: persisted ids of an untouched
+    /// node are already the display order, so they can be stepped over directly.
+    fn nth(&mut self, n: usize) -> Option<RelationRef<'a>> {
+        if self.overlay.is_none() && n > 0 {
+            // A relation id always names a relation, so each id skipped is one site skipped.
+            self.ids.nth(n - 1)?;
+            return self.next();
+        }
+        for _ in 0..n {
+            self.next()?;
+        }
+        self.next()
+    }
+}
+
+/// Display order of two sites: semantic references before module plumbing, then file, position, and
+/// finally the name of the node at the other end.
+fn site_order(left: &RelationRef<'_>, right: &RelationRef<'_>) -> std::cmp::Ordering {
+    relation_display_priority(left.kind)
+        .cmp(&relation_display_priority(right.kind))
+        .then_with(|| {
+            left.source_path
+                .unwrap_or("")
+                .cmp(right.source_path.unwrap_or(""))
+        })
+        .then_with(|| left.span.cmp(&right.span))
+        .then_with(|| left.node.cmp(right.node))
+}
+
+/// Whether two sites sit at one position, i.e. differ in `site_order` only by node name.
+fn same_position(left: &RelationRef<'_>, right: &RelationRef<'_>) -> bool {
+    relation_display_priority(left.kind) == relation_display_priority(right.kind)
+        && left.source_path.unwrap_or("") == right.source_path.unwrap_or("")
+        && left.span == right.span
+}
+
+/// Every edge kind once, so a per-kind tally is an array indexed by [`edge_kind_slot`].
+const EDGE_KINDS: [EdgeKind; 9] = [
+    EdgeKind::Import,
+    EdgeKind::ReExport,
+    EdgeKind::Calls,
+    EdgeKind::Extends,
+    EdgeKind::Implements,
+    EdgeKind::Instantiates,
+    EdgeKind::References,
+    EdgeKind::TypeOf,
+    EdgeKind::Decorates,
+];
+
+fn edge_kind_slot(kind: &EdgeKind) -> usize {
+    match kind {
+        EdgeKind::Import => 0,
+        EdgeKind::ReExport => 1,
+        EdgeKind::Calls => 2,
+        EdgeKind::Extends => 3,
+        EdgeKind::Implements => 4,
+        EdgeKind::Instantiates => 5,
+        EdgeKind::References => 6,
+        EdgeKind::TypeOf => 7,
+        EdgeKind::Decorates => 8,
+    }
+}
+
 fn relation_display_priority(kind: &EdgeKind) -> u8 {
     match kind {
         EdgeKind::Calls => 0,
@@ -1605,6 +1808,271 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].kind, EdgeKind::Calls);
+    }
+
+    /// Deterministic pseudo-random edges: a small node set and a handful of files and spans, so the
+    /// same (kind, file, span) position repeats and display-order ties actually occur.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    const KINDS: [EdgeKind; 9] = EDGE_KINDS;
+
+    fn random_edge(rng: &mut Lcg, files: u64) -> Edge {
+        let mut edge = edge(
+            &format!("n{}", rng.below(14)),
+            &format!("n{}", rng.below(14)),
+        );
+        edge.kind = KINDS[rng.below(9) as usize].clone();
+        edge.source_path = Some(format!("src/f{}.ts", rng.below(files)));
+        let line = rng.below(4) as u32;
+        edge.span = (rng.below(6) != 0).then_some(Span {
+            start_byte: line * 40,
+            end_byte: line * 40 + 5,
+            start_line: line,
+            start_column: 0,
+            end_line: line,
+            end_column: 5,
+        });
+        edge.confidence = match rng.below(3) {
+            0 => EdgeConfidence::Resolved {
+                score: 1.0,
+                reason: "t".into(),
+            },
+            1 => EdgeConfidence::Candidate {
+                score: 0.5,
+                reason: "t".into(),
+            },
+            _ => EdgeConfidence::Unresolved {
+                score: 0.1,
+                reason: "t".into(),
+            },
+        };
+        edge.type_only = rng.below(5) == 0;
+        edge
+    }
+
+    /// The algorithm the relation page used before sites were borrowed: build an owned view of every
+    /// surviving persisted relation and every overlay edge, sort them all, then truncate. Kept here
+    /// verbatim so the merge that replaced it is held to its answers, ties in node name included.
+    fn sorted_views(
+        graph: &GraphIndex,
+        node: &str,
+        reverse: bool,
+        limit: usize,
+    ) -> (Vec<RelationView>, usize) {
+        let Some(&node_id) = graph.node_index.get(node) else {
+            return (Vec::new(), 0);
+        };
+        let relation_ids = if reverse {
+            graph.reverse_relation_ids.get(node_id as usize)
+        } else {
+            graph.forward_relation_ids.get(node_id as usize)
+        };
+        let view = |relation: &CompactRelation| graph.relation_ref(relation, reverse).to_view();
+        if !graph.relation_overlay_nodes.contains(node) {
+            let total = relation_ids.map_or(0, <[u32]>::len);
+            let items = relation_ids
+                .into_iter()
+                .flatten()
+                .take(limit)
+                .filter_map(|relation_id| graph.relations.get(*relation_id as usize))
+                .map(view)
+                .collect();
+            return (items, total);
+        }
+        let mut items = relation_ids
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| graph.relations.get(*relation_id as usize))
+            .filter(|relation| {
+                relation
+                    .source_path
+                    .and_then(|id| graph.nodes.get(id as usize))
+                    .is_none_or(|path| !graph.relation_file_overlays.contains_key(path.as_ref()))
+            })
+            .map(view)
+            .collect::<Vec<_>>();
+        let overlay_relations = if reverse {
+            graph.overlay_reverse_relations.get(node)
+        } else {
+            graph.overlay_forward_relations.get(node)
+        };
+        items.extend(
+            overlay_relations
+                .into_iter()
+                .flatten()
+                .map(|edge| RelationView {
+                    node: if reverse {
+                        edge.from.clone()
+                    } else {
+                        edge.to.clone()
+                    },
+                    kind: edge.kind.clone(),
+                    source_path: edge.source_path.clone(),
+                    span: edge.span,
+                    confidence: match edge.confidence_kind {
+                        0 => "resolved",
+                        1 => "candidate",
+                        _ => "unresolved",
+                    },
+                    type_only: edge.type_only,
+                    provenance: edge.provenance.clone(),
+                }),
+        );
+        items.sort_by(|left, right| {
+            (
+                relation_display_priority(&left.kind),
+                left.source_path.as_deref().unwrap_or(""),
+                left.span,
+                left.node.as_str(),
+            )
+                .cmp(&(
+                    relation_display_priority(&right.kind),
+                    right.source_path.as_deref().unwrap_or(""),
+                    right.span,
+                    right.node.as_str(),
+                ))
+        });
+        let total = items.len();
+        items.truncate(limit);
+        (items, total)
+    }
+
+    /// The per-kind tally the page reported before kinds got an array slot each.
+    fn mapped_kind_counts(
+        graph: &GraphIndex,
+        node: &str,
+        reverse: bool,
+    ) -> BTreeMap<&'static str, usize> {
+        let (views, _) = sorted_views(graph, node, reverse, usize::MAX);
+        let mut counts = BTreeMap::new();
+        for view in views {
+            *counts.entry(view.kind.as_str()).or_default() += 1;
+        }
+        counts
+    }
+
+    fn assert_pages_match(graph: &GraphIndex, nodes: &[String], context: &str) {
+        for node in nodes {
+            for reverse in [true, false] {
+                let (expected, expected_total) = sorted_views(graph, node, reverse, usize::MAX);
+                let (sites, total) = graph.direct_relations(node, reverse);
+                assert_eq!(total, expected_total, "{context}: total {node} {reverse}");
+                let actual: Vec<_> = sites.map(|site| site.to_view()).collect();
+                assert_eq!(
+                    actual, expected,
+                    "{context}: order {node} reverse={reverse}"
+                );
+                // Any page, reached by skipping, is the same slice of that order.
+                for skip in [0, 1, 2, 5, expected.len(), expected.len() + 3] {
+                    for take in [0, 1, 4] {
+                        let (sites, _) = graph.direct_relations(node, reverse);
+                        let page: Vec<_> =
+                            sites.skip(skip).take(take).map(|s| s.to_view()).collect();
+                        let from = skip.min(expected.len());
+                        let to = (skip + take).min(expected.len());
+                        assert_eq!(
+                            page,
+                            expected[from..to],
+                            "{context}: page {node} {skip}+{take}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    graph.direct_relations_limit(node, reverse, 3).0,
+                    expected.iter().take(3).cloned().collect::<Vec<_>>(),
+                    "{context}: limit {node}"
+                );
+                assert_eq!(
+                    graph.direct_relation_kind_counts(node, reverse),
+                    mapped_kind_counts(graph, node, reverse),
+                    "{context}: kinds {node} reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_kind_slots_are_dense_and_named_once() {
+        let mut names = BTreeSet::new();
+        for (index, kind) in EDGE_KINDS.iter().enumerate() {
+            assert_eq!(edge_kind_slot(kind), index);
+            assert!(names.insert(kind.as_str()), "{kind:?} shares a name");
+        }
+    }
+
+    #[test]
+    fn borrowed_sites_match_the_owned_views_for_an_untouched_graph() {
+        let mut rng = Lcg(7);
+        let edges: Vec<Edge> = (0..300).map(|_| random_edge(&mut rng, 9)).collect();
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        let nodes: Vec<String> = (0..16).map(|index| format!("n{index}")).collect();
+        assert_pages_match(&graph, &nodes, "untouched");
+        assert_eq!(graph.direct_relations("missing", true).1, 0);
+        assert!(graph.direct_relations("missing", true).0.next().is_none());
+    }
+
+    /// A node an incremental overlay touched used to build and sort a view of every site on every
+    /// call. The merge that replaced it must give the order that sort gave: surviving persisted
+    /// sites and the overlay's together, ties at one position broken by node name.
+    #[test]
+    fn overlaid_sites_merge_into_the_order_a_full_sort_gives() {
+        for seed in 1..=12u64 {
+            let mut rng = Lcg(seed);
+            let edges: Vec<Edge> = (0..260).map(|_| random_edge(&mut rng, 9)).collect();
+            let mut graph = GraphIndex::from_edges(&edges, "before".into());
+
+            let mut overlay = IncrementalGraphOverlay::default();
+            // Rewritten files (one of them new), a removed file, and one the overlay never mentions.
+            for file in [1u64, 4, 9] {
+                let path = format!("src/f{file}.ts");
+                let fresh: Vec<Edge> = (0..(5 + rng.below(25)))
+                    .map(|_| {
+                        let mut edge = random_edge(&mut rng, 1);
+                        edge.source_path = Some(path.clone());
+                        edge
+                    })
+                    .collect();
+                overlay
+                    .file_upserts
+                    .insert(path, fresh.iter().map(OwnedEdge::from).collect());
+            }
+            overlay.file_tombstones.insert("src/f6.ts".to_owned());
+            // The edges whose endpoints count as touched: what the rewritten and removed files held
+            // before, and what the rewritten ones hold now.
+            for edge in &edges {
+                let path = edge.source_path.as_deref().unwrap_or("");
+                if overlay.file_upserts.contains_key(path) || overlay.file_tombstones.contains(path)
+                {
+                    overlay.edge_counts.insert(OwnedEdge::from(edge), None);
+                }
+            }
+            for edges in overlay.file_upserts.values() {
+                for edge in edges {
+                    overlay.edge_counts.insert(edge.clone(), Some(1));
+                }
+            }
+            graph.apply_incremental_overlay(&overlay, "after", 0);
+            graph.finish_incremental_overlays();
+
+            let nodes: Vec<String> = (0..16).map(|index| format!("n{index}")).collect();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| graph.relation_overlay_nodes.contains(node)),
+                "seed {seed}: the overlay touched nothing"
+            );
+            assert_pages_match(&graph, &nodes, &format!("overlaid seed {seed}"));
+        }
     }
 
     #[test]
