@@ -1037,17 +1037,18 @@ fn set_request_read_timeout(
 }
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
-    let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPC frame too large",
-        ));
-    }
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame too large"))?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&payload)
+    // The length prefix and the payload leave in one write. Two writes are two syscalls and, on a
+    // stream socket, wake the reader twice: once for four bytes, once for the rest.
+    let mut frame = Vec::with_capacity(512);
+    frame.extend_from_slice(&[0; 4]);
+    serde_json::to_writer(&mut frame, value).map_err(io::Error::other)?;
+    let payload_len = frame.len() - 4;
+    let len = u32::try_from(payload_len)
+        .ok()
+        .filter(|_| payload_len <= MAX_FRAME_BYTES)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame too large"))?;
+    frame[..4].copy_from_slice(&len.to_le_bytes());
+    writer.write_all(&frame)
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T> {
@@ -1216,6 +1217,55 @@ mod tests {
         let error =
             read_frame_with_limit::<serde_json::Value>(&mut bytes.as_slice(), 16).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_frame_leaves_in_one_write() {
+        struct Recorder(Vec<Vec<u8>>);
+        impl Write for Recorder {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let value = serde_json::json!({ "answer": [1, 2, 3], "text": "x".repeat(1000) });
+        let mut sink = Recorder(Vec::new());
+        write_frame(&mut sink, &value).unwrap();
+        assert_eq!(
+            sink.0.len(),
+            1,
+            "length prefix and payload must not be separate writes"
+        );
+        let wire = sink.0.concat();
+        assert_eq!(
+            u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize,
+            wire.len() - 4
+        );
+        assert_eq!(
+            read_frame::<serde_json::Value>(&mut wire.as_slice()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_is_refused_before_it_is_written() {
+        struct Refuses;
+        impl Write for Refuses {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("nothing may be written for an oversized frame");
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let value = serde_json::Value::String("x".repeat(MAX_FRAME_BYTES));
+        let error = write_frame(&mut Refuses, &value).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
