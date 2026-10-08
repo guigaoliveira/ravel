@@ -5790,6 +5790,72 @@ mod agent_context_tests {
         check(&cold, 180 + 1 - 3);
     }
 
+    /// A page of sites names each site with `qualified_name_by_id`. It must say what decoding the whole
+    /// entry said: for ids that are unique, ids that overloads share, ids a sync replaced or removed,
+    /// and ids that never existed.
+    #[test]
+    fn the_qualified_name_lookup_agrees_with_decoding_the_whole_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let a = root.join("src/a.ts");
+        let b = root.join("src/b.ts");
+        std::fs::write(
+            &a,
+            "export function over(x: string): void;\nexport function over(x: number): void;\n\
+             export function over(x: unknown): void {}\n\
+             export class Box { open() {} close() {} }\nexport const answer = 42;\n",
+        )
+        .unwrap();
+        std::fs::write(&b, "export function other() { return 1; }\n").unwrap();
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let check = |engine: &WorkspaceEngine, extra: &[&str]| -> usize {
+            let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+            let dict = runtime.materialize().unwrap();
+            let mut ids: Vec<String> = dict
+                .entries
+                .iter()
+                .chain(&dict.duplicates)
+                .map(|entry| entry.id.clone())
+                .collect();
+            let known = ids.len();
+            ids.extend(extra.iter().map(|id| (*id).to_owned()));
+            ids.push("symbol://src/none.ts#value:none".to_owned());
+            for id in &ids {
+                assert_eq!(
+                    runtime.qualified_name_by_id(id),
+                    runtime.get_by_id(id).map(|entry| entry.qualified_name),
+                    "{id}"
+                );
+            }
+            known
+        };
+        assert!(check(&engine, &[]) >= 6);
+
+        // One file gains a symbol and loses a method, another is replaced outright; both reach the
+        // symbol tables as overlay upserts and removals.
+        std::fs::write(
+            &a,
+            "export function over(x: string): void;\nexport function over(x: number): void;\n\
+             export function over(x: unknown): void {}\n\
+             export class Box { open() {} }\nexport const answer = 42;\nexport const fresh = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(&b, "export function replacement() { return 2; }\n").unwrap();
+        engine.sync(Some(&[a, b])).unwrap();
+        assert!(
+            check(
+                &engine,
+                &[
+                    "symbol://src/a.ts#value:Box.close",
+                    "symbol://src/b.ts#value:other"
+                ]
+            ) >= 6
+        );
+    }
+
     #[test]
     fn a_workspace_of_unparsed_components_does_not_certify_its_zeros() {
         // `.vue`, `.svelte` and `.astro` contain TypeScript and import TS symbols. Leaving them out of
