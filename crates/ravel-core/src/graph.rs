@@ -849,6 +849,51 @@ impl GraphIndex {
         )
     }
 
+    /// Incoming plus outgoing relation count of one node: the sum of the totals
+    /// `direct_relations_limit` reports, without building the relations.
+    ///
+    /// A node an incremental overlay touched has no precomputed list to measure, and asking
+    /// `direct_relations_limit` for a limit of zero still materialized and sorted every relation
+    /// of it just to count them -- for a hub that is one allocation per reference.
+    pub fn direct_degree(&self, node: &str) -> usize {
+        let Some(&node_id) = self.node_index.get(node) else {
+            return 0;
+        };
+        let overlaid = self.relation_overlay_nodes.contains(node);
+        [true, false]
+            .into_iter()
+            .map(|reverse| {
+                let relation_ids = if reverse {
+                    self.reverse_relation_ids.get(node_id as usize)
+                } else {
+                    self.forward_relation_ids.get(node_id as usize)
+                };
+                if !overlaid {
+                    return relation_ids.map_or(0, <[u32]>::len);
+                }
+                let base = relation_ids
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|relation_id| self.relations.get(*relation_id as usize))
+                    .filter(|relation| {
+                        relation
+                            .source_path
+                            .and_then(|id| self.nodes.get(id as usize))
+                            .is_none_or(|path| {
+                                !self.relation_file_overlays.contains_key(path.as_ref())
+                            })
+                    })
+                    .count();
+                let overlay = if reverse {
+                    self.overlay_reverse_relations.get(node)
+                } else {
+                    self.overlay_forward_relations.get(node)
+                };
+                base + overlay.map_or(0, Vec::len)
+            })
+            .sum()
+    }
+
     /// Complete per-kind edge counts for one node. Bounded by the number of
     /// edge kinds, so it stays cheap even for hubs where the relation page
     /// itself must truncate.
@@ -1948,6 +1993,53 @@ mod tests {
         assert!(!after.contains("never.ts"), "invented a neighbour");
         assert!(after.contains("keep.ts"), "untouched neighbour lost");
         assert!(after.contains("already.ts"), "re-added neighbour lost");
+    }
+
+    /// `direct_degree` stands in for two `direct_relations_limit(.., 0)` calls, which for a node
+    /// an overlay touched built every relation just to count it. The count has to agree with them
+    /// for plain nodes, for nodes whose file was rewritten, and for nodes whose file was removed.
+    #[test]
+    fn direct_degree_matches_the_relation_totals_with_and_without_overlays() {
+        let from_file = |from: &str, to: &str, file: &str| {
+            let mut edge = edge(from, to);
+            edge.source_path = Some(file.into());
+            edge
+        };
+        let originals = [
+            from_file("a", "hub", "x.ts"),
+            from_file("b", "hub", "y.ts"),
+            from_file("hub", "c", "x.ts"),
+            from_file("c", "a", "z.ts"),
+        ];
+        let mut graph = GraphIndex::from_edges(&originals, "before".into());
+        let totals = |graph: &GraphIndex, node: &str| {
+            graph.direct_relations_limit(node, true, 0).1
+                + graph.direct_relations_limit(node, false, 0).1
+        };
+        for node in ["a", "b", "c", "d", "hub", "missing"] {
+            assert_eq!(graph.direct_degree(node), totals(&graph, node), "{node}");
+        }
+        // x.ts is rewritten to a single new edge and y.ts is deleted.
+        let replacement = OwnedEdge::from(&from_file("d", "hub", "x.ts"));
+        let mut overlay = IncrementalGraphOverlay::default();
+        overlay
+            .file_upserts
+            .insert("x.ts".into(), [replacement.clone()].into_iter().collect());
+        overlay.file_tombstones.insert("y.ts".into());
+        overlay.edge_counts.insert(replacement, Some(1));
+        for removed in [&originals[0], &originals[1], &originals[2]] {
+            overlay.edge_counts.insert(OwnedEdge::from(removed), None);
+        }
+        graph.apply_incremental_overlay(&overlay, "after", 2);
+        graph.finish_incremental_overlays();
+        let mut overlaid = 0;
+        for node in ["a", "b", "c", "d", "hub", "missing"] {
+            assert_eq!(graph.direct_degree(node), totals(&graph, node), "{node}");
+            overlaid += graph.relation_overlay_nodes.contains(node) as usize;
+        }
+        assert!(overlaid >= 4, "the overlay path was not exercised");
+        // hub kept nothing from x.ts or y.ts and gained the replacement.
+        assert_eq!(graph.direct_degree("hub"), 1);
     }
 
     fn edge(from: &str, to: &str) -> Edge {

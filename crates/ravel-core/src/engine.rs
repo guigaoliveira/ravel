@@ -152,7 +152,7 @@ struct PackedSymbolMetaBackend {
     reader: Arc<crate::generation_pack::GenerationPackReader>,
     index: crate::model::SymbolMetaShardIndex,
     removed_ids: BTreeSet<String>,
-    removed_digests: BTreeSet<[u8; 32]>,
+    removed_digests: FxHashSet<[u8; 32]>,
     upserts: FxHashMap<String, crate::model::SymbolMeta>,
     /// Shards whose archive has already been validated in this process. Entries are
     /// borrowed from the mmap, so nothing decoded needs caching — only the fact that
@@ -161,6 +161,52 @@ struct PackedSymbolMetaBackend {
     validated_name_shards: Mutex<FxHashMap<u8, ()>>,
     validated_qualified_shards: Mutex<FxHashMap<u8, ()>>,
     _generation_guard: crate::generation_gc::GenerationGuard,
+}
+
+impl PackedSymbolMetaBackend {
+    /// Drops the archived locations an overlay removed, keeping the ones it re-added.
+    fn drop_superseded(&self, locations: &mut Vec<crate::model::SymbolMetaLocation>) {
+        // Nothing removed means nothing to test, and a name shared by thousands of files has
+        // thousands of locations.
+        if self.removed_digests.is_empty() {
+            return;
+        }
+        locations.retain(|location| {
+            !self.removed_digests.contains(&location.id_digest)
+                || self.upserts.values().any(|entry| {
+                    blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
+                })
+        });
+    }
+
+    /// Overlay entries the archive does not already list for the same lookup: those `matches`
+    /// accepts whose id is not among `locations`.
+    fn additions_beyond(
+        &self,
+        locations: &[crate::model::SymbolMetaLocation],
+        matches: impl Fn(&crate::model::SymbolMeta) -> bool,
+    ) -> Vec<crate::model::SymbolMeta> {
+        let candidates: Vec<_> = self
+            .upserts
+            .values()
+            .filter(|entry| matches(entry))
+            .collect();
+        if candidates.is_empty() {
+            // The digest set below is the expensive part, and only an overlay entry can use it.
+            return Vec::new();
+        }
+        let location_digests = locations
+            .iter()
+            .map(|location| location.id_digest)
+            .collect::<BTreeSet<_>>();
+        candidates
+            .into_iter()
+            .filter(|entry| {
+                !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl SymbolMetaRuntime {
@@ -400,25 +446,8 @@ impl SymbolMetaRuntime {
             }
             SymbolMetaBackend::Packed(packed) => {
                 let mut locations = self.lookup_locations(false, name);
-                locations.retain(|location| {
-                    !packed.removed_digests.contains(&location.id_digest)
-                        || packed.upserts.values().any(|entry| {
-                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
-                        })
-                });
-                let location_digests = locations
-                    .iter()
-                    .map(|location| location.id_digest)
-                    .collect::<BTreeSet<_>>();
-                let additions = packed
-                    .upserts
-                    .values()
-                    .filter(|entry| entry.name == name)
-                    .filter(|entry| {
-                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                packed.drop_superseded(&mut locations);
+                let additions = packed.additions_beyond(&locations, |entry| entry.name == name);
                 let total = locations.len() + additions.len();
                 let mut result = locations
                     .into_iter()
@@ -454,25 +483,9 @@ impl SymbolMetaRuntime {
             }
             SymbolMetaBackend::Packed(packed) => {
                 let mut locations = self.lookup_locations(true, query);
-                locations.retain(|location| {
-                    !packed.removed_digests.contains(&location.id_digest)
-                        || packed.upserts.values().any(|entry| {
-                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
-                        })
-                });
-                let location_digests = locations
-                    .iter()
-                    .map(|location| location.id_digest)
-                    .collect::<BTreeSet<_>>();
-                let additions = packed
-                    .upserts
-                    .values()
-                    .filter(|entry| entry.qualified_name == query)
-                    .filter(|entry| {
-                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                packed.drop_superseded(&mut locations);
+                let additions =
+                    packed.additions_beyond(&locations, |entry| entry.qualified_name == query);
                 let total = locations.len() + additions.len();
                 let mut result = locations
                     .into_iter()
@@ -2825,14 +2838,15 @@ impl WorkspaceEngine {
     }
 
     fn degradation(&self) -> serde_json::Value {
+        self.degradation_given(self.stats().ok().as_ref())
+    }
+
+    /// `degradation` for a caller that has already read the index stats.
+    fn degradation_given(&self, stats: Option<&IndexStats>) -> serde_json::Value {
         let config_problems = crate::resolver::load_tsconfig_reporting(&self.root)
             .problems
             .len();
-        let unparsed_files = self
-            .stats()
-            .ok()
-            .map(|stats| stats.parse_errors)
-            .unwrap_or(0);
+        let unparsed_files = stats.map_or(0, |stats| stats.parse_errors);
         // Only the formats that carry TypeScript. A Python build script or a vendored `.h` does not
         // reference TS symbols, so counting them made every query on any polyglot repo report its
         // zeros as unreliable forever -- destroying the signal in the opposite direction.
@@ -3045,48 +3059,58 @@ impl WorkspaceEngine {
         // Use raw paths — auto_sync already ran. Context combines deterministic spelling
         // lookup with definition-level term evidence: a one-word concept may occur in a path or
         // qualified name, while prose intent words must not turn the query into a hard AND.
-        let (searches, eager_graph, eager_symbol_runtime) = std::thread::scope(|scope| {
-            let graph = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let opened = self.graph();
-                crate::timing::stage("context.worker_graph", started, String::new);
-                opened
+        let run_searches = || {
+            let prefix_started = std::time::Instant::now();
+            let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+            crate::timing::stage("context.search_prefix", prefix_started, String::new);
+            let terms_started = std::time::Instant::now();
+            let term_hits =
+                self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+            crate::timing::stage("context.search_terms", terms_started, || {
+                format!("hits={}", term_hits.len())
             });
-            let symbol_runtime = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let runtime = self.symbol_meta_runtime();
-                crate::timing::stage("context.worker_symbol_meta", started, String::new);
-                runtime
-            });
-            let searches = (|| {
-                let prefix_started = std::time::Instant::now();
-                let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
-                crate::timing::stage("context.search_prefix", prefix_started, String::new);
-                let terms_started = std::time::Instant::now();
-                let term_hits =
-                    self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
-                crate::timing::stage("context.search_terms", terms_started, || {
-                    format!("hits={}", term_hits.len())
+            Ok::<_, EngineError>((hits, term_hits))
+        };
+        // A resident engine answers both from its caches, which is cheaper than starting two
+        // threads to do it. The threads exist to overlap the cold loads with the searches.
+        let resident = self.inner.graph_cache.lock().unwrap().is_some()
+            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
+        let (searches, eager_graph, eager_symbol_runtime) = if resident {
+            let graph = self.graph();
+            let symbol_runtime = self.symbol_meta_runtime();
+            (run_searches(), graph, symbol_runtime)
+        } else {
+            std::thread::scope(|scope| {
+                let graph = scope.spawn(|| {
+                    let started = std::time::Instant::now();
+                    let opened = self.graph();
+                    crate::timing::stage("context.worker_graph", started, String::new);
+                    opened
                 });
-                Ok::<_, EngineError>((hits, term_hits))
-            })();
-            let graph = graph
-                .join()
-                .map_err(|_| EngineError::Search("context graph worker panicked".into()))
-                .and_then(|result| result);
-            let symbol_runtime = symbol_runtime
-                .join()
-                .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
-                .and_then(|result| result);
-            (searches, graph, symbol_runtime)
-        });
+                let symbol_runtime = scope.spawn(|| {
+                    let started = std::time::Instant::now();
+                    let runtime = self.symbol_meta_runtime();
+                    crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                    runtime
+                });
+                let searches = run_searches();
+                let graph = graph
+                    .join()
+                    .map_err(|_| EngineError::Search("context graph worker panicked".into()))
+                    .and_then(|result| result);
+                let symbol_runtime = symbol_runtime
+                    .join()
+                    .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
+                    .and_then(|result| result);
+                (searches, graph, symbol_runtime)
+            })
+        };
         let (mut hits, term_hits) = searches?;
         let mut term_hits = term_hits;
         if let Ok(graph) = &eager_graph {
             for hit in &mut term_hits {
                 if let Some(id) = hit.definition_id.as_deref() {
-                    let degree = graph.direct_relations_limit(id, true, 0).1
-                        + graph.direct_relations_limit(id, false, 0).1;
+                    let degree = graph.direct_degree(id);
                     hit.score_micros = hit
                         .score_micros
                         .saturating_add((degree as u64).min(40) * 500)
@@ -3431,7 +3455,9 @@ impl WorkspaceEngine {
                     .any(|name| name.to_lowercase().contains(&asked))
         };
         let invented_name = identifier_query && exact_identity.is_empty() && !primary_is_lexical;
-        let degradation = self.degradation();
+        // Read once for both the degradation signals and the snapshot id below.
+        let stats = self.stats().ok();
+        let degradation = self.degradation_given(stats.as_ref());
         let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
@@ -3526,7 +3552,7 @@ impl WorkspaceEngine {
                         // tell a real zero from an unasked one.
                         "authoritative_zero": graph_primary.is_some() && undegraded,
                     },
-                    "sid": self.stats().map(|s| s.snapshot_id).ok(),
+                    "sid": stats.map(|stats| stats.snapshot_id),
                 }))
     }
 
