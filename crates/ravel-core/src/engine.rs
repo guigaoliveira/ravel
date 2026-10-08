@@ -354,6 +354,34 @@ impl SymbolMetaRuntime {
         }
     }
 
+    /// `get_by_id(id).map(|entry| entry.qualified_name)` without decoding the rest of the entry:
+    /// a page of reference sites names every site this way and reads nothing else.
+    fn qualified_name_by_id(&self, id: &str) -> Option<String> {
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => {
+                dict.get_by_id(id).map(|entry| entry.qualified_name.clone())
+            }
+            SymbolMetaBackend::Packed(packed) => {
+                if let Some(entry) = packed.upserts.get(id) {
+                    return Some(entry.qualified_name.clone());
+                }
+                if packed.removed_ids.contains(id) {
+                    return None;
+                }
+                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |archived| {
+                    let start = archived
+                        .entries
+                        .partition_point(|entry| entry.id.as_str() < id);
+                    archived.entries[start..]
+                        .iter()
+                        .take_while(|entry| entry.id.as_str() == id)
+                        .last()
+                        .map(|entry| entry.qualified_name.as_str().to_owned())
+                })?
+            }
+        }
+    }
+
     fn entries_for(&self, name: &str, limit: usize) -> (Vec<crate::model::SymbolMeta>, usize) {
         match &self.backend {
             SymbolMetaBackend::Owned(dict) => {
@@ -3933,13 +3961,24 @@ impl WorkspaceEngine {
         // to it steps over the earlier sites without building them.
         let (relations, total) = graph.direct_relations(&resolved, reverse);
         let by_kind = graph.direct_relation_kind_counts(&resolved, reverse);
+        // A function that references the symbol several times is several adjacent sites, so the
+        // name just looked up is usually the one the next site needs.
+        let mut previous: Option<(&str, String)> = None;
         let sites: Vec<_> = relations
             .skip(cursor)
             .take(limit)
             .map(|relation| {
-                let related = symbols
-                    .as_ref()
-                    .and_then(|symbols| symbols.get_by_id(relation.node));
+                let symbol = match &previous {
+                    Some((node, name)) if *node == relation.node => name.clone(),
+                    _ => {
+                        let name = symbols
+                            .as_ref()
+                            .and_then(|symbols| symbols.qualified_name_by_id(relation.node))
+                            .unwrap_or_else(|| relation.node.to_owned());
+                        previous = Some((relation.node, name.clone()));
+                        name
+                    }
+                };
                 // No `id` field: it is "symbol://" + path + "#" + kind + qualified
                 // name, so emitting it alongside `path` and `symbol` triples the cost
                 // of every site. `symbol` is the chaining key — these tools accept a
@@ -3948,10 +3987,7 @@ impl WorkspaceEngine {
                 let mut site = serde_json::json!({
                     "path": relation.source_path,
                     "line": relation.span.map(|span| span.start_line + 1),
-                    "symbol": related
-                        .as_ref()
-                        .map(|entry| entry.qualified_name.clone())
-                        .unwrap_or_else(|| relation.node.to_owned()),
+                    "symbol": symbol,
                     "kind": relation.kind.as_str(),
                 });
                 if relation.type_only {
