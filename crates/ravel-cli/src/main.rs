@@ -839,7 +839,7 @@ fn reference_sites(
     scope: Option<&str>,
     rollup: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let rollup = match rollup {
+    let rollup_mode = match rollup {
         None => None,
         Some(value) => Some(ravel_core::engine::RollupMode::parse(value).ok_or_else(|| {
             anyhow::anyhow!(
@@ -847,13 +847,31 @@ fn reference_sites(
             )
         })?),
     };
+    // A daemon that is already running holds the graph and symbol tables in memory; asking it skips
+    // loading them again for one answer, as `context` does.
+    if let Some(value) = daemon_call_if_running(
+        root,
+        ravel_core::daemon::DaemonOperation::ReferenceSites {
+            node: node.to_owned(),
+            reverse,
+            limit: page_size,
+            cursor,
+            scope: scope.map(str::to_owned),
+            rollup: rollup.map(str::to_owned),
+        },
+    )? {
+        return Ok(value);
+    }
     let engine = WorkspaceEngine::load(root, &Flags::default())?;
     Ok(engine.reference_sites_with(
         node,
         reverse,
         page_size,
         cursor,
-        ravel_core::engine::RelationOptions { scope, rollup },
+        ravel_core::engine::RelationOptions {
+            scope,
+            rollup: rollup_mode,
+        },
     )?)
 }
 
