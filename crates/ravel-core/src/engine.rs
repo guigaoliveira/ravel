@@ -535,6 +535,48 @@ impl SymbolMetaRuntime {
     }
 }
 
+/// The hits of `context`'s two searches: by terms, then by spelling.
+type ContextSearches = Result<(Vec<SearchHit>, Vec<SearchHit>), EngineError>;
+
+/// What `context` reads from the index after the sync: its two searches, the graph, and the
+/// symbol metadata.
+struct ContextInputs {
+    searches: ContextSearches,
+    graph: Result<Arc<GraphIndex>, EngineError>,
+    symbol_runtime: Result<Option<Arc<SymbolMetaRuntime>>, EngineError>,
+}
+
+/// `ContextInputs` being loaded on threads that started before the sync, from the generation
+/// that was current then.
+struct SpeculatedInputs {
+    generation: Option<String>,
+    graph: std::thread::JoinHandle<Result<Arc<GraphIndex>, EngineError>>,
+    symbol_runtime: std::thread::JoinHandle<Result<Option<Arc<SymbolMetaRuntime>>, EngineError>>,
+    searches: std::thread::JoinHandle<ContextSearches>,
+}
+
+impl SpeculatedInputs {
+    /// The inputs, unless the index moved to another generation while they loaded -- then they
+    /// describe a tree the sync has replaced and the caller loads them again. Every thread is
+    /// joined either way, so none outlives the call holding the old generation open.
+    fn settle(self, engine: &WorkspaceEngine) -> Option<ContextInputs> {
+        let (graph, symbol_runtime, searches) = (
+            self.graph.join(),
+            self.symbol_runtime.join(),
+            self.searches.join(),
+        );
+        let unchanged = engine.storage().current_generation().ok().flatten() == self.generation;
+        match (graph, symbol_runtime, searches) {
+            (Ok(graph), Ok(symbol_runtime), Ok(searches)) if unchanged => Some(ContextInputs {
+                searches,
+                graph,
+                symbol_runtime,
+            }),
+            _ => None,
+        }
+    }
+}
+
 struct PreparedPath {
     /// Whether the file exists on disk. Without this, "deleted" and "present but unusable" both
     /// arrive as `bytes: None`, and the second was silently treated as the first.
@@ -2887,6 +2929,117 @@ impl WorkspaceEngine {
             .ok()
     }
 
+    /// The two searches `context` ranks with: the terms search (best definitions by shared
+    /// tokens) and the spelling search. Terms first: the first search opens the index, and one
+    /// opened for terms serves the spelling search too, while one opened for spellings has to be
+    /// opened again (the whole pack directory, decoded a second time) before it can answer terms.
+    fn context_searches(&self, query: &str, limit: usize) -> ContextSearches {
+        let terms_started = std::time::Instant::now();
+        let term_hits =
+            self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+        crate::timing::stage("context.search_terms", terms_started, || {
+            format!("hits={}", term_hits.len())
+        });
+        let prefix_started = std::time::Instant::now();
+        let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+        crate::timing::stage("context.search_prefix", prefix_started, String::new);
+        Ok((hits, term_hits))
+    }
+
+    /// Everything `context` reads from the index once it is up to date, loaded in parallel.
+    fn context_inputs(&self, query: &str, limit: usize) -> ContextInputs {
+        // A resident engine answers from its caches, which is cheaper than starting two threads
+        // to do it. The threads exist to overlap the cold loads with the searches.
+        let resident = self.inner.graph_cache.lock().unwrap().is_some()
+            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
+        if resident {
+            let graph = self.graph();
+            let symbol_runtime = self.symbol_meta_runtime();
+            return ContextInputs {
+                searches: self.context_searches(query, limit),
+                graph,
+                symbol_runtime,
+            };
+        }
+        std::thread::scope(|scope| {
+            let graph = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let opened = self.graph();
+                crate::timing::stage("context.worker_graph", started, String::new);
+                opened
+            });
+            let symbol_runtime = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let runtime = self.symbol_meta_runtime();
+                crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                runtime
+            });
+            let searches = self.context_searches(query, limit);
+            ContextInputs {
+                searches,
+                graph: graph
+                    .join()
+                    .map_err(|_| EngineError::Search("context graph worker panicked".into()))
+                    .and_then(|result| result),
+                symbol_runtime: symbol_runtime
+                    .join()
+                    .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
+                    .and_then(|result| result),
+            }
+        })
+    }
+
+    /// Starts loading `context`'s inputs before the sync, for an engine that has to load them.
+    ///
+    /// The sync is `git status` (tens of milliseconds on a big tree) and almost always finds the
+    /// index current, in which case what was loaded meanwhile is exactly what the sync would have
+    /// let it load -- and the loads, the slowest part of a cold call, are done by the time git
+    /// answers. When the sync does publish a generation the result is discarded by `settle`.
+    fn speculate_context_inputs(&self, query: &str, limit: usize) -> Option<SpeculatedInputs> {
+        let resident = self.inner.graph_cache.lock().unwrap().is_some()
+            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
+        if resident || !self.config.sync.auto {
+            return None;
+        }
+        let generation = self.storage().current_generation().ok().flatten();
+        let engine = Arc::new(self.clone());
+        let owned_query = query.to_owned();
+        let graph = {
+            let engine = Arc::clone(&engine);
+            std::thread::Builder::new()
+                .name("ravel-ctx-graph".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let opened = engine.graph();
+                    crate::timing::stage("context.worker_graph", started, String::new);
+                    opened
+                })
+                .ok()?
+        };
+        let symbol_runtime = {
+            let engine = Arc::clone(&engine);
+            std::thread::Builder::new()
+                .name("ravel-ctx-symbols".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let runtime = engine.symbol_meta_runtime();
+                    crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                    runtime
+                })
+                .ok()?
+        };
+        let searches = std::thread::Builder::new()
+            .name("ravel-ctx-search".into())
+            .spawn(move || engine.context_searches(&owned_query, limit))
+            .ok()?;
+        Some(SpeculatedInputs {
+            generation,
+            graph,
+            symbol_runtime,
+            searches,
+        })
+    }
+
     /// Index health for agents. Cheap: does not spawn git status.
     /// Why an empty answer from this index might not mean "nothing references it". `authoritative_zero`
     /// used to report only that a name resolved, which says the question was *asked*, not that the
@@ -3072,63 +3225,19 @@ impl WorkspaceEngine {
         /// agents. Totals beyond this must route to the paginated walk.
         const CONTEXT_RELATION_LIMIT_MAX: usize = 50;
         let context_started = std::time::Instant::now();
+        let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
         let coverage_walk = self.prefetch_coverage_probe();
+        let speculation = self.speculate_context_inputs(query, limit);
         let synced = self.auto_sync_if_dirty()?;
         let after_sync = std::time::Instant::now();
         crate::timing::stage("context.sync", context_started, String::new);
-        let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
-        // Use raw paths — auto_sync already ran. Context combines deterministic spelling
-        // lookup with definition-level term evidence: a one-word concept may occur in a path or
-        // qualified name, while prose intent words must not turn the query into a hard AND.
-        let run_searches = || {
-            // Terms first: the first search opens the index, and one opened for terms serves the
-            // spelling search too, while one opened for spellings has to be opened again (the
-            // whole pack directory, decoded a second time) before it can answer terms.
-            let terms_started = std::time::Instant::now();
-            let term_hits =
-                self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
-            crate::timing::stage("context.search_terms", terms_started, || {
-                format!("hits={}", term_hits.len())
-            });
-            let prefix_started = std::time::Instant::now();
-            let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
-            crate::timing::stage("context.search_prefix", prefix_started, String::new);
-            Ok::<_, EngineError>((hits, term_hits))
-        };
-        // A resident engine answers both from its caches, which is cheaper than starting two
-        // threads to do it. The threads exist to overlap the cold loads with the searches.
-        let resident = self.inner.graph_cache.lock().unwrap().is_some()
-            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
-        let (searches, eager_graph, eager_symbol_runtime) = if resident {
-            let graph = self.graph();
-            let symbol_runtime = self.symbol_meta_runtime();
-            (run_searches(), graph, symbol_runtime)
-        } else {
-            std::thread::scope(|scope| {
-                let graph = scope.spawn(|| {
-                    let started = std::time::Instant::now();
-                    let opened = self.graph();
-                    crate::timing::stage("context.worker_graph", started, String::new);
-                    opened
-                });
-                let symbol_runtime = scope.spawn(|| {
-                    let started = std::time::Instant::now();
-                    let runtime = self.symbol_meta_runtime();
-                    crate::timing::stage("context.worker_symbol_meta", started, String::new);
-                    runtime
-                });
-                let searches = run_searches();
-                let graph = graph
-                    .join()
-                    .map_err(|_| EngineError::Search("context graph worker panicked".into()))
-                    .and_then(|result| result);
-                let symbol_runtime = symbol_runtime
-                    .join()
-                    .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
-                    .and_then(|result| result);
-                (searches, graph, symbol_runtime)
-            })
-        };
+        let ContextInputs {
+            searches,
+            graph: eager_graph,
+            symbol_runtime: eager_symbol_runtime,
+        } = speculation
+            .and_then(|speculation| speculation.settle(self))
+            .unwrap_or_else(|| self.context_inputs(query, limit));
         let (mut hits, term_hits) = searches?;
         let mut term_hits = term_hits;
         if let Ok(graph) = &eager_graph {
@@ -5197,6 +5306,57 @@ mod agent_context_tests {
             .into_iter()
             .any(|hit| hit.value == "beta");
         assert!(found, "symbol added after the index was not picked up");
+    }
+
+    /// A process that has loaded nothing starts reading the index while its sync still waits on
+    /// git. When that sync publishes a generation, what was read describes the tree it replaced,
+    /// and answering from it would miss the very edit the sync just indexed.
+    #[test]
+    fn context_discards_what_it_loaded_before_a_sync_that_published() {
+        let root = tempfile::tempdir().unwrap();
+        let service = root.path().join("service.ts");
+        std::fs::write(&service, "export function alpha() { return 1; }\n").unwrap();
+        for command in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&command)
+                .current_dir(root.path())
+                .status()
+                .expect("git must be available for this test");
+            assert!(status.success(), "git {command:?} failed");
+        }
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        std::fs::write(
+            &service,
+            "export function alpha() { return 1; }\nexport function betaMarker() { return 2; }\n",
+        )
+        .unwrap();
+
+        // A fresh engine has no caches, so its context call loads ahead of the sync.
+        let cold = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let found = cold.context("betaMarker", 10).unwrap();
+        assert_eq!(found["auto_synced"], true, "{found:#}");
+        assert_eq!(found["primary"], "betaMarker", "{found:#}");
+        assert_eq!(found["detail"]["name"], "betaMarker", "{found:#}");
+
+        // The caches are warm now and the tree is settled: the same answer, nothing to sync.
+        let again = cold.context("betaMarker", 10).unwrap();
+        assert_eq!(again["auto_synced"], false, "{again:#}");
+        assert_eq!(again["detail"], found["detail"]);
     }
 
     #[test]
