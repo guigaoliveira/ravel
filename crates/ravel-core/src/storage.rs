@@ -2143,7 +2143,7 @@ pub struct FileSnapshotStorage {
 type CachedArtifactIndex = (String, Vec<String>, Option<Arc<ArtifactIndex>>);
 
 pub(crate) struct PackedSymbolMeta {
-    pub(crate) reader: GenerationPackReader,
+    pub(crate) reader: Arc<GenerationPackReader>,
     pub(crate) index: SymbolMetaShardIndex,
     pub(crate) overlays: Vec<SymbolMetaOverlay>,
     pub(crate) generation_guard: crate::generation_gc::GenerationGuard,
@@ -2428,12 +2428,10 @@ impl FileSnapshotStorage {
         }
         let path = self.root.join(pack_name);
         let reader =
-            Arc::new(
-                GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
-                    path: path.clone(),
-                    message: error.to_string(),
-                })?,
-            );
+            GenerationPackReader::open_shared(&path).map_err(|error| StorageError::Invalid {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
         self.pack_readers
             .lock()
             .unwrap()
@@ -4829,12 +4827,12 @@ impl FileSnapshotStorage {
             && let Some((pack, symbol_key)) = symbol_reference.split_once('#')
         {
             let path = self.root.join(pack);
-            let reader = Arc::new(GenerationPackReader::open(&path).map_err(|error| {
+            let reader = GenerationPackReader::open_shared(&path).map_err(|error| {
                 StorageError::Invalid {
                     path: path.clone(),
                     message: error.to_string(),
                 }
-            })?);
+            })?;
             let mut index = SearchIndex::from_packed_dict(
                 Arc::clone(&reader),
                 symbol_key.to_owned(),
@@ -4847,14 +4845,12 @@ impl FileSnapshotStorage {
                 let term_reader = if term_pack == pack {
                     Arc::clone(&reader)
                 } else {
-                    Arc::new(
-                        GenerationPackReader::open(self.root.join(term_pack)).map_err(|error| {
-                            StorageError::Invalid {
-                                path: self.root.join(term_pack),
-                                message: error.to_string(),
-                            }
-                        })?,
-                    )
+                    GenerationPackReader::open_shared(self.root.join(term_pack)).map_err(
+                        |error| StorageError::Invalid {
+                            path: self.root.join(term_pack),
+                            message: error.to_string(),
+                        },
+                    )?
                 };
                 index =
                     index.with_packed_terms(term_reader, term_key.to_owned(), MAX_COMPONENT_BYTES);
@@ -4881,12 +4877,13 @@ impl FileSnapshotStorage {
         let mut index = SearchIndex::from_parts(dict, terms);
         if let Some((pack, key)) = packed_terms {
             let path = self.root.join(pack);
-            let reader =
-                GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+            let reader = GenerationPackReader::open_shared(&path).map_err(|error| {
+                StorageError::Invalid {
                     path: path.clone(),
                     message: error.to_string(),
-                })?;
-            index = index.with_packed_terms(Arc::new(reader), key.to_owned(), MAX_COMPONENT_BYTES);
+                }
+            })?;
+            index = index.with_packed_terms(reader, key.to_owned(), MAX_COMPONENT_BYTES);
         }
         Ok(Some(
             index
@@ -4973,11 +4970,12 @@ impl FileSnapshotStorage {
         };
         let path = self.root.join(self.component_ref_path(name));
         let mut meta = if let Some((_, record)) = name.split_once('#') {
-            let reader =
-                GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
+            let reader = GenerationPackReader::open_shared(&path).map_err(|error| {
+                StorageError::Invalid {
                     path: path.clone(),
                     message: error.to_string(),
-                })?;
+                }
+            })?;
             let Some(result) = reader
                 .with_record_for_validation(record, MAX_COMPONENT_BYTES, |bytes| {
                     let archived = rkyv::access::<
@@ -5053,10 +5051,11 @@ impl FileSnapshotStorage {
             return Ok(None);
         };
         let path = self.root.join(pack_name);
-        let reader = GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
+        let reader =
+            GenerationPackReader::open_shared(&path).map_err(|error| StorageError::Invalid {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
         let index = reader
             .with_record(record, MAX_COMPONENT_BYTES, |bytes| {
                 bincode::deserialize::<SymbolMetaShardIndex>(bytes)

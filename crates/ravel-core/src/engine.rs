@@ -149,7 +149,7 @@ enum SymbolMetaBackend {
 
 #[derive(Debug)]
 struct PackedSymbolMetaBackend {
-    reader: crate::generation_pack::GenerationPackReader,
+    reader: Arc<crate::generation_pack::GenerationPackReader>,
     index: crate::model::SymbolMetaShardIndex,
     removed_ids: BTreeSet<String>,
     removed_digests: BTreeSet<[u8; 32]>,
