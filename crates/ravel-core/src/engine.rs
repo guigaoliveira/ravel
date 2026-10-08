@@ -2867,6 +2867,26 @@ impl WorkspaceEngine {
             .all(|key| degradation[key].as_u64() == Some(0))
     }
 
+    /// Starts the coverage walk behind `degradation` on its own thread, for a process that has
+    /// not run it yet.
+    ///
+    /// A fresh process -- every CLI call -- walks up to 20,000 directory entries to fill that
+    /// cache, which came after the searches on the critical path although it needs nothing from
+    /// them or from the sync. Started first, it overlaps the `git status` the sync waits on and
+    /// the cold index loads. A resident engine already holds the answer and spawns nothing.
+    fn prefetch_coverage_probe(&self) -> Option<std::thread::JoinHandle<()>> {
+        if self.inner.unsupported_sources.lock().unwrap().is_some() {
+            return None;
+        }
+        let engine = self.clone();
+        std::thread::Builder::new()
+            .name("ravel-coverage".into())
+            .spawn(move || {
+                let _ = engine.unsupported_sources_cached();
+            })
+            .ok()
+    }
+
     /// Index health for agents. Cheap: does not spawn git status.
     /// Why an empty answer from this index might not mean "nothing references it". `authoritative_zero`
     /// used to report only that a name resolved, which says the question was *asked*, not that the
@@ -3052,6 +3072,7 @@ impl WorkspaceEngine {
         /// agents. Totals beyond this must route to the paginated walk.
         const CONTEXT_RELATION_LIMIT_MAX: usize = 50;
         let context_started = std::time::Instant::now();
+        let coverage_walk = self.prefetch_coverage_probe();
         let synced = self.auto_sync_if_dirty()?;
         let after_sync = std::time::Instant::now();
         crate::timing::stage("context.sync", context_started, String::new);
@@ -3060,15 +3081,18 @@ impl WorkspaceEngine {
         // lookup with definition-level term evidence: a one-word concept may occur in a path or
         // qualified name, while prose intent words must not turn the query into a hard AND.
         let run_searches = || {
-            let prefix_started = std::time::Instant::now();
-            let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
-            crate::timing::stage("context.search_prefix", prefix_started, String::new);
+            // Terms first: the first search opens the index, and one opened for terms serves the
+            // spelling search too, while one opened for spellings has to be opened again (the
+            // whole pack directory, decoded a second time) before it can answer terms.
             let terms_started = std::time::Instant::now();
             let term_hits =
                 self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
             crate::timing::stage("context.search_terms", terms_started, || {
                 format!("hits={}", term_hits.len())
             });
+            let prefix_started = std::time::Instant::now();
+            let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+            crate::timing::stage("context.search_prefix", prefix_started, String::new);
             Ok::<_, EngineError>((hits, term_hits))
         };
         // A resident engine answers both from its caches, which is cheaper than starting two
@@ -3458,6 +3482,9 @@ impl WorkspaceEngine {
         // Read once for both the degradation signals and the snapshot id below.
         let stats = self.stats().ok();
         let degradation = self.degradation_given(stats.as_ref());
+        if let Some(walk) = coverage_walk {
+            let _ = walk.join();
+        }
         let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
