@@ -863,7 +863,7 @@ fn reference_sites(
         return Ok(value);
     }
     let engine = WorkspaceEngine::load(root, &Flags::default())?;
-    Ok(engine.reference_sites_with(
+    let page = engine.reference_sites_with(
         node,
         reverse,
         page_size,
@@ -872,7 +872,11 @@ fn reference_sites(
             scope,
             rollup: rollup_mode,
         },
-    )?)
+    )?;
+    // The process prints this page and exits. Tearing the index down first -- on a large workspace
+    // that is hundreds of thousands of small strings -- only delays the answer; the OS reclaims it.
+    std::mem::forget(engine);
+    Ok(page)
 }
 
 fn daemon_call_if_running(
