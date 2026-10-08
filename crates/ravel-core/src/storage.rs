@@ -4803,6 +4803,8 @@ impl FileSnapshotStorage {
                         path: path.clone(),
                         message: format!("missing pack record {graph_record}"),
                     })?;
+                // The index owns everything it took from the archive.
+                reader.release_record(graph_record);
                 crate::timing::stage("graph.open.archive", open_started, String::new);
                 if graph.snapshot_id() == self.component_snapshot_id(&manifest).stable_key() {
                     let mut graph = graph;

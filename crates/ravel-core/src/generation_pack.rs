@@ -522,6 +522,30 @@ impl GenerationPackReader {
         Ok(Some(read(&plain)))
     }
 
+    /// Drop this mapping's resident pages of `key`, for a caller that has turned the record into
+    /// owned data and will not read it again. A reader opened per loader released them with its
+    /// mapping; one shared by every loader of a long-lived process (the daemon) keeps them beside
+    /// the copy -- on the 20k-file corpus the graph record alone held 72 MB of the pack resident.
+    pub(crate) fn release_record(&self, key: &str) {
+        #[cfg(unix)]
+        if let Some(entry) = self.entry(key)
+            && entry.offset.saturating_add(entry.len) <= self.directory_offset
+        {
+            // SAFETY: a read-only shared mapping of a pack no writer modifies: dropping its pages
+            // only makes the next access to them fault them in again from the page cache,
+            // unchanged, for this reader or any other holding the same mapping.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    entry.offset as usize,
+                    entry.len as usize,
+                )
+            };
+        }
+        #[cfg(not(unix))]
+        let _ = key;
+    }
+
     /// Borrow a bounded record without recomputing its blake3 checksum. The consumer must fully
     /// validate the record format before interpreting it; this is intended for bytecheck/rkyv
     /// hot paths. `ravel validate` still verifies the stored checksum separately.
@@ -996,6 +1020,47 @@ mod tests {
         let mut writer = StreamingGenerationPackWriter::new(path).unwrap();
         writer.add("value", value).unwrap();
         writer.publish().unwrap();
+    }
+
+    /// Releasing a record's pages is only a hint about residency: every holder of the shared
+    /// mapping, and the releasing one itself, still reads the record as it was written.
+    #[test]
+    fn a_released_record_reads_back_unchanged_through_the_shared_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        // Incompressible and several pages long, so the record is stored raw and spans whole pages.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let payload: Vec<u8> = (0..(3 << 20))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        write_pack(&path, &payload);
+
+        let loader = GenerationPackReader::open_shared(&path).unwrap();
+        let other = GenerationPackReader::open_shared(&path).unwrap();
+        let limit = payload.len() as u64;
+        let copied = loader
+            .with_record_for_validation("value", limit, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        loader.release_record("value");
+        loader.release_record("missing");
+        assert_eq!(copied, payload);
+        for reader in [&loader, &other] {
+            let again = reader
+                .with_record_for_validation("value", limit, <[u8]>::to_vec)
+                .unwrap()
+                .unwrap();
+            assert!(
+                again == payload,
+                "released pages must fault back in unchanged"
+            );
+        }
+        assert_eq!(other.read("value", limit).unwrap().unwrap(), payload);
     }
 
     #[test]
