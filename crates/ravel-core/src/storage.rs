@@ -2435,7 +2435,8 @@ impl FileSnapshotStorage {
             .write(true)
             .open(&path)
             .map_err(|source| self.io(source, path.clone()))?;
-        fs4::fs_std::FileExt::lock_shared(&file).map_err(|source| self.io(source, path))?;
+        crate::generation_gc::lock_shared_without_queueing(&file)
+            .map_err(|source| self.io(source, path))?;
         Ok(file)
     }
 

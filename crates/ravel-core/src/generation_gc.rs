@@ -49,9 +49,33 @@ impl GenerationGuard {
         if exclusive {
             FileExt::lock_exclusive(&file)?;
         } else {
-            FileExt::lock_shared(&file)?;
+            lock_shared_without_queueing(&file)?;
         }
         Ok(Self { _file: file })
+    }
+}
+
+/// Take a shared lock by retrying a non-blocking attempt rather than sleeping in the kernel's
+/// queue for it.
+///
+/// macOS does not wake every waiter when an exclusive `flock` is released: it wakes one and queues
+/// the others behind the lock that one is granted. Readers that arrived together behind a GC pass
+/// -- a cold `context` starts three -- then sleep for as long as the first keeps its shared lock,
+/// and a cached search index or symbol table keeps it for the life of the process. The daemon hung
+/// that way, every reader thread in `flock(LOCK_SH)` with no exclusive holder left. The exclusive
+/// holders (generation GC, artifact compaction) only ever try their lock and keep it for
+/// milliseconds, so retrying costs nothing a query can measure.
+pub(crate) fn lock_shared_without_queueing(file: &fs::File) -> io::Result<()> {
+    let mut pause = std::time::Duration::from_micros(200);
+    loop {
+        match FileExt::try_lock_shared(file) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(10));
     }
 }
 
@@ -121,6 +145,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Readers that queued behind an exclusive holder all get in once it lets go, even though each
+    /// keeps its lock afterwards. Sleeping in `flock` for it, macOS let one through and left the
+    /// others queued behind that one's lock for as long as it was held.
+    #[test]
+    fn readers_queued_behind_an_exclusive_lock_all_enter_while_each_stays_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let exclusive = GenerationGuard::exclusive(dir.path()).unwrap();
+        let (entered, arrivals) = mpsc::channel();
+        let release = Arc::new(Barrier::new(4));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let root = dir.path().to_path_buf();
+                let entered = entered.clone();
+                let release = release.clone();
+                std::thread::spawn(move || {
+                    let _shared = GenerationGuard::shared(&root).unwrap();
+                    entered.send(()).unwrap();
+                    release.wait();
+                })
+            })
+            .collect();
+        // Long enough for every reader to be waiting on the exclusive holder.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(arrivals.try_recv().is_err(), "a reader got past a writer");
+        drop(exclusive);
+        for reader in 0..3 {
+            arrivals
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("reader {reader} of 3 never got its shared lock"));
+        }
+        release.wait();
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 
     #[test]
