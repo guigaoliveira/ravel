@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-09
+
 The calls an agent makes every turn got cheaper in CPU and memory, with every
 answer byte-identical to 1.18.0's. Measured on the 20,040-file synthetic corpus
 with `scripts/ab_verify.py`.
