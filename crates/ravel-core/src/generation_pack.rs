@@ -10,7 +10,10 @@ use std::{
     fs,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
@@ -288,26 +291,103 @@ struct DirectoryEntry {
     entry: Entry,
 }
 
+/// Which file a registered reader maps. The inode tells a pack replaced by rename from the one a
+/// reader holds; length and modification time tell one rewritten in place under the same name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackIdentity {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl PackIdentity {
+    fn of(path: &Path, metadata: &fs::Metadata) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+        }
+    }
+}
+
+/// One slot per pack this process has mapped. The slot is locked while its reader is built, so
+/// loaders racing for the same pack open it once and the rest wait for that result.
+type PackSlot = Arc<Mutex<Weak<GenerationPackReader>>>;
+
+/// Packs mapped by this process. Weak, so a pack still unmaps when its last user lets go.
+static OPEN_PACKS: Mutex<Vec<(PackIdentity, PackSlot)>> = Mutex::new(Vec::new());
+
 impl GenerationPackReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PackError> {
         let path = path.as_ref().to_path_buf();
-        let file = fs::File::open(&path).map_err(|source| PackError::Io {
-            path: path.clone(),
+        let (file, metadata) = Self::open_file(&path)?;
+        Self::map(path, &file, metadata.len())
+    }
+
+    /// [`open`](Self::open), except that a pack some other loader of this process has already
+    /// mapped and still holds is reused instead of mapped, hashed and decoded again.
+    ///
+    /// A cold query opens the same pack several times over -- the symbol dictionary, the term
+    /// index, the graph and the symbol metadata each live in it, and each loader used to pay for
+    /// the directory (a checksum and a decode proportional to the record count) on its own. The
+    /// pack is immutable and every holder keeps its own generation guard, so sharing the mapping
+    /// changes no lifetime: the last holder still unmaps it.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>, PackError> {
+        let path = path.as_ref().to_path_buf();
+        let (file, metadata) = Self::open_file(&path)?;
+        let identity = PackIdentity::of(&path, &metadata);
+        let slot = {
+            let mut packs = OPEN_PACKS.lock().unwrap_or_else(|e| e.into_inner());
+            // Forget packs nobody holds any more, so the list stays as long as the live set.
+            packs.retain(|(_, slot)| {
+                slot.try_lock().map_or(true, |weak| {
+                    weak.strong_count() > 0 || Arc::strong_count(slot) > 1
+                })
+            });
+            match packs.iter().find(|(known, _)| *known == identity) {
+                Some((_, slot)) => Arc::clone(slot),
+                None => {
+                    let slot = PackSlot::default();
+                    packs.push((identity, Arc::clone(&slot)));
+                    slot
+                }
+            }
+        };
+        let mut weak = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reader) = weak.upgrade() {
+            return Ok(reader);
+        }
+        let reader = Arc::new(Self::map(path, &file, metadata.len())?);
+        *weak = Arc::downgrade(&reader);
+        Ok(reader)
+    }
+
+    fn open_file(path: &Path) -> Result<(fs::File, fs::Metadata), PackError> {
+        let file = fs::File::open(path).map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
             source,
         })?;
-        let file_len = file
-            .metadata()
-            .map_err(|source| PackError::Io {
-                path: path.clone(),
-                source,
-            })?
-            .len();
+        let metadata = file.metadata().map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok((file, metadata))
+    }
+
+    fn map(path: PathBuf, file: &fs::File, file_len: u64) -> Result<Self, PackError> {
         if file_len < HEADER_LEN + FOOTER_LEN {
             return invalid(&path, "truncated header/footer");
         }
         // SAFETY: the immutable generation file is protected by a generation lease while any
         // reader is alive. Writers publish a new path and never modify a referenced pack.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|source| PackError::Io {
+        let mmap = unsafe { Mmap::map(file) }.map_err(|source| PackError::Io {
             path: path.clone(),
             source,
         })?;
@@ -440,6 +520,30 @@ impl GenerationPackReader {
         }
         let plain = decompress_record(bytes, entry.plain_len, &self.path)?;
         Ok(Some(read(&plain)))
+    }
+
+    /// Drop this mapping's resident pages of `key`, for a caller that has turned the record into
+    /// owned data and will not read it again. A reader opened per loader released them with its
+    /// mapping; one shared by every loader of a long-lived process (the daemon) keeps them beside
+    /// the copy -- on the 20k-file corpus the graph record alone held 72 MB of the pack resident.
+    pub(crate) fn release_record(&self, key: &str) {
+        #[cfg(unix)]
+        if let Some(entry) = self.entry(key)
+            && entry.offset.saturating_add(entry.len) <= self.directory_offset
+        {
+            // SAFETY: a read-only shared mapping of a pack no writer modifies: dropping its pages
+            // only makes the next access to them fault them in again from the page cache,
+            // unchanged, for this reader or any other holding the same mapping.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    entry.offset as usize,
+                    entry.len as usize,
+                )
+            };
+        }
+        #[cfg(not(unix))]
+        let _ = key;
     }
 
     /// Borrow a bounded record without recomputing its blake3 checksum. The consumer must fully
@@ -910,6 +1014,135 @@ mod tests {
         bytes[directory_offset] ^= 1;
         fs::write(&path, bytes).unwrap();
         assert!(GenerationPackReader::open(path).is_err());
+    }
+
+    fn write_pack(path: &Path, value: &[u8]) {
+        let mut writer = StreamingGenerationPackWriter::new(path).unwrap();
+        writer.add("value", value).unwrap();
+        writer.publish().unwrap();
+    }
+
+    /// Releasing a record's pages is only a hint about residency: every holder of the shared
+    /// mapping, and the releasing one itself, still reads the record as it was written.
+    #[test]
+    fn a_released_record_reads_back_unchanged_through_the_shared_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        // Incompressible and several pages long, so the record is stored raw and spans whole pages.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let payload: Vec<u8> = (0..(3 << 20))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        write_pack(&path, &payload);
+
+        let loader = GenerationPackReader::open_shared(&path).unwrap();
+        let other = GenerationPackReader::open_shared(&path).unwrap();
+        let limit = payload.len() as u64;
+        let copied = loader
+            .with_record_for_validation("value", limit, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        loader.release_record("value");
+        loader.release_record("missing");
+        assert_eq!(copied, payload);
+        for reader in [&loader, &other] {
+            let again = reader
+                .with_record_for_validation("value", limit, <[u8]>::to_vec)
+                .unwrap()
+                .unwrap();
+            assert!(
+                again == payload,
+                "released pages must fault back in unchanged"
+            );
+        }
+        assert_eq!(other.read("value", limit).unwrap().unwrap(), payload);
+    }
+
+    #[test]
+    fn loaders_of_one_pack_share_a_reader_for_as_long_as_one_is_held() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"first");
+
+        let first = GenerationPackReader::open_shared(&path).unwrap();
+        let second = GenerationPackReader::open_shared(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "one mapping, not two");
+        assert_eq!(second.read("value", 8).unwrap().unwrap(), b"first");
+
+        // Sharing never extends a mapping: once the last holder lets go the registry keeps nothing
+        // alive, and the next loader maps the pack afresh.
+        drop((first, second));
+        let still_mapped = |path: &Path| {
+            OPEN_PACKS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(identity, slot)| {
+                    identity.path == path && slot.lock().unwrap().strong_count() > 0
+                })
+                .count()
+        };
+        assert_eq!(still_mapped(&path), 0);
+        let reopened = GenerationPackReader::open_shared(&path).unwrap();
+        assert_eq!(reopened.read("value", 8).unwrap().unwrap(), b"first");
+        assert_eq!(still_mapped(&path), 1);
+    }
+
+    #[test]
+    fn a_pack_replaced_under_the_same_name_is_never_served_from_the_old_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"old");
+        let held = GenerationPackReader::open_shared(&path).unwrap();
+
+        // Publication is a rename onto the live name; the old inode stays mapped by `held`.
+        let staged = dir.path().join("staged.pack");
+        write_pack(&staged, b"new-and-longer");
+        fs::rename(&staged, &path).unwrap();
+
+        let current = GenerationPackReader::open_shared(&path).unwrap();
+        assert!(!Arc::ptr_eq(&held, &current));
+        assert_eq!(held.read("value", 32).unwrap().unwrap(), b"old");
+        assert_eq!(
+            current.read("value", 32).unwrap().unwrap(),
+            b"new-and-longer"
+        );
+    }
+
+    #[test]
+    fn concurrent_loaders_open_a_pack_once_and_a_bad_pack_fails_each_of_them() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"shared");
+        let readers: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| GenerationPackReader::open_shared(&path).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+        );
+        drop(readers);
+
+        let corrupt = dir.path().join("corrupt.pack");
+        fs::write(
+            &corrupt,
+            b"not a pack at all, but longer than a header and a footer",
+        )
+        .unwrap();
+        assert!(GenerationPackReader::open_shared(&corrupt).is_err());
+        assert!(
+            GenerationPackReader::open_shared(&corrupt).is_err(),
+            "a failed open leaves nothing behind that a retry could mistake for success"
+        );
     }
 
     #[test]

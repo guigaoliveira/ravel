@@ -85,6 +85,12 @@ type CoverageProbe = (
     Arc<(BTreeMap<String, usize>, usize, bool)>,
 );
 
+/// Long enough that a burst of tool calls walks once, short enough that a
+/// workspace gaining a new language is noticed within the same session.
+const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Entries a coverage walk visits before it stops and says it was cut short.
+const COVERAGE_WALK_BUDGET: usize = 20_000;
+
 #[derive(Debug)]
 struct EngineInner {
     snapshot_cache: Mutex<Option<Arc<IndexSnapshot>>>,
@@ -104,6 +110,9 @@ struct EngineInner {
     /// files exist on disk, which has nothing to do with which index generation is
     /// published, so invalidating it on publish re-walked for no reason.
     unsupported_sources: Mutex<Option<CoverageProbe>>,
+    /// The one number of that walk `degradation` reads -- how many component-format sources it saw --
+    /// under the same TTL, so answering a relation query does not run the full probe.
+    component_sources: Mutex<Option<(std::time::Instant, usize)>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -114,7 +123,7 @@ struct EngineInner {
     >,
     config_hash: String,
     /// Debounce dirty discovery for concurrent tool calls in the same warm MCP tick.
-    dirty_cache: Mutex<Option<(std::time::Instant, Vec<PathBuf>)>>,
+    dirty_cache: Mutex<Option<DirtyListing>>,
     /// Serialize full and incremental publications from MCP watchers and tool calls.
     update_lock: Mutex<()>,
     /// Most recent background/explicit update failure. Queries may keep serving the last
@@ -125,6 +134,23 @@ struct EngineInner {
     structural_cache: Mutex<Option<(String, Arc<StructuralPackReader>)>>,
     /// Coalesce best-effort generation cleanup outside agent-facing sync latency.
     maintenance_scheduled: AtomicBool,
+    /// The daemon's file watcher, when this engine has one: lets a query learn that nothing changed
+    /// since the last full check without asking git. See [`crate::watch::WatchGate`].
+    watch_gate: Mutex<Option<Arc<crate::watch::WatchGate>>>,
+    /// Dirty checks the watcher answered without asking git.
+    quiet_checks: AtomicU64,
+    /// The decoded artifact index, left for the next storage handle (see [`Self::storage`]).
+    artifact_index: crate::storage::SharedArtifactIndex,
+}
+
+/// A whole-tree listing of dirty sources, remembered for a few milliseconds.
+#[derive(Debug)]
+struct DirtyListing {
+    /// When git was asked. A listing says nothing about edits made after this moment.
+    asked: std::time::Instant,
+    /// When it was remembered, which is what its few milliseconds are counted from.
+    kept: std::time::Instant,
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -140,10 +166,10 @@ enum SymbolMetaBackend {
 
 #[derive(Debug)]
 struct PackedSymbolMetaBackend {
-    reader: crate::generation_pack::GenerationPackReader,
+    reader: Arc<crate::generation_pack::GenerationPackReader>,
     index: crate::model::SymbolMetaShardIndex,
     removed_ids: BTreeSet<String>,
-    removed_digests: BTreeSet<[u8; 32]>,
+    removed_digests: FxHashSet<[u8; 32]>,
     upserts: FxHashMap<String, crate::model::SymbolMeta>,
     /// Shards whose archive has already been validated in this process. Entries are
     /// borrowed from the mmap, so nothing decoded needs caching — only the fact that
@@ -152,6 +178,52 @@ struct PackedSymbolMetaBackend {
     validated_name_shards: Mutex<FxHashMap<u8, ()>>,
     validated_qualified_shards: Mutex<FxHashMap<u8, ()>>,
     _generation_guard: crate::generation_gc::GenerationGuard,
+}
+
+impl PackedSymbolMetaBackend {
+    /// Drops the archived locations an overlay removed, keeping the ones it re-added.
+    fn drop_superseded(&self, locations: &mut Vec<crate::model::SymbolMetaLocation>) {
+        // Nothing removed means nothing to test, and a name shared by thousands of files has
+        // thousands of locations.
+        if self.removed_digests.is_empty() {
+            return;
+        }
+        locations.retain(|location| {
+            !self.removed_digests.contains(&location.id_digest)
+                || self.upserts.values().any(|entry| {
+                    blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
+                })
+        });
+    }
+
+    /// Overlay entries the archive does not already list for the same lookup: those `matches`
+    /// accepts whose id is not among `locations`.
+    fn additions_beyond(
+        &self,
+        locations: &[crate::model::SymbolMetaLocation],
+        matches: impl Fn(&crate::model::SymbolMeta) -> bool,
+    ) -> Vec<crate::model::SymbolMeta> {
+        let candidates: Vec<_> = self
+            .upserts
+            .values()
+            .filter(|entry| matches(entry))
+            .collect();
+        if candidates.is_empty() {
+            // The digest set below is the expensive part, and only an overlay entry can use it.
+            return Vec::new();
+        }
+        let location_digests = locations
+            .iter()
+            .map(|location| location.id_digest)
+            .collect::<BTreeSet<_>>();
+        candidates
+            .into_iter()
+            .filter(|entry| {
+                !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl SymbolMetaRuntime {
@@ -201,12 +273,17 @@ impl SymbolMetaRuntime {
     }
 
     fn shard_id(key: &str, shard_bits: u8) -> u8 {
+        Self::shard_of(blake3::hash(key.as_bytes()).as_bytes(), shard_bits)
+    }
+
+    /// The shard of a key from the digest of that key.
+    fn shard_of(digest: &[u8; 32], shard_bits: u8) -> u8 {
         let mask = if shard_bits == 8 {
             u8::MAX
         } else {
             (1u8 << shard_bits) - 1
         };
-        blake3::hash(key.as_bytes()).as_bytes()[0] & mask
+        digest[0] & mask
     }
 
     /// Ceiling for one symbol-meta shard record, matching the bound the previous
@@ -315,12 +392,47 @@ impl SymbolMetaRuntime {
         &self,
         location: crate::model::SymbolMetaLocation,
     ) -> Option<crate::model::SymbolMeta> {
-        let id = self.with_id_shard(location.shard, |archived| {
+        /// What the archived entry a location points at turned into.
+        enum Located {
+            /// It is the definition `get_by_id` would return, so it was decoded right here.
+            Decoded(crate::model::SymbolMeta),
+            /// Something else may answer for this id (an overlay, or a duplicate stored later).
+            Resolve(String),
+        }
+        let SymbolMetaBackend::Packed(packed) = &self.backend else {
+            return None;
+        };
+        let located = self.with_id_shard(location.shard, |archived| {
             let entry = archived.entries.get(location.index as usize)?;
-            (blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest)
-                .then(|| entry.id.as_str().to_owned())
+            let digest = blake3::hash(entry.id.as_bytes());
+            if digest.as_bytes() != &location.id_digest {
+                return None;
+            }
+            let id = entry.id.as_str();
+            // Resolving the id again would find this same entry -- the last one stored under that
+            // id, in the shard that id hashes to, unless an overlay speaks for it -- after hashing
+            // the id a second time and bisecting the shard for it. Name lookups resolve thousands
+            // of locations, so settle the common case from the entry in hand.
+            let is_the_answer = Self::shard_of(digest.as_bytes(), packed.index.shard_bits)
+                == location.shard
+                && !packed.upserts.contains_key(id)
+                && !packed.removed_ids.contains(id)
+                && archived
+                    .entries
+                    .get(location.index as usize + 1)
+                    .is_none_or(|next| next.id.as_str() != id);
+            if is_the_answer {
+                rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(entry)
+                    .ok()
+                    .map(Located::Decoded)
+            } else {
+                Some(Located::Resolve(id.to_owned()))
+            }
         })??;
-        self.get_by_id(&id)
+        match located {
+            Located::Decoded(meta) => Some(meta),
+            Located::Resolve(id) => self.get_by_id(&id),
+        }
     }
 
     fn get_by_id(&self, id: &str) -> Option<crate::model::SymbolMeta> {
@@ -354,6 +466,34 @@ impl SymbolMetaRuntime {
         }
     }
 
+    /// `get_by_id(id).map(|entry| entry.qualified_name)` without decoding the rest of the entry:
+    /// a page of reference sites names every site this way and reads nothing else.
+    fn qualified_name_by_id(&self, id: &str) -> Option<String> {
+        match &self.backend {
+            SymbolMetaBackend::Owned(dict) => {
+                dict.get_by_id(id).map(|entry| entry.qualified_name.clone())
+            }
+            SymbolMetaBackend::Packed(packed) => {
+                if let Some(entry) = packed.upserts.get(id) {
+                    return Some(entry.qualified_name.clone());
+                }
+                if packed.removed_ids.contains(id) {
+                    return None;
+                }
+                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |archived| {
+                    let start = archived
+                        .entries
+                        .partition_point(|entry| entry.id.as_str() < id);
+                    archived.entries[start..]
+                        .iter()
+                        .take_while(|entry| entry.id.as_str() == id)
+                        .last()
+                        .map(|entry| entry.qualified_name.as_str().to_owned())
+                })?
+            }
+        }
+    }
+
     fn entries_for(&self, name: &str, limit: usize) -> (Vec<crate::model::SymbolMeta>, usize) {
         match &self.backend {
             SymbolMetaBackend::Owned(dict) => {
@@ -363,25 +503,8 @@ impl SymbolMetaRuntime {
             }
             SymbolMetaBackend::Packed(packed) => {
                 let mut locations = self.lookup_locations(false, name);
-                locations.retain(|location| {
-                    !packed.removed_digests.contains(&location.id_digest)
-                        || packed.upserts.values().any(|entry| {
-                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
-                        })
-                });
-                let location_digests = locations
-                    .iter()
-                    .map(|location| location.id_digest)
-                    .collect::<BTreeSet<_>>();
-                let additions = packed
-                    .upserts
-                    .values()
-                    .filter(|entry| entry.name == name)
-                    .filter(|entry| {
-                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                packed.drop_superseded(&mut locations);
+                let additions = packed.additions_beyond(&locations, |entry| entry.name == name);
                 let total = locations.len() + additions.len();
                 let mut result = locations
                     .into_iter()
@@ -417,25 +540,9 @@ impl SymbolMetaRuntime {
             }
             SymbolMetaBackend::Packed(packed) => {
                 let mut locations = self.lookup_locations(true, query);
-                locations.retain(|location| {
-                    !packed.removed_digests.contains(&location.id_digest)
-                        || packed.upserts.values().any(|entry| {
-                            blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
-                        })
-                });
-                let location_digests = locations
-                    .iter()
-                    .map(|location| location.id_digest)
-                    .collect::<BTreeSet<_>>();
-                let additions = packed
-                    .upserts
-                    .values()
-                    .filter(|entry| entry.qualified_name == query)
-                    .filter(|entry| {
-                        !location_digests.contains(blake3::hash(entry.id.as_bytes()).as_bytes())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                packed.drop_superseded(&mut locations);
+                let additions =
+                    packed.additions_beyond(&locations, |entry| entry.qualified_name == query);
                 let total = locations.len() + additions.len();
                 let mut result = locations
                     .into_iter()
@@ -481,6 +588,48 @@ impl SymbolMetaRuntime {
                     entries,
                 )))
             }
+        }
+    }
+}
+
+/// The hits of `context`'s two searches: by terms, then by spelling.
+type ContextSearches = Result<(Vec<SearchHit>, Vec<SearchHit>), EngineError>;
+
+/// What `context` reads from the index after the sync: its two searches, the graph, and the
+/// symbol metadata.
+struct ContextInputs {
+    searches: ContextSearches,
+    graph: Result<Arc<GraphIndex>, EngineError>,
+    symbol_runtime: Result<Option<Arc<SymbolMetaRuntime>>, EngineError>,
+}
+
+/// `ContextInputs` being loaded on threads that started before the sync, from the generation
+/// that was current then.
+struct SpeculatedInputs {
+    generation: Option<String>,
+    graph: std::thread::JoinHandle<Result<Arc<GraphIndex>, EngineError>>,
+    symbol_runtime: std::thread::JoinHandle<Result<Option<Arc<SymbolMetaRuntime>>, EngineError>>,
+    searches: std::thread::JoinHandle<ContextSearches>,
+}
+
+impl SpeculatedInputs {
+    /// The inputs, unless the index moved to another generation while they loaded -- then they
+    /// describe a tree the sync has replaced and the caller loads them again. Every thread is
+    /// joined either way, so none outlives the call holding the old generation open.
+    fn settle(self, engine: &WorkspaceEngine) -> Option<ContextInputs> {
+        let (graph, symbol_runtime, searches) = (
+            self.graph.join(),
+            self.symbol_runtime.join(),
+            self.searches.join(),
+        );
+        let unchanged = engine.storage().current_generation().ok().flatten() == self.generation;
+        match (graph, symbol_runtime, searches) {
+            (Ok(graph), Ok(symbol_runtime), Ok(searches)) if unchanged => Some(ContextInputs {
+                searches,
+                graph,
+                symbol_runtime,
+            }),
+            _ => None,
         }
     }
 }
@@ -587,16 +736,35 @@ fn symbol_id_path(id: &str) -> Option<&str> {
 /// The directory a site lives in, trimmed to `depth` components. The filename is dropped first: a
 /// path shallower than the depth would otherwise put the file itself in the `prefix` field, so a
 /// root-level `util.ts` came back as a "directory" named `util.ts`.
-fn directory_prefix(path: &str, depth: usize) -> String {
+fn directory_prefix(path: &str, depth: usize) -> &str {
     // `src/a.ts` and `./src/a.ts` are the same directory. Without trimming, the second produced a
     // bucket named `.` that reads as the repo root.
-    let path = path.trim_start_matches("./");
-    let components: Vec<&str> = path.split('/').collect();
-    let directories = &components[..components.len().saturating_sub(1)];
-    if directories.is_empty() {
-        return "(repo root)".to_owned();
+    let mut path = path;
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
     }
-    directories[..directories.len().min(depth)].join("/")
+    // The prefix is a slice of the path: it ends where the `depth`-th directory component does, or
+    // at the last one for a path shallower than that. Joining the components back up would copy it
+    // for every site of a rollup that only counts them.
+    let mut end = None;
+    let mut kept = 0;
+    if depth > 0 {
+        for (index, byte) in path.bytes().enumerate() {
+            if byte == b'/' {
+                end = Some(index);
+                kept += 1;
+                if kept == depth {
+                    break;
+                }
+            }
+        }
+    }
+    match end {
+        Some(end) => &path[..end],
+        // A depth of zero keeps no directory at all, but there was one to keep.
+        None if path.contains('/') => "",
+        None => "(repo root)",
+    }
 }
 
 /// Turn the matched definitions into an outcome, honouring `scope` in every case.
@@ -952,6 +1120,7 @@ impl WorkspaceEngine {
                 symbol_meta_cache: Mutex::new(None),
                 file_hashes_cache: Mutex::new(None),
                 unsupported_sources: Mutex::new(None),
+                component_sources: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 worktree_identity: Mutex::new(None),
                 config_hash,
@@ -961,8 +1130,37 @@ impl WorkspaceEngine {
                 observed_generation: Mutex::new(None),
                 structural_cache: Mutex::new(None),
                 maintenance_scheduled: AtomicBool::new(false),
+                watch_gate: Mutex::new(None),
+                quiet_checks: AtomicU64::new(0),
+                artifact_index: crate::storage::SharedArtifactIndex::default(),
             }),
         })
+    }
+
+    /// Start loading, on a background thread, the graph a relation query (`callers_of`,
+    /// `calls_from`) is certain to ask for. `context` starts its own loads, the symbol metadata and
+    /// searches included.
+    ///
+    /// A one-shot query spends its first stretch waiting for the auto-sync's `git status`, a child
+    /// process the caller only waits on, and only then loads the graph (about 150ms on a 20k-file
+    /// workspace, 25 of them the child). The load does not depend on the answer of git. Should the
+    /// sync publish a new generation after all, the loader notices the changed `CURRENT` and loads
+    /// again, exactly as it does when another request races a sync in the daemon, so a prefetch
+    /// can cost work but cannot serve stale data. The loader holds its cache lock while loading, so
+    /// the query that follows waits for the result instead of repeating it.
+    ///
+    /// The component-source walk `degradation` reads is left on the critical path. Started here
+    /// too it saved 3-14 ms more, but its thread raised the peak RSS of a 2k-file query by 8 MB
+    /// (+24%), and a name that resolves to candidates -- whose answer never reads it -- paid for
+    /// the whole walk.
+    pub fn prefetch_for_relations(&self) {
+        let engine = self.clone();
+        // A failed spawn only forgoes the head start.
+        let _ = std::thread::Builder::new()
+            .name("ravel-prefetch".into())
+            .spawn(move || {
+                let _ = engine.graph();
+            });
     }
 
     fn is_git_repo_cached(&self) -> bool {
@@ -1006,11 +1204,15 @@ impl WorkspaceEngine {
         *cache = Some((fingerprint, identity.clone()));
         identity
     }
+    /// A storage handle for the workspace. Handles are cheap and made per operation, but they all
+    /// leave the decoded artifact index in one place: a long-lived engine decodes it once and then
+    /// only layers on what each sync publishes.
     pub fn storage(&self) -> FileSnapshotStorage {
         FileSnapshotStorage::with_retention(
             self.root.join(&self.config.storage.home),
             self.config.storage.retention,
         )
+        .with_shared_artifact_index(&self.inner.artifact_index)
     }
     pub fn index(&self) -> Result<IndexStats, EngineError> {
         let _guard = self.inner.update_lock.lock().unwrap();
@@ -1516,6 +1718,10 @@ impl WorkspaceEngine {
         if let Some(paths) = only_paths {
             self.validate_sync_paths(paths)?;
         }
+        // One handle for the whole sync. It memoizes the pack readers and the decoded artifact
+        // index, and a fresh handle per phase made each phase open the pack and decode the whole
+        // index again -- three times for a single edited file.
+        let storage = self.storage();
         let paths: Vec<PathBuf> = match only_paths {
             // Explicit paths are still bounded by what a full index would collect. Accepting a
             // gitignored path here makes the index depend on which command ran last: `sync` adds
@@ -1548,26 +1754,13 @@ impl WorkspaceEngine {
                 // A path that is absent from disk *and* absent from the index is not a deletion --
                 // there is nothing to delete. It is a typo, a wrong cwd, or a relative-vs-absolute
                 // slip, and returning whole-index stats for it reads as "synced, you are up to date".
-                let indexed = self.storage().source_hashes_for_paths(
-                    &kept
-                        .iter()
-                        .map(|path| {
-                            let absolute = if path.is_absolute() {
-                                path.to_path_buf()
-                            } else {
-                                self.root.join(path)
-                            };
-                            absolute
-                                .strip_prefix(&self.root)
-                                .unwrap_or(absolute.as_path())
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                        })
-                        .collect::<Vec<_>>(),
-                )?;
-                let phantom: Vec<&PathBuf> = kept
+                //
+                // Only a path that is gone from disk needs the index to settle that. Asking for
+                // every path decoded the whole artifact index to answer a question about files that
+                // are all there.
+                let missing: Vec<(&PathBuf, String)> = kept
                     .iter()
-                    .filter(|path| {
+                    .filter_map(|path| {
                         // Resolve against the workspace, not the process cwd: callers pass relative
                         // paths (the MCP tool does), and testing those against cwd made a brand new
                         // file look nonexistent.
@@ -1577,17 +1770,32 @@ impl WorkspaceEngine {
                             self.root.join(path)
                         };
                         if absolute.exists() {
-                            return false;
+                            return None;
                         }
                         let rel = absolute
                             .strip_prefix(&self.root)
                             .unwrap_or(absolute.as_path())
                             .to_string_lossy()
                             .replace('\\', "/");
-                        // The map answers for every requested path, with `None` when the index has
-                        // no hash for it -- so presence of the key proves nothing.
-                        indexed.get(&rel).and_then(Option::as_ref).is_none()
+                        Some((path, rel))
                     })
+                    .collect();
+                let indexed = if missing.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    storage.source_hashes_for_paths(
+                        &missing
+                            .iter()
+                            .map(|(_, rel)| rel.clone())
+                            .collect::<Vec<_>>(),
+                    )?
+                };
+                let phantom: Vec<&PathBuf> = missing
+                    .iter()
+                    // The map answers for every requested path, with `None` when the index has no
+                    // hash for it -- so presence of the key proves nothing.
+                    .filter(|(_, rel)| indexed.get(rel).and_then(Option::as_ref).is_none())
+                    .map(|(path, _)| *path)
                     .collect();
                 if !phantom.is_empty() && phantom.len() == kept.len() {
                     return Err(EngineError::Unresolved {
@@ -1625,42 +1833,38 @@ impl WorkspaceEngine {
 
         // Read/hash each path once. The prepared bytes are reused below if publication is needed.
         let sync_start = std::time::Instant::now();
-        let (fast_noop, prepared) = self.prepare_paths(&paths)?;
+        let (fast_noop, prepared) = self.prepare_paths(&storage, &paths)?;
         // Any path whose working-tree content differs from HEAD is about to enter the index in that
         // uncommitted form; remember it so a later revert is not mistaken for "nothing changed".
         // Pruned first, so a path that has since gone back to matching stops being carried.
         {
-            let git_dirty: BTreeSet<String> = self
-                .discover_dirty_sources()
-                .iter()
-                .map(|path| {
-                    path.strip_prefix(&self.root)
-                        .unwrap_or(path.as_path())
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                })
-                .collect();
-            let mut recorded = self.dirty_synced();
             let synced_now: BTreeSet<String> = prepared
                 .iter()
                 .map(|prepared| prepared.relative.clone())
                 .collect();
+            // Only the synced paths matter here, so the question goes to git for those alone.
+            let git_dirty = self.dirty_sources_among(&synced_now);
+            let mut recorded = self.dirty_synced();
+            let carried = recorded.clone();
             recorded.retain(|rel| !synced_now.contains(rel) || git_dirty.contains(rel));
             let still_dirty: BTreeSet<String> =
                 synced_now.intersection(&git_dirty).cloned().collect();
             recorded.extend(still_dirty);
-            self.write_dirty_synced(&recorded);
+            // A record that did not change is already on disk; rewriting it cost two fsyncs.
+            if recorded != carried {
+                self.write_dirty_synced(&recorded);
+            }
         }
         crate::timing::stage("sync.prepare_paths", sync_start, || {
             format!("paths={}", paths.len())
         });
         if fast_noop {
-            if let Ok(Some(stats)) = self.storage().open_stats() {
+            if let Ok(Some(stats)) = storage.open_stats() {
                 return Ok(stats);
             }
         }
         let delta_start = std::time::Instant::now();
-        if let Some(stats) = self.try_incremental_delta(&prepared)? {
+        if let Some(stats) = self.try_incremental_delta(&storage, &prepared)? {
             crate::timing::stage("sync.structural_delta.total", delta_start, String::new);
             return Ok(stats);
         }
@@ -1891,9 +2095,9 @@ impl WorkspaceEngine {
     /// publishes component overlays; the full snapshot is reconstructed only on explicit demand.
     fn try_incremental_delta(
         &self,
+        storage: &FileSnapshotStorage,
         prepared: &[PreparedPath],
     ) -> Result<Option<IndexStats>, EngineError> {
-        let storage = self.storage();
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         // Loading the previous artifact and re-parsing the new bytes are both
         // per-file work with no shared state; a burst of edits (or a pull) used
@@ -2421,7 +2625,11 @@ impl WorkspaceEngine {
         Some(artifact)
     }
 
-    fn prepare_paths(&self, paths: &[PathBuf]) -> Result<(bool, Vec<PreparedPath>), EngineError> {
+    fn prepare_paths(
+        &self,
+        storage: &FileSnapshotStorage,
+        paths: &[PathBuf],
+    ) -> Result<(bool, Vec<PreparedPath>), EngineError> {
         if paths.is_empty() {
             return Ok((true, Vec::new()));
         }
@@ -2473,7 +2681,6 @@ impl WorkspaceEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         };
-        let storage = self.storage();
         let generation_started = std::time::Instant::now();
         let has_generation = storage.current_generation()?.is_some();
         crate::timing::stage(
@@ -2738,22 +2945,19 @@ impl WorkspaceEngine {
     }
 
     fn degradation(&self) -> serde_json::Value {
+        self.degradation_given(self.stats().ok().as_ref())
+    }
+
+    /// `degradation` for a caller that has already read the index stats.
+    fn degradation_given(&self, stats: Option<&IndexStats>) -> serde_json::Value {
         let config_problems = crate::resolver::load_tsconfig_reporting(&self.root)
             .problems
             .len();
-        let unparsed_files = self
-            .stats()
-            .ok()
-            .map(|stats| stats.parse_errors)
-            .unwrap_or(0);
+        let unparsed_files = stats.map_or(0, |stats| stats.parse_errors);
         // Only the formats that carry TypeScript. A Python build script or a vendored `.h` does not
         // reference TS symbols, so counting them made every query on any polyglot repo report its
         // zeros as unreliable forever -- destroying the signal in the opposite direction.
-        let probe = self.unsupported_sources_cached();
-        let hidden_references = crate::config::COMPONENT_SOURCE_EXTENSIONS
-            .iter()
-            .filter_map(|extension| probe.0.get(*extension))
-            .sum::<usize>();
+        let hidden_references = self.component_sources_cached();
         serde_json::json!({
             "config_problems": config_problems,
             "unparsed_files": unparsed_files,
@@ -2768,6 +2972,139 @@ impl WorkspaceEngine {
         ["config_problems", "unparsed_files", "unparsed_components"]
             .iter()
             .all(|key| degradation[key].as_u64() == Some(0))
+    }
+
+    /// Starts the component-source walk behind `degradation` on its own thread, for a process
+    /// that has not run it yet.
+    ///
+    /// A fresh process -- every CLI call -- walks up to 20,000 directory entries to fill that
+    /// cache, which came after the searches on the critical path although it needs nothing from
+    /// them or from the sync. Started first, it overlaps the `git status` the sync waits on and
+    /// the cold index loads. A resident engine already holds the answer and spawns nothing.
+    fn prefetch_coverage_probe(&self) -> Option<std::thread::JoinHandle<()>> {
+        if self.inner.component_sources.lock().unwrap().is_some()
+            || self.inner.unsupported_sources.lock().unwrap().is_some()
+        {
+            return None;
+        }
+        let engine = self.clone();
+        std::thread::Builder::new()
+            .name("ravel-coverage".into())
+            .spawn(move || {
+                let _ = engine.component_sources_cached();
+            })
+            .ok()
+    }
+
+    /// The two searches `context` ranks with: the terms search (best definitions by shared
+    /// tokens) and the spelling search. Terms first: the first search opens the index, and one
+    /// opened for terms serves the spelling search too, while one opened for spellings has to be
+    /// opened again (the whole pack directory, decoded a second time) before it can answer terms.
+    fn context_searches(&self, query: &str, limit: usize) -> ContextSearches {
+        let terms_started = std::time::Instant::now();
+        let term_hits =
+            self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
+        crate::timing::stage("context.search_terms", terms_started, || {
+            format!("hits={}", term_hits.len())
+        });
+        let prefix_started = std::time::Instant::now();
+        let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
+        crate::timing::stage("context.search_prefix", prefix_started, String::new);
+        Ok((hits, term_hits))
+    }
+
+    /// Everything `context` reads from the index once it is up to date, loaded in parallel.
+    fn context_inputs(&self, query: &str, limit: usize) -> ContextInputs {
+        // A resident engine answers from its caches, which is cheaper than starting two threads
+        // to do it. The threads exist to overlap the cold loads with the searches.
+        let resident = self.inner.graph_cache.lock().unwrap().is_some()
+            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
+        if resident {
+            let graph = self.graph();
+            let symbol_runtime = self.symbol_meta_runtime();
+            return ContextInputs {
+                searches: self.context_searches(query, limit),
+                graph,
+                symbol_runtime,
+            };
+        }
+        std::thread::scope(|scope| {
+            let graph = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let opened = self.graph();
+                crate::timing::stage("context.worker_graph", started, String::new);
+                opened
+            });
+            let symbol_runtime = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let runtime = self.symbol_meta_runtime();
+                crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                runtime
+            });
+            let searches = self.context_searches(query, limit);
+            ContextInputs {
+                searches,
+                graph: graph
+                    .join()
+                    .map_err(|_| EngineError::Search("context graph worker panicked".into()))
+                    .and_then(|result| result),
+                symbol_runtime: symbol_runtime
+                    .join()
+                    .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
+                    .and_then(|result| result),
+            }
+        })
+    }
+
+    /// Starts loading `context`'s inputs before the sync, for an engine that has to load them.
+    ///
+    /// The sync is `git status` (tens of milliseconds on a big tree) and almost always finds the
+    /// index current, in which case what was loaded meanwhile is exactly what the sync would have
+    /// let it load -- and the loads, the slowest part of a cold call, are done by the time git
+    /// answers. When the sync does publish a generation the result is discarded by `settle`.
+    fn speculate_context_inputs(&self, query: &str, limit: usize) -> Option<SpeculatedInputs> {
+        let resident = self.inner.graph_cache.lock().unwrap().is_some()
+            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
+        if resident || !self.config.sync.auto {
+            return None;
+        }
+        let generation = self.storage().current_generation().ok().flatten();
+        let engine = Arc::new(self.clone());
+        let owned_query = query.to_owned();
+        let graph = {
+            let engine = Arc::clone(&engine);
+            std::thread::Builder::new()
+                .name("ravel-ctx-graph".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let opened = engine.graph();
+                    crate::timing::stage("context.worker_graph", started, String::new);
+                    opened
+                })
+                .ok()?
+        };
+        let symbol_runtime = {
+            let engine = Arc::clone(&engine);
+            std::thread::Builder::new()
+                .name("ravel-ctx-symbols".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let runtime = engine.symbol_meta_runtime();
+                    crate::timing::stage("context.worker_symbol_meta", started, String::new);
+                    runtime
+                })
+                .ok()?
+        };
+        let searches = std::thread::Builder::new()
+            .name("ravel-ctx-search".into())
+            .spawn(move || engine.context_searches(&owned_query, limit))
+            .ok()?;
+        Some(SpeculatedInputs {
+            generation,
+            graph,
+            symbol_runtime,
+            searches,
+        })
     }
 
     /// Index health for agents. Cheap: does not spawn git status.
@@ -2827,6 +3164,16 @@ impl WorkspaceEngine {
         let mark = std::time::Instant::now();
         let (disk_bytes, generations) = Self::index_footprint(&home);
         crate::timing::stage("status.footprint", mark, String::new);
+        // The stats already count the files that carry a diagnostic. Naming them means decoding
+        // the whole artifact index, so a workspace where that count is zero -- nearly all of them
+        // -- does not pay for it on every call.
+        let mark = std::time::Instant::now();
+        let diagnostics = if stats.as_ref().is_some_and(|stats| stats.parse_errors == 0) {
+            Vec::new()
+        } else {
+            self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT)
+        };
+        crate::timing::stage("status.diagnostics", mark, String::new);
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,
@@ -2859,7 +3206,7 @@ impl WorkspaceEngine {
                 "walk_truncated": walk_truncated,
             },
             "binary_version": crate::VERSION,
-            "diagnostics": self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT),
+            "diagnostics": diagnostics,
             "config_problems": config_problems
                 .iter()
                 .map(|problem| {
@@ -2955,55 +3302,25 @@ impl WorkspaceEngine {
         /// agents. Totals beyond this must route to the paginated walk.
         const CONTEXT_RELATION_LIMIT_MAX: usize = 50;
         let context_started = std::time::Instant::now();
+        let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
+        let coverage_walk = self.prefetch_coverage_probe();
+        let speculation = self.speculate_context_inputs(query, limit);
         let synced = self.auto_sync_if_dirty()?;
         let after_sync = std::time::Instant::now();
         crate::timing::stage("context.sync", context_started, String::new);
-        let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
-        // Use raw paths — auto_sync already ran. Context combines deterministic spelling
-        // lookup with definition-level term evidence: a one-word concept may occur in a path or
-        // qualified name, while prose intent words must not turn the query into a hard AND.
-        let (searches, eager_graph, eager_symbol_runtime) = std::thread::scope(|scope| {
-            let graph = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let opened = self.graph();
-                crate::timing::stage("context.worker_graph", started, String::new);
-                opened
-            });
-            let symbol_runtime = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let runtime = self.symbol_meta_runtime();
-                crate::timing::stage("context.worker_symbol_meta", started, String::new);
-                runtime
-            });
-            let searches = (|| {
-                let prefix_started = std::time::Instant::now();
-                let hits = self.search_raw(query, SearchKind::Prefix, limit.saturating_add(1))?;
-                crate::timing::stage("context.search_prefix", prefix_started, String::new);
-                let terms_started = std::time::Instant::now();
-                let term_hits =
-                    self.search_raw(query, SearchKind::Terms, limit.saturating_mul(16).max(128))?;
-                crate::timing::stage("context.search_terms", terms_started, || {
-                    format!("hits={}", term_hits.len())
-                });
-                Ok::<_, EngineError>((hits, term_hits))
-            })();
-            let graph = graph
-                .join()
-                .map_err(|_| EngineError::Search("context graph worker panicked".into()))
-                .and_then(|result| result);
-            let symbol_runtime = symbol_runtime
-                .join()
-                .map_err(|_| EngineError::Search("context symbol worker panicked".into()))
-                .and_then(|result| result);
-            (searches, graph, symbol_runtime)
-        });
+        let ContextInputs {
+            searches,
+            graph: eager_graph,
+            symbol_runtime: eager_symbol_runtime,
+        } = speculation
+            .and_then(|speculation| speculation.settle(self))
+            .unwrap_or_else(|| self.context_inputs(query, limit));
         let (mut hits, term_hits) = searches?;
         let mut term_hits = term_hits;
         if let Ok(graph) = &eager_graph {
             for hit in &mut term_hits {
                 if let Some(id) = hit.definition_id.as_deref() {
-                    let degree = graph.direct_relations_limit(id, true, 0).1
-                        + graph.direct_relations_limit(id, false, 0).1;
+                    let degree = graph.direct_degree(id);
                     hit.score_micros = hit
                         .score_micros
                         .saturating_add((degree as u64).min(40) * 500)
@@ -3348,7 +3665,12 @@ impl WorkspaceEngine {
                     .any(|name| name.to_lowercase().contains(&asked))
         };
         let invented_name = identifier_query && exact_identity.is_empty() && !primary_is_lexical;
-        let degradation = self.degradation();
+        // Read once for both the degradation signals and the snapshot id below.
+        let stats = self.stats().ok();
+        let degradation = self.degradation_given(stats.as_ref());
+        if let Some(walk) = coverage_walk {
+            let _ = walk.join();
+        }
         let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
@@ -3443,7 +3765,7 @@ impl WorkspaceEngine {
                         // tell a real zero from an unasked one.
                         "authoritative_zero": graph_primary.is_some() && undegraded,
                     },
-                    "sid": self.stats().map(|s| s.snapshot_id).ok(),
+                    "sid": stats.map(|stats| stats.snapshot_id),
                 }))
     }
 
@@ -3533,9 +3855,6 @@ impl WorkspaceEngine {
     /// Counts, how many indexable sources the same walk saw, and whether the budget cut it short.
     /// All three come from one pass so the warning compares like with like.
     fn unsupported_sources_cached(&self) -> Arc<(BTreeMap<String, usize>, usize, bool)> {
-        /// Long enough that a burst of tool calls walks once, short enough that a
-        /// workspace gaining a new language is noticed within the same session.
-        const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
         let mut cache = self.inner.unsupported_sources.lock().unwrap();
         if let Some((walked_at, counts)) = cache.as_ref()
             && walked_at.elapsed() < COVERAGE_TTL
@@ -3544,10 +3863,36 @@ impl WorkspaceEngine {
         }
         let counts = Arc::new(crate::config::unsupported_source_counts(
             &self.config,
-            20_000,
+            COVERAGE_WALK_BUDGET,
         ));
         *cache = Some((std::time::Instant::now(), Arc::clone(&counts)));
         counts
+    }
+
+    /// How many component-format sources (`.vue`, `.svelte`, `.astro`) the coverage walk sees, which
+    /// is all `degradation` reads of it. A fresh full probe already holds the number; otherwise this
+    /// walks without classifying every other file, and keeps the result for the same TTL.
+    fn component_sources_cached(&self) -> usize {
+        let from_full_probe = |counts: &BTreeMap<String, usize>| -> usize {
+            crate::config::COMPONENT_SOURCE_EXTENSIONS
+                .iter()
+                .filter_map(|extension| counts.get(*extension))
+                .sum()
+        };
+        if let Some((walked_at, counts)) = self.inner.unsupported_sources.lock().unwrap().as_ref()
+            && walked_at.elapsed() < COVERAGE_TTL
+        {
+            return from_full_probe(&counts.0);
+        }
+        let mut cache = self.inner.component_sources.lock().unwrap();
+        if let Some((walked_at, count)) = cache.as_ref()
+            && walked_at.elapsed() < COVERAGE_TTL
+        {
+            return *count;
+        }
+        let count = crate::config::component_source_count(&self.config, COVERAGE_WALK_BUDGET);
+        *cache = Some((std::time::Instant::now(), count));
+        count
     }
 
     /// Hash sidecar for the current generation. Cached because auto-sync consults
@@ -3797,44 +4142,60 @@ impl WorkspaceEngine {
         // three services costs six figures of tokens; this costs a few hundred, and the cost does
         // not grow with the symbol.
         if let Some(RollupMode::Dir { depth }) = options.rollup {
-            let (relations, total) =
-                graph.direct_relations_limit(&resolved, reverse, ROLLUP_MAX_SITES);
-            let covered = relations.len();
+            let (sites, total) = graph.direct_relations(&resolved, reverse);
             // Edges and files answer different questions. Two edges from one file (an import plus an
             // extends) are one place to change, so reporting only the edge count doubles a migration
             // estimate; both are carried.
-            let mut counts: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
-                Default::default();
-            for relation in &relations {
+            //
+            // Paths and prefixes are borrowed from the graph: a rollup visits up to
+            // `ROLLUP_MAX_SITES` sites and only the handful of buckets it ends with are ever shown.
+            let mut slots: FxHashMap<&str, usize> = FxHashMap::default();
+            let mut buckets: Vec<(&str, usize, FxHashSet<&str>)> = Vec::new();
+            // The last grouped path and its bucket: sites of one file are mostly adjacent, and the
+            // next one from the same file only adds an edge.
+            let mut last: Option<(&str, usize)> = None;
+            let mut covered = 0usize;
+            for relation in sites.take(ROLLUP_MAX_SITES) {
+                covered += 1;
                 // Which path answers "where is this concentrated" depends on the direction. For
                 // callers it is where the reference is written. For callees that path is the queried
                 // symbol's own file, identical for every row -- grouping by it collapses the whole
                 // answer into one bucket and erases the very thing being asked about, so the
                 // referenced symbol's own file is used instead.
                 let grouping_path = if reverse {
-                    relation.source_path.as_deref()
+                    relation.source_path
                 } else {
-                    symbol_id_path(&relation.node)
+                    symbol_id_path(relation.node)
                 };
+                if let (Some(path), Some((last_path, slot))) = (grouping_path, last)
+                    && path == last_path
+                {
+                    buckets[slot].1 += 1;
+                    continue;
+                }
                 // A site without a usable path is real -- it just cannot be grouped by one, and
                 // folding it into some arbitrary bucket would misreport where the impact sits.
                 let key = match grouping_path {
                     Some(path) => directory_prefix(path, depth),
-                    None => "(unknown path)".to_owned(),
+                    None => "(unknown path)",
                 };
-                let bucket = counts.entry(key).or_default();
-                bucket.0 += 1;
-                if let Some(path) = grouping_path {
-                    bucket.1.insert(path.to_owned());
-                }
+                let slot = *slots.entry(key).or_insert_with(|| {
+                    buckets.push((key, 0, FxHashSet::default()));
+                    buckets.len() - 1
+                });
+                buckets[slot].1 += 1;
+                last = grouping_path.map(|path| {
+                    buckets[slot].2.insert(path);
+                    (path, slot)
+                });
             }
-            let group_total = counts.len();
-            let mut ranked: Vec<(String, usize, usize)> = counts
+            let group_total = buckets.len();
+            let mut ranked: Vec<(&str, usize, usize)> = buckets
                 .into_iter()
-                .map(|(prefix, (edges, files))| (prefix, edges, files.len()))
+                .map(|(prefix, edges, files)| (prefix, edges, files.len()))
                 .collect();
             // Count first, then name, so equal counts stay in a stable order across calls.
-            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
             let head: Vec<_> = ranked.iter().take(ROLLUP_TOP_GROUPS).cloned().collect();
             let tail: usize = ranked
                 .iter()
@@ -3894,18 +4255,28 @@ impl WorkspaceEngine {
             }
             return Ok(response);
         }
-        // Ask for the page plus everything before it, then slice: relation order is
-        // deterministic, so a cursor is an offset into the same sequence.
-        let end = cursor.saturating_add(limit);
-        let (relations, total) = graph.direct_relations_limit(&resolved, reverse, end);
+        // Relation order is deterministic, so a cursor is an offset into the same sequence; skipping
+        // to it steps over the earlier sites without building them.
+        let (relations, total) = graph.direct_relations(&resolved, reverse);
         let by_kind = graph.direct_relation_kind_counts(&resolved, reverse);
+        // A function that references the symbol several times is several adjacent sites, so the
+        // name just looked up is usually the one the next site needs.
+        let mut previous: Option<(&str, String)> = None;
         let sites: Vec<_> = relations
-            .into_iter()
             .skip(cursor)
+            .take(limit)
             .map(|relation| {
-                let related = symbols
-                    .as_ref()
-                    .and_then(|symbols| symbols.get_by_id(&relation.node));
+                let symbol = match &previous {
+                    Some((node, name)) if *node == relation.node => name.clone(),
+                    _ => {
+                        let name = symbols
+                            .as_ref()
+                            .and_then(|symbols| symbols.qualified_name_by_id(relation.node))
+                            .unwrap_or_else(|| relation.node.to_owned());
+                        previous = Some((relation.node, name.clone()));
+                        name
+                    }
+                };
                 // No `id` field: it is "symbol://" + path + "#" + kind + qualified
                 // name, so emitting it alongside `path` and `symbol` triples the cost
                 // of every site. `symbol` is the chaining key — these tools accept a
@@ -3914,10 +4285,7 @@ impl WorkspaceEngine {
                 let mut site = serde_json::json!({
                     "path": relation.source_path,
                     "line": relation.span.map(|span| span.start_line + 1),
-                    "symbol": related
-                        .as_ref()
-                        .map(|entry| entry.qualified_name.clone())
-                        .unwrap_or_else(|| relation.node.clone()),
+                    "symbol": symbol,
                     "kind": relation.kind.as_str(),
                 });
                 if relation.type_only {
@@ -4220,6 +4588,13 @@ impl WorkspaceEngine {
     /// Discover dirty source paths according to `[sync]` config.
     /// Empty when mode=none, no git available, or clean tree. Never requires git to exist.
     pub fn discover_dirty_sources(&self) -> Vec<PathBuf> {
+        self.dirty_listing(None)
+    }
+
+    /// [`Self::discover_dirty_sources`], except that a remembered listing answers only if git was
+    /// asked at or after `not_before`: a caller that has just learned of an edit cannot be handed a
+    /// listing from before it.
+    fn dirty_listing(&self, not_before: Option<std::time::Instant>) -> Vec<PathBuf> {
         // mode=none or auto without .git → empty (caller uses explicit paths / watch).
         if !self.config.sync_allows_git() || !self.is_git_repo_cached() {
             return Vec::new();
@@ -4227,19 +4602,17 @@ impl WorkspaceEngine {
         // Same-tick MCP: reuse dirty list ~50ms (not a perf SLA — avoids double git spawn).
         {
             let cache = self.inner.dirty_cache.lock().unwrap();
-            if let Some((at, paths)) = cache.as_ref() {
-                if at.elapsed()
+            if let Some(listing) = cache.as_ref() {
+                if listing.kept.elapsed()
                     < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
+                    && not_before.is_none_or(|floor| listing.asked >= floor)
                 {
-                    return paths.clone();
+                    return listing.paths.clone();
                 }
             }
         }
-        let discovery = crate::git::DirtyDiscovery {
-            include_untracked: self.config.sync.include_untracked,
-            skip_sibling_emit: self.config.sync.skip_sibling_emit,
-            sibling_emit: self.config.sibling_emit_rules(),
-        };
+        let asked = std::time::Instant::now();
+        let discovery = self.dirty_discovery();
         let extensions = crate::config::effective_extensions(&self.config);
         let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
             .unwrap_or_default()
@@ -4248,8 +4621,63 @@ impl WorkspaceEngine {
                 self.config.is_source_with_extensions(p, &extensions) && !self.config.is_noise(p)
             })
             .collect();
-        *self.inner.dirty_cache.lock().unwrap() = Some((std::time::Instant::now(), paths.clone()));
+        *self.inner.dirty_cache.lock().unwrap() = Some(DirtyListing {
+            asked,
+            kept: std::time::Instant::now(),
+            paths: paths.clone(),
+        });
         paths
+    }
+
+    fn dirty_discovery(&self) -> crate::git::DirtyDiscovery {
+        crate::git::DirtyDiscovery {
+            include_untracked: self.config.sync.include_untracked,
+            skip_sibling_emit: self.config.sync.skip_sibling_emit,
+            sibling_emit: self.config.sibling_emit_rules(),
+        }
+    }
+
+    /// The members of `relative` that [`Self::discover_dirty_sources`] would list, found without
+    /// listing the rest of the tree. Asking git about a whole worktree is the most expensive thing
+    /// a sync does (~35 ms on 20k files), and the dirty record only ever asks about the paths it
+    /// just synced.
+    fn dirty_sources_among(&self, relative: &BTreeSet<String>) -> BTreeSet<String> {
+        if relative.is_empty() || !self.config.sync_allows_git() || !self.is_git_repo_cached() {
+            return BTreeSet::new();
+        }
+        let workspace_relative = |path: &Path| {
+            path.strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        // A whole-tree listing from the last few milliseconds answers for any subset of it.
+        {
+            let cache = self.inner.dirty_cache.lock().unwrap();
+            if let Some(listing) = cache.as_ref()
+                && listing.kept.elapsed()
+                    < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
+            {
+                return listing
+                    .paths
+                    .iter()
+                    .map(|path| workspace_relative(path))
+                    .filter(|path| relative.contains(path))
+                    .collect();
+            }
+        }
+        let extensions = crate::config::effective_extensions(&self.config);
+        let wanted: Vec<String> = relative.iter().cloned().collect();
+        crate::git::changed_paths_among(&self.root, &self.dirty_discovery(), &wanted)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| {
+                self.config.is_source_with_extensions(path, &extensions)
+                    && !self.config.is_noise(path)
+            })
+            .map(|path| workspace_relative(&path))
+            .filter(|path| relative.contains(path))
+            .collect()
     }
 
     /// Fast freshness: dirty discovery (git if present) + hash-sidecar no-op.
@@ -4269,12 +4697,65 @@ impl WorkspaceEngine {
         if !self.is_git_repo_cached() || !self.config.sync_allows_git() {
             return Ok(None);
         }
+        // A daemon's file watcher can say that nothing has changed since a full check last found
+        // the index consistent with the tree. That skips asking git about the whole worktree, which
+        // is nearly all of what a clean-tree query costs.
+        let gate = self.inner.watch_gate.lock().unwrap().clone();
+        let probe = gate.as_ref().and_then(|gate| gate.probe());
+        // The index as the probe found it.
+        let generation = probe
+            .as_ref()
+            .and_then(|_| self.storage().current_generation().ok().flatten());
+        if let (Some(gate), Some(probe), Some(generation)) = (&gate, &probe, &generation)
+            && gate.is_quiet(probe, generation)
+        {
+            self.inner.quiet_checks.fetch_add(1, Ordering::Relaxed);
+            crate::timing::note("autosync.quiet", String::new);
+            return Ok(None);
+        }
+        // A check that may be recorded as clean has to look at the tree as the probe found it, not
+        // at a listing remembered from before the edit the probe has just counted.
+        let (synced, consistent) =
+            self.auto_sync_after_discovery(probe.as_ref().map(|probe| probe.started()))?;
+        if consistent && let (Some(gate), Some(probe), Some(found)) = (&gate, &probe, generation) {
+            // What the check vouches for is the index it compared the tree with: the one the probe
+            // found, or the one the sync that made them agree published.
+            let checked = if synced.is_some() {
+                self.storage().current_generation().ok().flatten()
+            } else {
+                Some(found)
+            };
+            if let Some(checked) = checked {
+                gate.mark_clean(probe, checked);
+            }
+        }
+        Ok(synced)
+    }
+
+    /// Dirty checks the watcher answered without asking git (for tests).
+    #[cfg(test)]
+    pub(crate) fn quiet_checks(&self) -> u64 {
+        self.inner.quiet_checks.load(Ordering::Relaxed)
+    }
+
+    /// Hand the engine the daemon's watcher gate. Until then every dirty check asks git.
+    pub(crate) fn attach_watch_gate(&self, gate: Arc<crate::watch::WatchGate>) {
+        *self.inner.watch_gate.lock().unwrap() = Some(gate);
+    }
+
+    /// The git-backed half of [`Self::auto_sync_if_dirty`]. Also says whether the check ran to
+    /// completion with the index consistent with the tree afterwards (nothing was dirty, every
+    /// dirty path matched the index, or the sync that made it so succeeded).
+    fn auto_sync_after_discovery(
+        &self,
+        listed_after: Option<std::time::Instant>,
+    ) -> Result<(Option<IndexStats>, bool), EngineError> {
         // Discover first, load the sidecar second. The sidecar unzips the artifact
         // index into tens of thousands of owned paths and hashes, and on a clean tree
         // there is nothing to compare it against — loading it before knowing whether
         // any path is dirty charged every query for work no query needed.
         let dirty_started = std::time::Instant::now();
-        let mut dirty = self.discover_dirty_sources();
+        let mut dirty = self.dirty_listing(listed_after);
         // A path the index absorbed while it was dirty stays suspect until its content matches what
         // the index holds, even once git calls the tree clean.
         let recorded = self.dirty_synced();
@@ -4299,13 +4780,13 @@ impl WorkspaceEngine {
             format!("paths={}", dirty.len())
         });
         if dirty.is_empty() {
-            return Ok(None);
+            return Ok((None, true));
         }
         // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
         // Prevents accidental full-snapshot open on every search.
         let hashes_started = std::time::Instant::now();
         let Some(hashes) = self.file_hashes_cached()? else {
-            return Ok(None);
+            return Ok((None, false));
         };
         crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
@@ -4355,12 +4836,12 @@ impl WorkspaceEngine {
             }
         }
         if !need_sync {
-            return Ok(None);
+            return Ok((None, true));
         }
         match self.sync(Some(&dirty)) {
-            Ok(s) => Ok(Some(s)),
+            Ok(s) => Ok((Some(s), true)),
             // Keep serving the last complete snapshot; context/status expose the warning.
-            Err(_) => Ok(None),
+            Err(_) => Ok((None, false)),
         }
     }
 
@@ -4829,6 +5310,40 @@ mod resident_sync_tests {
         assert_eq!(chain.overlays.len(), 1);
         assert_eq!(chain.current_snapshot, current.snapshot_id.stable_key());
     }
+
+    /// A one-shot reader starts loading the graph while another process publishes. Whatever the
+    /// interleaving, the reader's next answer must describe the generation that is current by then,
+    /// never the one its background load happened to read.
+    #[test]
+    fn a_prefetch_racing_a_publication_never_serves_the_old_generation() {
+        let (root, writer, service) = fixture();
+        let mut previous = None;
+        for round in 0..12 {
+            let reader = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+            reader.prefetch_for_relations();
+            std::fs::write(
+                &service,
+                format!(
+                    "export const answer = () => 42;\nexport const extra{round} = () => answer();\n"
+                ),
+            )
+            .unwrap();
+            writer.sync(Some(std::slice::from_ref(&service))).unwrap();
+
+            let observed = reader.reference_sites("answer", true, 50, 0).unwrap();
+            let fresh = WorkspaceEngine::load(root.path(), &Flags::default())
+                .unwrap()
+                .reference_sites("answer", true, 50, 0)
+                .unwrap();
+            assert_eq!(observed, fresh, "round {round}");
+            assert_ne!(
+                Some(&observed),
+                previous.as_ref(),
+                "round {round} changed nothing"
+            );
+            previous = Some(observed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4920,6 +5435,494 @@ mod generation_cache_lock_tests {
 }
 
 #[cfg(test)]
+mod watch_gate_tests {
+    use super::*;
+    use crate::watch::{PersistentWatcher, Timing, WatchGate};
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    struct Watched {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        engine: WorkspaceEngine,
+        gate: Arc<WatchGate>,
+        _watcher: Option<PersistentWatcher>,
+    }
+
+    /// A committed, indexed repository with the daemon's kind of watcher attached to its engine.
+    /// `blind_to` names a file the watcher is made deaf to (a stand-in for a change no backend
+    /// would report). `None` when this machine's temp directory is not a filesystem the gate
+    /// vouches for, in which case there is nothing for these tests to prove.
+    fn watched(
+        reverify: Duration,
+        blind_to: Option<&'static str>,
+        listening: bool,
+    ) -> Option<Watched> {
+        watched_after(reverify, blind_to, listening, |_| {})
+    }
+
+    /// [`watched`], with `before_arming` run on the indexed tree before the watcher exists.
+    fn watched_after(
+        reverify: Duration,
+        blind_to: Option<&'static str>,
+        listening: bool,
+        before_arming: impl FnOnce(&Path),
+    ) -> Option<Watched> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(
+                root.join(name),
+                format!("export function {}0() {{ return 0; }}\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        git(&root, &["init", "-q", "."]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "seed"]);
+        let mut engine = WorkspaceEngine::load(&root, &Flags::default()).unwrap();
+        if !listening {
+            // Without a watcher, a dirty listing remembered for a few milliseconds answers for the
+            // full check and hides the very edits these tests make right after one. With one, the
+            // check is never handed a listing from before the probe.
+            engine.config.sync.discovery_cache_ms = 0;
+        }
+        engine.index().unwrap();
+        before_arming(&root);
+        let storage_root = root.join(&engine.config.storage.home);
+        let timing = if listening {
+            // A healthy backend returns a marker in microseconds; the long deadline is for a
+            // machine so loaded that this test's own threads are starved.
+            Timing {
+                barrier: Duration::from_secs(3),
+                pause: Duration::from_millis(200),
+                reverify,
+                settle: Duration::from_secs(2),
+            }
+        } else {
+            // A watcher that never answers is meant to leave the gate paused for the whole test.
+            Timing {
+                pause: Duration::from_secs(30),
+                reverify,
+                settle: Duration::from_secs(2),
+                ..Timing::default()
+            }
+        };
+        let gate = WatchGate::with_timing(&root, &storage_root, timing);
+        if !gate.is_trusted() {
+            return None;
+        }
+        let watcher = listening.then(|| {
+            let ignore = Arc::new(crate::config::IgnoreChain::new(&engine.config));
+            let config = engine.config.clone();
+            let storage = storage_root.clone();
+            let blind = blind_to.map(|name| root.join(name));
+            PersistentWatcher::new_with_gate(&root, 4_096, gate.clone(), move |path| {
+                blind.as_deref() != Some(path)
+                    && crate::config::watch_event_is_relevant(&config, &ignore, &storage, path)
+            })
+            .unwrap()
+        });
+        engine.attach_watch_gate(gate.clone());
+        Some(Watched {
+            _dir: dir,
+            root,
+            engine,
+            gate,
+            _watcher: watcher,
+        })
+    }
+
+    fn append(root: &Path, name: &str, text: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(name))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn has_symbol(engine: &WorkspaceEngine, name: &str) -> bool {
+        engine
+            .search_raw(name, SearchKind::Exact, 5)
+            .unwrap()
+            .into_iter()
+            .any(|hit| hit.value == name)
+    }
+
+    /// Check until the watcher answers one for the engine. A marker the machine was too busy to
+    /// return in time only costs a full check or two first, never a wrong answer.
+    fn until_quiet(engine: &WorkspaceEngine) {
+        let before = engine.quiet_checks();
+        for _ in 0..10 {
+            assert!(engine.auto_sync_if_dirty().unwrap().is_none());
+            if engine.quiet_checks() > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        panic!("a tree that stays still was never called quiet");
+    }
+
+    /// Every edit is found by the very next check, whether or not the checks in between were
+    /// answered by the watcher, and a tree that stays still stops being asked about.
+    #[test]
+    fn a_quiet_tree_skips_the_dirty_check_and_every_edit_is_still_found() {
+        let Some(w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+        assert_eq!(w.engine.quiet_checks(), 0, "the first check has to look");
+        until_quiet(&w.engine);
+
+        for round in 0..25 {
+            let name = format!("added{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            // No pause, no sync call: the check right after the write must see it.
+            let synced = w.engine.auto_sync_if_dirty().unwrap();
+            assert!(synced.is_some(), "edit {round} was not picked up");
+            assert!(has_symbol(&w.engine, &name), "edit {round} is not indexed");
+            until_quiet(&w.engine);
+        }
+        // Editing a different file, then undoing the edit, is two changes, both found.
+        append(
+            &w.root,
+            "b.ts",
+            "export function transient() { return 1; }\n",
+        );
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "transient"));
+        std::fs::write(w.root.join("b.ts"), "export function b0() { return 0; }\n").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(!has_symbol(&w.engine, "transient"));
+    }
+
+    #[test]
+    fn creations_renames_and_deletions_are_each_found_immediately() {
+        let Some(w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_none());
+
+        std::fs::write(w.root.join("n1.ts"), "export function created1() {}\n").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created1"));
+
+        std::fs::create_dir_all(w.root.join("fresh/deeper")).unwrap();
+        std::fs::write(
+            w.root.join("fresh/deeper/n2.ts"),
+            "export function created2() {}\n",
+        )
+        .unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created2"));
+
+        // A second file in the directory created a moment ago: the case a recursive backend can
+        // miss, because the directory's own watch is installed after it is announced.
+        std::fs::write(
+            w.root.join("fresh/deeper/n3.ts"),
+            "export function created3() {}\n",
+        )
+        .unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "created3"));
+
+        std::fs::rename(w.root.join("n1.ts"), w.root.join("n1_moved.ts")).unwrap();
+        w.engine.auto_sync_if_dirty().unwrap();
+        assert!(
+            has_symbol(&w.engine, "created1"),
+            "the moved file is indexed"
+        );
+        assert_eq!(
+            w.engine
+                .search_raw("created1", SearchKind::Exact, 5)
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.value == "created1")
+                .count(),
+            1,
+            "and the old path is gone"
+        );
+
+        std::fs::remove_file(w.root.join("c.ts")).unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(!has_symbol(&w.engine, "c0"));
+    }
+
+    /// The bound on the one thing the gate cannot do: a change no event ever reports is found when
+    /// the quiet verdict expires, not never.
+    #[test]
+    fn a_change_the_watcher_never_reports_is_found_when_the_verdict_expires() {
+        let Some(w) = watched(Duration::from_millis(400), Some("b.ts"), true) else {
+            return;
+        };
+        until_quiet(&w.engine);
+
+        append(&w.root, "b.ts", "export function unseen() { return 1; }\n");
+        let started = std::time::Instant::now();
+        let mut found_after = None;
+        while started.elapsed() < Duration::from_secs(3) {
+            if w.engine.auto_sync_if_dirty().unwrap().is_some() {
+                found_after = Some(started.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let found_after = found_after.expect("an unreported change must still be found");
+        assert!(has_symbol(&w.engine, "unseen"));
+        assert!(
+            found_after < Duration::from_millis(400) + Duration::from_millis(1_500),
+            "found only after {found_after:?}"
+        );
+    }
+
+    /// A gate whose watcher does not answer its markers (dead backend, wrong filesystem, anything)
+    /// must cost a few short waits and then nothing, and never change an answer.
+    #[test]
+    fn a_gate_nobody_feeds_pauses_and_every_check_still_looks() {
+        let Some(w) = watched(Duration::from_secs(60), None, false) else {
+            return;
+        };
+        for round in 0..6 {
+            let name = format!("deaf{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            assert!(
+                w.engine.auto_sync_if_dirty().unwrap().is_some(),
+                "edit {round} must be found without any watcher"
+            );
+            assert!(has_symbol(&w.engine, &name));
+            if round >= 3 {
+                let started = std::time::Instant::now();
+                assert!(w.gate.probe().is_none());
+                assert!(
+                    started.elapsed() < Duration::from_millis(25),
+                    "a paused gate must not keep waiting for markers"
+                );
+            }
+        }
+        assert_eq!(w.engine.quiet_checks(), 0);
+    }
+
+    /// The few milliseconds git's answer is remembered for must not leak into the verdict: an edit
+    /// made right after a check is found by the next one, and no mark is taken from a listing that
+    /// predates it. Without that, a window of milliseconds would stretch to the quiet verdict's
+    /// whole life.
+    #[test]
+    fn a_remembered_listing_cannot_hide_an_edit_from_the_verdict() {
+        let Some(mut w) = watched(Duration::from_secs(60), None, true) else {
+            return;
+        };
+        w.engine.config.sync.discovery_cache_ms = 60_000;
+        until_quiet(&w.engine);
+        for round in 0..10 {
+            let name = format!("early{round}");
+            append(
+                &w.root,
+                "a.ts",
+                &format!("export function {name}() {{ return {round}; }}\n"),
+            );
+            assert!(
+                w.engine.auto_sync_if_dirty().unwrap().is_some(),
+                "edit {round} was hidden by a remembered listing"
+            );
+            assert!(has_symbol(&w.engine, &name));
+            until_quiet(&w.engine);
+        }
+    }
+
+    /// Whatever happened before the watcher was armed is for a full check to find, and the first
+    /// check after arming is one.
+    #[test]
+    fn an_edit_made_before_the_watcher_was_armed_is_found_by_the_first_check() {
+        let Some(w) = watched_after(Duration::from_secs(60), None, true, |root| {
+            append(
+                root,
+                "a.ts",
+                "export function beforeArming() { return 1; }\n",
+            );
+        }) else {
+            return;
+        };
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "beforeArming"));
+        until_quiet(&w.engine);
+    }
+
+    /// The filter in front of the watcher keeps the ignore rules it first read. After a rules file
+    /// changes it may drop edits to files git now lists, so the gate stops speaking for the tree.
+    #[test]
+    fn un_ignoring_a_directory_is_noticed_though_the_watcher_still_filters_by_the_old_rules() {
+        let Some(w) = watched_after(Duration::from_secs(60), None, true, |root| {
+            std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+            std::fs::create_dir_all(root.join("gen")).unwrap();
+            std::fs::write(root.join("gen/x.ts"), "export function generated1() {}\n").unwrap();
+        }) else {
+            return;
+        };
+        // The first event the watcher filters makes it read (and remember) the root's rules.
+        append(&w.root, "a.ts", "export function warm() {}\n");
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        until_quiet(&w.engine);
+        assert!(
+            !has_symbol(&w.engine, "generated1"),
+            "ignored files are not indexed"
+        );
+
+        std::fs::write(w.root.join(".gitignore"), "").unwrap();
+        assert!(w.engine.auto_sync_if_dirty().unwrap().is_some());
+        assert!(has_symbol(&w.engine, "generated1"));
+
+        append(&w.root, "gen/x.ts", "export function generated2() {}\n");
+        assert!(
+            w.engine.auto_sync_if_dirty().unwrap().is_some(),
+            "an edit to the un-ignored file was filtered out and the gate did not notice"
+        );
+        assert!(has_symbol(&w.engine, "generated2"));
+    }
+}
+
+#[cfg(test)]
+mod dirty_record_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn record(engine: &WorkspaceEngine) -> Vec<String> {
+        engine.dirty_synced().into_iter().collect()
+    }
+
+    /// Three files in a committed repository, indexed.
+    fn fixture() -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(
+                root.path().join(name),
+                format!("export const {} = 1;\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        git(root.path(), &["init", "-q", "."]);
+        git(root.path(), &["add", "-A"]);
+        git(root.path(), &["commit", "-qm", "seed"]);
+        let mut engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        // The record follows what git says now. A listing remembered for a few milliseconds would
+        // make these assertions depend on how fast the test happens to run.
+        engine.config.sync.discovery_cache_ms = 0;
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    fn edit(root: &Path, name: &str, value: u32) {
+        std::fs::write(
+            root.join(name),
+            format!("export const {} = {value};\n", &name[..1]),
+        )
+        .unwrap();
+    }
+
+    /// The record carries exactly the synced paths that are still uncommitted, however many other
+    /// files are dirty: asking git about the synced paths alone must not change what is recorded.
+    #[test]
+    fn the_dirty_record_holds_the_synced_paths_that_differ_from_head() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(
+            record(&engine),
+            ["a.ts"],
+            "b.ts is dirty but was not synced, so it is not recorded"
+        );
+
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert_eq!(record(&engine), ["a.ts", "b.ts"]);
+
+        // A revert followed by a sync of that path stops carrying it; the other stays.
+        git(root, &["checkout", "--", "a.ts"]);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(record(&engine), ["b.ts"]);
+
+        // A sync that touches neither leaves the record alone.
+        engine.sync(Some(&[root.join("c.ts")])).unwrap();
+        assert_eq!(record(&engine), ["b.ts"]);
+
+        // Committing everything makes the next sync of the path drop it.
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "b"]);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert!(record(&engine).is_empty());
+        assert!(!engine.dirty_synced_path().exists());
+    }
+
+    /// An untracked file is dirty in the same sense, and a deleted tracked one too.
+    #[test]
+    fn untracked_and_deleted_paths_are_recorded_while_they_differ_from_head() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        std::fs::write(root.join("fresh.ts"), "export const fresh = 1;\n").unwrap();
+        std::fs::remove_file(root.join("c.ts")).unwrap();
+        engine
+            .sync(Some(&[root.join("fresh.ts"), root.join("c.ts")]))
+            .unwrap();
+        assert_eq!(record(&engine), ["c.ts", "fresh.ts"]);
+    }
+
+    /// A record that did not change is not written again: it costs two fsyncs and the file on
+    /// disk already says the same thing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_dirty_record_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        let path = engine.dirty_synced_path();
+        let written = std::fs::metadata(&path).unwrap().ino();
+
+        // Syncing the same, unchanged file again records the same thing.
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), written);
+        assert_eq!(record(&engine), ["a.ts"]);
+
+        // A different set is written (atomic_write replaces the file).
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), written);
+        assert_eq!(record(&engine), ["a.ts", "b.ts"]);
+    }
+}
+
+#[cfg(test)]
 mod agent_context_tests {
     use super::*;
 
@@ -4983,6 +5986,57 @@ mod agent_context_tests {
         assert!(found, "symbol added after the index was not picked up");
     }
 
+    /// A process that has loaded nothing starts reading the index while its sync still waits on
+    /// git. When that sync publishes a generation, what was read describes the tree it replaced,
+    /// and answering from it would miss the very edit the sync just indexed.
+    #[test]
+    fn context_discards_what_it_loaded_before_a_sync_that_published() {
+        let root = tempfile::tempdir().unwrap();
+        let service = root.path().join("service.ts");
+        std::fs::write(&service, "export function alpha() { return 1; }\n").unwrap();
+        for command in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&command)
+                .current_dir(root.path())
+                .status()
+                .expect("git must be available for this test");
+            assert!(status.success(), "git {command:?} failed");
+        }
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        std::fs::write(
+            &service,
+            "export function alpha() { return 1; }\nexport function betaMarker() { return 2; }\n",
+        )
+        .unwrap();
+
+        // A fresh engine has no caches, so its context call loads ahead of the sync.
+        let cold = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let found = cold.context("betaMarker", 10).unwrap();
+        assert_eq!(found["auto_synced"], true, "{found:#}");
+        assert_eq!(found["primary"], "betaMarker", "{found:#}");
+        assert_eq!(found["detail"]["name"], "betaMarker", "{found:#}");
+
+        // The caches are warm now and the tree is settled: the same answer, nothing to sync.
+        let again = cold.context("betaMarker", 10).unwrap();
+        assert_eq!(again["auto_synced"], false, "{again:#}");
+        assert_eq!(again["detail"], found["detail"]);
+    }
+
     #[test]
     fn context_reports_relation_totals_when_truncated() {
         let root = tempfile::tempdir().unwrap();
@@ -5024,6 +6078,79 @@ mod agent_context_tests {
             }),
             "expected re-query hint with exact limit, got {warnings:?}"
         );
+    }
+
+    /// A name lookup decodes the entry each location points at. That must be the definition
+    /// resolving the location's id would return, for every kind of id: unique, declared twice in
+    /// one file (the archive keeps the last), and rewritten or removed by a later sync.
+    #[test]
+    fn a_name_lookup_decodes_what_resolving_each_location_would() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("a.ts"),
+            "export function dup(a: string): void;\n\
+             export function dup(a: number): void;\n\
+             export function dup(a: any): void {}\n\
+             export class First { run() { return 1; } }\n\
+             export class Second { run() { return 2; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("b.ts"),
+            "export class Third { run() { return 3; } }\nexport function gone() {}\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let reference = |runtime: &SymbolMetaRuntime,
+                         location: crate::model::SymbolMetaLocation| {
+            let id = runtime.with_id_shard(location.shard, |archived| {
+                let entry = archived.entries.get(location.index as usize)?;
+                (blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest)
+                    .then(|| entry.id.as_str().to_owned())
+            })??;
+            runtime.get_by_id(&id)
+        };
+        let check = |engine: &WorkspaceEngine| {
+            let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+            let mut compared = 0;
+            for name in ["dup", "run", "First", "gone", "added"] {
+                for location in runtime.lookup_locations(false, name) {
+                    assert_eq!(
+                        runtime.get_by_location(location),
+                        reference(&runtime, location),
+                        "{name}"
+                    );
+                    compared += 1;
+                }
+            }
+            compared
+        };
+        assert!(check(&engine) >= 5);
+
+        // b.ts is rewritten (its `run` and `gone` are replaced) and a.ts gains a definition.
+        std::fs::write(
+            root.path().join("b.ts"),
+            "export class Third { run() { return 30; } }\nexport function added() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("a.ts"),
+            "export function dup(a: any): void {}\n\
+             export class First { run() { return 1; } }\n\
+             export class Second { run() { return 2; } }\n\
+             export function added() {}\n",
+        )
+        .unwrap();
+        engine
+            .sync(Some(&[root.path().join("a.ts"), root.path().join("b.ts")]))
+            .unwrap();
+        let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+        assert!(
+            matches!(&runtime.backend, SymbolMetaBackend::Packed(packed) if !packed.upserts.is_empty()),
+            "the sync should have left an overlay to resolve through"
+        );
+        assert!(check(&engine) >= 4);
     }
 
     #[test]
@@ -5595,6 +6722,168 @@ mod agent_context_tests {
         );
     }
 
+    /// Pages are slices of one sequence, whether the node is untouched or an incremental sync put it
+    /// behind an overlay (where each page used to rebuild and sort every site). Walking the cursor must
+    /// reproduce a single large page, and the totals every page repeats must keep adding up.
+    #[test]
+    fn pages_walked_by_cursor_reproduce_one_large_page_before_and_after_a_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src/callers")).unwrap();
+        std::fs::write(
+            root.join("src/hub.ts"),
+            "export function hub(x: number) { return x; }\n",
+        )
+        .unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                root.join(format!("src/callers/c{i}.ts")),
+                format!(
+                    "import {{ hub }} from '../hub';\nexport function c{i}() {{ hub(1); return hub(2); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let walk = |engine: &WorkspaceEngine, page_size: usize| -> (Vec<serde_json::Value>, u64) {
+            let (mut sites, mut cursor) = (Vec::new(), 0usize);
+            loop {
+                let page = engine
+                    .reference_sites("hub", true, page_size, cursor)
+                    .unwrap();
+                let total = page["total"].as_u64().unwrap();
+                sites.extend(page["sites"].as_array().unwrap().iter().cloned());
+                match page["next_cursor"].as_str() {
+                    Some(next) => cursor = next.parse().unwrap(),
+                    None => return (sites, total),
+                }
+            }
+        };
+        let check = |engine: &WorkspaceEngine, expected_total: u64| {
+            let (whole, total) = walk(engine, 1000);
+            assert_eq!(total, expected_total);
+            assert_eq!(whole.len() as u64, total);
+            for page_size in [1, 7, 50] {
+                let (paged, paged_total) = walk(engine, page_size);
+                assert_eq!(paged_total, total);
+                assert_eq!(paged, whole, "page size {page_size}");
+            }
+            let first = engine.reference_sites("hub", true, 5, 0).unwrap();
+            let by_kind: u64 = first["by_kind"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|count| count.as_u64().unwrap())
+                .sum();
+            assert_eq!(by_kind, total, "kind counts must cover every site");
+            let rollup = engine
+                .reference_sites_with(
+                    "hub",
+                    true,
+                    5,
+                    0,
+                    RelationOptions {
+                        scope: None,
+                        rollup: Some(RollupMode::Dir { depth: 2 }),
+                    },
+                )
+                .unwrap();
+            assert_eq!(rollup["grouped_sites"].as_u64().unwrap(), total);
+        };
+        // 60 imports plus 120 calls.
+        check(&engine, 180);
+
+        // An edit the index absorbs as an overlay: one caller gains a call and another loses its import.
+        std::fs::write(
+            root.join("src/callers/c3.ts"),
+            "import { hub } from '../hub';\nexport function c3() { hub(1); hub(2); return hub(3); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/callers/c4.ts"),
+            "export function c4() { return 4; }\n",
+        )
+        .unwrap();
+        engine
+            .sync(Some(&[
+                root.join("src/callers/c3.ts"),
+                root.join("src/callers/c4.ts"),
+            ]))
+            .unwrap();
+        check(&engine, 180 + 1 - 3);
+        // And a process that has never seen the earlier state agrees.
+        let cold = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        check(&cold, 180 + 1 - 3);
+    }
+
+    /// A page of sites names each site with `qualified_name_by_id`. It must say what decoding the whole
+    /// entry said: for ids that are unique, ids that overloads share, ids a sync replaced or removed,
+    /// and ids that never existed.
+    #[test]
+    fn the_qualified_name_lookup_agrees_with_decoding_the_whole_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let a = root.join("src/a.ts");
+        let b = root.join("src/b.ts");
+        std::fs::write(
+            &a,
+            "export function over(x: string): void;\nexport function over(x: number): void;\n\
+             export function over(x: unknown): void {}\n\
+             export class Box { open() {} close() {} }\nexport const answer = 42;\n",
+        )
+        .unwrap();
+        std::fs::write(&b, "export function other() { return 1; }\n").unwrap();
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let check = |engine: &WorkspaceEngine, extra: &[&str]| -> usize {
+            let runtime = engine.symbol_meta_runtime().unwrap().unwrap();
+            let dict = runtime.materialize().unwrap();
+            let mut ids: Vec<String> = dict
+                .entries
+                .iter()
+                .chain(&dict.duplicates)
+                .map(|entry| entry.id.clone())
+                .collect();
+            let known = ids.len();
+            ids.extend(extra.iter().map(|id| (*id).to_owned()));
+            ids.push("symbol://src/none.ts#value:none".to_owned());
+            for id in &ids {
+                assert_eq!(
+                    runtime.qualified_name_by_id(id),
+                    runtime.get_by_id(id).map(|entry| entry.qualified_name),
+                    "{id}"
+                );
+            }
+            known
+        };
+        assert!(check(&engine, &[]) >= 6);
+
+        // One file gains a symbol and loses a method, another is replaced outright; both reach the
+        // symbol tables as overlay upserts and removals.
+        std::fs::write(
+            &a,
+            "export function over(x: string): void;\nexport function over(x: number): void;\n\
+             export function over(x: unknown): void {}\n\
+             export class Box { open() {} }\nexport const answer = 42;\nexport const fresh = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(&b, "export function replacement() { return 2; }\n").unwrap();
+        engine.sync(Some(&[a, b])).unwrap();
+        assert!(
+            check(
+                &engine,
+                &[
+                    "symbol://src/a.ts#value:Box.close",
+                    "symbol://src/b.ts#value:other"
+                ]
+            ) >= 6
+        );
+    }
+
     #[test]
     fn a_workspace_of_unparsed_components_does_not_certify_its_zeros() {
         // `.vue`, `.svelte` and `.astro` contain TypeScript and import TS symbols. Leaving them out of
@@ -5811,6 +7100,46 @@ mod agent_context_tests {
     }
 
     #[test]
+    fn status_names_the_files_with_diagnostics_only_while_there_are_any() {
+        // `status` skips decoding the artifact index when the stats say no file carries a
+        // diagnostic. That shortcut must not hide one that appears, nor linger once it is gone.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let grown = root.path().join("src/grown.ts");
+        let small = "export function growThing() { return 1; }\n";
+        std::fs::write(&grown, small).unwrap();
+        std::fs::write(
+            root.path().join("src/other.ts"),
+            "export const other = 1;\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let diagnostics = |engine: &WorkspaceEngine| {
+            engine.status().unwrap()["diagnostics"]
+                .as_array()
+                .cloned()
+                .unwrap()
+        };
+        assert!(diagnostics(&engine).is_empty());
+
+        let limit = engine.config.parser.max_file_size_kb.saturating_mul(1024) as usize;
+        let mut oversized = small.to_owned();
+        while oversized.len() <= limit {
+            oversized.push_str("// pad pad pad pad pad pad pad pad\n");
+        }
+        std::fs::write(&grown, &oversized).unwrap();
+        engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
+        let named = diagnostics(&engine);
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0]["path"], "src/grown.ts");
+
+        std::fs::write(&grown, small).unwrap();
+        engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
+        assert!(diagnostics(&engine).is_empty());
+    }
+
+    #[test]
     fn a_scope_naming_where_a_method_lives_resolves_it() {
         // Methods carry a qualified name like `Class.method`, so they only ever match by short name.
         // Deciding from the exact-qualified tier alone told the caller the definition does not exist
@@ -5977,6 +7306,49 @@ mod agent_context_tests {
         );
         // Deeper than the path goes is the whole directory, not padding.
         assert_eq!(directory_prefix("apps/util.ts", 9), "apps");
+    }
+
+    /// The prefix is now a slice of the path rather than its components joined back up. Hold it to the
+    /// join it replaced, including the paths nobody writes on purpose: doubled and leading separators,
+    /// repeated `./`, an empty path, and a depth of zero.
+    #[test]
+    fn a_sliced_directory_prefix_equals_the_joined_one() {
+        fn joined(path: &str, depth: usize) -> String {
+            let path = path.trim_start_matches("./");
+            let components: Vec<&str> = path.split('/').collect();
+            let directories = &components[..components.len().saturating_sub(1)];
+            if directories.is_empty() {
+                return "(repo root)".to_owned();
+            }
+            directories[..directories.len().min(depth)].join("/")
+        }
+        for path in [
+            "",
+            "a",
+            "a.ts",
+            "/",
+            "/a.ts",
+            "/abs/x.ts",
+            "a/",
+            "a//b.ts",
+            "a/b/",
+            "./a.ts",
+            "././a/b.ts",
+            "./",
+            "../a/b.ts",
+            "a/./b/c.ts",
+            "apps/svc/src/a/b/util.ts",
+            "packages/p0/src/feature0/hubuse_1.ts",
+            "dir with space/é/ü.ts",
+        ] {
+            for depth in 0..=7 {
+                assert_eq!(
+                    directory_prefix(path, depth),
+                    joined(path, depth),
+                    "path {path:?} depth {depth}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6238,6 +7610,130 @@ mod agent_context_tests {
         assert_eq!(
             context["candidates"][0]["path"],
             "apps/users/onboarding/service.ts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_artifact_index_tests {
+    use super::*;
+
+    /// A handle that has never seen another: the answer to compare the engine's own handles with.
+    fn from_scratch(engine: &WorkspaceEngine) -> FileSnapshotStorage {
+        FileSnapshotStorage::with_retention(
+            engine.root.join(&engine.config.storage.home),
+            engine.config.storage.retention,
+        )
+    }
+
+    /// The engine's handles leave the decoded artifact index for the next one. Over a long run of
+    /// edits, creations, deletions and renames (content-only and structural, one path and several)
+    /// they must still agree with a handle that decodes it afresh, and almost never decode it again.
+    #[test]
+    fn handles_that_share_the_artifact_index_agree_with_one_that_decodes_it_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut live: Vec<String> = Vec::new();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..30 {
+            let name = format!("src/m{index}.ts");
+            std::fs::write(
+                root.join(&name),
+                format!("export function fn{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+            live.push(name);
+        }
+        let engine = WorkspaceEngine::load(&root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let append = |root: &Path, name: &str, text: &str| {
+            let mut contents = std::fs::read_to_string(root.join(name)).unwrap();
+            contents.push_str(text);
+            std::fs::write(root.join(name), contents).unwrap();
+        };
+        let syncs = 80;
+        for round in 0..syncs {
+            let mut touched = Vec::new();
+            match next(6) {
+                0 => {
+                    let name = live[next(live.len())].clone();
+                    append(&root, &name, &format!("// edit {round}\n"));
+                    touched.push(name);
+                }
+                1 => {
+                    let name = live[next(live.len())].clone();
+                    append(
+                        &root,
+                        &name,
+                        &format!("export function added{round}() {{ return 1; }}\n"),
+                    );
+                    touched.push(name);
+                }
+                2 => {
+                    let name = format!("src/n{round}.ts");
+                    std::fs::write(
+                        root.join(&name),
+                        format!(
+                            "import {{ fn0 }} from './m0';\nexport function made{round}() {{ return fn0(); }}\n"
+                        ),
+                    )
+                    .unwrap();
+                    live.push(name.clone());
+                    touched.push(name);
+                }
+                3 if live.len() > 5 => {
+                    let name = live.remove(next(live.len()));
+                    std::fs::remove_file(root.join(&name)).unwrap();
+                    touched.push(name);
+                }
+                4 if live.len() > 5 => {
+                    let from = live.remove(next(live.len()));
+                    let to = format!("src/r{round}.ts");
+                    std::fs::rename(root.join(&from), root.join(&to)).unwrap();
+                    live.push(to.clone());
+                    touched.extend([from, to]);
+                }
+                _ => {
+                    for part in 0..3 {
+                        let name = live[next(live.len())].clone();
+                        append(
+                            &root,
+                            &name,
+                            &format!("export const batch{round}_{part} = 1;\n"),
+                        );
+                        touched.push(name);
+                    }
+                }
+            }
+            let paths: Vec<PathBuf> = touched.iter().map(|name| root.join(name)).collect();
+            engine.sync(Some(&paths)).unwrap();
+
+            let shared = engine.storage().open_file_hashes().unwrap().unwrap();
+            let fresh = from_scratch(&engine).open_file_hashes().unwrap().unwrap();
+            assert_eq!(shared, fresh, "the hash index diverged after round {round}");
+            for name in &touched {
+                let shared = engine.storage().open_artifact(name).unwrap();
+                let fresh = from_scratch(&engine).open_artifact(name).unwrap();
+                assert_eq!(
+                    shared.map(|artifact| artifact.source_hash),
+                    fresh.map(|artifact| artifact.source_hash),
+                    "{name} diverged after round {round}"
+                );
+            }
+        }
+        // Once to begin with, and again only if a compaction replaces the base index.
+        assert!(
+            engine.inner.artifact_index.full_decodes() <= 3,
+            "the index was decoded in full {} times over {syncs} syncs",
+            engine.inner.artifact_index.full_decodes()
         );
     }
 }

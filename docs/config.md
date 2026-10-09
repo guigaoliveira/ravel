@@ -127,6 +127,7 @@ hubs_top_k = 1000
 | `RAVEL_LOG_LEVEL` | log level |
 | `RAVEL_DAEMON_MAX_CONNECTIONS` | hard cap for all daemon connections; defaults to `max(8, CPUs * 4)` |
 | `RAVEL_DAEMON_MAX_LEASES` | hard cap for persistent MCP leases; defaults to the connection cap minus one request slot |
-| `RAVEL_DAEMON_REQUEST_TIMEOUT_MS` | handshake/request read timeout; established leases are not timed out |
+| `RAVEL_DAEMON_REQUEST_TIMEOUT_MS` | handshake/request read timeout; established leases, which also carry their session's requests, are not timed out |
 | `RAVEL_MCP_MAX_CACHED_ROOTS` | maximum cached workspace roots per MCP process; defaults to `8`; least-recently-used inactive roots are evicted |
 | `RAVEL_MCP_TOOLS` | `primary` / `all` (MCP surface) |
+| `RAVEL_WATCH_FASTPATH` | `0` makes the daemon ask git about the worktree on every query instead of trusting its file watcher when nothing has changed |

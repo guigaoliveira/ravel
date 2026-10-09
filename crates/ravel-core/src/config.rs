@@ -249,13 +249,20 @@ pub fn is_noise_path_with(
     extra_dirs: &[String],
 ) -> bool {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        if use_builtin && BUILTIN_NOISE_DIRS.iter().any(|n| *n == s) {
-            return true;
-        }
-        extra_dirs.iter().any(|d| d == s.as_ref())
-    })
+    rel.components()
+        .any(|c| is_noise_component(c, use_builtin, extra_dirs))
+}
+
+fn is_noise_component(
+    component: std::path::Component<'_>,
+    use_builtin: bool,
+    extra_dirs: &[String],
+) -> bool {
+    let s = component.as_os_str().to_string_lossy();
+    if use_builtin && BUILTIN_NOISE_DIRS.iter().any(|n| *n == s) {
+        return true;
+    }
+    extra_dirs.iter().any(|d| d == s.as_ref())
 }
 
 /// Extensions that will be discovered/indexed for this config (owned strings, user-extensible).
@@ -323,6 +330,16 @@ impl Config {
             self.ignore.use_builtin_dirs,
             &self.ignore.dirs,
         )
+    }
+
+    /// [`Config::is_noise`] for a path a directory walk of the project root produced `depth`
+    /// names down. The walk built the path by joining those names onto the root, so they are its
+    /// last `depth` components: reading just those answers the same question without comparing the
+    /// whole root prefix, which was more than half of what a coverage walk spent per file.
+    fn is_noise_below_root(&self, path: &Path, depth: usize) -> bool {
+        path.components().rev().take(depth).any(|component| {
+            is_noise_component(component, self.ignore.use_builtin_dirs, &self.ignore.dirs)
+        })
     }
 
     /// Convenience single-path check. Hot discovery precomputes the extension set once via
@@ -684,24 +701,12 @@ pub fn unsupported_source_counts(
         "rs", "py", "go", "java", "kt", "rb", "php", "cs", "swift", "c", "cc", "cpp", "h", "hpp",
         "scala", "ex", "exs", "dart", "lua", "zig",
     ];
-    let root = &config.project.root;
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .git_ignore(config.ignore.gitignore)
-        .git_global(false)
-        .git_exclude(config.ignore.gitignore)
-        .follow_links(false);
-    let custom = root.join(".ravelignore");
-    if custom.is_file() {
-        builder.add_ignore(custom);
-    }
     let effective = effective_extensions(config);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut supported_seen = 0usize;
     let mut truncated = false;
     let mut seen = 0usize;
-    for entry in builder.build().flatten() {
+    for entry in coverage_walk(config).flatten() {
         seen += 1;
         if seen > budget {
             truncated = true;
@@ -710,8 +715,9 @@ pub fn unsupported_source_counts(
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
+        let depth = entry.depth();
         let path = entry.into_path();
-        if config.is_noise(&path) {
+        if config.is_noise_below_root(&path, depth) {
             continue;
         }
         if let Some(extension) = path.extension().and_then(|value| value.to_str())
@@ -726,6 +732,54 @@ pub fn unsupported_source_counts(
         }
     }
     (counts, supported_seen, truncated)
+}
+
+/// The walk behind the coverage probes: hidden files included, gitignore honoured, links not followed.
+fn coverage_walk(config: &Config) -> ignore::Walk {
+    let root = &config.project.root;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(config.ignore.gitignore)
+        .git_global(false)
+        .git_exclude(config.ignore.gitignore)
+        .follow_links(false);
+    let custom = root.join(".ravelignore");
+    if custom.is_file() {
+        builder.add_ignore(custom);
+    }
+    builder.build()
+}
+
+/// How many [`COMPONENT_SOURCE_EXTENSIONS`] files [`unsupported_source_counts`] counts, from the same
+/// walk and the same budget but without classifying everything else.
+///
+/// An empty relation answer is only unreliable when such files exist, and that is all the
+/// answer-health check reads. The full probe decides for every file whether it sits under a noise
+/// directory -- by far the dearest step of a walk that otherwise only reads names -- to count
+/// extensions nobody asked about. Here the check runs for the few files that could change the count.
+pub fn component_source_count(config: &Config, budget: usize) -> usize {
+    let mut count = 0usize;
+    let mut seen = 0usize;
+    for entry in coverage_walk(config).flatten() {
+        seen += 1;
+        if seen > budget {
+            break;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| COMPONENT_SOURCE_EXTENSIONS.contains(&extension))
+            && !config.is_noise(path)
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Gitignore rules live at every level, not just the workspace root: `apps/web/.gitignore` holding
@@ -958,6 +1012,105 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// A tree with every kind of noise: built-in names at the top, nested and as file stems, a
+    /// custom directory, hidden directories, and names that merely contain a noise name.
+    fn noisy_tree(root: &Path) {
+        for relative in [
+            "src/ok.ts",
+            "src/deep/er/still.ts",
+            "src/build/inside_build.ts",
+            "node_modules/pkg/index.js",
+            "dist/a.js",
+            "build/b.ts",
+            ".git/HEAD",
+            ".git/objects/ab/cdef",
+            ".ravel/CURRENT",
+            "packages/p/node_modules/q/x.ts",
+            "packages/p/src/tmp/t.ts",
+            "packages/p/src/tmpl/t.ts",
+            "packages/p/src/distance.ts",
+            "packages/p/vendor_like/v.ts",
+            "generated/g.ts",
+            "src/generated/h.ts",
+            "src/lib.rs",
+            "src/view.vue",
+            "node_modules/pkg/skip.rs",
+            "generated/skip.py",
+            ".hidden/seen.py",
+            "target/debug/skip.rs",
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        }
+    }
+
+    /// The coverage walk decides "noise" from the names below the root instead of stripping the
+    /// root off every path; the two must agree on every entry the walk can produce.
+    #[test]
+    fn the_names_below_the_root_decide_noise_like_the_whole_path_does() {
+        let dir = tempdir().unwrap();
+        noisy_tree(dir.path());
+        // A trailing separator must not change any answer.
+        let spellings = [
+            dir.path().to_path_buf(),
+            PathBuf::from(format!("{}/", dir.path().display())),
+        ];
+        for root in spellings {
+            for (builtin, extra) in [
+                (true, vec![]),
+                (false, vec![]),
+                (true, vec!["generated".to_owned()]),
+                (false, vec!["generated".to_owned(), "src".to_owned()]),
+            ] {
+                let mut config = Config::default();
+                config.project.root = root.clone();
+                config.ignore.use_builtin_dirs = builtin;
+                config.ignore.dirs = extra.clone();
+                let mut visited = 0;
+                let mut walker = ignore::WalkBuilder::new(&root);
+                walker.hidden(false).git_ignore(false).follow_links(false);
+                for entry in walker.build().flatten() {
+                    visited += 1;
+                    assert_eq!(
+                        config.is_noise(entry.path()),
+                        config.is_noise_below_root(entry.path(), entry.depth()),
+                        "{} (depth {}) builtin={builtin} extra={extra:?}",
+                        entry.path().display(),
+                        entry.depth(),
+                    );
+                }
+                assert!(
+                    visited > 30,
+                    "the walk must actually see the tree: {visited}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_counts_skip_noise_directories_and_count_the_rest() {
+        let dir = tempdir().unwrap();
+        noisy_tree(dir.path());
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.ignore.dirs = vec!["generated".to_owned()];
+        let (counts, supported_seen, truncated) = unsupported_source_counts(&config, 20_000);
+        // `.rs`: only src/lib.rs (node_modules, target and generated are noise); `.vue`: one.
+        // `.py`: only .hidden/seen.py (generated/skip.py is under a custom noise directory).
+        assert_eq!(counts.get("rs"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("vue"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("py"), Some(&1), "{counts:?}");
+        // Indexable sources outside noise: src/ok.ts, src/deep/er/still.ts, src/build is noise,
+        // packages/p/src/tmpl/t.ts, packages/p/src/distance.ts, packages/p/vendor_like/v.ts,
+        // src/generated is noise.
+        assert_eq!(supported_seen, 5, "{counts:?}");
+        assert!(!truncated);
+        // A budget smaller than the tree stops the walk and says so.
+        let (_, _, cut) = unsupported_source_counts(&config, 5);
+        assert!(cut);
+    }
+
     #[test]
     fn defaults_are_deterministic() {
         assert_eq!(Config::default(), Config::default());
@@ -997,6 +1150,50 @@ mod tests {
                 "missing {expected}"
             );
         }
+    }
+
+    /// The answer-health check reads only the component-format counts of the coverage probe, and now
+    /// asks for just those. The number must stay what the full probe reports, including where
+    /// the walk's budget cuts it short and for the files that are not counted (noise directories,
+    /// other extensions, extension case).
+    #[test]
+    fn component_source_count_equals_the_full_probes_component_counts() {
+        let dir = tempdir().unwrap();
+        for (path, body) in [
+            ("src/a.ts", "export {}"),
+            ("src/b.vue", "<template/>"),
+            ("src/c.svelte", "<script/>"),
+            ("src/deep/er/d.astro", "---"),
+            ("pages/e.astro", "---"),
+            ("docs/f.VUE", "<template/>"),
+            ("lib/g.py", "pass"),
+            ("node_modules/pkg/h.vue", "<template/>"),
+            ("dist/i.astro", "---"),
+            (".hidden/j.vue", "<template/>"),
+            ("ignored/k.vue", "<template/>"),
+            ("l.svelte", "<script/>"),
+        ] {
+            let full = dir.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, body).unwrap();
+        }
+        fs::write(dir.path().join(".ravelignore"), "ignored/\n").unwrap();
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        for budget in [0, 1, 2, 3, 5, 8, 13, 100] {
+            let (counts, _, _) = unsupported_source_counts(&config, budget);
+            let expected: usize = COMPONENT_SOURCE_EXTENSIONS
+                .iter()
+                .filter_map(|extension| counts.get(*extension))
+                .sum();
+            assert_eq!(
+                component_source_count(&config, budget),
+                expected,
+                "budget {budget}"
+            );
+        }
+        // Not vacuous: the files that count are seen with room to spare.
+        assert_eq!(component_source_count(&config, 100), 6);
     }
 
     #[test]

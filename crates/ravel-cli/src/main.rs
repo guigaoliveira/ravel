@@ -16,7 +16,7 @@ use ravel_core::{
     analysis, config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health,
     search::SearchKind,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{mem::ManuallyDrop, path::PathBuf, time::Duration};
 
 const CLI_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -415,7 +415,7 @@ skip_sibling_emit = true
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.status()?, pretty)?;
         }
         Some(Command::Context {
@@ -434,7 +434,7 @@ skip_sibling_emit = true
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
         }
         Some(Command::Setup { claude, force: _ }) => {
@@ -580,7 +580,7 @@ skip_sibling_emit = true
             page_size,
             cursor,
         }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             let limits = QueryLimits {
                 depth,
                 nodes,
@@ -591,11 +591,11 @@ skip_sibling_emit = true
             emit_json(&engine.query(&node, reverse, &limits, None)?, pretty)?;
         }
         Some(Command::Search { query, kind, limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.search(&query, kind.into(), limit)?, pretty)?;
         }
         Some(Command::Impact { node, depth, risk }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             let limits = QueryLimits {
                 depth,
                 ..Default::default()
@@ -607,7 +607,7 @@ skip_sibling_emit = true
             }
         }
         Some(Command::Cycles { package, files }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             if files {
                 emit_json(&engine.file_cycles(package.as_deref())?, pretty)?;
             } else {
@@ -615,11 +615,11 @@ skip_sibling_emit = true
             }
         }
         Some(Command::Hubs { limit, kind }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.hubs(limit, kind.as_deref())?, pretty)?;
         }
         Some(Command::Orphans { limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.orphans(limit)?, pretty)?;
         }
         Some(Command::Packages) => {
@@ -712,7 +712,7 @@ skip_sibling_emit = true
             emit_json(&engine.describe_schema()?, pretty)?;
         }
         Some(Command::Stats) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.stats()?, pretty)?;
         }
         Some(Command::Watch) => {
@@ -826,6 +826,20 @@ fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
         .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
 }
 
+/// Load the engine for a command that answers one question and exits.
+///
+/// The process is about to end, so tearing the engine down is pure cost: freeing the interned graph
+/// nodes one by one took 80M instructions (about 25ms) on a 20k-file workspace, a moment before the
+/// kernel reclaims the whole address space anyway. Only for commands that read the index: any lock or
+/// temp file an auto-sync takes is scoped to that call and gone before the answer is printed, and
+/// the read guards and mappings the caches hold are released by the OS at exit.
+fn load_for_query(root: &std::path::Path) -> anyhow::Result<ManuallyDrop<WorkspaceEngine>> {
+    Ok(ManuallyDrop::new(WorkspaceEngine::load(
+        root,
+        &Flags::default(),
+    )?))
+}
+
 /// One page of a symbol's reference sites, in one direction.
 ///
 /// Named commands for the two questions people actually ask, answered with the
@@ -839,7 +853,7 @@ fn reference_sites(
     scope: Option<&str>,
     rollup: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let rollup = match rollup {
+    let rollup_mode = match rollup {
         None => None,
         Some(value) => Some(ravel_core::engine::RollupMode::parse(value).ok_or_else(|| {
             anyhow::anyhow!(
@@ -847,13 +861,32 @@ fn reference_sites(
             )
         })?),
     };
-    let engine = WorkspaceEngine::load(root, &Flags::default())?;
+    // A daemon that is already running holds the graph and symbol tables in memory; asking it skips
+    // loading them again for one answer, as `context` does.
+    if let Some(value) = daemon_call_if_running(
+        root,
+        ravel_core::daemon::DaemonOperation::ReferenceSites {
+            node: node.to_owned(),
+            reverse,
+            limit: page_size,
+            cursor,
+            scope: scope.map(str::to_owned),
+            rollup: rollup.map(str::to_owned),
+        },
+    )? {
+        return Ok(value);
+    }
+    let engine = load_for_query(root)?;
+    engine.prefetch_for_relations();
     Ok(engine.reference_sites_with(
         node,
         reverse,
         page_size,
         cursor,
-        ravel_core::engine::RelationOptions { scope, rollup },
+        ravel_core::engine::RelationOptions {
+            scope,
+            rollup: rollup_mode,
+        },
     )?)
 }
 

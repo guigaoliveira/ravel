@@ -372,3 +372,236 @@ fn daemon_lease_limit_is_hard_and_does_not_consume_more_connections() {
     drop(daemon.stdin.take());
     assert!(daemon.wait().unwrap().success());
 }
+
+fn indexed_workspace(symbol: &str) -> tempfile::TempDir {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/base.ts"),
+        format!("export function {symbol}() {{ return 1; }}\n"),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    assert!(command(binary, root.path(), &["index"]).status.success());
+    root
+}
+
+fn transient_daemon(root: &Path, max_connections: &str) -> std::process::Child {
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let daemon = Command::new(binary)
+        .arg("--root")
+        .arg(root)
+        .args(["daemon-serve", "--transient"])
+        .env("RAVEL_DAEMON_MAX_CONNECTIONS", max_connections)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = ravel_core::daemon::DaemonClient::for_root(root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !client.is_ready() {
+        assert!(Instant::now() < deadline, "daemon never became ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon
+}
+
+#[test]
+fn a_lease_answers_queries_without_taking_another_connection() {
+    use ravel_core::daemon::DaemonOperation;
+
+    let root = indexed_workspace("leaseBase");
+    // One connection in all, and the lease holds it: anything that needed a connection of its own
+    // would be turned away.
+    let mut daemon = transient_daemon(root.path(), "1");
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    let lease = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+
+    for _ in 0..5 {
+        let status = lease.call_text(DaemonOperation::Status).unwrap();
+        assert!(status.contains(r#""indexed":true"#), "{status}");
+    }
+    let context = lease
+        .call_text(DaemonOperation::Context {
+            query: "leaseBase".into(),
+            limit: 5,
+            detail: false,
+        })
+        .unwrap();
+    assert!(context.contains("leaseBase"), "{context}");
+    assert!(
+        client.call(DaemonOperation::Status).is_err(),
+        "the lease should have used the daemon's only connection"
+    );
+
+    drop(lease);
+    drop(daemon.stdin.take());
+    assert!(daemon.wait().unwrap().success());
+}
+
+#[test]
+fn a_lease_refuses_lifecycle_operations_and_keeps_serving() {
+    use ravel_core::daemon::{DaemonCallError, DaemonOperation};
+
+    let root = indexed_workspace("leaseKeeps");
+    let mut daemon = transient_daemon(root.path(), "8");
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    let lease = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+
+    match lease.call_text(DaemonOperation::Shutdown) {
+        Err(DaemonCallError::Remote(message)) => {
+            assert!(message.contains("not served"), "{message}")
+        }
+        other => panic!("a lease must not stop its daemon: {other:?}"),
+    }
+    assert!(
+        lease.call_text(DaemonOperation::Status).is_ok(),
+        "a refused operation must not end the lease"
+    );
+    assert!(client.is_ready(), "the daemon must still be up");
+
+    drop(lease);
+    drop(daemon.stdin.take());
+    assert!(daemon.wait().unwrap().success());
+}
+
+/// Process ids of the daemons serving `root`, found the way an operator would: by command line.
+#[cfg(target_os = "linux")]
+fn daemon_pids(root: &Path) -> Vec<u32> {
+    let root = root.canonicalize().unwrap();
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+        let serves = args.iter().any(|arg| *arg == b"daemon-serve");
+        let for_root = args
+            .iter()
+            .any(|arg| Path::new(std::str::from_utf8(arg).unwrap_or("")) == root);
+        if serves && for_root {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_mcp_session_recovers_when_its_daemon_is_killed() {
+    use std::io::{BufRead, BufReader, Write};
+
+    struct Session {
+        stdin: std::process::ChildStdin,
+        lines: std::sync::mpsc::Receiver<String>,
+        next_id: u64,
+    }
+    impl Session {
+        fn request(&mut self, method: &str, params: &str) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            writeln!(
+                self.stdin,
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
+            )
+            .unwrap();
+            self.stdin.flush().unwrap();
+            loop {
+                let line = self
+                    .lines
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("`ravel mcp` did not answer");
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        }
+
+        fn status(&mut self) -> Value {
+            let reply = self.request("tools/call", r#"{"name":"status","arguments":{}}"#);
+            assert_ne!(reply["result"]["isError"], true, "{reply}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str(text).unwrap()
+        }
+    }
+
+    let root = indexed_workspace("survivesKill");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let mut mcp = Command::new(binary)
+        .arg("--root")
+        .arg(root.path())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = mcp.stdout.take().unwrap();
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut session = Session {
+        stdin: mcp.stdin.take().unwrap(),
+        lines,
+        next_id: 0,
+    };
+    session.request(
+        "initialize",
+        r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}"#,
+    );
+    writeln!(
+        session.stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+
+    assert_eq!(session.status()["indexed"], true);
+    let before = daemon_pids(root.path());
+    assert_eq!(before.len(), 1, "expected one daemon, found {before:?}");
+
+    // The daemon dies under a session that holds a lease on it and sends its calls down it.
+    assert!(
+        Command::new("sh")
+            .args(["-c", &format!("kill -9 {}", before[0])])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Its parent never reaps it, so "dead" is a missing entry or a zombie.
+    let alive = |pid: u32| {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(") ")
+                .next()
+                .is_some_and(|rest| !rest.starts_with('Z'))
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(before[0]) {
+        assert!(Instant::now() < deadline, "the daemon did not die");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The next call starts a new daemon and a new lease instead of failing the agent's request.
+    assert_eq!(session.status()["indexed"], true);
+    let after = daemon_pids(root.path());
+    assert_eq!(after.len(), 1, "expected a new daemon, found {after:?}");
+    assert_ne!(after, before);
+    assert_eq!(session.status()["indexed"], true);
+
+    drop(session);
+    mcp.wait().unwrap();
+}

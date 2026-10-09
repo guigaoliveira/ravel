@@ -17,7 +17,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -168,12 +168,14 @@ pub struct RavelMcp {
     max_cached_roots: usize,
     mode: McpToolMode,
     default_root: Option<PathBuf>,
+    /// `default_root` with its symlinks resolved, once that has worked.
+    resolved_default_root: OnceLock<PathBuf>,
 }
 
 #[derive(Debug)]
 struct DaemonBinding {
-    client: crate::daemon::DaemonClient,
-    _lease: crate::daemon::DaemonClientLease,
+    /// The session's lease on the daemon; calls travel over its connection.
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     last_used: u64,
 }
@@ -214,7 +216,7 @@ impl Drop for EngineUse {
 }
 
 struct DaemonUse {
-    client: crate::daemon::DaemonClient,
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     cache: Arc<Mutex<HashMap<String, DaemonBinding>>>,
     max_cached_roots: usize,
@@ -262,6 +264,7 @@ impl RavelMcp {
             max_cached_roots: max_cached_roots_from_env(),
             mode,
             default_root,
+            resolved_default_root: OnceLock::new(),
         }
     }
 
@@ -312,15 +315,29 @@ impl RavelMcp {
         })
     }
 
+    /// The workspace a call is about, with symlinks resolved. Resolving costs a `readlink` per path
+    /// component, so the server's default root -- the one nearly every call names -- is resolved
+    /// once rather than on every call.
+    fn call_root(&self, root: Option<&str>) -> Option<PathBuf> {
+        let resolve = |path: PathBuf| path.canonicalize().unwrap_or(path);
+        match (root, &self.default_root) {
+            (Some(root), _) => Some(resolve(PathBuf::from(root))),
+            (None, Some(default)) => Some(match self.resolved_default_root.get() {
+                Some(resolved) => resolved.clone(),
+                // Only a success is remembered: a root that does not exist yet may later.
+                None => match default.canonicalize() {
+                    Ok(resolved) => self.resolved_default_root.get_or_init(|| resolved).clone(),
+                    Err(_) => default.clone(),
+                },
+            }),
+            (None, None) => std::env::current_dir().ok().map(resolve),
+        }
+    }
+
     fn daemon_client(&self, root: Option<&str>) -> Result<DaemonUse, String> {
-        let base = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| {
-                "no workspace root: pass `root` or start the server inside one".to_owned()
-            })?;
-        let root = base.canonicalize().unwrap_or(base);
+        let root = self.call_root(root).ok_or_else(|| {
+            "no workspace root: pass `root` or start the server inside one".to_owned()
+        })?;
         let key = root.to_string_lossy().into_owned();
         let mut daemons = self.daemons.lock().unwrap();
         let tick = self.next_cache_tick();
@@ -328,7 +345,7 @@ impl RavelMcp {
             binding.last_used = tick;
             binding.active.fetch_add(1, Ordering::AcqRel);
             return Ok(DaemonUse {
-                client: binding.client.clone(),
+                lease: binding.lease.clone(),
                 active: binding.active.clone(),
                 cache: self.daemons.clone(),
                 max_cached_roots: self.max_cached_roots,
@@ -337,20 +354,20 @@ impl RavelMcp {
         evict_inactive_daemon(&mut daemons, self.max_cached_roots.saturating_sub(1));
         // Keep the cause. Collapsing it into `None` here is what turned an upgraded-binary
         // situation into "shared daemon could not be started", with no hint of the remedy.
-        let (client, lease) = crate::daemon::ensure_transient(&root)
+        let (_, lease) = crate::daemon::ensure_transient(&root)
             .map_err(|error| format!("shared daemon could not be started: {error}"))?;
+        let lease = Arc::new(lease);
         let active = Arc::new(AtomicUsize::new(1));
         daemons.insert(
             key,
             DaemonBinding {
-                client: client.clone(),
-                _lease: lease,
+                lease: lease.clone(),
                 active: active.clone(),
                 last_used: tick,
             },
         );
         Ok(DaemonUse {
-            client,
+            lease,
             active,
             cache: self.daemons.clone(),
             max_cached_roots: self.max_cached_roots,
@@ -358,34 +375,34 @@ impl RavelMcp {
     }
 
     fn forget_daemon(&self, root: Option<&str>) {
-        let Some(base) = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-        else {
+        let Some(root) = self.call_root(root) else {
             return;
         };
-        let root = base.canonicalize().unwrap_or(base);
         self.daemons
             .lock()
             .unwrap()
             .remove(root.to_string_lossy().as_ref());
     }
 
+    /// The daemon's answer as the JSON text it serialized: a tool result is that text, so it is
+    /// never parsed into a `Value` and written out again.
     fn call_daemon(
         &self,
         root: Option<&str>,
         operation: crate::daemon::DaemonOperation,
-    ) -> Result<serde_json::Value, String> {
-        let client = self.daemon_client(root)?;
-        match client.client.call(operation.clone()) {
-            Ok(value) => Ok(value),
+    ) -> Result<String, String> {
+        let session = self.daemon_client(root)?;
+        match session.lease.call_text(operation.clone()) {
+            Ok(text) => Ok(text),
             Err(error) if should_respawn_after(&error) => {
+                // Let go of the old lease before asking for a new one: a daemon that is stopping
+                // exits only once none is held.
+                drop(session);
                 self.forget_daemon(root);
                 let retry = self.daemon_client(root)?;
                 retry
-                    .client
-                    .call(operation)
+                    .lease
+                    .call_text(operation)
                     .map_err(|error| error.to_string())
             }
             Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
@@ -595,7 +612,7 @@ impl RavelMcp {
     )]
     async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(10).max(1);
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Context {
                 query: request.query.clone(),
@@ -648,7 +665,7 @@ impl RavelMcp {
         annotations(title = "Index status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Status,
         ))
@@ -673,7 +690,7 @@ impl RavelMcp {
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        json_reply(self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Sync { paths },
         ))
@@ -917,7 +934,7 @@ async fn reference_sites_tool(
             "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
         )));
     }
-    json_reply(mcp.call_daemon(
+    daemon_reply(mcp.call_daemon(
         request.root.as_deref(),
         crate::daemon::DaemonOperation::ReferenceSites {
             node: request.node,
@@ -1017,6 +1034,11 @@ fn json_reply<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -
     json_ok(&result.map_err(tool_error)?)
 }
 
+/// A daemon answer is JSON text already, so it goes out as it came in.
+fn daemon_reply(result: Result<String, String>) -> ToolReply {
+    result.map_err(tool_error)
+}
+
 fn tool_error(error: impl std::fmt::Display) -> String {
     error_json(error.to_string())
 }
@@ -1055,6 +1077,39 @@ mod tests {
         let root = PathBuf::from("/tmp/ravel-mcp-root");
         let m = RavelMcp::with_root(root.clone());
         assert_eq!(m.default_root, Some(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_default_root_is_resolved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let server = RavelMcp::with_root(link.clone());
+        let resolved = real.canonicalize().unwrap();
+
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // Resolved once: the link can go and the answer does not change, because nothing asks
+        // the filesystem again.
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // A root named in the call is resolved every time.
+        assert_eq!(
+            server.call_root(Some(real.to_str().unwrap())),
+            Some(resolved)
+        );
+    }
+
+    #[test]
+    fn a_default_root_that_does_not_resolve_yet_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = dir.path().join("later");
+        let server = RavelMcp::with_root(later.clone());
+        assert_eq!(server.call_root(None), Some(later.clone()));
+        std::fs::create_dir(&later).unwrap();
+        assert_eq!(server.call_root(None), Some(later.canonicalize().unwrap()));
     }
 
     #[test]

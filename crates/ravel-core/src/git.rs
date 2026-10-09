@@ -212,9 +212,74 @@ pub fn changed_paths_with(
         // Fallback: tracked-only diffs (still no untracked).
         return dirty_tracked_diff(root);
     }
+    Ok(parse_porcelain(root, discovery, &output.stdout))
+}
 
+/// Dirty paths among `relative` (workspace-relative, `/`-separated): what [`changed_paths_with`]
+/// reports for those paths, without making git look at the rest of the tree.
+///
+/// `git status` stats every tracked file and reads every directory, so one answer costs time
+/// proportional to the whole worktree -- ~35 ms on 20k files -- even when the caller only wants to
+/// know about the file it just edited. Limited to a pathspec it reads the index and looks at that
+/// path alone (~8 ms). Any outcome other than a clean answer falls back to the whole-tree query, so
+/// this can only be faster, never different.
+pub fn changed_paths_among(
+    root: &Path,
+    discovery: &DirtyDiscovery,
+    relative: &[String],
+) -> Result<Vec<PathBuf>, GitError> {
+    if !is_git_repo(root) {
+        return Err(GitError::NotWorktree(root.to_path_buf()));
+    }
+    if relative.is_empty() {
+        return Ok(Vec::new());
+    }
+    match status_among(root, discovery, relative) {
+        Some(paths) => Ok(paths),
+        None => changed_paths_with(root, discovery),
+    }
+}
+
+/// `git status` limited to `relative`, or `None` when that query cannot answer: too many paths, a
+/// pathspec git refuses (one that crosses into a submodule, say), or a git too old to know
+/// `--literal-pathspecs`.
+fn status_among(
+    root: &Path,
+    discovery: &DirtyDiscovery,
+    relative: &[String],
+) -> Option<Vec<PathBuf>> {
+    /// Far below any argument-length limit; a bigger batch is a pull or a rebase, where the
+    /// whole-tree answer is the cheaper one anyway.
+    const MAX_PATHSPECS: usize = 64;
+    if relative.len() > MAX_PATHSPECS {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        // Names are literal: `[id].ts` and `*.ts` are files here, not patterns.
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--no-renames"])
+        .arg(if discovery.include_untracked {
+            "-u"
+        } else {
+            "--untracked-files=no"
+        })
+        .arg("--")
+        .args(relative)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_porcelain(root, discovery, &output.stdout))
+}
+
+/// The paths in `git status --porcelain=v1 -z` output, filtered the way discovery has always
+/// filtered them and returned sorted.
+fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for record in output.stdout.split(|byte| *byte == 0) {
+    for record in stdout.split(|byte| *byte == 0) {
         if record.len() < 4 {
             continue;
         }
@@ -241,7 +306,7 @@ pub fn changed_paths_with(
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 /// Tracked-only dirty list via `git diff` (no porcelain, no untracked).
@@ -669,5 +734,233 @@ mod artifact_tests {
                 cooccurrence_count: 1
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod among_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use tempfile::{TempDir, tempdir};
+
+    fn run(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn write(dir: &Path, relative: &str, text: &str) {
+        let path = dir.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    /// A repository whose worktree has every kind of entry `git status` can report, with names
+    /// that would be wrong as patterns.
+    fn messy_repo() -> (TempDir, Vec<String>) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        run(root, &["init", "-q", "."]);
+        let tracked = [
+            "src/clean.ts",
+            "src/edited.ts",
+            "src/staged.ts",
+            "src/staged_then_edited.ts",
+            "src/deleted.ts",
+            "src/with space.ts",
+            "src/[id].ts",
+            "src/{x,y}.ts",
+            "src/!bang.ts",
+            "src/café.ts",
+            "-dash.ts",
+            "pkg/a/index.ts",
+        ];
+        for name in tracked {
+            write(root, name, "export const v = 1;\n");
+        }
+        write(root, ".gitignore", "ignored/\n");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "seed"]);
+
+        for name in [
+            "src/edited.ts",
+            "src/staged.ts",
+            "src/staged_then_edited.ts",
+            "src/with space.ts",
+            "src/[id].ts",
+            "src/{x,y}.ts",
+            "src/!bang.ts",
+            "src/café.ts",
+            "-dash.ts",
+        ] {
+            write(root, name, "export const v = 2;\n");
+        }
+        run(root, &["add", "src/staged.ts", "src/staged_then_edited.ts"]);
+        write(root, "src/staged_then_edited.ts", "export const v = 3;\n");
+        fs::remove_file(root.join("src/deleted.ts")).unwrap();
+        // Untracked: a new file in a tracked directory, one in a brand new directory, a declaration
+        // file and a source map (both skipped by discovery), a sibling emit, and an ignored file.
+        write(root, "src/brand_new.ts", "export const n = 1;\n");
+        write(root, "fresh/dir/deep/new.ts", "export const n = 1;\n");
+        write(root, "src/gen.d.ts", "export {};\n");
+        write(root, "src/gen.js.map", "{}");
+        write(root, "src/emit.ts", "export const e = 1;\n");
+        write(root, "src/emit.js", "exports.e = 1;\n");
+        write(root, "ignored/skipped.ts", "export const i = 1;\n");
+
+        let mut universe: Vec<String> = tracked.iter().map(|name| (*name).to_owned()).collect();
+        universe.extend(
+            [
+                "src/brand_new.ts",
+                "fresh/dir/deep/new.ts",
+                "src/gen.d.ts",
+                "src/gen.js.map",
+                "src/emit.ts",
+                "src/emit.js",
+                "ignored/skipped.ts",
+                "src/never_existed.ts",
+                "nowhere/at/all.ts",
+            ]
+            .map(String::from),
+        );
+        (dir, universe)
+    }
+
+    fn relative(root: &Path, paths: Vec<PathBuf>) -> BTreeSet<String> {
+        paths
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn asking_about_some_paths_gives_the_whole_tree_answer_restricted_to_them() {
+        let (dir, universe) = messy_repo();
+        let root = dir.path();
+        for discovery in [
+            DirtyDiscovery::default(),
+            DirtyDiscovery {
+                include_untracked: false,
+                ..DirtyDiscovery::default()
+            },
+        ] {
+            let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+            assert!(
+                whole.len() >= 8,
+                "the fixture must exercise many entry kinds, got {whole:?}"
+            );
+            let mut subsets: Vec<Vec<String>> = vec![universe.clone(), Vec::new()];
+            subsets.extend(universe.iter().map(|name| vec![name.clone()]));
+            subsets.extend(universe.windows(3).map(<[String]>::to_vec));
+            subsets.extend(
+                universe
+                    .iter()
+                    .step_by(2)
+                    .map(|name| vec![name.clone(), "src/clean.ts".into()]),
+            );
+            for subset in subsets {
+                let wanted: BTreeSet<String> = subset.iter().cloned().collect();
+                let expected: BTreeSet<String> = whole.intersection(&wanted).cloned().collect();
+                let answered = if subset.is_empty() {
+                    Vec::new()
+                } else {
+                    // The pathspec query itself, so a silent fallback to the whole tree cannot
+                    // make this pass.
+                    status_among(root, &discovery, &subset)
+                        .unwrap_or_else(|| panic!("the pathspec query refused {subset:?}"))
+                };
+                assert_eq!(
+                    relative(root, answered.clone()),
+                    relative(
+                        root,
+                        changed_paths_among(root, &discovery, &subset).unwrap()
+                    )
+                );
+                let among = relative(root, answered);
+                // Whatever else git volunteers, the entries for the asked-for paths must match
+                // the whole-tree answer exactly: none missing, none invented.
+                let among_wanted: BTreeSet<String> = among.intersection(&wanted).cloned().collect();
+                assert_eq!(
+                    among_wanted, expected,
+                    "untracked={} subset={subset:?}",
+                    discovery.include_untracked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_batch_past_the_pathspec_limit_still_answers() {
+        let (dir, universe) = messy_repo();
+        let root = dir.path();
+        let discovery = DirtyDiscovery::default();
+        let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+        let mut many = universe.clone();
+        many.extend((0..100).map(|n| format!("src/pad{n}.ts")));
+        let among = relative(root, changed_paths_among(root, &discovery, &many).unwrap());
+        let wanted: BTreeSet<String> = many.into_iter().collect();
+        assert_eq!(
+            among
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            whole
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_path_inside_a_nested_repository_agrees_with_the_whole_tree_query() {
+        let (dir, _) = messy_repo();
+        let root = dir.path();
+        // A repository inside the worktree: git refuses pathspecs that cross into it, and the
+        // answer must then come from the whole-tree query rather than being lost.
+        let nested = root.join("vendor/lib");
+        fs::create_dir_all(&nested).unwrap();
+        run(&nested, &["init", "-q", "."]);
+        write(&nested, "inner.ts", "export const i = 1;\n");
+        let discovery = DirtyDiscovery::default();
+        let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+        let ask = vec!["vendor/lib/inner.ts".to_owned(), "src/edited.ts".to_owned()];
+        let wanted: BTreeSet<String> = ask.iter().cloned().collect();
+        let among = relative(root, changed_paths_among(root, &discovery, &ask).unwrap());
+        assert_eq!(
+            among
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            whole
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(among.contains("src/edited.ts"));
+    }
+
+    #[test]
+    fn outside_a_repository_it_says_so_like_the_whole_tree_query() {
+        let dir = tempdir().unwrap();
+        let discovery = DirtyDiscovery::default();
+        assert!(matches!(
+            changed_paths_among(dir.path(), &discovery, &["a.ts".to_owned()]),
+            Err(GitError::NotWorktree(_))
+        ));
+        assert!(matches!(
+            changed_paths_with(dir.path(), &discovery),
+            Err(GitError::NotWorktree(_))
+        ));
     }
 }
