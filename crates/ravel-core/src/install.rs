@@ -1682,7 +1682,18 @@ fn replace_marked_section(text: &str, replacement: &str) -> String {
     let after_begin = start + MARKER_BEGIN.len();
     let end = text[after_begin..]
         .find(MARKER_END)
-        .map(|i| after_begin + i + MARKER_END.len())
+        .map(|i| {
+            // The end marker's own line break goes with the block: the replacement brings its
+            // own, so keeping this one added a blank line on every reinstall, and left one
+            // behind on uninstall.
+            let end = after_begin + i + MARKER_END.len();
+            let rest = &text[end..];
+            end + if rest.starts_with("\r\n") {
+                2
+            } else {
+                usize::from(rest.starts_with('\n'))
+            }
+        })
         .unwrap_or(text.len());
     let mut out = String::new();
     out.push_str(&text[..start]);
@@ -1995,6 +2006,34 @@ b = 2
         assert!(next.contains("explore SYMBOL"));
         assert!(next.contains("# y"));
         assert_eq!(next.matches(MARKER_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn reinstalling_instructions_changes_nothing_and_uninstall_restores_the_file() {
+        let dir = tempdir().unwrap();
+        let original = "# Notes\n\nmine\n";
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            fs::write(dir.path().join(name), original).unwrap();
+        }
+        fs::write(dir.path().join("GEMINI.md"), "# G\r\n").unwrap();
+        let opts = local_opts(dir.path(), vec![]);
+        let read = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
+
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        let first = read("AGENTS.md");
+        assert!(first.starts_with(original) && first.ends_with(&format!("{MARKER_END}\n")));
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert_eq!(read("AGENTS.md"), first);
+        assert_eq!(read("CLAUDE.md"), first);
+
+        strip_project_instructions(dir.path(), &mut Vec::new()).unwrap();
+        assert_eq!(read("AGENTS.md"), original);
+        assert_eq!(read("CLAUDE.md"), original);
+        assert_eq!(read("GEMINI.md"), "# G\r\n");
+
+        let crlf = format!("a\r\n{MARKER_BEGIN}\r\nold\r\n{MARKER_END}\r\nb\r\n");
+        assert_eq!(replace_marked_section(&crlf, ""), "a\r\nb\r\n");
     }
 
     #[test]
