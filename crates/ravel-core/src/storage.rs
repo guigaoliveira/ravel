@@ -119,6 +119,29 @@ static STRUCTURAL_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 // for a different temp `.ravel`.
 #[cfg(test)]
 static STRUCTURAL_FAILPOINT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Test-only: runs once a whole-generation reader has read the manifest it answers from, so a test
+/// can publish the next generation in exactly that window. Gated on the armed store, like the
+/// failpoints above.
+#[cfg(test)]
+type ManifestReadHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static AFTER_MANIFEST_READ: std::sync::Mutex<Option<ManifestReadHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn after_manifest_read(root: &Path) {
+    let hook = {
+        let mut slot = AFTER_MANIFEST_READ.lock().unwrap();
+        if slot.as_ref().is_some_and(|(armed, _)| armed == root) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
 
 fn structural_publish_failpoint(stage: u8, path: &Path) -> Result<(), StorageError> {
     if STRUCTURAL_PUBLISH_FAILPOINT.load(Ordering::Relaxed) == stage {
@@ -3058,13 +3081,22 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
-        let Some(chain) = manifest.structural_packs else {
+        self.structural_graph_base_in(&manifest)
+    }
+
+    /// `open_structural_graph_base` as of `manifest`, for a caller already answering from one
+    /// generation. The caller holds the generation guard.
+    fn structural_graph_base_in(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Option<IncrementalGraphState>, StorageError> {
+        let Some(chain) = &manifest.structural_packs else {
             return Ok(None);
         };
         if chain.current_snapshot != manifest.snapshot_id.stable_key() {
             return Ok(None);
         }
-        let path = self.root.join(chain.base);
+        let path = self.root.join(&chain.base);
         let reader = GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
             path: path.clone(),
             message: error.to_string(),
@@ -3114,7 +3146,7 @@ impl FileSnapshotStorage {
             by_file.extend(shard.by_file);
         }
         // Apply each overlay's file section over the union, in chain order, before reconstruction.
-        for overlay_name in chain.overlays {
+        for overlay_name in &chain.overlays {
             let overlay_path = self.root.join(overlay_name);
             let overlay_reader = GenerationPackReader::open(&overlay_path).map_err(|error| {
                 StorageError::Invalid {
@@ -3737,7 +3769,18 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
-        if let Some(location) = self.current_artifact_location(&manifest, path)?
+        self.open_artifact_in(&manifest, path)
+    }
+
+    /// `open_artifact` as of `manifest`, for a caller already answering from one generation:
+    /// reading `CURRENT` again could land on a later one. The caller holds the generation guard and
+    /// the artifact read lock.
+    fn open_artifact_in(
+        &self,
+        manifest: &Manifest,
+        path: &str,
+    ) -> Result<Option<FileArtifact>, StorageError> {
+        if let Some(location) = self.current_artifact_location(manifest, path)?
             && location.store.is_some()
         {
             let index = ArtifactIndex {
@@ -3752,7 +3795,7 @@ impl FileSnapshotStorage {
         if let Some(store) = manifest.artifact_store.as_deref()
             && let Some((pack, prefix)) = store.split_once('#')
         {
-            let Some(index) = self.cached_artifact_index(&manifest)? else {
+            let Some(index) = self.cached_artifact_index(manifest)? else {
                 return Ok(None);
             };
             if !index.entries.contains_key(path) || index.tombstones.contains(path) {
@@ -3768,11 +3811,11 @@ impl FileSnapshotStorage {
                 }
             });
         }
-        let Some(location) = self.current_artifact_location(&manifest, path)? else {
+        let Some(location) = self.current_artifact_location(manifest, path)? else {
             return Ok(None);
         };
         let store = manifest.artifact_store.clone().or_else(|| {
-            self.read_artifact_index(&manifest)
+            self.read_artifact_index(manifest)
                 .ok()
                 .flatten()
                 .map(|index| index.store)
@@ -4948,6 +4991,8 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        after_manifest_read(&self.root);
         self.ensure_supported_schema(&manifest)?;
         if let Some(chain) = manifest
             .structural_packs
@@ -5028,7 +5073,7 @@ impl FileSnapshotStorage {
                     return Ok(Some(graph));
                 }
             }
-            if let Some(state) = self.open_structural_graph_base()? {
+            if let Some(state) = self.structural_graph_base_in(&manifest)? {
                 return Ok(Some(GraphIndex::from_edges(
                     &state.edges(),
                     manifest.snapshot_id.stable_key(),
@@ -5790,6 +5835,10 @@ impl SnapshotStorage for FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
+        // Everything below answers from this manifest; reading `CURRENT` again could mix in a
+        // generation published since.
+        #[cfg(test)]
+        after_manifest_read(&self.root);
         if manifest.schema_version != SCHEMA_VERSION {
             return Err(StorageError::Invalid {
                 path: self.current_path(),
@@ -5838,11 +5887,12 @@ impl SnapshotStorage for FileSnapshotStorage {
             let mut files = BTreeMap::new();
             for path in index.entries.keys() {
                 let artifact = if index.overrides.contains(path) {
-                    self.open_artifact(path)?
-                        .ok_or_else(|| StorageError::Invalid {
+                    self.open_artifact_in(&manifest, path)?.ok_or_else(|| {
+                        StorageError::Invalid {
                             path: base_path.clone(),
                             message: format!("missing overlaid artifact {path}"),
-                        })?
+                        }
+                    })?
                 } else {
                     let key = format!("artifact/{path}");
                     let bytes = reader
@@ -5865,7 +5915,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             if manifest.structural_packs.as_ref().is_some_and(|chain| {
                 !chain.overlays.is_empty()
                     && chain.current_snapshot == manifest.snapshot_id.stable_key()
-            }) && let Some(graph) = self.open_structural_graph_base()?
+            }) && let Some(graph) = self.structural_graph_base_in(&manifest)?
             {
                 edges = graph.edges();
             }
@@ -5908,7 +5958,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             .structural_packs
             .as_ref()
             .is_some_and(|chain| chain.current_snapshot == manifest.snapshot_id.stable_key())
-            && let Some(graph) = self.open_structural_graph_base()?
+            && let Some(graph) = self.structural_graph_base_in(&manifest)?
         {
             // The incremental writer deliberately avoids rebuilding the global edge vector.
             // Materialize it only when the full-snapshot API explicitly asks for it.
@@ -7000,6 +7050,135 @@ mod tests {
                 .all(|error| error.to_string().contains("run `ravel index`"))
         );
     }
+    /// A whole-generation read answers from the manifest it read first. `open_current` looked each
+    /// edited artifact up through `CURRENT` again, so a sync landing mid-read handed it the next
+    /// generation's file under this generation's id.
+    #[test]
+    fn a_snapshot_reads_one_generation_while_the_next_is_published() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        publish_packed(&store, &snapshot_with_files(2));
+        publish_body_edit(&store, "src/file-0.ts", 1);
+        let read_from = store.read_manifest().unwrap().unwrap();
+        let writer = dir.path().to_path_buf();
+        *AFTER_MANIFEST_READ.lock().unwrap() = Some((
+            dir.path().to_path_buf(),
+            Box::new(move || {
+                publish_body_edit(&FileSnapshotStorage::new(&writer), "src/file-0.ts", 2);
+            }),
+        ));
+
+        let snapshot = store.open_current().unwrap().unwrap();
+        assert!(
+            AFTER_MANIFEST_READ.lock().unwrap().is_none(),
+            "hook never ran"
+        );
+        assert_ne!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            read_from.snapshot_id
+        );
+        assert_eq!(snapshot.id, read_from.snapshot_id);
+        let revision_1 = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 1\n",
+        );
+        assert_eq!(
+            snapshot.files["src/file-0.ts"].source_hash,
+            revision_1.source_hash
+        );
+    }
+
+    /// The same for the graph: when the archived graph predates the generation, `open_graph`
+    /// rebuilds it from the structural chain, which it also read through `CURRENT` again.
+    #[test]
+    fn a_graph_reads_one_generation_while_the_next_is_published() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let import = |to: &str| crate::model::Edge {
+            from: "src/a.ts".into(),
+            to: to.into(),
+            kind: crate::model::EdgeKind::Import,
+            confidence: crate::model::EdgeConfidence::Resolved {
+                score: 1.0,
+                reason: "test".into(),
+            },
+            type_only: false,
+            source_path: Some("src/a.ts".into()),
+            span: None,
+            provenance: crate::model::EdgeProvenance::Resolution,
+        };
+        let mut base = snapshot();
+        base.edges = vec![import("src/b.ts")];
+        let mut stager = store
+            .begin_structural_pack_base(base.id.stable_key())
+            .unwrap();
+        stager.stage_graph_edges(&base.edges).unwrap();
+        stager.stage_snapshot(&base).unwrap();
+        let staged = stager.finish().unwrap();
+        store.publish_packed_snapshot(&base, staged).unwrap();
+
+        let mut state = IncrementalGraphState::from_edges(&base.edges);
+        let mut retarget = |to: &str| {
+            state.replace_owned_files(BTreeMap::from([(
+                "src/a.ts".to_owned(),
+                Some(BTreeSet::from([crate::incremental_graph::OwnedEdge::from(
+                    &import(to),
+                )])),
+            )]))
+        };
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        let changed = BTreeSet::from(["src/a.ts".to_owned()]);
+        let mut read_from = base.clone();
+        read_from.id.content_state = "imports c".into();
+        let overlay = retarget("src/c.ts");
+        let universe = ResolutionUniverseOverlay::default();
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &read_from,
+                    &changed,
+                    Some((&overlay, &universe, &reverse)),
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        let mut next = base;
+        next.id.content_state = "imports d".into();
+        let next_overlay = retarget("src/d.ts");
+        let writer = dir.path().to_path_buf();
+        *AFTER_MANIFEST_READ.lock().unwrap() = Some((
+            dir.path().to_path_buf(),
+            Box::new(move || {
+                assert!(
+                    FileSnapshotStorage::new(&writer)
+                        .publish_structural_overlay(
+                            &next,
+                            &changed,
+                            Some((&next_overlay, &universe, &reverse)),
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                );
+            }),
+        ));
+
+        let graph = store.open_graph().unwrap().unwrap();
+        assert!(
+            AFTER_MANIFEST_READ.lock().unwrap().is_none(),
+            "hook never ran"
+        );
+        assert_eq!(graph.snapshot_id(), read_from.id.stable_key());
+        assert_eq!(graph.neighbors_forward("src/a.ts"), vec!["src/c.ts"]);
+    }
+
     /// The manifest cache was keyed on mtime alone, taken after the bytes were read. Where
     /// timestamps are coarse, two generations published in one tick share an mtime, and the cache
     /// kept answering with the first.
