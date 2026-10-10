@@ -546,6 +546,8 @@ pub fn export_package_dot(graph: &GraphIndex) -> String {
 /// Map a source path to likely test companions using common naming conventions.
 pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
     const DEFAULT_TEST_PATTERNS: &[&str] = &[".spec.ts", ".test.ts", ".spec.js", ".test.js"];
+    /// Source extensions the defaults above do not already cover.
+    const SOURCE_ONLY_EXTENSIONS: &[&str] = &["tsx", "jsx", "mts", "cts", "mjs", "cjs"];
     let path = path.replace('\\', "/");
     // strip extension
     let stem = path
@@ -557,15 +559,20 @@ pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
         .rsplit_once('.')
         .map(|(s, _)| s.to_owned())
         .unwrap_or_else(|| base.to_owned());
-    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
+    // Empty for a root-level file: `./foo.test.ts` names the same file as `foo.test.ts`, and both
+    // passed the on-disk check, so every test was listed twice.
+    let dir = path
+        .rsplit_once('/')
+        .map(|(d, _)| format!("{d}/"))
+        .unwrap_or_default();
     let mut out = Vec::new();
     let mut apply = |pat: &str| {
         // Only extension-style patterns (`.spec.ts`). The former `{pre}.{ext}` line was
         // bit-identical to `{stem}{pat}` (pre==stem) and only survived via dedup — dropped.
         if pat.starts_with('.') {
             out.push(format!("{stem}{pat}"));
-            out.push(format!("{dir}/__tests__/{base_stem}{pat}"));
-            out.push(format!("{dir}/{base_stem}{pat}"));
+            out.push(format!("{dir}__tests__/{base_stem}{pat}"));
+            out.push(format!("{dir}{base_stem}{pat}"));
             // src→test mirrors (NestJS/Jest monorepo layout): apps/X/src/**/f.ts
             // → apps/X/test/**/f.spec.ts (and tests/).
             if let Some((prefix, suffix)) = stem.split_once("/src/") {
@@ -580,6 +587,12 @@ pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
     if patterns.is_empty() {
         for &pat in DEFAULT_TEST_PATTERNS {
             apply(pat);
+        }
+        // Tests are usually written in the source's own dialect: `Button.tsx` → `Button.test.tsx`.
+        let extension = base.rsplit_once('.').map(|(_, ext)| ext);
+        if let Some(ext) = extension.filter(|ext| SOURCE_ONLY_EXTENSIONS.contains(ext)) {
+            apply(&format!(".spec.{ext}"));
+            apply(&format!(".test.{ext}"));
         }
     } else {
         for pat in patterns {
@@ -827,6 +840,45 @@ mod tests {
             ),
             "missing src→test mirror candidate, got {candidates:#?}"
         );
+    }
+
+    /// A root-level file has no directory to prefix: `./foo.test.ts` named the same file as
+    /// `foo.test.ts`, and `related-tests` checks both on disk, so it listed every test twice.
+    #[test]
+    fn related_tests_for_a_root_level_file_are_listed_once() {
+        let candidates = related_tests("foo.ts", &[]);
+        assert!(
+            candidates.iter().all(|c| !c.starts_with("./")),
+            "{candidates:#?}"
+        );
+        assert!(candidates.contains(&"foo.test.ts".to_owned()));
+        assert!(candidates.contains(&"__tests__/foo.test.ts".to_owned()));
+    }
+
+    /// Tests are usually written in the source's own dialect: `Button.tsx` → `Button.test.tsx`.
+    #[test]
+    fn related_tests_follow_the_source_extension() {
+        let candidates = related_tests("src/Button.tsx", &[]);
+        for expected in [
+            "src/Button.test.tsx",
+            "src/Button.spec.tsx",
+            "src/__tests__/Button.test.tsx",
+            "test/Button.test.tsx",
+            // The defaults still apply.
+            "src/Button.test.ts",
+        ] {
+            assert!(
+                candidates.contains(&expected.to_owned()),
+                "missing {expected}, got {candidates:#?}"
+            );
+        }
+        let module = related_tests("lib/util.mjs", &[]);
+        assert!(
+            module.contains(&"lib/util.test.mjs".to_owned()),
+            "{module:#?}"
+        );
+        // A plain `.ts` source adds nothing beyond the defaults.
+        assert_eq!(related_tests("src/a.ts", &[]).len(), 16);
     }
 
     #[test]
