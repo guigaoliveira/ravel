@@ -845,6 +845,12 @@ fn visible_local_definition(
     if definition.qualified_name == definition.name {
         return true;
     }
+    // Class and interface members (and the members of an object type) are reached through
+    // `this`, an instance, or the owner itself -- never as a bare name, even inside the owner.
+    // Enum members are the exception: a later initializer names an earlier member bare.
+    if matches!(definition.kind.as_ref(), "method" | "property") {
+        return false;
+    }
     let Some(source) = source else {
         return false;
     };
@@ -2812,6 +2818,80 @@ class Child extends Base implements Shape {
                 && edge.to == "src/b.ts"
                 && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         }));
+    }
+
+    /// Calls edges leaving the symbol with `from_id`, as `(target id, line)` pairs.
+    fn calls_from(edges: &[Edge], from_id: &str) -> Vec<String> {
+        edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.from == from_id)
+            .map(|edge| edge.to.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_class_member_does_not_shadow_an_import_of_the_same_name() {
+        // Class and interface members are reached through `this`, an instance, or the class
+        // itself -- never as a bare name. Treating `Logger.format` as lexically visible inside
+        // `Logger` sent every `format(x)` there to the method instead of the imported function,
+        // and a wrapper method calling the import of its own name resolved to itself and vanished.
+        let root = tempdir().unwrap();
+        let formatter = write_artifact(
+            root.path(),
+            "src/fmt.ts",
+            "export function format(x: string) { return x; }",
+        );
+        let logger = write_artifact(
+            root.path(),
+            "src/logger.ts",
+            "import { format } from './fmt';\n\
+             export class Logger {\n\
+               format(x: string) { return format(x); }\n\
+               log(x: string) { return format(x); }\n\
+             }\n\
+             export interface Shape { format(x: string): string; }\n\
+             export class Shaped { run(x: string) { return format(x); } }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (formatter.path.clone(), formatter.clone()),
+            (logger.path.clone(), logger.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        let imported = symbol_id(&formatter, "format");
+        for caller in ["Logger.format", "Logger.log", "Shaped.run"] {
+            assert_eq!(
+                calls_from(&edges, &symbol_id(&logger, caller)),
+                std::slice::from_ref(&imported),
+                "{caller} calls the imported function"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enum_member_stays_visible_inside_its_own_initializers() {
+        // `B = A << 1` names `Flags.A` bare; that is the one kind of member that is in scope.
+        let flags = parse_source("src/flags.ts", b"export enum Flags { A = 1, B = A << 1 }");
+        let logger = parse_source("src/logger.ts", b"class Logger { format() {} log() {} }");
+        let symbol = |artifact: &FileArtifact, qualified: &str| {
+            artifact
+                .symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == qualified)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {qualified} in {:?}", artifact.symbols))
+        };
+        let visible = |artifact: &FileArtifact, definition: &str, from: &str| {
+            let source = symbol(artifact, from);
+            visible_local_definition(
+                &SymbolDefinition::from_symbol(artifact, &symbol(artifact, definition)),
+                Some(&source),
+                source.span,
+            )
+        };
+        assert!(visible(&flags, "Flags.A", "Flags.B"));
+        assert!(visible(&flags, "Flags.A", "Flags"));
+        assert!(!visible(&logger, "Logger.format", "Logger.log"));
+        assert!(!visible(&logger, "Logger.format", "Logger"));
     }
 
     fn universe_of(files: &[(&str, &str)]) -> (BTreeMap<String, FileArtifact>, ResolutionUniverse) {
