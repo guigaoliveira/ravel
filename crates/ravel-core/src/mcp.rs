@@ -781,12 +781,25 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> ToolReply {
-        let kind = match request.kind.as_deref() {
+        // Anything else is refused: run as an exact search, `contains` or a misspelling came back as
+        // an ordinary-looking "nothing found". Case is forgiven; it cannot change which kind is meant.
+        let kind = match request
+            .kind
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("exact") => SearchKind::Exact,
             Some("prefix") => SearchKind::Prefix,
             Some("fuzzy") => SearchKind::Fuzzy,
             Some("regex") => SearchKind::Regex,
             Some("terms") => SearchKind::Terms,
-            _ => SearchKind::Exact,
+            Some(_) => {
+                return Err(error_json(format!(
+                    "unknown search kind `{}`; supported: exact, prefix, fuzzy, regex, terms",
+                    request.kind.unwrap_or_default()
+                )));
+            }
         };
         let limit = request.limit.unwrap_or(20).max(1);
         let engine = self.engine(request.root).map_err(tool_error)?;
@@ -1260,6 +1273,50 @@ mod tests {
             .expect("follower did not take over after leader exit");
         drop(replacement);
         follower.join().unwrap();
+    }
+
+    /// The answer of a tool whose work never waits (these engine calls block instead).
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the tool waited"),
+        }
+    }
+
+    #[test]
+    fn a_search_kind_that_is_not_one_is_refused_not_run_as_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.ts"),
+            "export function prefixTarget() { return 1; }\n",
+        )
+        .unwrap();
+        WorkspaceEngine::load(dir.path(), &Default::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        let server = RavelMcp::with_mode(McpToolMode::All);
+        let search = |kind: &str| {
+            ready(server.search_symbols(Parameters(SearchRequest {
+                root: Some(dir.path().to_string_lossy().into_owned()),
+                query: "prefixTarg".into(),
+                kind: Some(kind.into()),
+                limit: None,
+            })))
+        };
+
+        let found = search("prefix").unwrap();
+        assert!(found.contains("prefixTarget"), "{found}");
+        // What a model is likely to write for the same thing.
+        assert_eq!(search("Prefix").unwrap(), found);
+        // Silently searching for the exact spelling instead answered "nothing found".
+        for kind in ["contains", "substring", ""] {
+            let refused = search(kind).unwrap_err();
+            assert!(refused.contains("exact"), "{kind:?}: {refused}");
+        }
     }
 
     #[test]
