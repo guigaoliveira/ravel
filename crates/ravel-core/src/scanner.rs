@@ -557,7 +557,9 @@ fn extract_node(
     }
 
     if kind == "export_statement" {
-        exports.push(extract_export(node, source));
+        if is_module_level(node) {
+            exports.push(extract_export(node, source));
+        }
         let declaration = node.child_by_field_name("declaration");
         let declaration_id = declaration.map(|n| n.id());
         let symbols_before_declaration = symbols.len();
@@ -1500,6 +1502,21 @@ fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
         span: span(node),
         bindings,
     }
+}
+
+/// An export inside `namespace X { }` or `declare module 'm' { }` exports from that namespace or
+/// module, not from the file. Those bodies are the only statement blocks an export can sit in, so
+/// any enclosing block means the statement is not a module export. Walking ancestors rather than
+/// requiring a `program` parent keeps top-level exports that error recovery wrapped in `ERROR`.
+fn is_module_level(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "statement_block" {
+            return false;
+        }
+        ancestor = current.parent();
+    }
+    true
 }
 
 fn require_specifier(call: Node<'_>, source: &[u8]) -> Option<String> {
@@ -2845,6 +2862,31 @@ type Remote = import('./remote').Thing;
                 .iter()
                 .any(|(name, _)| matches!(*name, "Dependency" | "Options"))
         );
+    }
+
+    #[test]
+    fn exports_inside_namespaces_and_ambient_modules_are_not_file_exports() {
+        let artifact = parse_source(
+            "declarations.ts",
+            br#"
+namespace Tools { export function work() {} }
+declare module 'm' { export function g(): void; export default function h(): void; }
+export function top() {}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let exported: Vec<_> = artifact
+            .exports
+            .iter()
+            .flat_map(|export| &export.bindings)
+            .map(|binding| binding.exported.as_str())
+            .collect();
+        assert_eq!(exported, vec!["top"], "{:?}", artifact.exports);
+        assert!(has_symbol(&artifact, "Tools.work", "function_declaration"));
     }
 
     #[test]
