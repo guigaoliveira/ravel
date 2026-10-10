@@ -890,7 +890,7 @@ fn extract_node(
     }
 
     if matches!(kind, "required_parameter" | "optional_parameter")
-        && is_parameter_property(node, source)
+        && is_parameter_property(node)
         && enclosing
             .and_then(|owner| owner.member_owner.as_ref())
             .is_some()
@@ -1626,13 +1626,17 @@ fn extract_commonjs_export(node: Node<'_>, source: &[u8]) -> Option<Export> {
     })
 }
 
-fn is_parameter_property(node: Node<'_>, source: &[u8]) -> bool {
-    let text = node_text(node, source).trim_start();
-    text.starts_with("public ")
-        || text.starts_with("private ")
-        || text.starts_with("protected ")
-        || text.starts_with("readonly ")
-        || text.starts_with("override ")
+/// A modifier makes a constructor parameter a class property. Read from the parameter's own child
+/// tokens, not its text: decorators come first (`@Inject(X) private readonly svc: Svc`), which is
+/// exactly how NestJS/Angular declare injected dependencies.
+fn is_parameter_property(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "accessibility_modifier" | "override_modifier" | "readonly"
+        )
+    })
 }
 
 fn declared_names(node: Node<'_>, source: &[u8]) -> Vec<(String, Span)> {
@@ -2784,6 +2788,51 @@ type Remote = import('./remote').Thing;
                 .iter()
                 .any(|(name, _)| matches!(*name, "Dependency" | "Options"))
         );
+    }
+
+    #[test]
+    fn decorated_constructor_parameter_properties_are_class_members() {
+        let artifact = parse_source(
+            "controller.ts",
+            br#"
+class Ctl {
+  constructor(
+    @Inject(TOKEN) private readonly svc: Svc,
+    @Optional() public other?: Other,
+    plain: Plain,
+    readonly flag: Flag,
+  ) {}
+  run() { this.svc.doIt(); }
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for name in ["Ctl.svc", "Ctl.other", "Ctl.flag"] {
+            assert!(
+                has_symbol(&artifact, name, "property"),
+                "missing {name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(!has_symbol(&artifact, "Ctl.plain", "property"));
+        let has_ref = |from: &str, to: &str, kind: EdgeKind| {
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == from
+                    && reference.to == to
+                    && reference.kind == kind
+            })
+        };
+        assert!(
+            has_ref("Ctl.svc", "Inject", EdgeKind::Decorates),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(has_ref("Ctl.svc", "Svc", EdgeKind::TypeOf));
+        assert!(has_ref("Ctl.other", "Optional", EdgeKind::Decorates));
     }
 
     #[test]
