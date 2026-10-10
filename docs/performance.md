@@ -1,5 +1,9 @@
 # Performance notes
 
+The [2026-10-10 MCP merge review](mcp-merge-performance.md) compares the 1.19.0
+source baseline, merged branches and a measured coverage optimization, including
+CPU, RSS/PSS, functional checks and the regressions that remain.
+
 Ravel is designed for fast repeated queries against an existing `.ravel/`
 index. Sidecars keep common reads small, while `sync` updates only changed
 files when possible.

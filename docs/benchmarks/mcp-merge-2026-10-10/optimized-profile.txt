@@ -1,0 +1,67 @@
+--------------------------------------------------------------------------------
+Profile data file '<BENCH>/results/optimized-context-final.callgrind' (creator: callgrind-3.26.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 95795872
+Trigger: Program termination
+Profiled target:  <BENCH>/bins/optimized --root <BENCH>/full-large/merged context helper0_10 --limit 10 (PID 1805403, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       95
+Include dirs:     
+User annotated:   
+Auto-annotation:  off
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+412,846,702 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                    file:function
+--------------------------------------------------------------------------------
+379,077,333 (91.82%)  ./nptl/./nptl/pthread_create.c:start_thread [/usr/lib/x86_64-linux-gnu/libc.so.6]
+378,904,524 (91.78%)  ???:<std::sys::thread::unix::Thread>::new::thread_start [<BENCH>/bins/optimized]
+203,220,591 (49.22%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#0}, core::result::Result<alloc::sync::Arc<ravel_core::graph::GraphIndex>, ravel_core::engine::EngineError>>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/optimized]
+203,220,062 (49.22%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#0}, core::result::Result<alloc::sync::Arc<ravel_core::graph::GraphIndex>, ravel_core::engine::EngineError>> [<BENCH>/bins/optimized]
+203,219,313 (49.22%)  ???:<ravel_core::engine::WorkspaceEngine>::graph [<BENCH>/bins/optimized]
+203,203,852 (49.22%)  ???:<ravel_core::storage::FileSnapshotStorage>::open_graph [<BENCH>/bins/optimized]
+190,726,419 (46.20%)  ???:<rkyv::string::ArchivedString as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+182,542,604 (44.22%)  ???:<ravel_core::generation_pack::GenerationPackReader>::with_record_for_validation::<core::result::Result<ravel_core::graph::GraphIndex, alloc::string::String>, <ravel_core::storage::FileSnapshotStorage>::open_graph::{closure#2}> [<BENCH>/bins/optimized]
+154,951,354 (37.53%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#2}, core::result::Result<(alloc::vec::Vec<ravel_core::search::SearchHit>, alloc::vec::Vec<ravel_core::search::SearchHit>), ravel_core::engine::EngineError>>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/optimized]
+154,950,813 (37.53%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#2}, core::result::Result<(alloc::vec::Vec<ravel_core::search::SearchHit>, alloc::vec::Vec<ravel_core::search::SearchHit>), ravel_core::engine::EngineError>> [<BENCH>/bins/optimized]
+154,950,080 (37.53%)  ???:<ravel_core::engine::WorkspaceEngine>::context_searches [<BENCH>/bins/optimized]
+154,949,904 (37.53%)  ???:<ravel_core::engine::WorkspaceEngine>::search_raw [<BENCH>/bins/optimized]
+154,704,552 (37.47%)  ???:blake3::compress_subtree_wide::<blake3::join::SerialJoin>'2 [<BENCH>/bins/optimized]
+137,571,340 (33.32%)  ???:<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error> as rkyv::validation::archive::ArchiveContextExt<rancor::Error>>::in_subtree::<str, (), <rkyv::string::ArchivedString as bytecheck::Verify<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::verify::{closure#0}> [<BENCH>/bins/optimized]
+135,004,787 (32.70%)  ???:<ravel_core::search::SearchIndex>::search [<BENCH>/bins/optimized]
+117,195,245 (28.39%)  ???:<ravel_core::graph::GraphIndex>::from_archived_flat [<BENCH>/bins/optimized]
+103,339,332 (25.03%)  ???:<ravel_core::generation_pack::GenerationPackReader>::with_record_for_validation::<core::result::Result<alloc::vec::Vec<ravel_core::search::SearchHit>, ravel_core::search::SearchError>, <ravel_core::search::TermRuntime>::search::{closure#0}> [<BENCH>/bins/optimized]
+101,440,087 (24.57%)  ???:ravel_core::search::access_validated_once::<ravel_core::search::ArchivedTermIndex> [<BENCH>/bins/optimized]
+101,440,019 (24.57%)  ???:<ravel_core::search::ArchivedTermIndex as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+101,396,316 (24.56%)  ???:<rkyv::vec::ArchivedVec<ravel_core::search::ArchivedTermDocument> as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+ 65,346,310 (15.83%)  ???:<ravel_core::graph::ArchivedFlatCompactGraph as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+ 56,022,810 (13.57%)  ???:<ravel_core::graph::NameIndex>::insert [<BENCH>/bins/optimized]
+ 39,453,742 ( 9.56%)  ???:<ravel_core::generation_pack::GenerationPackReader>::map [<BENCH>/bins/optimized]
+ 39,451,777 ( 9.56%)  ???:<ravel_core::generation_pack::GenerationPackReader>::open_shared::<&std::path::PathBuf> [<BENCH>/bins/optimized]
+ 33,769,341 ( 8.18%)  ???:0x0000000000023340 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+ 33,155,147 ( 8.03%)  ???:(below main) [<BENCH>/bins/optimized]
+ 33,155,135 ( 8.03%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 32,865,886 ( 7.96%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 32,818,224 ( 7.95%)  ???:main [<BENCH>/bins/optimized]
+ 32,818,213 ( 7.95%)  ???:std::rt::lang_start_internal [<BENCH>/bins/optimized]
+ 32,690,133 ( 7.92%)  ???:std::rt::lang_start::<core::result::Result<(), anyhow::Error>>::{closure#0} [<BENCH>/bins/optimized]
+ 32,690,125 ( 7.92%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> core::result::Result<(), anyhow::Error>, core::result::Result<(), anyhow::Error>> [<BENCH>/bins/optimized]
+ 32,690,121 ( 7.92%)  ???:ravel::main [<BENCH>/bins/optimized]
+ 31,991,167 ( 7.75%)  ???:<ravel_core::engine::WorkspaceEngine>::context_with_detail [<BENCH>/bins/optimized]
+ 31,336,579 ( 7.59%)  ???:<ravel_core::search::DictRuntime>::search [<BENCH>/bins/optimized]
+ 31,335,887 ( 7.59%)  ???:<ravel_core::generation_pack::GenerationPackReader>::with_record_for_validation::<core::result::Result<alloc::vec::Vec<ravel_core::search::SearchHit>, ravel_core::search::SearchError>, <ravel_core::search::DictRuntime>::search::{closure#0}> [<BENCH>/bins/optimized]
+ 31,329,047 ( 7.59%)  ???:ravel_core::search::access_validated_once::<ravel_core::search::ArchivedSymbolDict> [<BENCH>/bins/optimized]
+ 31,328,979 ( 7.59%)  ???:<ravel_core::search::ArchivedSymbolDict as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+ 29,723,613 ( 7.20%)  ???:<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error> as rkyv::validation::archive::ArchiveContextExt<rancor::Error>>::in_subtree::<ravel_core::model::ArchivedSymbolMetaIdShard, (), rkyv::api::checked::check_pos_with_context<ravel_core::model::ArchivedSymbolMetaIdShard, rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>::{closure#0}> [<BENCH>/bins/optimized]
+ 29,379,413 ( 7.12%)  ???:<ravel_core::model::ArchivedSymbolMeta as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/optimized]
+ 20,392,016 ( 4.94%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::prefetch_coverage_probe::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/optimized]
+

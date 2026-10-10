@@ -1,0 +1,327 @@
+{
+  "scale": "small",
+  "sessions": 9,
+  "variants": {
+    "v1.19.0": {
+      "cold": {
+        "callers-of helper0_0 --limit 20": {
+          "wall_ms": 30.340358,
+          "cpu_ms": 41.117999999999995,
+          "peak_rss_mib": 41.06640625
+        },
+        "context helper0_10 --limit 10": {
+          "wall_ms": 19.932222,
+          "cpu_ms": 43.714999999999996,
+          "peak_rss_mib": 48.5078125
+        },
+        "context method0 --limit 5": {
+          "wall_ms": 18.364855,
+          "cpu_ms": 40.899,
+          "peak_rss_mib": 50.4140625
+        },
+        "hubs --limit 20": {
+          "wall_ms": 9.134246,
+          "cpu_ms": 8.604,
+          "peak_rss_mib": 41.109375
+        },
+        "status": {
+          "wall_ms": 18.180821,
+          "cpu_ms": 17.768,
+          "peak_rss_mib": 41.06640625
+        }
+      },
+      "warm": {
+        "status": {
+          "p50": 1.0557915,
+          "p95": 1.376179,
+          "cpu_ms": 0.5,
+          "n": 300
+        },
+        "exact": {
+          "p50": 1.6273445,
+          "p95": 2.274566,
+          "cpu_ms": 1.3333333333333333,
+          "n": 300
+        },
+        "ambiguous": {
+          "p50": 2.1977745000000004,
+          "p95": 3.408415,
+          "cpu_ms": 2.033333333333333,
+          "n": 300
+        },
+        "terms": {
+          "p50": 1.7868955,
+          "p95": 2.516417,
+          "cpu_ms": 1.5333333333333332,
+          "n": 300
+        },
+        "callers": {
+          "p50": 0.9143625,
+          "p95": 1.475621,
+          "cpu_ms": 0.7,
+          "n": 300
+        },
+        "callees": {
+          "p50": 0.771719,
+          "p95": 1.170102,
+          "cpu_ms": 0.6,
+          "n": 300
+        }
+      },
+      "sync": {
+        "noop": {
+          "wall": 9.966562,
+          "cpu_incl_query": 30.0,
+          "rss_after": 67.58984375
+        },
+        "body": {
+          "wall": 48.00601,
+          "cpu_incl_query": 50.0,
+          "rss_after": 70.8046875
+        },
+        "structural": {
+          "wall": 57.986207,
+          "cpu_incl_query": 60.0,
+          "rss_after": 73.15625
+        },
+        "restore": {
+          "wall": 60.252744,
+          "cpu_incl_query": 50.0,
+          "rss_after": 73.6796875
+        }
+      },
+      "resident": {
+        "rss_mib": 64.63671875,
+        "pss_mib": 54.1455078125,
+        "anonymous_mib": 31.78125
+      },
+      "first_status": 14.879676,
+      "initial_memory": {
+        "status": 27.7705078125,
+        "exact": 53.3212890625,
+        "ambiguous": 51.8330078125,
+        "terms": 53.1455078125,
+        "callers": 53.9580078125,
+        "callees": 54.1455078125
+      },
+      "paced_exact": {
+        "p50": 2.9158185,
+        "cpu_ms": 2.6666666666666665
+      }
+    },
+    "merged": {
+      "cold": {
+        "callers-of helper0_0 --limit 20": {
+          "wall_ms": 37.347699,
+          "cpu_ms": 47.976,
+          "peak_rss_mib": 41.06640625
+        },
+        "context helper0_10 --limit 10": {
+          "wall_ms": 23.131105,
+          "cpu_ms": 44.47,
+          "peak_rss_mib": 49.07421875
+        },
+        "context method0 --limit 5": {
+          "wall_ms": 20.859661,
+          "cpu_ms": 41.381,
+          "peak_rss_mib": 53.14453125
+        },
+        "hubs --limit 20": {
+          "wall_ms": 9.298777,
+          "cpu_ms": 8.875,
+          "peak_rss_mib": 41.109375
+        },
+        "status": {
+          "wall_ms": 22.769976,
+          "cpu_ms": 22.355,
+          "peak_rss_mib": 41.06640625
+        }
+      },
+      "warm": {
+        "status": {
+          "p50": 1.0411190000000001,
+          "p95": 1.382218,
+          "cpu_ms": 0.5333333333333333,
+          "n": 300
+        },
+        "exact": {
+          "p50": 1.603428,
+          "p95": 2.157644,
+          "cpu_ms": 1.2666666666666666,
+          "n": 300
+        },
+        "ambiguous": {
+          "p50": 1.8907205,
+          "p95": 2.81382,
+          "cpu_ms": 1.7,
+          "n": 300
+        },
+        "terms": {
+          "p50": 2.0177379999999996,
+          "p95": 2.857397,
+          "cpu_ms": 1.7333333333333334,
+          "n": 300
+        },
+        "callers": {
+          "p50": 1.0534275,
+          "p95": 1.494823,
+          "cpu_ms": 0.7,
+          "n": 300
+        },
+        "callees": {
+          "p50": 0.7929035,
+          "p95": 1.317372,
+          "cpu_ms": 0.6666666666666666,
+          "n": 300
+        }
+      },
+      "sync": {
+        "noop": {
+          "wall": 10.00806,
+          "cpu_incl_query": 40.0,
+          "rss_after": 70.703125
+        },
+        "body": {
+          "wall": 48.786497,
+          "cpu_incl_query": 30.0,
+          "rss_after": 71.796875
+        },
+        "structural": {
+          "wall": 65.740506,
+          "cpu_incl_query": 80.0,
+          "rss_after": 76.68359375
+        },
+        "restore": {
+          "wall": 64.396017,
+          "cpu_incl_query": 50.0,
+          "rss_after": 75.93359375
+        }
+      },
+      "resident": {
+        "rss_mib": 68.20703125,
+        "pss_mib": 57.8466796875,
+        "anonymous_mib": 35.9140625
+      },
+      "first_status": 19.556362,
+      "initial_memory": {
+        "status": 31.4375,
+        "exact": 53.7177734375,
+        "ambiguous": 53.5302734375,
+        "terms": 54.5302734375,
+        "callers": 57.7216796875,
+        "callees": 57.8466796875
+      },
+      "paced_exact": {
+        "p50": 2.7055990000000003,
+        "cpu_ms": 2.1666666666666665
+      }
+    },
+    "optimized": {
+      "cold": {
+        "callers-of helper0_0 --limit 20": {
+          "wall_ms": 25.406515,
+          "cpu_ms": 36.356,
+          "peak_rss_mib": 41.06640625
+        },
+        "context helper0_10 --limit 10": {
+          "wall_ms": 17.080045,
+          "cpu_ms": 35.363,
+          "peak_rss_mib": 48.8984375
+        },
+        "context method0 --limit 5": {
+          "wall_ms": 16.055286,
+          "cpu_ms": 32.02,
+          "peak_rss_mib": 46.62890625
+        },
+        "hubs --limit 20": {
+          "wall_ms": 9.328361,
+          "cpu_ms": 8.875999999999998,
+          "peak_rss_mib": 41.109375
+        },
+        "status": {
+          "wall_ms": 20.641246,
+          "cpu_ms": 20.238,
+          "peak_rss_mib": 41.06640625
+        }
+      },
+      "warm": {
+        "status": {
+          "p50": 0.9831559999999999,
+          "p95": 1.34322,
+          "cpu_ms": 0.5333333333333333,
+          "n": 300
+        },
+        "exact": {
+          "p50": 1.63247,
+          "p95": 2.385953,
+          "cpu_ms": 1.3666666666666667,
+          "n": 300
+        },
+        "ambiguous": {
+          "p50": 1.8388635,
+          "p95": 2.9481,
+          "cpu_ms": 1.6,
+          "n": 300
+        },
+        "terms": {
+          "p50": 1.903798,
+          "p95": 2.780418,
+          "cpu_ms": 1.6333333333333333,
+          "n": 300
+        },
+        "callers": {
+          "p50": 0.9630639999999999,
+          "p95": 1.460778,
+          "cpu_ms": 0.7333333333333333,
+          "n": 300
+        },
+        "callees": {
+          "p50": 0.6738204999999999,
+          "p95": 1.386129,
+          "cpu_ms": 0.6,
+          "n": 300
+        }
+      },
+      "sync": {
+        "noop": {
+          "wall": 9.587838,
+          "cpu_incl_query": 30.0,
+          "rss_after": 67.8515625
+        },
+        "body": {
+          "wall": 46.447493,
+          "cpu_incl_query": 40.0,
+          "rss_after": 68.921875
+        },
+        "structural": {
+          "wall": 64.502588,
+          "cpu_incl_query": 60.0,
+          "rss_after": 71.51953125
+        },
+        "restore": {
+          "wall": 65.278868,
+          "cpu_incl_query": 50.0,
+          "rss_after": 74.0
+        }
+      },
+      "resident": {
+        "rss_mib": 65.0234375,
+        "pss_mib": 54.9189453125,
+        "anonymous_mib": 33.03515625
+      },
+      "first_status": 17.716327,
+      "initial_memory": {
+        "status": 29.6220703125,
+        "exact": 50.6650390625,
+        "ambiguous": 50.5244140625,
+        "terms": 51.5244140625,
+        "callers": 54.7939453125,
+        "callees": 54.9189453125
+      },
+      "paced_exact": {
+        "p50": 2.7084175000000004,
+        "cpu_ms": 2.0
+      }
+    }
+  }
+}

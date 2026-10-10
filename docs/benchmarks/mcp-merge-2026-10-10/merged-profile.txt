@@ -1,0 +1,61 @@
+--------------------------------------------------------------------------------
+Profile data file '<BENCH>/results/merged-context-final.callgrind' (creator: callgrind-3.26.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 271472071
+Trigger: Program termination
+Profiled target:  <BENCH>/bins/merged --root <BENCH>/full-large/merged context helper0_10 --limit 10 (PID 1805326, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       95
+Include dirs:     
+User annotated:   
+Auto-annotation:  off
+
+--------------------------------------------------------------------------------
+Ir                     
+--------------------------------------------------------------------------------
+1,114,332,925 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                      file:function
+--------------------------------------------------------------------------------
+1,082,903,424 (97.18%)  ./nptl/./nptl/pthread_create.c:start_thread [/usr/lib/x86_64-linux-gnu/libc.so.6]
+1,082,688,511 (97.16%)  ???:<std::sys::thread::unix::Thread>::new::thread_start [<BENCH>/bins/merged]
+  743,529,363 (66.72%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::prefetch_coverage_probe::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/merged]
+  743,528,950 (66.72%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<<ravel_core::engine::WorkspaceEngine>::prefetch_coverage_probe::{closure#0}, ()> [<BENCH>/bins/merged]
+  743,528,428 (66.72%)  ???:<ravel_core::engine::WorkspaceEngine>::component_sources_cached [<BENCH>/bins/merged]
+  743,528,148 (66.72%)  ???:ravel_core::config::component_source_probe [<BENCH>/bins/merged]
+  723,499,519 (64.93%)  ???:<core::iter::adapters::filter_map::FilterMap<alloc::vec::into_iter::IntoIter<std::path::PathBuf>, ravel_core::config::coverage_paths::{closure#0}> as core::iter::traits::iterator::Iterator>::next [<BENCH>/bins/merged]
+  722,637,646 (64.85%)  ???:ravel_core::config::coverage_paths::{closure#0} [<BENCH>/bins/merged]
+  641,263,082 (57.55%)  ???:<ravel_core::config::IgnoreChain>::is_ignored [<BENCH>/bins/merged]
+  445,611,428 (39.99%)  ???:<ravel_core::config::IgnoreChain>::rules_for [<BENCH>/bins/merged]
+  439,738,149 (39.46%)  ???:<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Immut, std::path::PathBuf, alloc::sync::Arc<ravel_core::config::DirectoryRules>, alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::<std::path::Path> [<BENCH>/bins/merged]
+  419,935,380 (37.68%)  ???:std::path::compare_components [<BENCH>/bins/merged]
+  196,343,100 (17.62%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#0}, core::result::Result<alloc::sync::Arc<ravel_core::graph::GraphIndex>, ravel_core::engine::EngineError>>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/merged]
+  196,342,571 (17.62%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#0}, core::result::Result<alloc::sync::Arc<ravel_core::graph::GraphIndex>, ravel_core::engine::EngineError>> [<BENCH>/bins/merged]
+  196,341,822 (17.62%)  ???:<ravel_core::engine::WorkspaceEngine>::graph [<BENCH>/bins/merged]
+  196,326,361 (17.62%)  ???:<ravel_core::storage::FileSnapshotStorage>::open_graph [<BENCH>/bins/merged]
+  181,179,921 (16.26%)  ???:<std::path::Components as core::iter::traits::iterator::Iterator>::next [<BENCH>/bins/merged]
+  175,661,522 (15.76%)  ???:<ravel_core::generation_pack::GenerationPackReader>::with_record_for_validation::<core::result::Result<ravel_core::graph::GraphIndex, alloc::string::String>, <ravel_core::storage::FileSnapshotStorage>::open_graph::{closure#2}> [<BENCH>/bins/merged]
+  169,042,367 (15.17%)  ???:<rkyv::string::ArchivedString as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/merged]
+  154,704,552 (13.88%)  ???:blake3::compress_subtree_wide::<blake3::join::SerialJoin>'2 [<BENCH>/bins/merged]
+  142,484,055 (12.79%)  ???:<std::thread::lifecycle::spawn_unchecked<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#2}, core::result::Result<(alloc::vec::Vec<ravel_core::search::SearchHit>, alloc::vec::Vec<ravel_core::search::SearchHit>), ravel_core::engine::EngineError>>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} [<BENCH>/bins/merged]
+  142,483,514 (12.79%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<<ravel_core::engine::WorkspaceEngine>::speculate_context_inputs::{closure#2}, core::result::Result<(alloc::vec::Vec<ravel_core::search::SearchHit>, alloc::vec::Vec<ravel_core::search::SearchHit>), ravel_core::engine::EngineError>> [<BENCH>/bins/merged]
+  142,482,781 (12.79%)  ???:<ravel_core::engine::WorkspaceEngine>::context_searches [<BENCH>/bins/merged]
+  142,482,605 (12.79%)  ???:<ravel_core::engine::WorkspaceEngine>::search_raw [<BENCH>/bins/merged]
+  128,258,124 (11.51%)  ???:<std::path::Path>::_strip_prefix [<BENCH>/bins/merged]
+  122,537,650 (11.00%)  ???:<ravel_core::search::SearchIndex>::search [<BENCH>/bins/merged]
+  117,195,241 (10.52%)  ???:<ravel_core::graph::GraphIndex>::from_archived_flat [<BENCH>/bins/merged]
+   96,003,300 ( 8.62%)  ???:<ravel_core::generation_pack::GenerationPackReader>::with_record_for_validation::<core::result::Result<alloc::vec::Vec<ravel_core::search::SearchHit>, ravel_core::search::SearchError>, <ravel_core::search::TermRuntime>::search::{closure#0}> [<BENCH>/bins/merged]
+   94,103,943 ( 8.44%)  ???:ravel_core::search::access_validated_once::<ravel_core::search::ArchivedTermIndex> [<BENCH>/bins/merged]
+   94,103,897 ( 8.44%)  ???:<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error> as rkyv::validation::archive::ArchiveContextExt<rancor::Error>>::in_subtree::<ravel_core::search::ArchivedTermIndex, (), rkyv::api::checked::check_pos_with_context<ravel_core::search::ArchivedTermIndex, rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>::{closure#0}> [<BENCH>/bins/merged]
+   94,058,676 ( 8.44%)  ???:<rkyv::vec::ArchivedVec<ravel_core::search::ArchivedTermDocument> as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/merged]
+   74,805,003 ( 6.71%)  ???:<ignore::gitignore::Gitignore>::matched::<&std::path::Path> [<BENCH>/bins/merged]
+   58,465,232 ( 5.25%)  ???:<ravel_core::graph::ArchivedFlatCompactGraph as bytecheck::CheckBytes<rancor::Strategy<rkyv::validation::Validator<rkyv::validation::archive::validator::ArchiveValidator, rkyv::validation::shared::validator::SharedValidator>, rancor::Error>>>::check_bytes [<BENCH>/bins/merged]
+   56,022,810 ( 5.03%)  ???:<ravel_core::graph::NameIndex>::insert [<BENCH>/bins/merged]
+   39,453,811 ( 3.54%)  ???:<ravel_core::generation_pack::GenerationPackReader>::map [<BENCH>/bins/merged]
+

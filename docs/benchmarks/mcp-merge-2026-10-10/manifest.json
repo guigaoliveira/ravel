@@ -1,0 +1,24 @@
+{
+  "baseline_commit": "cedd98e64380d1b16540502c14ff04c253023410",
+  "merged_commit": "775200b9a41ddb20bff76a857d7a86b21b544c53",
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "target": "x86_64-unknown-linux-gnu",
+  "build": "cargo build --release --locked --bin ravel",
+  "cpu": "Intel Core Ultra 7 265H",
+  "kernel": "7.0.0-30-generic",
+  "affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "profiler": "Callgrind 3.26.0; user-space Ir, not hardware cycles",
+  "binaries": {
+    "optimized": "b1b1053616e7b66cc0f7f50937de708afe73e8b4083df5769300d2bfe2f1ee09",
+    "v1.19.0": "107a6206b6502e47be7cbfb06d4a96f255a273d0411630b0c3bf14eeba28c4a2",
+    "merged": "097149861507e591fd19c92873a179b869f24554283ba036a6f2bff04f21e75f"
+  },
+  "optimized_commit": "b8a889237023df5ebfc28a5a8c058edca093df10",
+  "main_sync_commit": "7bec523",
+  "source_tree_unchanged_by_main_sync": true
+}
