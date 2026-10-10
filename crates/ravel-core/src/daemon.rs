@@ -1245,10 +1245,7 @@ fn serve_operation(
             Ok(serde_json::json!({ "shutdown": true, "sessions": sessions }))
         }
     };
-    match response {
-        Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
-        Err(error) => write_frame(stream, &WireResponse::Error(error.to_string()))?,
-    }
+    write_reply(stream, response)?;
     if matches!(operation_kind, OperationKind::Sync | OperationKind::Query) {
         // After the reply is on the wire, so the collection never adds to the latency the agent
         // sees. A sync's working set is freed by now; so is a query's -- and a query for a name
@@ -1327,6 +1324,11 @@ fn set_request_read_timeout(
 }
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
+    writer.write_all(&encode_frame(value)?)
+}
+
+/// A frame ready to send, or `InvalidInput` when it is over [`MAX_FRAME_BYTES`].
+fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     // The length prefix and the payload leave in one write. Two writes are two syscalls and, on a
     // stream socket, wake the reader twice: once for four bytes, once for the rest.
     let mut frame = Vec::with_capacity(512);
@@ -1338,6 +1340,27 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Resu
         .filter(|_| payload_len <= MAX_FRAME_BYTES)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame too large"))?;
     frame[..4].copy_from_slice(&len.to_le_bytes());
+    Ok(frame)
+}
+
+/// Send an operation's answer. One too large for a frame is answered with an error the caller can
+/// act on. Closing the connection instead read, to a session holding a lease, as a daemon that had
+/// died: it started another lease and asked the same question all over again.
+fn write_reply(writer: &mut impl Write, response: Result<Value, String>) -> io::Result<()> {
+    let response = match response {
+        Ok(value) => WireResponse::Value(value),
+        Err(error) => WireResponse::Error(error),
+    };
+    let frame = match encode_frame(&response) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            encode_frame(&WireResponse::Error(format!(
+                "the answer is larger than the {} MiB a daemon reply can carry; ask for fewer \
+                 results (a lower `limit`)",
+                MAX_FRAME_BYTES >> 20
+            )))?
+        }
+        frame => frame?,
+    };
     writer.write_all(&frame)
 }
 
@@ -1723,6 +1746,30 @@ mod tests {
         assert!(DaemonCallError::Remote(SHUTTING_DOWN.into()).is_shutting_down());
         assert!(!DaemonCallError::Remote("no such symbol".into()).is_shutting_down());
         assert!(!DaemonCallError::Transport(io::Error::other(SHUTTING_DOWN)).is_shutting_down());
+    }
+
+    #[test]
+    fn an_answer_too_large_for_a_frame_is_refused_in_words_not_by_hanging_up() {
+        let mut wire = Vec::new();
+        let huge = serde_json::Value::String("x".repeat(MAX_FRAME_BYTES));
+        write_reply(&mut wire, Ok(huge)).unwrap();
+        match read_frame::<WireResponse>(&mut wire.as_slice()).unwrap() {
+            WireResponse::Error(message) => assert!(message.contains("limit"), "{message}"),
+            other => panic!("expected an error the caller can act on, got {other:?}"),
+        }
+
+        let mut wire = Vec::new();
+        write_reply(&mut wire, Ok(serde_json::json!({ "sites": [] }))).unwrap();
+        write_reply(&mut wire, Err("no such symbol".into())).unwrap();
+        let mut frames = wire.as_slice();
+        assert_eq!(
+            read_frame::<WireResponse>(&mut frames).unwrap(),
+            WireResponse::Value(serde_json::json!({ "sites": [] }))
+        );
+        assert_eq!(
+            read_frame::<WireResponse>(&mut frames).unwrap(),
+            WireResponse::Error("no such symbol".into())
+        );
     }
 
     #[test]
