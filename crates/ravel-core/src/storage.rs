@@ -2526,13 +2526,19 @@ impl FileSnapshotStorage {
     fn acquire_artifact_read_lock(&self) -> Result<fs::File, StorageError> {
         fs::create_dir_all(&self.root).map_err(|source| self.io(source, self.root.clone()))?;
         let path = self.root.join("artifact-gc.lock");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| self.io(source, path.clone()))?;
+        // A shared lock needs the file to exist, not to be writable, and closing a handle opened
+        // for writing reaches a file watcher as a finished write -- once per artifact read. Same
+        // as `GenerationGuard`: only the first reader, which creates the file, opens it for writing.
+        let file = match fs::File::open(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path),
+            opened => opened,
+        }
+        .map_err(|source| self.io(source, path.clone()))?;
         crate::generation_gc::lock_shared_without_queueing(&file)
             .map_err(|source| self.io(source, path))?;
         Ok(file)
@@ -7700,6 +7706,34 @@ mod tests {
                 .unwrap()
         );
         worker.join().unwrap();
+    }
+
+    /// Every artifact read takes this shared lock, and closing a handle that was opened for writing
+    /// reaches a file watcher as a finished write -- the same fix `GenerationGuard` already has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_artifact_read_lock_is_taken_through_a_read_only_handle() {
+        use std::os::fd::AsRawFd;
+        const O_RDONLY: u32 = 0;
+        const O_RDWR: u32 = 2;
+        let access_mode = |file: &fs::File| {
+            let info =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .unwrap();
+            u32::from_str_radix(flags.trim(), 8).unwrap() & 0o3
+        };
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        // The first reader creates the file, which needs a write-capable open; later ones do not.
+        drop(store.acquire_artifact_read_lock().unwrap());
+        let reader = store.acquire_artifact_read_lock().unwrap();
+        assert_eq!(access_mode(&reader), O_RDONLY);
+        drop(reader);
+        let compactor = store.acquire_artifact_gc_lock().unwrap();
+        assert_eq!(access_mode(&compactor), O_RDWR);
     }
 
     #[test]
