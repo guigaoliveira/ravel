@@ -1690,6 +1690,18 @@ impl WorkspaceEngine {
         Ok(file)
     }
 
+    /// The `config_hash` of a snapshot id: this workspace's configuration and the resolver
+    /// configuration its edges were resolved with. Without the second, re-indexing after a tsconfig
+    /// change published different edges under the same generation, so an engine holding the old
+    /// graph saw nothing new and kept answering from it.
+    fn snapshot_config_hash(&self, resolver: &crate::resolver::ResolverConfig) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.inner.config_hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(crate::resolver::resolver_fingerprint(resolver).as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     fn refresh_external_generation(&self) -> Result<(), EngineError> {
         let generation = self.storage().current_generation()?;
         let mut observed = self.inner.observed_generation.lock().unwrap();
@@ -1874,6 +1886,15 @@ impl WorkspaceEngine {
         crate::timing::stage("sync.prepare_paths", sync_start, || {
             format!("paths={}", paths.len())
         });
+        // Resolution reads tsconfig, and a changed one re-points imports in files nobody edited.
+        // Every tier below re-resolves only what changed, so after such a change the sync is a full
+        // index: `sync tsconfig.json` returned the old stats as if it had applied the new aliases.
+        if storage.read_manifest()?.is_some_and(|manifest| {
+            manifest.snapshot_id.config_hash
+                != self.snapshot_config_hash(&load_tsconfig(&self.root))
+        }) {
+            return self.index_unlocked();
+        }
         if fast_noop {
             if let Ok(Some(stats)) = storage.open_stats() {
                 return Ok(stats);
@@ -2439,7 +2460,7 @@ impl WorkspaceEngine {
         snapshot_id.revision = identity.revision;
         snapshot_id.content_state = content_state;
         snapshot_id.grammar_version = crate::scanner::GRAMMAR_VERSION.into();
-        snapshot_id.config_hash = self.inner.config_hash.clone();
+        snapshot_id.config_hash = self.snapshot_config_hash(&resolver_config);
         let generation = snapshot_id.stable_key();
         let stats = IndexStats {
             files: changes
@@ -2764,6 +2785,7 @@ impl WorkspaceEngine {
     ) -> Result<IndexStats, EngineError> {
         // Works without git — identity falls back to path + "nogit".
         let identity = self.worktree_identity_cached();
+        let resolver = load_tsconfig(&self.root);
         let content_state = content_state_override.unwrap_or_else(|| {
             // Per-file digests combine by XOR, which is associative and
             // commutative, so the fold parallelizes without changing the result.
@@ -2795,7 +2817,7 @@ impl WorkspaceEngine {
             content_state,
             schema_version: INDEX_SCHEMA_VERSION,
             grammar_version: crate::scanner::GRAMMAR_VERSION.into(),
-            config_hash: self.inner.config_hash.clone(),
+            config_hash: self.snapshot_config_hash(&resolver),
         };
         let storage = self.storage();
         let (edges, staged_pack) = if overlay_paths.is_some()
@@ -2803,7 +2825,6 @@ impl WorkspaceEngine {
         {
             (edges, None)
         } else {
-            let resolver = load_tsconfig(&self.root);
             let resolve_start = std::time::Instant::now();
             let (resolved_edges, traces, universe) =
                 resolve_edges_with_structural_data(&self.root, &files, &resolver);
@@ -5890,6 +5911,62 @@ mod watch_gate_tests {
             "an edit to the un-ignored file was filtered out and the gate did not notice"
         );
         assert!(has_symbol(&w.engine, "generated2"));
+    }
+}
+
+#[cfg(test)]
+mod resolver_config_tests {
+    use super::*;
+
+    const ALIASED: &str =
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["src/*"] } } }"#;
+
+    /// `main.ts` imports `target` through an alias that the tsconfig does not define yet.
+    fn fixture() -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/lib")).unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("src/lib/target.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/main.ts"),
+            "import { target } from '@app/lib/target';\nexport const value = target();\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    #[test]
+    fn syncing_the_tsconfig_resolves_with_it() {
+        let (root, engine) = fixture();
+        let before = engine.stats().unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), ALIASED).unwrap();
+        let synced = engine
+            .sync(Some(&[root.path().join("tsconfig.json")]))
+            .unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert_eq!(synced, fresh.index().unwrap());
+        assert!(synced.edges > before.edges, "{before:?} -> {synced:?}");
+    }
+
+    #[test]
+    fn a_reindex_after_a_tsconfig_change_is_a_new_generation() {
+        let (root, resident) = fixture();
+        let warm = resident.graph().unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), ALIASED).unwrap();
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        let fresh = resident.graph().unwrap();
+        assert_ne!(fresh.snapshot_id(), warm.snapshot_id());
+        assert!(fresh.edge_count() > warm.edge_count());
     }
 }
 

@@ -282,7 +282,11 @@ fn index_rebuilds_when_effective_config_changes_without_source_edits() {
         after.snapshot_id.config_hash
     );
     assert_ne!(before.snapshot_id, after.snapshot_id);
-    assert_eq!(after.snapshot_id.config_hash, second.config.hash());
+    // The id follows the inputs and nothing else: the same config indexes to the same generation.
+    let third = engine(dir.path());
+    third.index().unwrap();
+    let again = third.storage().read_manifest().unwrap().unwrap();
+    assert_eq!(again.snapshot_id, after.snapshot_id);
 }
 
 #[test]
