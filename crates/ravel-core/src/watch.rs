@@ -223,6 +223,15 @@ impl PersistentWatcher {
         max_paths: usize,
         max_batch: Duration,
     ) -> Result<CoalescedChange, WatchError> {
+        // The quiet period has to fit inside a batch, with room to spare: one that does not is
+        // never observed, so a pending reconcile is put off forever and every later event is
+        // drained unread. Capping it at the batch itself is not enough, because the batch is
+        // already shorter than that by the time the first wait starts.
+        let debounce = if debounce >= max_batch {
+            max_batch / 2
+        } else {
+            debounce
+        };
         let mut paths = BTreeSet::new();
         let mut entries = EntryKinds::default();
         let mut needs_reconcile = self.reconcile_pending.swap(false, Ordering::AcqRel);
@@ -1308,6 +1317,35 @@ mod tests {
             .unwrap();
         assert!(after_quiet.needs_reconcile);
         assert!(after_quiet.paths.is_empty());
+    }
+
+    /// A quiet period longer than a whole batch could never be observed inside one: the pending
+    /// reconcile was put off forever, and every event after it drained unread.
+    #[test]
+    fn a_debounce_longer_than_the_batch_does_not_make_the_watcher_deaf() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let watcher = PersistentWatcher::new(&root, 4_096).unwrap();
+        watcher.reconcile_pending.store(true, Ordering::Release);
+        let next = || {
+            watcher.next_batch(
+                Duration::from_millis(400),
+                Duration::from_secs(2),
+                64,
+                Duration::from_millis(100),
+            )
+        };
+
+        assert!(
+            (0..5).any(|_| next().unwrap().needs_reconcile),
+            "the pending reconcile never ran"
+        );
+        std::fs::write(root.join("after.ts"), "export {}\n").unwrap();
+        let batch = next().unwrap();
+        assert!(
+            batch.paths.contains(&root.join("after.ts")),
+            "an edit after it went unheard: {batch:?}"
+        );
     }
 
     #[test]
