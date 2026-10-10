@@ -899,6 +899,9 @@ fn daemon_call_if_running(
     match client.call(operation) {
         Ok(value) => Ok(Some(value)),
         Err(DaemonCallError::Transport(_)) => Ok(None),
+        // A transient daemon draining after its last session refuses new work. That says nothing
+        // about the question, which this process can answer on its own as if none were running.
+        Err(DaemonCallError::Remote(error)) if error.contains("shutting down") => Ok(None),
         Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
     }
 }

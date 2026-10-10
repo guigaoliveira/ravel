@@ -332,6 +332,14 @@ impl Config {
         )
     }
 
+    /// [`Config::is_noise`] for a path already relative to the project root, so that no
+    /// component of the root itself (a checkout under `/tmp`, say) can count.
+    pub fn is_noise_relative(&self, relative: &Path) -> bool {
+        relative.components().any(|component| {
+            is_noise_component(component, self.ignore.use_builtin_dirs, &self.ignore.dirs)
+        })
+    }
+
     /// [`Config::is_noise`] for a path a directory walk of the project root produced `depth`
     /// names down. The walk built the path by joining those names onto the root, so they are its
     /// last `depth` components: reading just those answers the same question without comparing the
