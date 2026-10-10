@@ -7,6 +7,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,7 +38,10 @@ pub struct ImpactReport {
     /// True when the traversal completed within budgets, so `total_affected`
     /// is the actual count rather than a saturated lower bound.
     pub exact: bool,
+    /// True when `affected` omits reached nodes ranked after this page, or the
+    /// traversal itself stopped at a budget.
     pub truncated: bool,
+    /// The budget the traversal hit, else `page_size` when only the page was cut.
     pub reason: Option<String>,
 }
 
@@ -144,43 +148,60 @@ pub fn file_cycles(graph: &GraphIndex, path_filter: Option<&str>) -> Vec<CycleIn
 }
 
 /// Impact with risk scoring from reverse BFS depths + reverse adjacency degree.
+///
+/// Every node the walk reached is scored, and the page (`limits.cursor`, `limits.page_size`) is
+/// cut from that ranking. The walk pages by name, so ranking only its first page could leave the
+/// direct dependents -- the highest risk -- out of the report entirely.
 pub fn impact_with_risk(
     graph: &GraphIndex,
     node: &str,
     limits: &QueryLimits,
 ) -> Result<ImpactReport, crate::graph::QueryError> {
-    let (page, depth_map) = graph.callers_of_with_depths(node, limits)?;
+    // The depth map covers the whole walk; a name-ordered page of it would only be discarded.
+    let walk_limits = QueryLimits {
+        page_size: 0,
+        cursor: 0,
+        ..limits.clone()
+    };
+    let (walk, depth_map) = graph.callers_of_with_depths(node, &walk_limits)?;
 
-    let mut affected = Vec::new();
-    for item in &page.items {
-        let id = graph.node_id(item);
-        let depth = id.and_then(|id| depth_map.get(&id)).copied().unwrap_or(1);
-        let in_degree = id.map(|id| graph.in_degree_id(id)).unwrap_or(0);
-        let (risk, score) = score_risk(depth, in_degree);
-        affected.push(ImpactItem {
-            symbol: item.clone(),
+    let mut ranked: Vec<(&str, usize, usize, RiskLevel, u32)> = depth_map
+        .into_iter()
+        // Depth 0 is the root itself.
+        .filter(|&(_, depth)| depth > 0)
+        .filter_map(|(id, depth)| {
+            let in_degree = graph.in_degree_id(id);
+            let (risk, score) = score_risk(depth, in_degree);
+            Some((graph.node_name(id)?, depth, in_degree, risk, score))
+        })
+        .collect();
+    // Names are unique, so the key is total and an unstable sort is deterministic.
+    ranked.sort_unstable_by_key(|&(symbol, _, _, risk, score)| {
+        (risk_rank(risk), Reverse(score), symbol)
+    });
+    let total_affected = ranked.len();
+    let start = limits.cursor.min(total_affected);
+    let end = start.saturating_add(limits.page_size).min(total_affected);
+    let more = end < total_affected;
+    let affected = ranked[start..end]
+        .iter()
+        .map(|&(symbol, depth, in_degree, risk, score)| ImpactItem {
+            symbol: symbol.to_owned(),
             depth,
             in_degree,
             risk,
             score,
-        });
-    }
-    affected.sort_by(|a, b| {
-        risk_rank(a.risk)
-            .cmp(&risk_rank(b.risk))
-            .then_with(|| b.score.cmp(&a.score))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+        })
+        .collect();
     Ok(ImpactReport {
         root: node.into(),
-        snapshot_id: page.snapshot_id,
-        // `items` is only the first bounded page; visited nodes describe the complete traversal
-        // admitted by the configured budgets.
-        total_affected: page.visited_nodes.saturating_sub(1),
-        exact: !page.truncated,
+        snapshot_id: walk.snapshot_id,
+        total_affected,
+        exact: !walk.truncated,
         affected,
-        truncated: page.truncated,
-        reason: page.reason,
+        // `affected` leaves out ranked nodes after this page as surely as a budget-cut walk does.
+        truncated: walk.truncated || more,
+        reason: walk.reason.or_else(|| more.then(|| "page_size".into())),
     })
 }
 
@@ -719,6 +740,51 @@ mod tests {
         .unwrap();
         assert_eq!(report.affected.len(), 1);
         assert_eq!(report.total_affected, 2);
+    }
+
+    /// target ← z ← a000..a104: the only direct dependent sorts after the 105 indirect ones by
+    /// name. Paging by name before ranking left `z` out of the report while it claimed to be
+    /// complete; the page has to be cut from the risk ranking of everything the walk reached.
+    #[test]
+    fn impact_page_is_cut_from_the_risk_ranking_of_every_reached_node() {
+        let mut edges = vec![edge("z", "target")];
+        edges.extend((0..105).map(|i| edge(&format!("a{i:03}"), "z")));
+        let graph = GraphIndex::from_edges(&edges, "s".into());
+
+        let report = impact_with_risk(&graph, "target", &QueryLimits::default()).unwrap();
+        assert_eq!(report.affected.len(), 100);
+        assert_eq!(report.affected[0].symbol, "z");
+        assert_eq!(report.affected[0].risk, RiskLevel::High);
+        assert_eq!(report.total_affected, 106);
+        assert!(report.exact, "the walk itself was complete");
+        assert!(report.truncated, "six reached nodes are not in `affected`");
+        assert_eq!(report.reason.as_deref(), Some("page_size"));
+
+        // The next page continues the same ranking and ends it.
+        let rest = impact_with_risk(
+            &graph,
+            "target",
+            &QueryLimits {
+                cursor: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rest: Vec<_> = rest.affected.iter().map(|i| i.symbol.as_str()).collect();
+        assert_eq!(rest, ["a099", "a100", "a101", "a102", "a103", "a104"]);
+
+        let complete = impact_with_risk(
+            &graph,
+            "target",
+            &QueryLimits {
+                page_size: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(complete.affected.len(), 106);
+        assert!(!complete.truncated);
+        assert_eq!(complete.reason, None);
     }
 
     #[test]
