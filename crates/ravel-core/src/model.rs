@@ -736,10 +736,9 @@ impl FileList {
     }
 
     pub fn in_package_limit(&self, package: &str, limit: usize) -> Vec<String> {
-        let prefix = format!("/{package}/");
         self.paths
             .iter()
-            .filter(|path| path.contains(&prefix))
+            .filter(|path| crate::graph::package_name(path) == package)
             .take(limit)
             .cloned()
             .collect()
@@ -829,5 +828,30 @@ mod file_hash_tests {
         let idx = FileHashIndex::from_snapshot(&snap);
         assert_eq!(idx.get("a.ts"), Some("abc"));
         assert!(!idx.contains("missing.ts"));
+    }
+
+    #[test]
+    fn files_in_a_package_are_the_files_listed_under_its_name() {
+        let paths = [
+            "apps/admin/src/app/app.component.ts",
+            "apps/app/src/main.ts",
+            "src/util.ts",
+            "lib/b.ts",
+        ];
+        let list = FileList {
+            format_version: FileList::FORMAT_VERSION,
+            snapshot_id: "s".into(),
+            paths: paths.iter().map(|path| path.to_string()).collect(),
+        };
+        // `src/app/` is a folder inside package `admin`, not package `app`.
+        assert_eq!(list.in_package("app"), ["apps/app/src/main.ts"]);
+        for package in crate::analysis::list_packages_from_paths(paths) {
+            assert_eq!(
+                list.in_package(&package.name).len(),
+                package.files,
+                "{}",
+                package.name
+            );
+        }
     }
 }

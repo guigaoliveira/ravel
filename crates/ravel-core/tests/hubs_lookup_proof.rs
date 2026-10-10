@@ -44,7 +44,8 @@ fn build_graph() -> GraphIndex {
 
 /// OLD path: resolve every node name back to its id via the HashMap.
 fn hubs_name_based(graph: &GraphIndex, limit: usize) -> Vec<(usize, String, usize)> {
-    let mut heap: BinaryHeap<Reverse<(usize, String, usize)>> = BinaryHeap::new();
+    // Max-heap keyed by the reported order: the top is what the cutoff drops first.
+    let mut heap: BinaryHeap<(Reverse<usize>, String, usize)> = BinaryHeap::new();
     for name in graph.node_names() {
         let in_d = graph.in_degree(name);
         if in_d == 0 {
@@ -52,22 +53,25 @@ fn hubs_name_based(graph: &GraphIndex, limit: usize) -> Vec<(usize, String, usiz
         }
         let out_d = graph.out_degree(name);
         if heap.len() < limit {
-            heap.push(Reverse((in_d, name.to_owned(), out_d)));
-        } else if let Some(Reverse((min_in, _, _))) = heap.peek() {
-            if in_d > *min_in {
-                heap.pop();
-                heap.push(Reverse((in_d, name.to_owned(), out_d)));
-            }
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
+        } else if let Some((worst_in, worst_name, _)) = heap.peek()
+            && (Reverse(in_d), name) < (*worst_in, worst_name.as_str())
+        {
+            heap.pop();
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
         }
     }
-    let mut v: Vec<_> = heap.into_iter().map(|Reverse(t)| t).collect();
+    let mut v: Vec<_> = heap
+        .into_iter()
+        .map(|(Reverse(in_d), name, out_d)| (in_d, name, out_d))
+        .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     v
 }
 
 /// NEW path: iterate in index order, use the id directly.
 fn hubs_id_based(graph: &GraphIndex, limit: usize) -> Vec<(usize, String, usize)> {
-    let mut heap: BinaryHeap<Reverse<(usize, String, usize)>> = BinaryHeap::new();
+    let mut heap: BinaryHeap<(Reverse<usize>, String, usize)> = BinaryHeap::new();
     for (id, name) in graph.node_names().enumerate() {
         let id = id as u32;
         let in_d = graph.in_degree_id(id);
@@ -76,15 +80,18 @@ fn hubs_id_based(graph: &GraphIndex, limit: usize) -> Vec<(usize, String, usize)
         }
         let out_d = graph.out_degree_id(id);
         if heap.len() < limit {
-            heap.push(Reverse((in_d, name.to_owned(), out_d)));
-        } else if let Some(Reverse((min_in, _, _))) = heap.peek() {
-            if in_d > *min_in {
-                heap.pop();
-                heap.push(Reverse((in_d, name.to_owned(), out_d)));
-            }
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
+        } else if let Some((worst_in, worst_name, _)) = heap.peek()
+            && (Reverse(in_d), name) < (*worst_in, worst_name.as_str())
+        {
+            heap.pop();
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
         }
     }
-    let mut v: Vec<_> = heap.into_iter().map(|Reverse(t)| t).collect();
+    let mut v: Vec<_> = heap
+        .into_iter()
+        .map(|(Reverse(in_d), name, out_d)| (in_d, name, out_d))
+        .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     v
 }

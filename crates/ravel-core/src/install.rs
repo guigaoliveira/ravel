@@ -1,31 +1,51 @@
 //! Cross-agent install: detect coding agents and wire Ravel MCP + instruction snippets.
 //! Agent setup UX: auto-detection, global/local scope, and printable config.
 
+use anyhow::Context;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     fs::{File, OpenOptions},
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
 };
 
+/// Serializes concurrent `ravel install` / `uninstall` runs on one config file.
+///
+/// The lock lives in Ravel's private runtime directory, keyed by the config's path. It used to sit
+/// beside the config, which for a project install meant a stray `.mcp.json.ravel.lock` in the
+/// user's repository, one `git add -A` away from being committed. The config itself cannot be the
+/// lock: it is replaced by rename, so a second writer would open, and lock, a different file.
 fn lock_config(path: &Path) -> anyhow::Result<File> {
     use fs4::fs_std::FileExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("config"))
-        .to_os_string();
-    name.push(".ravel.lock");
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("config"));
+    // Canonical, so `./.mcp.json` and `/abs/repo/.mcp.json` take the same lock.
+    let key = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(file_name);
+    let directory = crate::daemon::runtime_base()
+        .unwrap_or_else(|_| env::temp_dir())
+        .join("ravel")
+        .join("config-locks");
+    fs::create_dir_all(&directory)?;
+    let digest = blake3::hash(key.to_string_lossy().as_bytes()).to_hex();
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(parent.join(name))?;
+        .open(directory.join(format!("{}.lock", &digest[..32])))?;
     file.lock_exclusive()?;
+    // The sidecar 1.15 and earlier left next to the config.
+    let mut legacy = file_name.to_os_string();
+    legacy.push(".ravel.lock");
+    let _ = fs::remove_file(parent.join(legacy));
     Ok(file)
 }
 
@@ -168,12 +188,66 @@ pub struct InstallReport {
     pub next_steps: Vec<String>,
 }
 
+impl InstallReport {
+    /// How many agents could not be configured: the run reports them and then fails.
+    pub fn errors(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| action.action == "error")
+            .count()
+    }
+}
+
 /// Resolve this process's binary path for MCP command (stable across shells).
 pub fn resolve_ravel_bin() -> PathBuf {
     env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok())
         .unwrap_or_else(|| PathBuf::from("ravel"))
+}
+
+/// The command a config written at `location` should launch Ravel with.
+///
+/// A global config belongs to one user on one machine, so it names this binary's absolute path and
+/// does not depend on whatever PATH a GUI-launched agent inherits. A project config (`.mcp.json`,
+/// `.codex/config.toml`, …) exists to be committed and shared, and an absolute path from one
+/// machine fails on every other — so it names `ravel` from PATH whenever this machine resolves it
+/// that way, which is also what a teammate's install provides.
+pub fn launch_command(location: InstallLocation, ravel_bin: &Path) -> PathBuf {
+    match location {
+        InstallLocation::Local if on_path(MCP_SERVER_NAME, env::var_os("PATH").as_deref()) => {
+            PathBuf::from(MCP_SERVER_NAME)
+        }
+        _ => ravel_bin.to_path_buf(),
+    }
+}
+
+/// Whether `name` resolves to an executable through `path` the way an MCP client spawning it would.
+/// On Windows only `.exe` counts: clients spawn without a shell, so npm's `ravel.cmd` shim does not
+/// resolve from a bare `ravel`.
+fn on_path(name: &str, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    env::split_paths(path).any(|directory| is_executable(&directory.join(&file)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Detect which agents look installed (binary on PATH and/or config dir present).
@@ -195,19 +269,17 @@ fn agent_looks_installed(kind: AgentKind) -> bool {
     let home = home_dir();
     match kind {
         AgentKind::Claude => {
-            which_ok("claude")
-                || home.join(".claude.json").exists()
-                || home.join(".claude").is_dir()
+            which_ok("claude") || claude_global_path().exists() || claude_home().is_dir()
         }
         AgentKind::Cursor => {
             which_ok("cursor")
                 || home.join(".cursor").is_dir()
                 || home.join(".cursor").join("mcp.json").exists()
         }
-        AgentKind::Codex => which_ok("codex") || home.join(".codex").is_dir(),
+        AgentKind::Codex => which_ok("codex") || codex_home().is_dir(),
         AgentKind::OpenCode => {
             which_ok("opencode")
-                || home.join(".config").join("opencode").is_dir()
+                || opencode_global_dir().is_dir()
                 || home.join(".opencode").is_dir()
         }
         AgentKind::Gemini => which_ok("gemini") || home.join(".gemini").is_dir(),
@@ -241,6 +313,28 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Codex keeps its config, AGENTS.md and state under `$CODEX_HOME`, which defaults to `~/.codex`.
+/// Writing to `~/.codex` regardless would leave a relocated install silently unwired.
+fn codex_home() -> PathBuf {
+    env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".codex"))
+}
+
+/// `$CLAUDE_CONFIG_DIR`, when set to something.
+fn claude_config_dir() -> Option<PathBuf> {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where Claude Code keeps its user settings and skills: `$CLAUDE_CONFIG_DIR`, defaulting to
+/// `~/.claude`, the same relocation [`codex_home`] follows for Codex.
+fn claude_home() -> PathBuf {
+    claude_config_dir().unwrap_or_else(|| home_dir().join(".claude"))
+}
+
 fn dirs_config() -> PathBuf {
     if cfg!(target_os = "macos") {
         home_dir().join("Library").join("Application Support")
@@ -249,10 +343,17 @@ fn dirs_config() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
     } else {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".config"))
+        xdg_config_home()
     }
+}
+
+/// `$XDG_CONFIG_HOME`, or `~/.config` when it is unset or empty — the spec treats the two alike,
+/// and an empty value taken literally put configs under the current directory.
+fn xdg_config_home() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
 }
 
 /// MCP entry shared by Claude / Cursor / Gemini / Windsurf / VS Code style JSON.
@@ -271,11 +372,13 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
     let command = ravel_bin.to_string_lossy();
     let cmd_json = serde_json::to_string(command.as_ref())
         .expect("serializing a path string to JSON cannot fail");
+    let cmd_shell = shell_quote(&command);
     let cmd_toml = toml::Value::String(command.into_owned()).to_string();
     match kind {
         AgentKind::Claude => match location {
             InstallLocation::Global => format!(
-                r#"# ~/.claude.json  (mcpServers key)
+                r#"# ~/.claude.json  (mcpServers key; $CLAUDE_CONFIG_DIR/.claude.json when set)
+# or: claude mcp add --scope user ravel -- {cmd_shell} serve --mcp
 {{
   "mcpServers": {{
     "ravel": {{
@@ -289,6 +392,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
             ),
             InstallLocation::Local => format!(
                 r#"# .mcp.json (project root)
+# or: claude mcp add --scope project ravel -- {cmd_shell} serve --mcp
 {{
   "mcpServers": {{
     "ravel": {{
@@ -319,15 +423,20 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
             }
         ),
         AgentKind::Codex => format!(
-            r#"# {}
+            r#"# {}{}
 [mcp_servers.ravel]
 command = {cmd_toml}
 args = ["serve", "--mcp"]
 "#,
             if location == InstallLocation::Global {
-                "~/.codex/config.toml"
+                "~/.codex/config.toml ($CODEX_HOME/config.toml when set)"
             } else {
-                ".codex/config.toml"
+                ".codex/config.toml (loaded once the project is trusted)"
+            },
+            if location == InstallLocation::Global {
+                format!("\n# or: codex mcp add ravel -- {cmd_shell} serve --mcp")
+            } else {
+                String::new()
             }
         ),
         AgentKind::OpenCode => format!(
@@ -343,7 +452,7 @@ args = ["serve", "--mcp"]
 }}
 "#,
             if location == InstallLocation::Global {
-                "~/.config/opencode/opencode.json"
+                "~/.config/opencode/opencode.json ($XDG_CONFIG_HOME/opencode/opencode.json when set)"
             } else {
                 "opencode.json"
             }
@@ -399,6 +508,20 @@ args = ["serve", "--mcp"]
     }
 }
 
+/// Quote a path for the `… mcp add` one-liners `print_config` suggests (POSIX shells and
+/// PowerShell both take a single-quoted string literally).
+fn shell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@=".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 fn agent_instruction_block() -> String {
     format!(
         r#"{MARKER_BEGIN}
@@ -420,8 +543,8 @@ ravel explore SYMBOL           # broader context in one call (add --detail for t
 ravel sync path/to/edited.ts   # after a write, for immediate certainty
 ```
 
-Answers reflect **uncommitted edits**: every call auto-syncs Git-dirty files against a
-tracked git-dirty discovery first, so results match the working tree rather than the last commit.
+Answers reflect **uncommitted edits**: every call first syncs the files Git reports as changed,
+so results match the working tree rather than the last commit.
 
 Relation and impact results are pages carrying exact totals — follow `next_cursor` instead
 of treating one page as the whole answer.
@@ -434,6 +557,120 @@ your own editor.
     )
 }
 
+/// First line of every skill file `ravel install` writes. Uninstall removes only files carrying it,
+/// and install leaves a same-named skill without it alone: that one belongs to the user.
+const SKILL_MANAGED_MARKER: &str =
+    "<!-- managed by `ravel install`; `ravel uninstall` removes it -->";
+
+/// An Agent Skill: the description sits in the agent's context in every project, and the body is
+/// read only when a question matches it. That is what reaches a repository `ravel install` never
+/// ran in — the instruction block lands only in the project it was run from — and it is the one
+/// instruction format Claude Code and Codex both load.
+///
+/// `allowed-tools` (Claude Code) pre-approves the read-only CLI calls while the skill is active,
+/// so the CLI path costs no permission prompt per query; Codex ignores the field.
+fn agent_skill() -> String {
+    format!(
+        r#"---
+name: ravel
+description: Answers relational questions about TypeScript/JavaScript code from a local resolved code graph — who calls, references, imports or depends on a symbol, what it calls, what breaks if it changes (blast radius / impact), with the file and line of every site. Use instead of grepping a name and reading each hit when the question is about callers, usages, dependencies, or change impact in a TS/JS repository.
+allowed-tools: Bash(ravel status *) Bash(ravel explore *) Bash(ravel context *) Bash(ravel callers-of *) Bash(ravel calls-from *) Bash(ravel search *) Bash(ravel impact *) Bash(ravel sync *)
+---
+{SKILL_MANAGED_MARKER}
+
+# Ravel
+
+Pick the tool by the question. When the `ravel` MCP server is connected, call its tools;
+otherwise run the CLI, which prints compact JSON.
+
+| Question | MCP tool | CLI |
+|---|---|---|
+| Who calls / uses / depends on X; what breaks if I change X | `callers_of` | `ravel callers-of X` |
+| What does X call or import | `calls_from` | `ravel calls-from X` |
+| What is X and what surrounds it | `explore` | `ravel explore X` |
+| Is this repo indexed, and how much of it | `status` | `ravel status` |
+| Where does this literal text appear | — | `grep` / `rg`: not a graph question |
+
+- Run `status` once per session. When its `hint` says the code is not covered (sources Ravel
+  does not parse), use text search instead.
+- Answers include uncommitted edits. Right after writing a file, `sync` its path
+  (`ravel sync path/to/file.ts`) for immediate certainty.
+- A bare name that matches several definitions returns `candidates`: re-query with a candidate
+  `id`, or narrow with `scope` (`--scope path/fragment`).
+- Relation results are pages with exact `total`s. Follow `next_cursor` (`--cursor N`) instead of
+  treating one page as the whole answer; `rollup: "dir"` (`--rollup dir`) counts per directory.
+- For another project, pass `root` (MCP) or append `--root /abs/path` (CLI).
+- Ravel never edits source files; edit with your own tools.
+"#
+    )
+}
+
+/// Where each agent loads user-level and project-level skills from, for agents that read them.
+fn skill_path(kind: AgentKind, opts: &InstallOptions) -> Option<PathBuf> {
+    let base = match (kind, opts.location) {
+        (AgentKind::Claude, InstallLocation::Global) => claude_home(),
+        (AgentKind::Claude, InstallLocation::Local) => opts.project_root.join(".claude"),
+        // `~/.agents/skills` is the user location Codex documents; `$CODEX_HOME/skills` is kept only
+        // for compatibility.
+        (AgentKind::Codex, InstallLocation::Global) => home_dir().join(".agents"),
+        (AgentKind::Codex, InstallLocation::Local) => opts.project_root.join(".agents"),
+        _ => return None,
+    };
+    Some(base.join("skills").join(MCP_SERVER_NAME).join("SKILL.md"))
+}
+
+fn write_skill(
+    kind: AgentKind,
+    opts: &InstallOptions,
+    actions: &mut Vec<InstallAction>,
+) -> anyhow::Result<()> {
+    let Some(path) = skill_path(kind, opts) else {
+        return Ok(());
+    };
+    if path.exists() && !fs::read_to_string(&path)?.contains(SKILL_MANAGED_MARKER) {
+        actions.push(InstallAction {
+            agent: kind.id().into(),
+            path: path.display().to_string(),
+            action: "skip".into(),
+            detail: "a ravel skill not written by ravel install is already there".into(),
+        });
+        return Ok(());
+    }
+    write_text_atomic(&path, &agent_skill())?;
+    actions.push(InstallAction {
+        agent: kind.id().into(),
+        path: path.display().to_string(),
+        action: "wrote_skill".into(),
+        detail: "skills/ravel/SKILL.md".into(),
+    });
+    Ok(())
+}
+
+fn remove_skill(
+    kind: AgentKind,
+    opts: &InstallOptions,
+    actions: &mut Vec<InstallAction>,
+) -> anyhow::Result<()> {
+    let Some(path) = skill_path(kind, opts) else {
+        return Ok(());
+    };
+    if !path.exists() || !fs::read_to_string(&path)?.contains(SKILL_MANAGED_MARKER) {
+        return Ok(());
+    }
+    fs::remove_file(&path)?;
+    if let Some(dir) = path.parent() {
+        // Only if empty: anything else in there was put there by someone else.
+        let _ = fs::remove_dir(dir);
+    }
+    actions.push(InstallAction {
+        agent: kind.id().into(),
+        path: path.display().to_string(),
+        action: "removed_skill".into(),
+        detail: "skills/ravel/SKILL.md".into(),
+    });
+    Ok(())
+}
+
 /// Install Ravel into selected agents. Never clobbers unrelated MCP servers.
 pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
     let mut actions = Vec::new();
@@ -443,24 +680,26 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
         .collect();
 
     for kind in &opts.targets {
-        match install_one(*kind, opts, &mut actions) {
-            Ok(()) => {}
-            Err(e) => {
-                actions.push(InstallAction {
-                    agent: kind.id().into(),
-                    path: String::new(),
-                    action: "error".into(),
-                    detail: e.to_string(),
-                });
-            }
+        let result = install_one(*kind, opts, &mut actions)
+            .map_err(|error| (mcp_config_path(*kind, opts), error))
+            .and_then(|()| {
+                if opts.write_instructions {
+                    write_skill(*kind, opts, &mut actions)
+                        .map_err(|error| (skill_path(*kind, opts), error))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err((path, error)) = result {
+            actions.push(error_action(*kind, path, &error));
         }
     }
 
     if opts.write_instructions {
-        write_project_instructions(&opts.project_root, &mut actions)?;
+        write_project_instructions(opts, &mut actions)?;
     }
 
-    let next_steps = vec![
+    let mut next_steps = vec![
         "Restart your agent(s) so MCP reloads.".into(),
         format!(
             "In each project: cd <repo> && {} index",
@@ -471,6 +710,14 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
             opts.ravel_bin.display()
         ),
     ];
+    if opts.location == InstallLocation::Local && opts.ravel_bin.is_absolute() {
+        next_steps.push(format!(
+            "`ravel` is not on PATH here, so the project config launches {} — a path that only \
+             exists on this machine. Put `ravel` on PATH and re-run `ravel install --location \
+             local` before committing it.",
+            opts.ravel_bin.display()
+        ));
+    }
 
     Ok(InstallReport {
         ravel_bin: opts.ravel_bin.display().to_string(),
@@ -484,6 +731,20 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
     })
 }
 
+/// One agent that could not be configured, with the file it was working on — an error with an
+/// empty path left the user to guess which of their configs to fix.
+fn error_action(kind: AgentKind, path: Option<PathBuf>, error: &anyhow::Error) -> InstallAction {
+    InstallAction {
+        agent: kind.id().into(),
+        path: path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        action: "error".into(),
+        // `{:#}` keeps the cause after the context that names the file.
+        detail: format!("{error:#}"),
+    }
+}
+
 /// Remove Ravel MCP entries + instruction markers from selected agents.
 pub fn uninstall_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
     let mut actions = Vec::new();
@@ -493,16 +754,18 @@ pub fn uninstall_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> 
         .collect();
 
     for kind in &opts.targets {
-        match uninstall_one(*kind, opts, &mut actions) {
-            Ok(()) => {}
-            Err(e) => {
-                actions.push(InstallAction {
-                    agent: kind.id().into(),
-                    path: String::new(),
-                    action: "error".into(),
-                    detail: e.to_string(),
-                });
-            }
+        let result = uninstall_one(*kind, opts, &mut actions)
+            .map_err(|error| (mcp_config_path(*kind, opts), error))
+            .and_then(|()| {
+                if opts.write_instructions {
+                    remove_skill(*kind, opts, &mut actions)
+                        .map_err(|error| (skill_path(*kind, opts), error))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err((path, error)) = result {
+            actions.push(error_action(*kind, path, &error));
         }
     }
 
@@ -544,6 +807,10 @@ fn install_one(
             actions,
             "mcpServers",
         ),
+        AgentKind::Windsurf if opts.location == InstallLocation::Local => {
+            windsurf_has_no_project_config(actions);
+            Ok(())
+        }
         AgentKind::Windsurf => {
             install_json_mcp_servers(kind, &windsurf_mcp_path(), opts, actions, "mcpServers")
         }
@@ -575,6 +842,10 @@ fn uninstall_one(
         AgentKind::OpenCode => uninstall_opencode(opts, actions),
         AgentKind::Gemini => {
             remove_json_mcp_key(kind, &gemini_settings_path(opts), actions, "mcpServers")
+        }
+        AgentKind::Windsurf if opts.location == InstallLocation::Local => {
+            windsurf_has_no_project_config(actions);
+            Ok(())
         }
         AgentKind::Windsurf => {
             remove_json_mcp_key(kind, &windsurf_mcp_path(), actions, "mcpServers")
@@ -613,8 +884,30 @@ fn windsurf_mcp_path() -> PathBuf {
         .join("mcp_config.json")
 }
 
+/// Windsurf reads MCP servers from its user config only. A project install going there anyway
+/// rewrote the user's entry with the project's launch command (often a bare `ravel`), and a
+/// project uninstall removed it.
+fn windsurf_has_no_project_config(actions: &mut Vec<InstallAction>) {
+    actions.push(InstallAction {
+        agent: AgentKind::Windsurf.id().into(),
+        path: String::new(),
+        action: "skip".into(),
+        detail: "Windsurf has no project MCP config; use --location global".into(),
+    });
+}
+
+/// Claude Code's user config, resolved as Claude Code resolves it: a legacy `.config.json` in
+/// the config home wins when present; otherwise `.claude.json` in `$CLAUDE_CONFIG_DIR` when that
+/// is set, else in the home directory. Writing `~/.claude.json` regardless left a relocated
+/// install unwired.
 fn claude_global_path() -> PathBuf {
-    home_dir().join(".claude.json")
+    let legacy = claude_home().join(".config.json");
+    if legacy.exists() {
+        return legacy;
+    }
+    claude_config_dir()
+        .unwrap_or_else(home_dir)
+        .join(".claude.json")
 }
 
 fn claude_local_path(opts: &InstallOptions) -> PathBuf {
@@ -622,9 +915,9 @@ fn claude_local_path(opts: &InstallOptions) -> PathBuf {
 }
 
 fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => claude_global_path(),
-        InstallLocation::Local => claude_local_path(opts),
+    let (path, other_scope) = match opts.location {
+        InstallLocation::Global => (claude_global_path(), claude_local_path(opts)),
+        InstallLocation::Local => (claude_local_path(opts), claude_global_path()),
     };
     upsert_json_mcp_servers(&path, &opts.ravel_bin, true)?;
     actions.push(InstallAction {
@@ -633,9 +926,17 @@ fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
         action: "wrote_mcp".into(),
         detail: "mcpServers.ravel".into(),
     });
+    if let Some(detail) = claude_scope_conflict(&other_scope, &opts.ravel_bin) {
+        actions.push(InstallAction {
+            agent: "claude".into(),
+            path: other_scope.display().to_string(),
+            action: "warn".into(),
+            detail,
+        });
+    }
 
     if opts.claude_permissions && opts.location == InstallLocation::Global {
-        let settings = home_dir().join(".claude").join("settings.json");
+        let settings = claude_home().join("settings.json");
         if let Err(e) = ensure_claude_allowlist(&settings) {
             actions.push(InstallAction {
                 agent: "claude".into(),
@@ -655,6 +956,33 @@ fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
     Ok(())
 }
 
+/// Claude Code reads both the user config and the project `.mcp.json`. The same server name in
+/// both with different commands is reported as a conflict at every `claude mcp list` — which is
+/// exactly what a global install followed by a project one produces, since the project entry
+/// launches `ravel` from PATH and the global one names the absolute binary.
+fn claude_scope_conflict(other_scope: &Path, command: &Path) -> Option<String> {
+    let text = fs::read_to_string(other_scope).ok()?;
+    let root: Value = serde_json::from_str(&text).ok()?;
+    let existing = root
+        .get("mcpServers")?
+        .get(MCP_SERVER_NAME)?
+        .get("command")?;
+    if existing.as_str() == Some(command.to_string_lossy().as_ref()) {
+        return None;
+    }
+    Some(format!(
+        "{} also defines a `ravel` server, launched as {}. Claude Code flags the two scopes as \
+         different endpoints; the project entry wins. Keep one: `claude mcp remove ravel -s {}`.",
+        other_scope.display(),
+        existing,
+        if other_scope.file_name() == Some(OsStr::new(".mcp.json")) {
+            "project"
+        } else {
+            "user"
+        }
+    ))
+}
+
 fn uninstall_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
     let path = match opts.location {
         InstallLocation::Global => claude_global_path(),
@@ -664,16 +992,17 @@ fn uninstall_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
 }
 
 fn ensure_claude_allowlist(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        // Don't create settings.json from scratch (user may not want defaults).
+    // Claude Code creates this file itself only when the user changes an option, so a fresh
+    // install usually has none — and then every ravel call asked for permission. Creating it
+    // with the one rule is safe (there are no defaults to pre-empt). Its directory, however, is
+    // the sign Claude Code is actually installed: without it, this would seed a config for an
+    // agent that is not there.
+    let installed = path.parent().is_some_and(Path::is_dir);
+    if !installed {
         return Ok(());
     }
     let _lock = lock_config(path)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let text = fs::read_to_string(path)?;
-    let mut root: Value = serde_json::from_str(&text)?;
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     // Guard every downcast: a settings.json that parses to a non-object (`[]`, scalar), or
     // whose `permissions`/`allow` are the wrong JSON type, must not panic — coerce instead.
     anyhow::ensure!(
@@ -736,12 +1065,7 @@ fn upsert_json_mcp_servers(
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(path)?;
-    let mut root: Value = if path.exists() {
-        let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text)?
-    } else {
-        json!({})
-    };
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -757,12 +1081,30 @@ fn upsert_json_mcp_servers(
         "{}.mcpServers must be an object",
         path.display()
     );
-    servers
-        .as_object_mut()
-        .unwrap()
-        .insert(MCP_SERVER_NAME.into(), mcp_stdio_entry(ravel_bin));
+    let servers = servers.as_object_mut().unwrap();
+    let entry = merge_server_entry(servers.get(MCP_SERVER_NAME), mcp_stdio_entry(ravel_bin));
+    servers.insert(MCP_SERVER_NAME.into(), entry);
     write_json_pretty(path, &root)?;
     Ok(())
+}
+
+/// The entry `ravel install` writes, layered over what the user already had under that name.
+///
+/// Re-running install (an upgrade, a moved binary) must refresh how the server is launched without
+/// dropping what the user added to it — the documented way to get the full tool surface is an
+/// `env` block carrying `RAVEL_MCP_TOOLS=all`, and replacing the whole entry silently undid it.
+fn merge_server_entry(existing: Option<&Value>, fresh: Value) -> Value {
+    match (existing.and_then(Value::as_object), fresh) {
+        (Some(existing), Value::Object(fresh)) => {
+            let mut merged = existing.clone();
+            // A remote entry's keys would leave a stdio entry that also names a URL.
+            merged.remove("url");
+            merged.remove("headers");
+            merged.extend(fresh);
+            Value::Object(merged)
+        }
+        (_, fresh) => fresh,
+    }
 }
 
 fn remove_json_mcp_key(
@@ -781,8 +1123,7 @@ fn remove_json_mcp_key(
         });
         return Ok(());
     }
-    let text = fs::read_to_string(path)?;
-    let mut root: Value = serde_json::from_str(&text)?;
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     if let Some(obj) = root.as_object_mut() {
         if let Some(servers) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -808,11 +1149,15 @@ fn remove_json_mcp_key(
     Ok(())
 }
 
-fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => home_dir().join(".codex").join("config.toml"),
+fn codex_config_path(opts: &InstallOptions) -> PathBuf {
+    match opts.location {
+        InstallLocation::Global => codex_home().join("config.toml"),
         InstallLocation::Local => opts.project_root.join(".codex").join("config.toml"),
-    };
+    }
+}
+
+fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+    let path = codex_config_path(opts);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -822,24 +1167,18 @@ fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> any
     } else {
         String::new()
     };
-    if !text.trim().is_empty() {
-        toml::from_str::<toml::Value>(&text)?;
-    }
-    let command = serde_json::to_string(&opts.ravel_bin.to_string_lossy())?;
-    let block = format!(
-        "\n[mcp_servers.ravel]\ncommand = \"{}\"\nargs = [\"serve\", \"--mcp\"]\n",
-        command.trim_matches('"')
-    );
-    if text.contains("[mcp_servers.ravel]") {
-        // Replace existing block (simple line-based strip until next [section)
-        text = replace_toml_table(&text, "mcp_servers.ravel", &block);
+    let existing = parse_codex_config(&path, &text)?;
+    let server = codex_server_entry(&existing, &opts.ravel_bin);
+    let block = format!("\n{}", codex_server_table(&server)?);
+    if toml_table_range(&text, CODEX_RAVEL_TABLE).is_some() {
+        text = replace_toml_table(&text, CODEX_RAVEL_TABLE, &block);
     } else {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(block.trim_start());
     }
-    toml::from_str::<toml::Value>(&text)?;
+    ensure_only_ravel_changed(&path, existing, &text, Some(server))?;
     write_text_atomic(&path, &text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
@@ -851,10 +1190,7 @@ fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> any
 }
 
 fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => home_dir().join(".codex").join("config.toml"),
-        InstallLocation::Local => opts.project_root.join(".codex").join("config.toml"),
-    };
+    let path = codex_config_path(opts);
     let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
@@ -866,8 +1202,8 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         return Ok(());
     }
     let text = fs::read_to_string(&path)?;
-    toml::from_str::<toml::Value>(&text)?;
-    if !text.contains("[mcp_servers.ravel]") {
+    let existing = parse_codex_config(&path, &text)?;
+    if toml_table_range(&text, CODEX_RAVEL_TABLE).is_none() {
         actions.push(InstallAction {
             agent: "codex".into(),
             path: path.display().to_string(),
@@ -876,10 +1212,8 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         });
         return Ok(());
     }
-    let new_text = replace_toml_table(&text, "mcp_servers.ravel", "");
-    if !new_text.trim().is_empty() {
-        toml::from_str::<toml::Value>(&new_text)?;
-    }
+    let new_text = replace_toml_table(&text, CODEX_RAVEL_TABLE, "");
+    ensure_only_ravel_changed(&path, existing, &new_text, None)?;
     write_text_atomic(&path, &new_text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
@@ -890,72 +1224,201 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
     Ok(())
 }
 
-/// Replace or remove a TOML table `[name]` including nested keys until next top-level `[`.
-fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
-    let header = format!("[{table}]");
-    let Some(start) = text.find(&header) else {
-        return format!(
-            "{text}{}",
-            if replacement.is_empty() {
-                ""
-            } else {
-                replacement
-            }
-        );
-    };
-    // Find previous newline start of header line
-    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let after = &text[start + header.len()..];
-    let mut end = text.len();
-    for (i, line) in after.split_inclusive('\n').scan(0usize, |acc, l| {
-        let at = *acc;
-        *acc += l.len();
-        Some((at, l))
-    }) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            // only if it's a new table header at column 0-ish of original...
-            // after is relative; check absolute
-            let abs = start + header.len() + i;
-            if text[abs..].starts_with('[') {
-                // nested tables look like [mcp_servers.ravel.tools.x]
-                let rest = &text[abs + 1..];
-                let name_end = rest.find(']').unwrap_or(0);
-                let name = &rest[..name_end];
-                if !name.starts_with(&format!("{table}.")) && name != table {
-                    end = abs;
-                    break;
-                }
-            }
-        }
-        let _ = line;
+/// `[mcp_servers.ravel]` with the launch command refreshed and every other key the user set kept.
+///
+/// Re-running install is how an upgrade or a moved binary gets picked up, so it must not also
+/// discard what the user added under the table: an `env` block (Codex hands the server a cleaned
+/// environment, so `RAVEL_MCP_TOOLS=all` only arrives this way), a timeout, a tool allow-list, a
+/// per-tool approval. Comments inside this one table do not survive the rewrite; the rest of the
+/// file is left byte-for-byte.
+fn codex_server_entry(existing: &toml::Table, ravel_bin: &Path) -> toml::Table {
+    let mut server = existing
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    server.insert(
+        "command".into(),
+        toml::Value::String(ravel_bin.to_string_lossy().into_owned()),
+    );
+    server.insert(
+        "args".into(),
+        toml::Value::Array(vec!["serve".into(), "--mcp".into()]),
+    );
+    server
+}
+
+/// The `[mcp_servers.ravel]` block for `server`, as TOML text.
+fn codex_server_table(server: &toml::Table) -> anyhow::Result<String> {
+    let mut servers = toml::Table::new();
+    servers.insert(MCP_SERVER_NAME.into(), toml::Value::Table(server.clone()));
+    let mut root = toml::Table::new();
+    root.insert("mcp_servers".into(), toml::Value::Table(servers));
+    Ok(toml::to_string(&root)?)
+}
+
+const CODEX_RAVEL_TABLE: &str = "mcp_servers.ravel";
+
+fn parse_codex_config(path: &Path, text: &str) -> anyhow::Result<toml::Table> {
+    if text.trim().is_empty() {
+        return Ok(toml::Table::new());
     }
+    text.parse()
+        .with_context(|| format!("{} is not valid TOML", path.display()))
+}
+
+/// Refuse a rewrite of the Codex config that changes anything but the `ravel` server.
+///
+/// The block is cut out as text, which keeps every other byte of the file — comments included —
+/// but means a layout the cut misreads would drop the user's settings and still leave valid
+/// TOML. Comparing the parsed result with what the edit is meant to produce turns that into an
+/// error and an untouched file.
+fn ensure_only_ravel_changed(
+    path: &Path,
+    before: toml::Table,
+    after: &str,
+    server: Option<toml::Table>,
+) -> anyhow::Result<()> {
+    let after = parse_codex_config(path, after).ok();
+    let mut expected = before;
+    let servers = expected
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(servers) = servers.as_table_mut() {
+        match server {
+            Some(server) => servers.insert(MCP_SERVER_NAME.into(), toml::Value::Table(server)),
+            None => servers.remove(MCP_SERVER_NAME),
+        };
+    }
+    anyhow::ensure!(
+        after.is_some_and(|after| without_empty_servers(after) == without_empty_servers(expected)),
+        "{} could not be rewritten without changing settings other than [{CODEX_RAVEL_TABLE}]; \
+         left untouched — edit it by hand (`ravel install --print-config codex` prints the entry)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// An `mcp_servers` table left empty is the same config as none: the header that declared it
+/// may have been `[mcp_servers.ravel]` itself.
+fn without_empty_servers(mut config: toml::Table) -> toml::Table {
+    if config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty)
+    {
+        config.remove("mcp_servers");
+    }
+    config
+}
+
+/// The table a TOML header line opens — `[a.b]` or `[[a.b]]`, at any indentation — as its key
+/// path, and whether it is an array of tables. `None` for any other line.
+///
+/// The line goes through the TOML parser on its own, so quoting and spacing inside the brackets
+/// read the way Codex reads them, and the row of a multi-line array that merely starts with a
+/// bracket is not taken for a header.
+fn toml_header(line: &str) -> Option<(Vec<String>, bool)> {
+    let line = line.trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+    let mut table: toml::Table = line.parse().ok()?;
+    let mut path = Vec::new();
+    loop {
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, value) = table.into_iter().next()?;
+        path.push(key);
+        match value {
+            toml::Value::Table(inner) if !inner.is_empty() => table = inner,
+            toml::Value::Table(_) => return Some((path, false)),
+            toml::Value::Array(_) => return Some((path, true)),
+            _ => return None,
+        }
+    }
+}
+
+/// Where the `[table]` block sits in `text`: from its header line to the next header that opens
+/// anything but one of its own sub-tables. Every header ends it — indented ones, and `[[array]]`
+/// tables too — and comment lines directly above that next header stay with it.
+fn toml_table_range(text: &str, table: &str) -> Option<Range<usize>> {
+    let path: Vec<&str> = table.split('.').collect();
+    let under_table = |header: &[String]| {
+        header.len() > path.len() && header.iter().zip(&path).all(|(a, b)| a == b)
+    };
+    let mut lines = text.split_inclusive('\n').scan(0, |at, line| {
+        let start = *at;
+        *at += line.len();
+        Some((start, line))
+    });
+    let (start, _) = lines.by_ref().find(|(_, line)| {
+        toml_header(line).is_some_and(|(header, array)| {
+            !array && header.len() == path.len() && header.iter().zip(&path).all(|(a, b)| a == b)
+        })
+    })?;
+    let mut comments_from = None;
+    for (at, line) in lines {
+        if let Some((header, _)) = toml_header(line) {
+            if !under_table(&header) {
+                return Some(start..comments_from.unwrap_or(at));
+            }
+            comments_from = None;
+        } else if line.trim_start().starts_with('#') {
+            comments_from.get_or_insert(at);
+        } else {
+            comments_from = None;
+        }
+    }
+    Some(start..text.len())
+}
+
+/// Replace or remove the `[table]` block [`toml_table_range`] finds; append `replacement` when
+/// there is none.
+fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
+    let Some(range) = toml_table_range(text, table) else {
+        return format!("{text}{replacement}");
+    };
     let mut out = String::new();
-    out.push_str(&text[..line_start]);
+    out.push_str(&text[..range.start]);
     if !replacement.is_empty() {
         out.push_str(replacement.trim_start_matches('\n'));
         if !out.ends_with('\n') {
             out.push('\n');
         }
+        // The blank line that separated the old table from what follows went with it.
+        if range.end < text.len() {
+            out.push('\n');
+        }
     }
-    out.push_str(&text[end..]);
+    out.push_str(&text[range.end..]);
     out
 }
 
-fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
+/// OpenCode resolves its user config the XDG way on every platform, macOS and Windows included —
+/// not under Application Support or `%APPDATA%`, where a write would go unread.
+fn opencode_global_dir() -> PathBuf {
+    xdg_config_home().join("opencode")
+}
+
+fn opencode_config_path(opts: &InstallOptions) -> PathBuf {
+    match opts.location {
+        InstallLocation::Global => opencode_global_dir().join("opencode.json"),
         InstallLocation::Local => opts.project_root.join("opencode.json"),
-    };
+    }
+}
+
+fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+    let path = opencode_config_path(opts);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(&path)?;
-    let mut root: Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(&path)?)?
-    } else {
-        json!({ "$schema": "https://opencode.ai/config.json" })
-    };
+    let mut root = read_json_config(&path)?
+        .unwrap_or_else(|| json!({ "$schema": "https://opencode.ai/config.json" }));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -967,14 +1430,16 @@ fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
         .entry("mcp")
         .or_insert_with(|| json!({}));
     anyhow::ensure!(mcp.is_object(), "{}.mcp must be an object", path.display());
-    mcp.as_object_mut().unwrap().insert(
-        MCP_SERVER_NAME.into(),
+    let mcp = mcp.as_object_mut().unwrap();
+    let entry = merge_server_entry(
+        mcp.get(MCP_SERVER_NAME),
         json!({
             "type": "local",
             "command": [opts.ravel_bin.to_string_lossy(), "serve", "--mcp"],
             "enabled": true
         }),
     );
+    mcp.insert(MCP_SERVER_NAME.into(), entry);
     write_json_pretty(&path, &root)?;
     actions.push(InstallAction {
         agent: "opencode".into(),
@@ -989,10 +1454,7 @@ fn uninstall_opencode(
     opts: &InstallOptions,
     actions: &mut Vec<InstallAction>,
 ) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
-        InstallLocation::Local => opts.project_root.join("opencode.json"),
-    };
+    let path = opencode_config_path(opts);
     let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
@@ -1003,7 +1465,7 @@ fn uninstall_opencode(
         });
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
         removed = mcp.remove(MCP_SERVER_NAME).is_some();
@@ -1027,34 +1489,22 @@ fn uninstall_opencode(
     Ok(())
 }
 
-fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    // Prefer project-local .vscode/mcp.json (works in VS Code Copilot).
-    let path = match opts.location {
+fn vscode_config_path(opts: &InstallOptions) -> PathBuf {
+    match opts.location {
+        // Project-local .vscode/mcp.json works in VS Code Copilot.
         InstallLocation::Local => opts.project_root.join(".vscode").join("mcp.json"),
-        InstallLocation::Global => {
-            // User-level path varies; still write project if root is given, else user Code config.
-            if cfg!(target_os = "macos") {
-                home_dir()
-                    .join("Library")
-                    .join("Application Support")
-                    .join("Code")
-                    .join("User")
-                    .join("mcp.json")
-            } else {
-                // Linux + Windows user MCP path via config dir.
-                dirs_config().join("Code").join("User").join("mcp.json")
-            }
-        }
-    };
+        // `dirs_config()` is Application Support on macOS, so the user path is one expression.
+        InstallLocation::Global => dirs_config().join("Code").join("User").join("mcp.json"),
+    }
+}
+
+fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+    let path = vscode_config_path(opts);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(&path)?;
-    let mut root: Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(&path)?)?
-    } else {
-        json!({})
-    };
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -1078,10 +1528,12 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
         "{}.{key} must be an object",
         path.display()
     );
-    servers
-        .as_object_mut()
-        .unwrap()
-        .insert(MCP_SERVER_NAME.into(), mcp_stdio_entry(&opts.ravel_bin));
+    let servers = servers.as_object_mut().unwrap();
+    let entry = merge_server_entry(
+        servers.get(MCP_SERVER_NAME),
+        mcp_stdio_entry(&opts.ravel_bin),
+    );
+    servers.insert(MCP_SERVER_NAME.into(), entry);
     write_json_pretty(&path, &root)?;
     actions.push(InstallAction {
         agent: "vscode".into(),
@@ -1093,10 +1545,7 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
 }
 
 fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
-    let path = match opts.location {
-        InstallLocation::Local => opts.project_root.join(".vscode").join("mcp.json"),
-        InstallLocation::Global => dirs_config().join("Code").join("User").join("mcp.json"),
-    };
+    let path = vscode_config_path(opts);
     let _lock = lock_config(&path)?;
     if !path.exists() {
         actions.push(InstallAction {
@@ -1107,7 +1556,7 @@ fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
         });
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     for key in ["servers", "mcpServers"] {
         if let Some(servers) = root.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -1135,12 +1584,39 @@ fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
     Ok(())
 }
 
-fn write_project_instructions(root: &Path, actions: &mut Vec<InstallAction>) -> anyhow::Result<()> {
+/// Whether `root` is a project an instruction file belongs in.
+///
+/// A global install is usually run from wherever the shell happens to be — the README runs it
+/// before `cd` into a project — and creating `AGENTS.md` there (often the home directory) put an
+/// instruction file nobody reads into a directory that is not a repository.
+fn looks_like_project(root: &Path) -> bool {
+    root != home_dir()
+        && [".git", "package.json", "tsconfig.json", "jsconfig.json"]
+            .iter()
+            .any(|marker| root.join(marker).exists())
+}
+
+fn write_project_instructions(
+    opts: &InstallOptions,
+    actions: &mut Vec<InstallAction>,
+) -> anyhow::Result<()> {
+    let root = opts.project_root.as_path();
     let block = agent_instruction_block();
+    let in_project = opts.location == InstallLocation::Local || looks_like_project(root);
     for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
         let path = root.join(name);
         // Only create AGENTS.md automatically; append to others only if they exist.
-        if name != "AGENTS.md" && !path.exists() {
+        if !path.exists() && (name != "AGENTS.md" || !in_project) {
+            if name == "AGENTS.md" {
+                actions.push(InstallAction {
+                    agent: "instructions".into(),
+                    path: path.display().to_string(),
+                    action: "skip".into(),
+                    detail: "not a project directory; run `ravel install --location local` \
+                             inside a repository to add the AGENTS.md block there"
+                        .into(),
+                });
+            }
             continue;
         }
         let mut text = if path.exists() {
@@ -1165,8 +1641,9 @@ fn write_project_instructions(root: &Path, actions: &mut Vec<InstallAction>) -> 
             detail: name.into(),
         });
     }
-    // Cursor project rule only if the project already uses .cursor/
-    if root.join(".cursor").is_dir() {
+    // Cursor project rule only if the project already uses .cursor/ — and only in a project: a
+    // global install run from the home directory found ~/.cursor there and wrote a rule into it.
+    if in_project && root.join(".cursor").is_dir() {
         let cursor_rule = root.join(".cursor").join("rules").join("ravel.mdc");
         if let Some(parent) = cursor_rule.parent() {
             fs::create_dir_all(parent)?;
@@ -1229,13 +1706,50 @@ fn replace_marked_section(text: &str, replacement: &str) -> String {
     let after_begin = start + MARKER_BEGIN.len();
     let end = text[after_begin..]
         .find(MARKER_END)
-        .map(|i| after_begin + i + MARKER_END.len())
+        .map(|i| {
+            // The end marker's own line break goes with the block: the replacement brings its
+            // own, so keeping this one added a blank line on every reinstall, and left one
+            // behind on uninstall.
+            let end = after_begin + i + MARKER_END.len();
+            let rest = &text[end..];
+            end + if rest.starts_with("\r\n") {
+                2
+            } else {
+                usize::from(rest.starts_with('\n'))
+            }
+        })
         .unwrap_or(text.len());
     let mut out = String::new();
     out.push_str(&text[..start]);
     out.push_str(replacement);
     out.push_str(&text[end..]);
     out
+}
+
+/// A JSON config's contents, or `None` when there are none yet: no file, or an empty one (a
+/// `touch`, an editor's new buffer), which its agent reads as no settings at all.
+///
+/// A parse error names the file. Comments and trailing commas (JSONC, which some agents accept)
+/// are refused rather than rewritten away.
+fn read_json_config(path: &Path) -> anyhow::Result<Option<Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!("reading {}", path.display())));
+        }
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&text).map(Some).with_context(|| {
+        format!(
+            "{} is not plain JSON (comments and trailing commas are not supported), so it was \
+             left untouched; edit its `ravel` entry by hand (`ravel install --print-config` \
+             prints one)",
+            path.display()
+        )
+    })
 }
 
 fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {
@@ -1245,19 +1759,104 @@ fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {
 
 fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
+    let path = &symlink_target(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(text.as_bytes())?;
+    // The temporary file is created owner-only; a rewrite keeps the mode the file already had.
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(tmp.path(), metadata.permissions())?;
+    }
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
-/// List detection + suggested install without writing.
+/// The file a config path names once symlinks are followed.
+///
+/// Renaming over a symlink replaces the link itself, so a config a dotfile manager links into
+/// place became a regular file here and the managed copy silently stopped being the one in use.
+/// The rename goes to where the link points instead, still atomically.
+fn symlink_target(path: &Path) -> PathBuf {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return path.to_path_buf();
+    }
+    fs::canonicalize(path)
+        // A dangling link: create the file it names.
+        .or_else(|_| {
+            fs::read_link(path)
+                .map(|target| path.parent().unwrap_or_else(|| Path::new(".")).join(target))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The MCP config file `ravel install` writes for an agent at a location, when it has one.
+fn mcp_config_path(kind: AgentKind, opts: &InstallOptions) -> Option<PathBuf> {
+    Some(match (kind, opts.location) {
+        (AgentKind::Claude, InstallLocation::Global) => claude_global_path(),
+        (AgentKind::Claude, InstallLocation::Local) => claude_local_path(opts),
+        (AgentKind::Cursor, _) => cursor_mcp_path(opts),
+        (AgentKind::Codex, _) => codex_config_path(opts),
+        (AgentKind::OpenCode, _) => opencode_config_path(opts),
+        (AgentKind::Gemini, _) => gemini_settings_path(opts),
+        (AgentKind::Windsurf, InstallLocation::Global) => windsurf_mcp_path(),
+        (AgentKind::VsCode, _) => vscode_config_path(opts),
+        (AgentKind::Windsurf, InstallLocation::Local) | (AgentKind::Grok, _) => return None,
+    })
+}
+
+/// Whether a config file carries a `ravel` server entry, in whichever shape its agent uses.
+fn config_has_ravel(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    if path.extension() == Some(OsStr::new("toml")) {
+        return text.parse::<toml::Table>().is_ok_and(|table| {
+            table
+                .get("mcp_servers")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|servers| servers.contains_key(MCP_SERVER_NAME))
+        });
+    }
+    serde_json::from_str::<Value>(&text).is_ok_and(|root| {
+        ["mcpServers", "servers", "mcp"].iter().any(|key| {
+            root.get(key)
+                .and_then(|servers| servers.get(MCP_SERVER_NAME))
+                .is_some()
+        })
+    })
+}
+
+/// List detection + what is wired, without writing.
+///
+/// "Detected" says an agent is on this machine; `wired` says whether this install reaches it —
+/// the question a user with a silent agent actually has.
 pub fn doctor_agents(project_root: &Path) -> Value {
     let detected: Vec<_> = detect_agents().iter().map(|a| a.id()).collect();
     let bin = resolve_ravel_bin();
+    let probe = |location| InstallOptions {
+        targets: Vec::new(),
+        location,
+        project_root: project_root.to_path_buf(),
+        ravel_bin: bin.clone(),
+        write_instructions: false,
+        claude_permissions: false,
+    };
+    let (global, local) = (
+        probe(InstallLocation::Global),
+        probe(InstallLocation::Local),
+    );
+    let wired = |kind: AgentKind| {
+        let mcp = |opts: &InstallOptions| mcp_config_path(kind, opts).map(|p| config_has_ravel(&p));
+        let skill = |opts: &InstallOptions| skill_path(kind, opts).map(|p| p.exists());
+        json!({
+            "mcp_global": mcp(&global),
+            "mcp_local": mcp(&local),
+            "skill_global": skill(&global),
+            "skill_local": skill(&local),
+        })
+    };
     json!({
         "ravel_bin": bin.display().to_string(),
         "project": project_root.display().to_string(),
@@ -1267,6 +1866,7 @@ pub fn doctor_agents(project_root: &Path) -> Value {
                 "id": a.id(),
                 "label": a.label(),
                 "detected": agent_looks_installed(*a),
+                "wired": wired(*a),
             })
         }).collect::<Vec<_>>(),
         "hint": "ravel install   # wire MCP into detected agents",
@@ -1306,6 +1906,48 @@ mod tests {
         let v2: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(v2["mcpServers"].get("ravel").is_none());
         assert!(v2["mcpServers"].get("other").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through_the_link_and_keeps_its_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("dotfiles").join("mcp.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("home").join("mcp.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink("../dotfiles/mcp.json", &link).unwrap();
+
+        upsert_json_mcp_servers(&link, Path::new("/usr/bin/ravel"), true).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["ravel"]["command"], "/usr/bin/ravel");
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+
+        // A link whose target does not exist yet gets that target created.
+        let dangling = dir.path().join("home").join("settings.json");
+        symlink("../dotfiles/settings.json", &dangling).unwrap();
+        write_text_atomic(&dangling, "{}\n").unwrap();
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("dotfiles/settings.json")).unwrap(),
+            "{}\n"
+        );
     }
 
     #[test]
@@ -1427,12 +2069,86 @@ b = 2
     }
 
     #[test]
+    fn the_codex_block_ends_at_any_header_but_its_own_sub_tables() {
+        let rest = "[[hooks]]\nname = \"keep-me\"\n\n# github\n  [mcp_servers.github]\n  \
+                    env = { TOKEN = \"t\" }\n";
+        let text = format!(
+            "[ mcp_servers . ravel ]  # mine\ncommand = \"old\"\n\n\
+             [mcp_servers.ravel.tools.sync]\napproval_mode = \"approve\"\n\n{rest}"
+        );
+        assert_eq!(replace_toml_table(&text, CODEX_RAVEL_TABLE, ""), rest);
+
+        let replaced = replace_toml_table(&text, CODEX_RAVEL_TABLE, "\n[mcp_servers.ravel]\n");
+        assert_eq!(replaced, format!("[mcp_servers.ravel]\n\n{rest}"));
+
+        // Neither a commented-out header nor the row of a multi-line array opens a table.
+        let text = "# [mcp_servers.ravel]\nmatrix = [\n  [1, 2],\n  [\"a\"]\n]\n";
+        assert!(toml_table_range(text, CODEX_RAVEL_TABLE).is_none());
+        assert_eq!(
+            toml_header("  [[a.\"b c\"]] # x"),
+            Some((vec!["a".into(), "b c".into()], true))
+        );
+        assert_eq!(toml_header("  [1, 2],"), None);
+    }
+
+    #[test]
+    fn a_codex_rewrite_that_changes_other_settings_is_refused() {
+        let path = Path::new("config.toml");
+        let before: toml::Table = "model = \"m\"\n[mcp_servers.ravel]\ncommand = \"x\"\n\
+                                   [[hooks]]\nname = \"keep-me\"\n"
+            .parse()
+            .unwrap();
+        assert!(
+            ensure_only_ravel_changed(
+                path,
+                before.clone(),
+                "model = \"m\"\n[[hooks]]\nname = \"keep-me\"\n",
+                None
+            )
+            .is_ok()
+        );
+        let error = ensure_only_ravel_changed(path, before.clone(), "model = \"m\"\n", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config.toml"), "{error}");
+        assert!(ensure_only_ravel_changed(path, before, "model = \"", None).is_err());
+    }
+
+    #[test]
     fn marked_instructions_refresh() {
         let text = format!("# x\n{MARKER_BEGIN}\nold\n{MARKER_END}\n# y\n");
         let next = replace_marked_section(&text, &agent_instruction_block());
         assert!(next.contains("explore SYMBOL"));
         assert!(next.contains("# y"));
         assert_eq!(next.matches(MARKER_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn reinstalling_instructions_changes_nothing_and_uninstall_restores_the_file() {
+        let dir = tempdir().unwrap();
+        let original = "# Notes\n\nmine\n";
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            fs::write(dir.path().join(name), original).unwrap();
+        }
+        fs::write(dir.path().join("GEMINI.md"), "# G\r\n").unwrap();
+        let opts = local_opts(dir.path(), vec![]);
+        let read = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
+
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        let first = read("AGENTS.md");
+        assert!(first.starts_with(original) && first.ends_with(&format!("{MARKER_END}\n")));
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert_eq!(read("AGENTS.md"), first);
+        assert_eq!(read("CLAUDE.md"), first);
+
+        strip_project_instructions(dir.path(), &mut Vec::new()).unwrap();
+        assert_eq!(read("AGENTS.md"), original);
+        assert_eq!(read("CLAUDE.md"), original);
+        assert_eq!(read("GEMINI.md"), "# G\r\n");
+
+        let crlf = format!("a\r\n{MARKER_BEGIN}\r\nold\r\n{MARKER_END}\r\nb\r\n");
+        assert_eq!(replace_marked_section(&crlf, ""), "a\r\nb\r\n");
     }
 
     #[test]
@@ -1453,6 +2169,280 @@ b = 2
                 .unwrap();
         assert_eq!(mcp["mcpServers"]["ravel"]["command"], "/opt/ravel");
         assert!(dir.path().join("AGENTS.md").exists());
+    }
+
+    fn local_opts(root: &Path, targets: Vec<AgentKind>) -> InstallOptions {
+        InstallOptions {
+            targets,
+            location: InstallLocation::Local,
+            project_root: root.to_path_buf(),
+            ravel_bin: PathBuf::from("/new/ravel"),
+            write_instructions: true,
+            claude_permissions: false,
+        }
+    }
+
+    #[test]
+    fn reinstall_keeps_what_the_user_added_to_the_json_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"ravel":{"command":"/old/ravel","args":["mcp"],"env":{"RAVEL_MCP_TOOLS":"all"}}}}"#,
+        )
+        .unwrap();
+        upsert_json_mcp_servers(&path, Path::new("/new/ravel"), true).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["ravel"]["command"], "/new/ravel");
+        assert_eq!(v["mcpServers"]["ravel"]["args"], json!(["serve", "--mcp"]));
+        assert_eq!(v["mcpServers"]["ravel"]["env"]["RAVEL_MCP_TOOLS"], "all");
+    }
+
+    #[test]
+    fn codex_reinstall_refreshes_the_command_and_keeps_user_keys() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(".codex").join("config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            "# mine\nmodel = \"m\"\n\n[mcp_servers.ravel]\ncommand = \"/old/ravel\"\nargs = [\"mcp\"]\n\
+             tool_timeout_sec = 120\nenv = { RAVEL_MCP_TOOLS = \"all\" }\n\n\
+             [mcp_servers.ravel.tools.sync]\napproval_mode = \"approve\"\n\n[profiles.fast]\nmodel = \"x\"\n",
+        )
+        .unwrap();
+        let opts = local_opts(dir.path(), vec![AgentKind::Codex]);
+        install_codex(&opts, &mut Vec::new()).unwrap();
+
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(
+            text.starts_with("# mine\n"),
+            "the rest of the file is untouched:\n{text}"
+        );
+        let value: toml::Table = text.parse().unwrap();
+        let ravel = &value["mcp_servers"]["ravel"];
+        assert_eq!(ravel["command"].as_str(), Some("/new/ravel"));
+        assert_eq!(ravel["args"].as_array().unwrap().len(), 2);
+        assert_eq!(ravel["tool_timeout_sec"].as_integer(), Some(120));
+        assert_eq!(ravel["env"]["RAVEL_MCP_TOOLS"].as_str(), Some("all"));
+        assert_eq!(
+            ravel["tools"]["sync"]["approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(value["profiles"]["fast"]["model"].as_str(), Some("x"));
+    }
+
+    #[test]
+    fn skills_are_written_where_each_agent_loads_them_and_removed_on_uninstall() {
+        let dir = tempdir().unwrap();
+        let opts = local_opts(dir.path(), vec![AgentKind::Claude, AgentKind::Codex]);
+        let claude = dir.path().join(".claude/skills/ravel/SKILL.md");
+        let codex = dir.path().join(".agents/skills/ravel/SKILL.md");
+
+        install_agents(&opts).unwrap();
+        for path in [&claude, &codex] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(
+                text.starts_with("---\nname: ravel\ndescription: "),
+                "{text}"
+            );
+            assert!(text.contains(SKILL_MANAGED_MARKER));
+            assert!(text.contains("callers-of"));
+        }
+
+        uninstall_agents(&opts).unwrap();
+        assert!(!claude.exists() && !codex.exists());
+        assert!(!dir.path().join(".claude/skills/ravel").exists());
+    }
+
+    #[test]
+    fn a_skill_the_user_wrote_is_never_overwritten_or_removed() {
+        let dir = tempdir().unwrap();
+        let opts = local_opts(dir.path(), vec![AgentKind::Claude]);
+        let path = dir.path().join(".claude/skills/ravel/SKILL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "---\nname: ravel\ndescription: mine\n---\n").unwrap();
+
+        let report = install_agents(&opts).unwrap();
+        assert!(report.actions.iter().any(|a| a.action == "skip"));
+        uninstall_agents(&opts).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "---\nname: ravel\ndescription: mine\n---\n"
+        );
+    }
+
+    #[test]
+    fn global_install_outside_a_project_creates_no_agents_md() {
+        let dir = tempdir().unwrap();
+        let mut opts = local_opts(dir.path(), vec![]);
+        opts.location = InstallLocation::Global;
+        let mut actions = Vec::new();
+        write_project_instructions(&opts, &mut actions).unwrap();
+        assert!(!dir.path().join("AGENTS.md").exists());
+        assert!(actions.iter().any(|a| a.action == "skip"));
+
+        // Inside a repository it does, and an existing block is refreshed either way.
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert!(dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn global_install_outside_a_project_writes_no_cursor_rule() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".cursor")).unwrap();
+        let rule = dir.path().join(".cursor").join("rules").join("ravel.mdc");
+        let mut opts = local_opts(dir.path(), vec![]);
+        opts.location = InstallLocation::Global;
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert!(
+            !rule.exists(),
+            "a .cursor/ outside a project (~/.cursor) got a rule"
+        );
+
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert!(rule.is_file());
+    }
+
+    #[test]
+    fn project_configs_launch_ravel_from_path_only_when_it_resolves() {
+        let dir = tempdir().unwrap();
+        let binary = dir
+            .path()
+            .join(if cfg!(windows) { "ravel.exe" } else { "ravel" });
+        fs::write(&binary, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                !on_path("ravel", Some(dir.path().as_os_str())),
+                "a file that cannot be executed does not resolve"
+            );
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(on_path("ravel", Some(dir.path().as_os_str())));
+        assert!(!on_path(
+            "ravel",
+            Some(tempdir().unwrap().path().as_os_str())
+        ));
+        assert!(!on_path("ravel", None));
+        assert_eq!(
+            launch_command(InstallLocation::Global, Path::new("/abs/ravel")),
+            PathBuf::from("/abs/ravel"),
+            "a global config always names the absolute binary"
+        );
+    }
+
+    #[test]
+    fn config_locks_stay_out_of_the_project() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        // The sidecar older releases left beside the config is cleaned up, not recreated.
+        fs::write(dir.path().join(".mcp.json.ravel.lock"), "").unwrap();
+        upsert_json_mcp_servers(&path, Path::new("ravel"), true).unwrap();
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![std::ffi::OsString::from(".mcp.json")]);
+
+        let mut actions = Vec::new();
+        let missing = dir.path().join(".codex").join("config.toml");
+        remove_json_mcp_key(AgentKind::Codex, &missing, &mut actions, "mcpServers").unwrap();
+        assert!(
+            !dir.path().join(".codex").exists(),
+            "uninstalling from a config that is not there must not create its directory"
+        );
+    }
+
+    #[test]
+    fn claude_allowlist_is_created_only_where_claude_is_installed() {
+        let dir = tempdir().unwrap();
+        let absent = dir.path().join("nowhere").join("settings.json");
+        ensure_claude_allowlist(&absent).unwrap();
+        assert!(
+            !absent.exists(),
+            "no ~/.claude: Claude Code is not installed here"
+        );
+
+        fs::create_dir(dir.path().join(".claude")).unwrap();
+        let settings = dir.path().join(".claude").join("settings.json");
+        ensure_claude_allowlist(&settings).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v, json!({"permissions": {"allow": ["mcp__ravel__*"]}}));
+
+        // Idempotent, and additive on a file with other rules.
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["Read"]},"model":"x"}"#,
+        )
+        .unwrap();
+        ensure_claude_allowlist(&settings).unwrap();
+        ensure_claude_allowlist(&settings).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["allow"], json!(["Read", "mcp__ravel__*"]));
+        assert_eq!(v["model"], "x");
+    }
+
+    #[test]
+    fn claude_scope_conflict_is_reported_only_when_commands_differ() {
+        let dir = tempdir().unwrap();
+        let user = dir.path().join(".claude.json");
+        assert!(claude_scope_conflict(&user, Path::new("ravel")).is_none());
+        fs::write(
+            &user,
+            r#"{"mcpServers":{"ravel":{"command":"/abs/ravel","args":["serve","--mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(claude_scope_conflict(&user, Path::new("/abs/ravel")).is_none());
+        let warning = claude_scope_conflict(&user, Path::new("ravel")).unwrap();
+        assert!(
+            warning.contains("claude mcp remove ravel -s user"),
+            "{warning}"
+        );
+        let project = dir.path().join(".mcp.json");
+        fs::write(&project, r#"{"mcpServers":{"ravel":{"command":"ravel"}}}"#).unwrap();
+        let warning = claude_scope_conflict(&project, Path::new("/abs/ravel")).unwrap();
+        assert!(warning.contains("-s project"), "{warning}");
+    }
+
+    #[test]
+    fn merging_over_a_remote_entry_leaves_no_url_behind() {
+        let existing = json!({"type":"http","url":"https://x","headers":{"a":"b"},"env":{"K":"v"}});
+        let merged = merge_server_entry(Some(&existing), mcp_stdio_entry(Path::new("ravel")));
+        assert_eq!(merged["type"], "stdio");
+        assert_eq!(merged["env"]["K"], "v");
+        assert!(merged.get("url").is_none() && merged.get("headers").is_none());
+    }
+
+    #[test]
+    fn doctor_reports_what_each_config_shape_actually_wires() {
+        let dir = tempdir().unwrap();
+        let json = dir.path().join("mcp.json");
+        let toml = dir.path().join("config.toml");
+        assert!(!config_has_ravel(&json), "missing file");
+        fs::write(&json, r#"{"servers":{"ravel":{}}}"#).unwrap();
+        assert!(config_has_ravel(&json));
+        fs::write(&json, r#"{"mcpServers":{"other":{}}}"#).unwrap();
+        assert!(!config_has_ravel(&json));
+        fs::write(&toml, "[mcp_servers.ravel]\ncommand = \"ravel\"\n").unwrap();
+        assert!(config_has_ravel(&toml));
+        fs::write(&toml, "[mcp_servers.other]\ncommand = \"x\"\n").unwrap();
+        assert!(!config_has_ravel(&toml));
+
+        let opts = local_opts(dir.path(), vec![AgentKind::Claude]);
+        install_agents(&opts).unwrap();
+        let report = doctor_agents(dir.path());
+        let claude = report["supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "claude")
+            .unwrap();
+        assert_eq!(claude["wired"]["mcp_local"], true);
+        assert_eq!(claude["wired"]["skill_local"], true);
     }
 
     #[test]

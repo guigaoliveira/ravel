@@ -10,7 +10,10 @@ use std::{
     fs,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
@@ -273,30 +276,118 @@ impl StreamingGenerationPackWriter {
 pub struct GenerationPackReader {
     path: PathBuf,
     mmap: Mmap,
-    entries: BTreeMap<String, Entry>,
+    /// Directory entries in key order. Keys stay in the mapped directory and are compared as
+    /// bytes, which orders UTF-8 exactly as `String` does. Every CLI command opens the pack at
+    /// least once, and decoding the directory into an owned map allocated a key per record --
+    /// tens of thousands on a large workspace, 16ms per open before any record was read.
+    entries: Vec<DirectoryEntry>,
     directory_offset: u64,
 }
+
+#[derive(Debug)]
+struct DirectoryEntry {
+    /// Byte range of the key inside the mapped file, validated as UTF-8 when decoded.
+    key: std::ops::Range<usize>,
+    entry: Entry,
+}
+
+/// Which file a registered reader maps. The inode tells a pack replaced by rename from the one a
+/// reader holds; length and modification time tell one rewritten in place under the same name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackIdentity {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl PackIdentity {
+    fn of(path: &Path, metadata: &fs::Metadata) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+        }
+    }
+}
+
+/// One slot per pack this process has mapped. The slot is locked while its reader is built, so
+/// loaders racing for the same pack open it once and the rest wait for that result.
+type PackSlot = Arc<Mutex<Weak<GenerationPackReader>>>;
+
+/// Packs mapped by this process. Weak, so a pack still unmaps when its last user lets go.
+static OPEN_PACKS: Mutex<Vec<(PackIdentity, PackSlot)>> = Mutex::new(Vec::new());
 
 impl GenerationPackReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PackError> {
         let path = path.as_ref().to_path_buf();
-        let file = fs::File::open(&path).map_err(|source| PackError::Io {
-            path: path.clone(),
+        let (file, metadata) = Self::open_file(&path)?;
+        Self::map(path, &file, metadata.len())
+    }
+
+    /// [`open`](Self::open), except that a pack some other loader of this process has already
+    /// mapped and still holds is reused instead of mapped, hashed and decoded again.
+    ///
+    /// A cold query opens the same pack several times over -- the symbol dictionary, the term
+    /// index, the graph and the symbol metadata each live in it, and each loader used to pay for
+    /// the directory (a checksum and a decode proportional to the record count) on its own. The
+    /// pack is immutable and every holder keeps its own generation guard, so sharing the mapping
+    /// changes no lifetime: the last holder still unmaps it.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>, PackError> {
+        let path = path.as_ref().to_path_buf();
+        let (file, metadata) = Self::open_file(&path)?;
+        let identity = PackIdentity::of(&path, &metadata);
+        let slot = {
+            let mut packs = OPEN_PACKS.lock().unwrap_or_else(|e| e.into_inner());
+            // Forget packs nobody holds any more, so the list stays as long as the live set.
+            packs.retain(|(_, slot)| {
+                slot.try_lock().map_or(true, |weak| {
+                    weak.strong_count() > 0 || Arc::strong_count(slot) > 1
+                })
+            });
+            match packs.iter().find(|(known, _)| *known == identity) {
+                Some((_, slot)) => Arc::clone(slot),
+                None => {
+                    let slot = PackSlot::default();
+                    packs.push((identity, Arc::clone(&slot)));
+                    slot
+                }
+            }
+        };
+        let mut weak = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(reader) = weak.upgrade() {
+            return Ok(reader);
+        }
+        let reader = Arc::new(Self::map(path, &file, metadata.len())?);
+        *weak = Arc::downgrade(&reader);
+        Ok(reader)
+    }
+
+    fn open_file(path: &Path) -> Result<(fs::File, fs::Metadata), PackError> {
+        let file = fs::File::open(path).map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
             source,
         })?;
-        let file_len = file
-            .metadata()
-            .map_err(|source| PackError::Io {
-                path: path.clone(),
-                source,
-            })?
-            .len();
+        let metadata = file.metadata().map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok((file, metadata))
+    }
+
+    fn map(path: PathBuf, file: &fs::File, file_len: u64) -> Result<Self, PackError> {
         if file_len < HEADER_LEN + FOOTER_LEN {
             return invalid(&path, "truncated header/footer");
         }
         // SAFETY: the immutable generation file is protected by a generation lease while any
         // reader is alive. Writers publish a new path and never modify a referenced pack.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|source| PackError::Io {
+        let mmap = unsafe { Mmap::map(file) }.map_err(|source| PackError::Io {
             path: path.clone(),
             source,
         })?;
@@ -338,14 +429,27 @@ impl GenerationPackReader {
         })()
     }
 
+    fn key_bytes(&self, entry: &DirectoryEntry) -> &[u8] {
+        &self.mmap[entry.key.clone()]
+    }
+
+    fn entry(&self, key: &str) -> Option<&Entry> {
+        self.entries
+            .binary_search_by(|candidate| self.key_bytes(candidate).cmp(key.as_bytes()))
+            .ok()
+            .map(|index| &self.entries[index].entry)
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
+        self.entries.iter().map(|entry| {
+            std::str::from_utf8(self.key_bytes(entry)).expect("keys are validated when decoded")
+        })
     }
 
     /// Takes `&self`: reading only borrows the mmap and the decoded directory, so a
     /// reader can be shared and opened once instead of per record.
     pub fn read(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, PackError> {
-        let Some(entry) = self.entries.get(key) else {
+        let Some(entry) = self.entry(key) else {
             return Ok(None);
         };
         // Bound the expanded size: that is what the caller ends up holding.
@@ -387,7 +491,7 @@ impl GenerationPackReader {
         max_bytes: u64,
         read: impl FnOnce(&[u8]) -> T,
     ) -> Result<Option<T>, PackError> {
-        let Some(entry) = self.entries.get(key) else {
+        let Some(entry) = self.entry(key) else {
             return Ok(None);
         };
         if entry.plain_len > max_bytes || entry.plain_len > usize::MAX as u64 {
@@ -418,6 +522,30 @@ impl GenerationPackReader {
         Ok(Some(read(&plain)))
     }
 
+    /// Drop this mapping's resident pages of `key`, for a caller that has turned the record into
+    /// owned data and will not read it again. A reader opened per loader released them with its
+    /// mapping; one shared by every loader of a long-lived process (the daemon) keeps them beside
+    /// the copy -- on the 20k-file corpus the graph record alone held 72 MB of the pack resident.
+    pub(crate) fn release_record(&self, key: &str) {
+        #[cfg(unix)]
+        if let Some(entry) = self.entry(key)
+            && entry.offset.saturating_add(entry.len) <= self.directory_offset
+        {
+            // SAFETY: a read-only shared mapping of a pack no writer modifies: dropping its pages
+            // only makes the next access to them fault them in again from the page cache,
+            // unchanged, for this reader or any other holding the same mapping.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    entry.offset as usize,
+                    entry.len as usize,
+                )
+            };
+        }
+        #[cfg(not(unix))]
+        let _ = key;
+    }
+
     /// Borrow a bounded record without recomputing its blake3 checksum. The consumer must fully
     /// validate the record format before interpreting it; this is intended for bytecheck/rkyv
     /// hot paths. `ravel validate` still verifies the stored checksum separately.
@@ -427,7 +555,7 @@ impl GenerationPackReader {
         max_bytes: u64,
         validate: impl FnOnce(&[u8]) -> T,
     ) -> Result<Option<T>, PackError> {
-        let Some(entry) = self.entries.get(key) else {
+        let Some(entry) = self.entry(key) else {
             return Ok(None);
         };
         // Refuse instead of handing back compressed bytes: this path exists so the
@@ -487,7 +615,7 @@ fn decode_directory(
     bytes: &[u8],
     records_end: u64,
     path: &Path,
-) -> Result<BTreeMap<String, Entry>, PackError> {
+) -> Result<Vec<DirectoryEntry>, PackError> {
     if bytes.len() < 12 || &bytes[..8] != DIRECTORY_MAGIC {
         return invalid(path, "invalid directory header");
     }
@@ -495,8 +623,14 @@ fn decode_directory(
     if count > MAX_RECORDS {
         return invalid(path, "record count exceeds limit");
     }
+    // The directory starts where the records end, so a key's position in `bytes` maps to the
+    // file offset `records_end + position`.
+    let base = records_end as usize;
     let mut cursor = 12usize;
-    let mut entries = BTreeMap::new();
+    let mut entries = Vec::with_capacity(count as usize);
+    // Writers encode the directory from a sorted map, so it normally arrives strictly ordered;
+    // anything else is sorted below and still checked for duplicates.
+    let mut ordered = true;
     for _ in 0..count {
         let key_len = take_u32(bytes, &mut cursor, path)? as usize;
         if key_len == 0
@@ -508,12 +642,25 @@ fn decode_directory(
         {
             return invalid(path, "directory entry bounds are invalid");
         }
-        let key = std::str::from_utf8(&bytes[cursor..cursor + key_len])
-            .map_err(|_| PackError::Invalid {
-                path: path.to_path_buf(),
-                message: "directory key is not UTF-8".into(),
-            })?
-            .to_owned();
+        let key = &bytes[cursor..cursor + key_len];
+        if std::str::from_utf8(key).is_err() {
+            return invalid(path, "directory key is not UTF-8");
+        }
+        if let Some(previous) = entries
+            .last()
+            .map(|entry: &DirectoryEntry| &bytes[entry.key.start - base..entry.key.end - base])
+        {
+            match previous.cmp(key) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    return Err(PackError::DuplicateKey(
+                        String::from_utf8_lossy(key).into_owned(),
+                    ));
+                }
+                std::cmp::Ordering::Greater => ordered = false,
+            }
+        }
+        let key = base + cursor..base + cursor + key_len;
         cursor += key_len;
         let offset = take_u64(bytes, &mut cursor, path)?;
         let len = take_u64(bytes, &mut cursor, path)?;
@@ -526,31 +673,62 @@ fn decode_directory(
         {
             return invalid(path, "record points outside data region");
         }
-        if entries
-            .insert(
-                key.clone(),
-                Entry {
-                    offset,
-                    len,
-                    plain_len,
-                    checksum,
-                },
-            )
-            .is_some()
-        {
-            return Err(PackError::DuplicateKey(key));
-        }
+        entries.push(DirectoryEntry {
+            key,
+            entry: Entry {
+                offset,
+                len,
+                plain_len,
+                checksum,
+            },
+        });
     }
     if cursor != bytes.len() {
         return invalid(path, "trailing directory bytes");
     }
+    if !ordered {
+        let key_of = |entry: &DirectoryEntry| &bytes[entry.key.start - base..entry.key.end - base];
+        entries.sort_by(|left, right| key_of(left).cmp(key_of(right)));
+        if let Some(pair) = entries
+            .windows(2)
+            .find(|pair| key_of(&pair[0]) == key_of(&pair[1]))
+        {
+            return Err(PackError::DuplicateKey(
+                String::from_utf8_lossy(key_of(&pair[0])).into_owned(),
+            ));
+        }
+    }
     Ok(entries)
+}
+
+thread_local! {
+    // One zstd context per thread, reused for every record. `zstd::bulk::{compress, decompress}`
+    // create and free a context per call, and a full index compresses tens of thousands of shards:
+    // each call allocated (and the kernel zeroed) a fresh workspace. `compress2` starts a new frame
+    // from the stored parameters every time, so a reused context writes the same bytes.
+    static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+    static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Expand a compressed record, rejecting a length that disagrees with the directory.
 fn decompress_record(bytes: &[u8], plain_len: u64, path: &Path) -> Result<Vec<u8>, PackError> {
-    let plain =
-        zstd::bulk::decompress(bytes, plain_len as usize).map_err(|source| PackError::Io {
+    let plain = DECOMPRESSOR
+        .with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let decompressor = match slot.as_mut() {
+                Some(decompressor) => decompressor,
+                None => slot.insert(zstd::bulk::Decompressor::new()?),
+            };
+            let result = decompressor.decompress(bytes, plain_len as usize);
+            if result.is_err() {
+                // Never carry a context out of a failed frame into the next record.
+                *slot = None;
+            }
+            result
+        })
+        .map_err(|source| PackError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -564,11 +742,30 @@ fn decompress_record(bytes: &[u8], plain_len: u64, path: &Path) -> Result<Vec<u8
 }
 
 /// zstd a record, reporting the pack path on failure.
+///
+/// The result is trimmed to its length: `Compressor::compress` sizes its buffer for the worst case
+/// (slightly over the plain size) and staging holds thousands of compressed records at once, so the
+/// unused tails added up to roughly the uncompressed size of everything staged.
 pub(crate) fn compress_record(plain: &[u8], path: &Path) -> Result<Vec<u8>, PackError> {
-    zstd::bulk::compress(plain, COMPRESSION_LEVEL).map_err(|source| PackError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    COMPRESSOR
+        .with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let compressor = match slot.as_mut() {
+                Some(compressor) => compressor,
+                None => slot.insert(zstd::bulk::Compressor::new(COMPRESSION_LEVEL)?),
+            };
+            let result = compressor.compress(plain);
+            if result.is_err() {
+                *slot = None;
+            }
+            let mut compressed = result?;
+            compressed.shrink_to_fit();
+            Ok(compressed)
+        })
+        .map_err(|source| PackError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn padding_for(position: u64, alignment: u64) -> u64 {
@@ -608,6 +805,54 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn directory_of(keys: &[&str]) -> Vec<u8> {
+        let mut bytes = DIRECTORY_MAGIC.to_vec();
+        bytes.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for (index, key) in keys.iter().enumerate() {
+            bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&(HEADER_LEN + 16 * index as u64).to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&[index as u8; 32]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_directory_out_of_key_order_is_sorted_and_duplicates_are_refused() {
+        let path = Path::new("test.pack");
+        let records_end = 1024;
+        let keys_of = |entries: &[DirectoryEntry], bytes: &[u8]| -> Vec<String> {
+            entries
+                .iter()
+                .map(|entry| {
+                    let start = entry.key.start - records_end as usize;
+                    String::from_utf8(bytes[start..start + entry.key.len()].to_vec()).unwrap()
+                })
+                .collect()
+        };
+        let ordered = directory_of(&["a", "b/c", "b/d"]);
+        let entries = decode_directory(&ordered, records_end, path).unwrap();
+        assert_eq!(keys_of(&entries, &ordered), ["a", "b/c", "b/d"]);
+
+        // Not something this writer produces, but a reader must not binary-search it unsorted.
+        let shuffled = directory_of(&["b/d", "a", "b/c"]);
+        let entries = decode_directory(&shuffled, records_end, path).unwrap();
+        assert_eq!(keys_of(&entries, &shuffled), ["a", "b/c", "b/d"]);
+        assert_eq!(
+            entries[0].entry.checksum, [1; 32],
+            "entries move with their keys"
+        );
+
+        for keys in [&["a", "a"][..], &["b", "a", "b"][..]] {
+            assert!(matches!(
+                decode_directory(&directory_of(keys), records_end, path),
+                Err(PackError::DuplicateKey(key)) if key == keys[0]
+            ));
+        }
+    }
+
     #[test]
     fn roundtrip_alignment_and_bounded_reads() {
         let dir = tempdir().unwrap();
@@ -623,7 +868,12 @@ mod tests {
             reader.read("large", 99),
             Err(PackError::RecordTooLarge { .. })
         ));
-        assert!(reader.entries.values().all(|entry| entry.offset % 8 == 0));
+        assert!(
+            reader
+                .entries
+                .iter()
+                .all(|entry| entry.entry.offset % 8 == 0)
+        );
     }
 
     /// A compressed record must read back byte-identical, and its bound must apply to
@@ -653,14 +903,14 @@ mod tests {
         );
         assert_eq!(reader.read("plain", 64).unwrap().unwrap(), b"kept raw");
 
-        let stored = reader.entries["squashed"].len;
+        let stored = reader.entry("squashed").unwrap().len;
         assert!(
             stored < compressible.len() as u64,
             "payload should have shrunk: {stored} vs {}",
             compressible.len()
         );
-        assert!(reader.entries["squashed"].compressed());
-        assert!(!reader.entries["plain"].compressed());
+        assert!(reader.entry("squashed").unwrap().compressed());
+        assert!(!reader.entry("plain").unwrap().compressed());
 
         // The limit is checked against the expanded length.
         assert!(matches!(
@@ -691,7 +941,7 @@ mod tests {
         writer.publish().unwrap();
         let reader = GenerationPackReader::open(&path).unwrap();
         assert!(
-            !reader.entries["tiny"].compressed(),
+            !reader.entry("tiny").unwrap().compressed(),
             "a payload that does not shrink must be stored raw"
         );
         assert_eq!(reader.read("tiny", 4096).unwrap().unwrap(), tiny);
@@ -742,7 +992,7 @@ mod tests {
         // blake3 is verified on `read`, so a fresh reader still rejects the flip.
         let offset = {
             let reader = GenerationPackReader::open(&path).unwrap();
-            reader.entries["a"].offset as usize
+            reader.entry("a").unwrap().offset as usize
         };
         let mut corrupt = original;
         corrupt[offset] ^= 1;
@@ -764,6 +1014,135 @@ mod tests {
         bytes[directory_offset] ^= 1;
         fs::write(&path, bytes).unwrap();
         assert!(GenerationPackReader::open(path).is_err());
+    }
+
+    fn write_pack(path: &Path, value: &[u8]) {
+        let mut writer = StreamingGenerationPackWriter::new(path).unwrap();
+        writer.add("value", value).unwrap();
+        writer.publish().unwrap();
+    }
+
+    /// Releasing a record's pages is only a hint about residency: every holder of the shared
+    /// mapping, and the releasing one itself, still reads the record as it was written.
+    #[test]
+    fn a_released_record_reads_back_unchanged_through_the_shared_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        // Incompressible and several pages long, so the record is stored raw and spans whole pages.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let payload: Vec<u8> = (0..(3 << 20))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        write_pack(&path, &payload);
+
+        let loader = GenerationPackReader::open_shared(&path).unwrap();
+        let other = GenerationPackReader::open_shared(&path).unwrap();
+        let limit = payload.len() as u64;
+        let copied = loader
+            .with_record_for_validation("value", limit, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        loader.release_record("value");
+        loader.release_record("missing");
+        assert_eq!(copied, payload);
+        for reader in [&loader, &other] {
+            let again = reader
+                .with_record_for_validation("value", limit, <[u8]>::to_vec)
+                .unwrap()
+                .unwrap();
+            assert!(
+                again == payload,
+                "released pages must fault back in unchanged"
+            );
+        }
+        assert_eq!(other.read("value", limit).unwrap().unwrap(), payload);
+    }
+
+    #[test]
+    fn loaders_of_one_pack_share_a_reader_for_as_long_as_one_is_held() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"first");
+
+        let first = GenerationPackReader::open_shared(&path).unwrap();
+        let second = GenerationPackReader::open_shared(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "one mapping, not two");
+        assert_eq!(second.read("value", 8).unwrap().unwrap(), b"first");
+
+        // Sharing never extends a mapping: once the last holder lets go the registry keeps nothing
+        // alive, and the next loader maps the pack afresh.
+        drop((first, second));
+        let still_mapped = |path: &Path| {
+            OPEN_PACKS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(identity, slot)| {
+                    identity.path == path && slot.lock().unwrap().strong_count() > 0
+                })
+                .count()
+        };
+        assert_eq!(still_mapped(&path), 0);
+        let reopened = GenerationPackReader::open_shared(&path).unwrap();
+        assert_eq!(reopened.read("value", 8).unwrap().unwrap(), b"first");
+        assert_eq!(still_mapped(&path), 1);
+    }
+
+    #[test]
+    fn a_pack_replaced_under_the_same_name_is_never_served_from_the_old_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"old");
+        let held = GenerationPackReader::open_shared(&path).unwrap();
+
+        // Publication is a rename onto the live name; the old inode stays mapped by `held`.
+        let staged = dir.path().join("staged.pack");
+        write_pack(&staged, b"new-and-longer");
+        fs::rename(&staged, &path).unwrap();
+
+        let current = GenerationPackReader::open_shared(&path).unwrap();
+        assert!(!Arc::ptr_eq(&held, &current));
+        assert_eq!(held.read("value", 32).unwrap().unwrap(), b"old");
+        assert_eq!(
+            current.read("value", 32).unwrap().unwrap(),
+            b"new-and-longer"
+        );
+    }
+
+    #[test]
+    fn concurrent_loaders_open_a_pack_once_and_a_bad_pack_fails_each_of_them() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("generation.pack");
+        write_pack(&path, b"shared");
+        let readers: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| GenerationPackReader::open_shared(&path).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(reader, &readers[0]))
+        );
+        drop(readers);
+
+        let corrupt = dir.path().join("corrupt.pack");
+        fs::write(
+            &corrupt,
+            b"not a pack at all, but longer than a header and a footer",
+        )
+        .unwrap();
+        assert!(GenerationPackReader::open_shared(&corrupt).is_err());
+        assert!(
+            GenerationPackReader::open_shared(&corrupt).is_err(),
+            "a failed open leaves nothing behind that a retry could mistake for success"
+        );
     }
 
     #[test]

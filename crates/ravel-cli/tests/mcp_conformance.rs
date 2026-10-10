@@ -36,6 +36,7 @@ fn mcp_stdio_speaks_protocol() {
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sync","arguments":{"paths":["src/new.ts"]}}}"#,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"explore","arguments":{"query":"fresh"}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"callers_of","arguments":{"node":"fresh","rollup":"bogus"}}}"#,
     ];
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -65,7 +66,7 @@ fn mcp_stdio_speaks_protocol() {
     let mut by_id: HashMap<u64, serde_json::Value> = HashMap::new();
     let mut seen_lines: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && by_id.len() < 5 {
+    while Instant::now() < deadline && by_id.len() < 6 {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(line) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -94,6 +95,13 @@ fn mcp_stdio_speaks_protocol() {
     assert!(
         init["result"]["serverInfo"].is_object(),
         "initialize missing result.serverInfo: {init}"
+    );
+    // Client UIs and logs show this name; left to the library default it reads "rmcp".
+    assert_eq!(init["result"]["serverInfo"]["name"], "ravel", "{init}");
+    assert_eq!(
+        init["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{init}"
     );
 
     // 2. tools/list → the primary tool surface is present.
@@ -128,6 +136,32 @@ fn mcp_stdio_speaks_protocol() {
         sync["inputSchema"]["properties"].get("paths").is_some(),
         "sync schema must accept explicit edited paths: {sync}"
     );
+
+    // Annotations decide whether a client asks before each call. Codex's default `auto` mode
+    // prompts for any tool that is not `readOnlyHint` unless it is declared both non-destructive
+    // and closed-world, and treats a tool with no annotations as destructive and open-world.
+    for tool in list["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let annotations = &tool["annotations"];
+        assert_eq!(
+            annotations["openWorldHint"], false,
+            "{name}: Ravel never leaves the machine: {tool}"
+        );
+        if name == "sync" {
+            assert_eq!(annotations["readOnlyHint"], false, "{tool}");
+            assert_eq!(annotations["destructiveHint"], false, "{tool}");
+        } else {
+            assert_eq!(annotations["readOnlyHint"], true, "{name}: {tool}");
+        }
+        assert!(
+            tool["inputSchema"].get("$schema").is_none(),
+            "{name}: `$schema` restates the MCP default and costs tokens every session: {tool}"
+        );
+        assert!(
+            tool["inputSchema"]["properties"]["root"]["description"].is_string(),
+            "{name}: `root` must say what it is, or multi-project sessions guess: {tool}"
+        );
+    }
 
     // 3. tools/call → a real invocation returns a JSON-RPC result (not an error).
     let call = by_id
@@ -172,4 +206,17 @@ fn mcp_stdio_speaks_protocol() {
     let explore: serde_json::Value =
         serde_json::from_str(explore_text).expect("explore should return JSON text");
     assert_eq!(explore["detail"]["name"], "fresh", "{explore_text}");
+
+    // A refused call must be flagged as one: an `{"error": …}` body under `isError: false` reads to
+    // the model like an ordinary answer.
+    let refused = by_id
+        .get(&6)
+        .unwrap_or_else(|| panic!("no callers_of response.\n--- stdout ---\n{}", dump()));
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("unknown rollup")),
+        "{refused}"
+    );
 }

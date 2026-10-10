@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A function-by-function review of the codebase. Every fix below has a regression
+test, and a new randomized walk (`tests/incremental_walk.rs`) checks that
+incremental sync publishes what a full index would after every edit.
+
+### Upgrading
+- **The first sync after upgrading runs a full index, once.** Extraction and
+  resolution changed, and the snapshot id now covers the extractor version and
+  the tsconfig-derived resolver configuration. Sync used to keep every unchanged
+  file's old artifact, and re-indexing after a tsconfig change published new
+  edges under the old generation, so a running daemon never noticed.
+
+### Fixed — wrong or missing answers
+- **Undoing an edit no longer erases earlier edits.** Overlay packs, merged tiers
+  and artifact deltas were named from the generation key, which recurs when
+  content returns to an earlier state; a later publish overwrote files the live
+  manifest still read, and `callers-of` answered `total: 0`. Each publication now
+  names them uniquely. Packed chains also get their own artifact overlay store,
+  collected with the chain, instead of one file that grew forever.
+- **A root below the top of its repository** (a package in a monorepo) read git's
+  paths as if they were relative to itself: auto-sync never saw an edit,
+  `diff-impact` was always empty and `cochanged` named files outside the root.
+- **Incremental sync re-resolves what a full index would.** Adding or renaming a
+  member of an exported class, redeclaring a clause-exported name
+  (`export { foo }`), names forwarded by barrels (`export {…} from`, `export *`,
+  import-then-export), syncing `tsconfig.json`, and another process publishing
+  beside a daemon all left stale or missing edges.
+- **Extraction:** string literals inside exported values became fake re-export
+  sources; JavaScript classes got no `Extends` edges and their fields no symbols;
+  decorated constructor parameters (`@Inject() private svc`), decorated
+  `export default class`, `export declare`, defaulted destructuring
+  (`{ a = 1 }`, also through `require`) and for-of bindings were missed; object
+  literal methods became members of the enclosing class; exports inside
+  namespaces counted as file exports.
+- **Resolution:** class members shadowed imports of the same name; explicit
+  exports did not shadow `export *`, and `default` passed through it; imports
+  reached namespace members; `.d.ts` files were never probed and `./x.js`
+  preferred the emitted file over its TypeScript source; tsconfig `extends`
+  diamonds, inherited `paths`, `${configDir}`, a BOM or a comment-only file were
+  mishandled; a matched `paths` pattern still fell back to `baseUrl`.
+- **One ignore rule set** for `ravel index`, `sync` and the watchers. Anchored
+  `.ravelignore` patterns (`src/gen/`) now work in `ravel index`; `.ignore` files
+  and nested `.ravelignore` files are not read anywhere (see
+  [configuration](docs/config.md)). Watchers re-read the rules when they change,
+  and dirty discovery applies them, so an ignored tracked file no longer warns on
+  every answer. One unreadable directory no longer fails the whole index.
+- **Watchers index the files of a directory** that is created, renamed or moved,
+  and keep hearing when `debounce_ms` exceeds `max_batch_ms`.
+- **Analysis:** `impact` ranks everything reached before paging (the direct
+  dependents could be missing); `diff-impact` ranks across all changed files;
+  packages no longer depend on themselves (false `boundaries` findings, empty
+  `export`); `packages` and `files_in_package` name packages as the graph does;
+  hub ties, non-ASCII exact matches, depth truncation in cycles, `context`
+  candidate truncation and `related-tests` duplicates are fixed.
+
+### Changed
+- `ravel impact X` without `--risk` walks what depends on `X`, as `--risk` and
+  the MCP tool always did, instead of what `X` depends on.
+- `ravel daemon stop` with MCP sessions attached leaves the daemon to them until
+  the last disconnects (`"sessions": N`), instead of wedging it.
+- `install`, `uninstall` and `setup` exit non-zero, and name the file, when an
+  agent could not be configured.
+
+### Fixed — install, CLI, daemon and MCP
+- Codex: `ravel install`/`uninstall` deleted the `[[tables]]` and indented
+  tables that followed `[mcp_servers.ravel]`; a rewrite that would change any
+  other setting is now refused.
+- `--location local` no longer edits the global Windsurf config; OpenCode's user
+  config is written where OpenCode reads it on every platform;
+  `CLAUDE_CONFIG_DIR` is honoured; symlinked configs are written through the
+  link with their mode; reinstalling no longer adds a blank line to agent
+  instruction files; the Cursor rule is written only inside a project.
+- `diff-impact` refuses a revision starting with `-`, which git read as an
+  option (`--output=<file>` wrote a file from a read-only tool).
+- The CLI answers in-process when no daemon runtime directory exists; looking for
+  a daemon no longer creates or chmods one; a daemon that fails to start says
+  why at once; a reply too large for a frame is refused with an error.
+- MCP accepts a page's `next_cursor` back as `cursor`, and refuses an unknown
+  `search_symbols` kind instead of searching exactly.
+- `RAVEL_TIMING=0` (or `false`, `off`, empty) leaves timing off.
+
 ### Fixed — a barrel that imported a name and republished it resolved to nothing
 - **`export { X as Y }` with no `from` clause broke the chain.** The name being
   republished is usually one the module *imported*, not one it declared, and the
@@ -80,27 +160,331 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added — `status` says which part of the index is reclaimable
 - **A single `disk.bytes` total read as inherent cost.** It now carries
   `reclaimable_generations` (how many generations past retention `ravel gc` would drop)
-  and `artifact_overlay_bytes` (the artifact sidecar, a separate cost that `gc` does not
-  touch). Measured on a 21,228-file corpus: of **3.35 GB**, **1.27 GiB** was generations
+  and `artifact_overlay_bytes` (the total size of the artifact overlay stores). Measured on a 21,228-file corpus: of **3.35 GB**, **1.27 GiB** was generations
   past retention that `ravel gc` freed on demand — nothing in any response had said so,
   so there was no reason to run it — and a further **1.27 GiB** is the overlay sidecar.
 
 ### Known, measured, not yet fixed
-- **Artifact compaction never runs on a packed index.** `ravel index` publishes artifacts
-  inside the shared pack, so `manifest.artifact_store` is a pack reference
-  (`snapshot-<id>.pack#artifact/`) and every later write appends to
-  `artifacts.overlay.store`. The amplification check measures the manifest reference as a
-  filesystem path, finds nothing there, and reports "not amplified" — so the sidecar grows
-  without bound. Measured: **1,366,254,902 bytes of overlay against 319,045,027 live, a
-  4.28x amplification that never trips the 4x threshold.** Two further layers were found
-  while attempting the fix and are why it is not in this release: the compaction body
-  reads artifacts through a filesystem-path resolver that cannot reach a pack record, and
-  its own recomputed `live` total disagrees with the manifest's. `ravel gc` still reclaims
-  stale generations; only the sidecar is affected.
 - Asking for the *public* name of such an alias still resolves only to an unrelated
   declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup
   is keyed by declared names, so the alias is not a candidate. The edges are now
   correct and reachable from the canonical symbol; the name is not yet.
+
+## [1.19.0] - 2026-10-09
+
+The calls an agent makes every turn got cheaper in CPU and memory, with every
+answer byte-identical to 1.18.0's. Measured on the 20,040-file synthetic corpus
+with `scripts/ab_verify.py`.
+
+### Performance — warm MCP sessions
+- **No whole-worktree `git status` while nothing changed.** A daemon query used to
+  ask git about the whole tree before answering (~36 ms of CPU at 20k files). The
+  daemon's watcher now proves it is caught up (a marker file it must report back)
+  and the check is skipped when it has seen no relevant change since the last full
+  one. The skip stands aside on watcher errors, new directories, ignore-rule edits,
+  non-local filesystems and after 60 s; `RAVEL_WATCH_FASTPATH=0` turns it off. With
+  an agent's think time between calls, median latency fell 91–95% for `explore`,
+  `callers_of`, `calls_from` and `status` (e.g. `callers_of` 28.0 → 1.5 ms).
+- **Calls ride the session's lease connection** instead of a connect, thread and
+  handshake each (daemon protocol minor 2; older daemons still get one connection
+  per call). Replies are forwarded as text, frames are one write, and the watcher
+  no longer subscribes to reads.
+- **Cheaper answers inside the daemon:** `status` −99.8% instructions (it decoded
+  the artifact index to print an empty list), `explore` −59% to −80%,
+  `callers_of`/`calls_from` −67% to −85% per call.
+- **Less memory:** the MCP server plus daemon end a session at 204 MB instead of
+  237 MB (−14%); the daemon's peak RSS fell from 264 MB to 236 MB.
+
+### Performance — one-shot CLI
+- `context` −38% to −46% instructions and −53% to −61% wall time; `callers-of` and
+  `calls-from` −17% to −32% instructions and −41% to −45% wall time; `status` −62%
+  instructions. Peak RSS is 10–21% lower for the relation commands and 48% lower
+  for `status`.
+- `callers-of` and `calls-from` use a running daemon, as `context` already did.
+- Paging, counting and rolling up reference sites no longer copies or sorts every
+  site, so a late page of a hub costs what the first does.
+- `sync` of an unchanged file −49% and of a content-only edit −64% instructions.
+
+## [1.18.0] - 2026-10-07
+
+This release is about the two harnesses most MCP sessions run in — Claude Code and
+Codex — and the places where the wiring, not the graph, decided whether an agent
+used Ravel.
+
+### Fixed — Codex asked before every query
+- **MCP tools carry annotations.** None had any, and Codex's default `auto`
+  approval mode treats a tool without annotations as destructive and open-world,
+  so every `explore`, `callers_of` and `status` call waited on a prompt: the cheap
+  way to answer a question was the one that interrupted the user. Queries are now
+  `readOnlyHint: true`, `sync` is `destructiveHint: false`, and all are
+  `openWorldHint: false` — what Ravel actually does (it writes only its own index
+  under `.ravel/` and never leaves the machine), and exactly what Codex needs to
+  run them unprompted. Titles are included for client UIs.
+- **Failed calls set `isError`.** An unknown `rollup`, an unreachable daemon or a
+  missing workspace came back as an ordinary result whose body happened to be
+  `{"error": …}`. Clients pass the flag to the model (Codex reports the call as
+  failed), so a failure now reads as one. The body is unchanged.
+- **The handshake names Ravel.** `serverInfo` said `rmcp 2.2.0` — the MCP library —
+  and that is what client UIs and logs showed for the server. It is now `ravel`
+  with the binary version.
+
+### Fixed — reinstalling undid what you configured
+- **`ravel install` keeps the keys you added to the `ravel` entry.** Re-running it
+  after an upgrade replaced the entry wholesale, so an `env` block carrying
+  `RAVEL_MCP_TOOLS=all` — the documented way to get the full surface — vanished
+  silently, along with timeouts, allow-lists and per-tool approvals. JSON configs
+  (Claude Code, Cursor, Gemini, Windsurf, VS Code, OpenCode) now merge: `command`,
+  `args` and `type` are refreshed and everything else stays. Codex's
+  `[mcp_servers.ravel]` is rewritten from the parsed table, nested `env` and
+  `tools` tables included; the rest of `config.toml` is left byte-for-byte, though
+  comments inside the `ravel` table itself do not survive.
+- **Project configs no longer pin one machine's binary.** `--location local`
+  wrote the installer's absolute path into `.mcp.json`, `.codex/config.toml` and
+  the other project files — the files meant to be committed — so the config
+  failed for every teammate. They now launch `ravel` from PATH when this machine
+  resolves it that way (`ravel.exe` on Windows, where clients spawn without a
+  shell and npm's `ravel.cmd` would not resolve). Otherwise the absolute path is
+  kept and the report says why. Global configs still name the absolute binary.
+- **No more `.mcp.json.ravel.lock` in your repository.** The lock that serializes
+  concurrent installs sat beside each config, which for a project install meant a
+  stray file one `git add -A` from being committed. It now lives in Ravel's
+  private runtime directory, and the old sidecar is removed on the next install.
+  Uninstalling from a config that does not exist no longer creates its directory
+  (`.codex/`, `.vscode/`, `.cursor/`) either.
+- **A fresh Claude Code asked permission for every Ravel call.** The
+  `mcp__ravel__*` allow rule was added to `~/.claude/settings.json` only when the
+  file already existed, and Claude Code creates it only once the user changes a
+  setting — so on a new machine the rule was never written. It is now written
+  whenever `~/.claude/` exists (Claude Code is installed); where it does not, the
+  installer still seeds nothing for an agent that is not there.
+- **`$CODEX_HOME` is honoured.** Codex reads its config from there; install wrote
+  to `~/.codex` regardless and left a relocated Codex unwired.
+- **A global install no longer leaves `AGENTS.md` in your home directory.** The
+  README runs `ravel install` before `cd` into a project, so the instruction block
+  landed wherever the shell happened to be. It is now created only in a directory
+  that is a project (`.git`, `package.json`, `tsconfig.json`, `jsconfig.json`) or
+  with `--location local`; a file that already has the block is still refreshed.
+
+### Added — a skill, so the guidance reaches every repository
+- `ravel install` writes a `ravel` Agent Skill for Claude Code
+  (`~/.claude/skills/ravel/`, or `.claude/skills/ravel/` with `--location local`)
+  and Codex (`~/.agents/skills/ravel/`, or `.agents/skills/ravel/`). The
+  instruction block only ever lands in the one project install ran in; a skill's
+  description is in the agent's context in every project, and its body loads only
+  when a question matches it. It maps each question to the MCP tool and the CLI
+  command, and its `allowed-tools` pre-approves the read-only `ravel` CLI calls in
+  Claude Code while it is active (Codex ignores the field). `ravel uninstall`
+  removes it; a `ravel` skill you wrote yourself is never overwritten or removed.
+  `--no-instructions` skips it.
+- `--print-config claude|codex` also prints the `claude mcp add` /
+  `codex mcp add` equivalent.
+
+### Added — the install says what it found, and what it would break
+- **`ravel install` warns when Claude Code has `ravel` in both scopes.** The user
+  config and the project `.mcp.json` are both read, and the same server name
+  with different commands is reported by `claude mcp list` as a conflict at
+  every check, with the project entry winning. A global install followed by a
+  project one produces exactly that, so the report now says so and names the
+  `claude mcp remove ravel -s user|project` that resolves it.
+- **`ravel doctor` reports what is wired.** Per agent, `wired` says whether the
+  global and project MCP configs carry a `ravel` entry and whether the skill is
+  present — "detected" only ever said the agent was on the machine.
+
+### Changed
+- `ravel setup` is a deprecated, hidden alias for
+  `ravel install --location local` (`--claude` adds `--target claude`). It wrote
+  an unmarked snippet `uninstall` could not strip, and `--claude` left a
+  `.ravel/mcp.example.json` pointing at the old `ravel mcp` spelling; it now
+  writes the same marked block as `install`. `--force` is accepted and ignored:
+  the block is always refreshed.
+- Re-running install over a `ravel` entry that was a remote server drops its
+  `url` and `headers` instead of leaving a stdio entry that also names a URL.
+- Tool descriptions lost their `PRIMARY` prefixes and the parts the server
+  instructions already state; `root`, `query` and `limit` gained descriptions;
+  `$schema` and `format: "uint"` were dropped from input schemas. Bytes the model
+  sees for the five primary tools: 4503 -> 4535, with every parameter now
+  described.
+- Server instructions say when to pass `root` and that Ravel never edits source.
+- The README, install docs, `AGENTS.md`, CLI help, `cheatsheet` and `setup` still
+  described three primary tools and `ravel mcp`; they now list the five and
+  `serve --mcp`, and the cheatsheet leads with `callers-of`.
+
+## [1.17.0] - 2026-10-07
+
+The process that matters in an agent session is the shared daemon: it answers
+`explore` and `callers_of` and absorbs every edit, and it stays up for hours. This
+release measured one such session end to end (an MCP client driving `status`,
+`explore`, `callers_of`, four structural edits with `sync`, then queries again) and
+fixed what it found. Every answer is unchanged, and three were wrong before (see
+Fixed). Each change's own before/after is in its commit message; the session
+harness is `scripts/mcp_session_bench.py`, which also checks every warm daemon
+answer against a cold `ravel context` on the same tree.
+
+Measured against 1.16.0 on 3,591 files of real npm sources (effect, rxjs, typeorm,
+zod) and on a 20,040-file synthetic monorepo, 4 cores:
+
+| | real npm | 20k synthetic |
+|---|---|---|
+| structural `sync` through the daemon (one-line export added to a hub file) | 1,167–1,854 ms → 113–156 ms | 650 ms first, then 136–196 ms → 83 ms first, then 43–113 ms |
+| first `explore` after such a sync | 176–308 ms → 42–69 ms | 110–163 ms → 64–81 ms |
+| first `callers_of` of the session | 69 ms → 1.4 ms | 141 ms → 1.4 ms |
+| daemon RSS after the four syncs, idle | 715 MB → 136 MB | 558 MB → 256 MB |
+| MCP stdio process RSS | 134 MB → 16 MB | 133 MB → 5 MB |
+| overlay written per one-line hub edit | 21.1 MB → 59 KB | |
+| `.ravel/` after seven agent-style syncs | 167 MB → 104 MB | |
+
+Full `index` time, CPU and peak RSS are unchanged within noise on both corpora; the
+cold CLI commands are as in 1.16.0.
+
+**One slower sync after upgrading, then nothing.** A file's contribution to the
+dependency index now records more (see Fixed), so the resolver fingerprint moves
+and the first structural sync on an index built by 1.16.0 republishes a full base
+instead of appending an overlay — the cost of one `ravel index`, once. The schema
+version does not move and no command needs to be rerun by hand. A full index
+written by 1.17.0 is not byte-identical to 1.16.0's (the reverse section holds the
+extra keys); every answer is identical.
+
+### Fixed
+- **A file created since the last commit was invisible to `ravel sync` and to the
+  auto-sync before every query** until it was committed or its path was passed by
+  hand; `callers_of` on a symbol defined in it answered "nothing in the index is
+  named this". `sync.include_untracked` now defaults to true. The default existed for
+  speed, so the cost was measured first: `git status` with untracked files costs the
+  same 20 ms on the real corpus, 37 → 57 ms on 20k tracked files, 11 → 62 ms with all
+  20k untracked. Emit leftovers are still filtered; set it back to false on a tree with
+  thousands of un-ignored build outputs.
+- **Prefix search after a sync came back short of `limit`**, and `context` reported a
+  `matches_total` one short — the discrepancy 1.16.0 recorded as known. The dictionary
+  and the search overlay both list the names an edited file kept, and the duplicates
+  were removed only after the cut. `search parse --kind prefix --limit 50` returns
+  50 again.
+- **A member reference such as `z.ZodString` was registered in the dependency index
+  under `z.ZodString` only**, though it resolves through `z` and then through the bare
+  name `ZodString`. Renaming that interface would have left the file's `TypeOf` edge
+  in place. It was masked in 1.16.0 by the over-wide re-resolution below and surfaced
+  the moment that was narrowed (an eleven-edit sequence against a fresh index caught
+  it as one edge too many). A contribution now records every segment of a member
+  reference.
+
+### Changed — structural sync
+- **Importers whose edges did not change stay out of the overlay.** An export added to
+  a widely imported file re-resolved 86 files, 85 of which produced exactly the edges
+  they had; all 86 were written as full upserts: 21 MB per one-line edit, then
+  compacted on every sync, re-applied by every reader of the next generation, and
+  held resident. A file is now compared against the current generation first.
+- **Only files that bind a changed export are re-resolved.** Every exported name of
+  the edited file counted as changed, so every file defining or referring to
+  `parse`, `safeParse`, … was re-resolved for a new, unrelated export. The changed
+  set is now the declarations and export bindings whose identity differs, and an
+  importer is re-resolved only when it binds one of those names or a namespace; a
+  file that appears, disappears or changes a star re-export still re-resolves all its
+  importers. Affected files 86 → 2.
+
+### Changed — daemon
+- **A sync's memory goes back to the operating system once the reply is sent.** The
+  allocator kept the pages a sync touched committed until the next allocation
+  pressure, which an idle daemon never produces; its own statistics showed committed
+  memory equal to the session's peak at exit (725 MB on the real corpus).
+- **The resident query graph is advanced in place** by the overlay just published,
+  the way `open_graph` applies the chain on disk, instead of being dropped and rebuilt
+  from the archive by the first query after every sync.
+- **The resident reader's decoded shards are bounded.** It kept every universe, reverse
+  and graph shard a sync decoded for the rest of the session -- 130 universe shards after
+  one sync on the synthetic monorepo -- and the daemon now also collects after a query,
+  since a `context` for a name with twenty thousand definitions allocates tens of
+  megabytes to answer.
+- **Two sync lookups stopped decoding whole universe shards.** A module-resolution probe
+  (`x.ts`, `x.tsx`, `x/index.ts`, … for each import) decoded the entire shard its path
+  hashes to -- definitions and exports included -- to check one file set; the file sets
+  now have a small record of their own (`universe-files/`, with a marker so an index
+  from an earlier build still syncs through the full shard). And the search overlay asked
+  the universe about every name the edited file used to declare; only the names that
+  left the file need asking. Synthetic monorepo: structural delta 230 → 38 ms.
+- **`callers_of` and `calls_from` are served by the daemon.** They opened a second
+  engine, graph and file watcher inside the MCP stdio process; it now never opens the
+  index itself in the primary tool mode. The daemon protocol's minor version records
+  the new operation; the endpoint is version-scoped, so no older daemon can be asked.
+
+### Known
+- The daemon's idle RSS on the 20k-file synthetic monorepo is 256 MB after a session
+  that queried names with twenty thousand definitions: about 100 MB is the resident
+  query graph (382k nodes, 698k edges, one `Arc<str>` per node), the rest the search and
+  symbol-metadata runtimes and allocator slack. A more compact resident graph is the
+  next lever; not taken here.
+- A query issued while the tree has uncommitted edits spends ~25 ms in `git status`
+  (`sync.discovery_cache_ms` reuses the answer for 50 ms). Trusting the daemon's watcher
+  instead would hide an edit for its debounce window from the auto-sync, so it stays.
+
+## [1.16.0] - 2026-10-07
+
+Less CPU and memory everywhere a workspace has names that many files share, which
+is every real one: `get`, `execute`, `render`, a constructor. Every answer is
+unchanged — a full index writes `.ravel/` byte-identical to 1.15.0's, and every
+query dump, including after a series of structural syncs, matches 1.15.0's. Each
+change's own before/after is in its commit message; the corpus generator and the
+harness are `scripts/gen_corpus.py` and `scripts/perf_bench.py` (wall, CPU and
+peak RSS from each child's `rusage`; medians of 3–5 runs).
+
+**No reindex.** The schema version does not move. Structural overlays store their
+universe delta under a new key, so a binary from either side of this release
+declines the other's overlay chain and republishes a fresh base on its next
+structural sync — once, automatically.
+
+Measured on a 20,040-file / 697,728-edge synthetic monorepo and on 3,591 files of
+real npm sources (effect, rxjs, typeorm, zod), 4 cores, against 1.15.0:
+
+| | 20k synthetic | real npm |
+|---|---|---|
+| `index` wall / CPU | 36.0 s / 101.5 s → 20.4 s / 42.0 s | unchanged within noise |
+| `index` peak RSS | 1,779 MB → 1,468 MB | 588 MB → 497 MB |
+| one-file structural `sync` | 3,894 ms / 1,355 MB → 461 ms / 364 MB | 408 ms / 191 MB → 190 ms / 141 MB |
+| cold `query --reverse` | 155 ms / 228 MB → 116 ms / 192 MB | 51 ms → 21 ms |
+| cold `context` | 238 ms / 299 MB → 195 ms / 251 MB | 60 ms / 84 MB → 46 ms / 71 MB |
+| cold `hubs` | 1,769 ms / 479 MB → 12 ms / 29 MB | 286 ms / 132 MB → 10 ms / 23 MB |
+| cold `search` | 28 ms → 9 ms | 15 ms → 7 ms |
+
+### Changed — indexing
+- **References resolve in O(log n) per lookup instead of O(definers).** Every
+  reference asked "which definitions of this name are in this file?" by filtering
+  the name's workspace-wide list, so a method name declared by thousands of classes
+  made resolution quadratic. The lists were already sorted by path; a binary search
+  returns the same run in the same order. `resolve.symbol_refs` 17,277 ms → 402 ms.
+- **The graph base is sharded straight from the resolved edges.** The intermediate
+  state held a second owned copy of every edge only to reduce it to a digest; that
+  copy set the full-index RSS peak. Peak RSS −15%, graph build + shard 4.0 s → 2.0 s.
+- **The term index is built without per-symbol term strings.** A file's path was
+  re-tokenized for every symbol it declares and four strings per symbol were joined
+  only to be split again. Build 1,116 ms → 722 ms.
+- **zstd contexts are reused per thread**, and compressed buffers trimmed to their
+  length, instead of allocating a fresh context for each of tens of thousands of
+  records. Index CPU −4%; the bytes written are identical.
+
+### Changed — sync
+- **Universe overlays store per-file deltas.** An overlay carried the complete
+  definition list of every name the edited file declares — 78 MB for a one-line
+  edit on the synthetic workspace, written, compacted and re-read by every later
+  sync. It now stores only the edited files' runs: 6.5 KB.
+- **The reverse overlay is computed from the edited files' contributions.** A file
+  is in a key's membership set exactly when its own contribution names the key, so
+  the change is known without decoding sets that, for a common name, span most of
+  the workspace. It is always written as a delta, which applies to the same state.
+
+### Changed — queries
+- **`hubs` looks each hub up by id** instead of materializing metadata for every
+  symbol to annotate at most a thousand entries, and without `--kind` annotates only
+  the entries it returns.
+- **Opening the pack no longer allocates per record.** Every command opens it at
+  least once (`context` four times), and decoding its directory into a map cost 16 ms
+  per open on 38k records; the directory is now indexed in place: 2 ms.
+- **The graph keeps its adjacency flat.** A cold load expanded the archived arrays
+  into one `Vec` per node per table — about two million allocations — before reading
+  a single neighbor.
+
+### Known — present in 1.15.0, unchanged here (fixed in 1.17.0)
+- After a structural sync, `search --kind terms` can return low-score hits a fresh
+  index would not, and `context` can report a `matches_total` one higher. Found while
+  verifying this release; incremental answers match 1.15.0's exactly, so it is not
+  new, and it is not fixed here.
 
 ## [1.15.0] - 2026-08-01
 

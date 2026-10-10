@@ -45,7 +45,9 @@ pub fn metadata_fingerprint(root: &Path) -> GitMetadataFingerprint {
                     if path.is_absolute() {
                         path
                     } else {
-                        root.join(path)
+                        // Relative to the `.git` file, which sits above `root` when `root` is a
+                        // directory inside a submodule or a linked worktree.
+                        dot_git.parent().unwrap_or(root).join(path)
                     }
                 })
         })
@@ -138,6 +140,25 @@ fn git_marker(root: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// Where `root` sits below the top of its worktree: `packages/app` for a package in a monorepo,
+/// empty at the top. Git prints status, diff and show paths from the top whatever `-C` says.
+fn worktree_prefix(root: &Path) -> PathBuf {
+    git_marker(root)
+        .and_then(|marker| {
+            let top = marker.parent()?;
+            root.strip_prefix(top).ok().map(Path::to_path_buf)
+        })
+        .unwrap_or_default()
+}
+
+/// A path git printed (relative to the top of the worktree) made relative to `root` instead, or
+/// `None` when it lies outside `root`.
+fn relative_to_root(prefix: &Path, printed: &[u8]) -> Option<PathBuf> {
+    let printed = PathBuf::from(git_path(printed));
+    let relative = printed.strip_prefix(prefix).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
 /// Snapshot identity that never fails on non-git trees.
 pub fn worktree_identity_or_nogit(root: &Path) -> WorktreeIdentity {
     identify_worktree(root).unwrap_or_else(|_| {
@@ -153,8 +174,10 @@ pub fn worktree_identity_or_nogit(root: &Path) -> WorktreeIdentity {
 /// Options for dirty-path discovery (from `[sync]` config).
 #[derive(Debug, Clone)]
 pub struct DirtyDiscovery {
-    /// Include untracked files (`??`). **Default false** — untracked scans dominate latency
-    /// on TypeScript projects with tsc emit / build leftovers.
+    /// Include untracked files (`??`). Default true: a file an agent just created is dirty in
+    /// every sense that matters, and listing untracked files costs `git status` ~20 ms more on a
+    /// 20k-file tree (62 ms when all 20k are untracked). Off, such a file is invisible to
+    /// discovery until it is committed.
     pub include_untracked: bool,
     pub skip_sibling_emit: bool,
     pub sibling_emit: Vec<SiblingEmitRule>,
@@ -163,7 +186,7 @@ pub struct DirtyDiscovery {
 impl Default for DirtyDiscovery {
     fn default() -> Self {
         Self {
-            include_untracked: false,
+            include_untracked: true,
             skip_sibling_emit: true,
             sibling_emit: crate::config::default_sibling_emit_rules(),
         }
@@ -180,21 +203,27 @@ impl Default for DirtyDiscovery {
 /// repository stopped early and then reported the partial counts as if they were totals. Git
 /// already maintains this list; asking for it is one process instead of a bounded walk, so the
 /// cap -- and the truncation it produced -- disappears wherever there is a repository.
-pub fn worktree_source_paths(root: &Path) -> Result<Vec<PathBuf>, GitError> {
+pub fn worktree_source_paths(root: &Path, gitignore: bool) -> Result<Vec<PathBuf>, GitError> {
     if !is_git_repo(root) {
         return Err(GitError::NotWorktree(root.to_path_buf()));
     }
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            &root.to_string_lossy(),
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            // Same exclusion the walk applied: .gitignore, .git/info/exclude, global excludes.
-            "--exclude-standard",
-        ])
+    let mut command = std::process::Command::new("git");
+    // The source walk ignores global git excludes. The configured ignore chain filters tracked
+    // paths and .ravelignore below, while git prunes ignored untracked directories cheaply.
+    command.args([
+        "-C",
+        &root.to_string_lossy(),
+        "-c",
+        "core.excludesFile=",
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+    ]);
+    if gitignore {
+        command.arg("--exclude-standard");
+    }
+    let output = command
         .output()
         .map_err(|source| GitError::Operation(source.to_string()))?;
     if !output.status.success() {
@@ -206,7 +235,7 @@ pub fn worktree_source_paths(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         .stdout
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| root.join(String::from_utf8_lossy(entry).as_ref()))
+        .map(|entry| root.join(git_path(entry)))
         .collect())
 }
 
@@ -231,7 +260,7 @@ pub fn changed_paths_with(
         "-z".into(),
         "--no-renames".into(),
     ];
-    // Critical perf switch: never list thousands of untracked emit files by default.
+    // `-u` lists every untracked file; emit leftovers are filtered below and by the ignore chain.
     if discovery.include_untracked {
         args.push("-u".into());
     } else {
@@ -246,18 +275,83 @@ pub fn changed_paths_with(
         // Fallback: tracked-only diffs (still no untracked).
         return dirty_tracked_diff(root);
     }
+    Ok(parse_porcelain(root, discovery, &output.stdout))
+}
 
+/// Dirty paths among `relative` (workspace-relative, `/`-separated): what [`changed_paths_with`]
+/// reports for those paths, without making git look at the rest of the tree.
+///
+/// `git status` stats every tracked file and reads every directory, so one answer costs time
+/// proportional to the whole worktree -- ~35 ms on 20k files -- even when the caller only wants to
+/// know about the file it just edited. Limited to a pathspec it reads the index and looks at that
+/// path alone (~8 ms). Any outcome other than a clean answer falls back to the whole-tree query, so
+/// this can only be faster, never different.
+pub fn changed_paths_among(
+    root: &Path,
+    discovery: &DirtyDiscovery,
+    relative: &[String],
+) -> Result<Vec<PathBuf>, GitError> {
+    if !is_git_repo(root) {
+        return Err(GitError::NotWorktree(root.to_path_buf()));
+    }
+    if relative.is_empty() {
+        return Ok(Vec::new());
+    }
+    match status_among(root, discovery, relative) {
+        Some(paths) => Ok(paths),
+        None => changed_paths_with(root, discovery),
+    }
+}
+
+/// `git status` limited to `relative`, or `None` when that query cannot answer: too many paths, a
+/// pathspec git refuses (one that crosses into a submodule, say), or a git too old to know
+/// `--literal-pathspecs`.
+fn status_among(
+    root: &Path,
+    discovery: &DirtyDiscovery,
+    relative: &[String],
+) -> Option<Vec<PathBuf>> {
+    /// Far below any argument-length limit; a bigger batch is a pull or a rebase, where the
+    /// whole-tree answer is the cheaper one anyway.
+    const MAX_PATHSPECS: usize = 64;
+    if relative.len() > MAX_PATHSPECS {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        // Names are literal: `[id].ts` and `*.ts` are files here, not patterns.
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--no-renames"])
+        .arg(if discovery.include_untracked {
+            "-u"
+        } else {
+            "--untracked-files=no"
+        })
+        .arg("--")
+        .args(relative)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_porcelain(root, discovery, &output.stdout))
+}
+
+/// The paths in `git status --porcelain=v1 -z` output, filtered the way discovery has always
+/// filtered them and returned sorted.
+fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Vec<PathBuf> {
+    let prefix = worktree_prefix(root);
     let mut paths = Vec::new();
-    for record in output.stdout.split(|byte| *byte == 0) {
+    for record in stdout.split(|byte| *byte == 0) {
         if record.len() < 4 {
             continue;
         }
         let xy = &record[..2];
         let path_part = &record[3..];
-        if path_part.is_empty() {
+        let Some(abs) = relative_to_root(&prefix, path_part).map(|path| root.join(path)) else {
             continue;
-        }
-        let abs = root.join(git_path(path_part));
+        };
         let untracked = xy == b"??";
         if untracked {
             if !discovery.include_untracked {
@@ -275,7 +369,7 @@ pub fn changed_paths_with(
     }
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 /// Tracked-only dirty list via `git diff` (no porcelain, no untracked).
@@ -289,11 +383,14 @@ fn dirty_tracked_diff(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         .output()
         .map_err(|e| GitError::Operation(e.to_string()))?;
     if output.status.success() {
-        for path in output.stdout.split(|byte| *byte == 0) {
-            if !path.is_empty() {
-                paths.push(root.join(git_path(path)));
-            }
-        }
+        let prefix = worktree_prefix(root);
+        paths.extend(
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter_map(|path| relative_to_root(&prefix, path))
+                .map(|path| root.join(path)),
+        );
     }
     paths.sort();
     paths.dedup();
@@ -306,6 +403,17 @@ pub fn changed_paths_between(
     from: Option<&str>,
     to: Option<&str>,
 ) -> Result<Vec<PathBuf>, GitError> {
+    // Refs reach here from MCP clients. Git would read one that starts with `-` as an option, and
+    // `--output=<file>` writes a file. No ref name may start with `-`, so refuse it outright.
+    if let Some(option) = [from, to]
+        .into_iter()
+        .flatten()
+        .find(|r| r.starts_with('-'))
+    {
+        return Err(GitError::Operation(format!(
+            "invalid revision '{option}': a revision cannot start with '-'"
+        )));
+    }
     let mut args = vec![
         "-C".to_owned(),
         root.to_string_lossy().into_owned(),
@@ -321,6 +429,8 @@ pub fn changed_paths_between(
             args.push(format!("{from}...HEAD"));
         }
     }
+    // The range is a revision, never a path.
+    args.push("--".into());
     let output = std::process::Command::new("git")
         .args(&args)
         .output()
@@ -330,11 +440,12 @@ pub fn changed_paths_between(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    let prefix = worktree_prefix(root);
     let mut paths: Vec<_> = output
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| root.join(git_path(path)))
+        .filter_map(|path| relative_to_root(&prefix, path))
+        .map(|path| root.join(path))
         .collect();
     paths.sort();
     Ok(paths)
@@ -393,10 +504,23 @@ pub fn cochanged(
     cursor: usize,
 ) -> Result<CoChangePage, GitError> {
     let commits = commits.clamp(1, 5_000);
+    // The spelling the paths git prints get below: relative to `root`, `/`-separated, no `./`.
+    let file = {
+        let path = Path::new(file);
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     // First select commits that touched `file`. A pathspec on the later
     // `--name-only` command would hide every co-changed path and always return
     // an empty result.
     let revisions = std::process::Command::new("git")
+        // Names are literal: `[id].ts` is a file here, not a pattern.
+        .arg("--literal-pathspecs")
         .args([
             "-C",
             &root.to_string_lossy(),
@@ -404,7 +528,7 @@ pub fn cochanged(
             &format!("--max-count={commits}"),
             "--format=%H",
             "--",
-            file,
+            &file,
         ])
         .output()
         .map_err(|error| GitError::Operation(error.to_string()))?;
@@ -431,6 +555,7 @@ pub fn cochanged(
             &root.to_string_lossy(),
             "show",
             "--stdin",
+            "-z",
             "--format=format:--",
             "--name-only",
             "--no-renames",
@@ -455,29 +580,31 @@ pub fn cochanged(
         ));
     }
     use std::collections::HashMap;
-    // Grouped per commit first: a commit has to be measured whole before deciding whether its
-    // pairings mean anything.
-    let mut per_commit: Vec<Vec<String>> = Vec::new();
-    let mut current: Option<Vec<String>> = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line == "--" {
+    // Keep commit boundaries and NUL-delimited names: paths may contain newlines or Unicode.
+    // Count the whole commit before filtering to a nested workspace, so bulk edits stay bulk.
+    let mut per_commit: Vec<Vec<&[u8]>> = Vec::new();
+    let mut current: Option<Vec<&[u8]>> = None;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let record = if record == b"--" || record.starts_with(b"--\n") {
             if let Some(files) = current.take() {
                 per_commit.push(files);
             }
             current = Some(Vec::new());
-            continue;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(files) = current.as_mut() {
-            files.push(line.to_owned());
+            record.strip_prefix(b"--\n").unwrap_or_default()
+        } else {
+            record
+        };
+        if !record.is_empty()
+            && let Some(files) = current.as_mut()
+        {
+            files.push(record);
         }
     }
     if let Some(files) = current.take() {
         per_commit.push(files);
     }
 
+    let prefix = worktree_prefix(root);
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut commits_considered = 0usize;
     let mut commits_skipped_as_bulk = 0usize;
@@ -487,9 +614,12 @@ pub fn cochanged(
             continue;
         }
         commits_considered += 1;
-        for path in files {
-            if path != file {
-                *counts.entry(path.clone()).or_default() += 1;
+        for record in files {
+            if let Some(path) = relative_to_root(&prefix, record) {
+                let path = path.to_string_lossy().into_owned();
+                if path != file {
+                    *counts.entry(path).or_default() += 1;
+                }
             }
         }
     }
@@ -627,6 +757,65 @@ mod artifact_tests {
         let identity = identify_worktree(&nested).unwrap();
         assert_eq!(identity.root, nested);
         assert_eq!(identity.revision, "unborn");
+    }
+
+    #[test]
+    fn a_file_created_since_the_last_commit_is_dirty_by_default() {
+        let dir = tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(dir.path().join("tracked.ts"), "export {}\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "initial"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::create_dir_all(dir.path().join("src/feature")).unwrap();
+        fs::write(
+            dir.path().join("src/feature/new.ts"),
+            "export const fresh = 1;\n",
+        )
+        .unwrap();
+        // Agents create files faster than they commit them; discovery must see those files
+        // without a watcher, and it must still skip emit leftovers.
+        fs::write(dir.path().join("src/feature/new.d.ts"), "export {};\n").unwrap();
+        let dirty = changed_paths_with(dir.path(), &DirtyDiscovery::default()).unwrap();
+        let names: Vec<_> = dirty
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(names, ["src/feature/new.ts"]);
+        let tracked_only = changed_paths_with(
+            dir.path(),
+            &DirtyDiscovery {
+                include_untracked: false,
+                ..DirtyDiscovery::default()
+            },
+        )
+        .unwrap();
+        assert!(tracked_only.is_empty());
     }
 
     #[test]
@@ -850,5 +1039,333 @@ mod artifact_tests {
             unique.len(),
             "a page repeated an entry: {seen:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod among_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use tempfile::{TempDir, tempdir};
+
+    fn run(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn write(dir: &Path, relative: &str, text: &str) {
+        let path = dir.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    /// A repository whose worktree has every kind of entry `git status` can report, with names
+    /// that would be wrong as patterns.
+    fn messy_repo() -> (TempDir, Vec<String>) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        run(root, &["init", "-q", "."]);
+        let tracked = [
+            "src/clean.ts",
+            "src/edited.ts",
+            "src/staged.ts",
+            "src/staged_then_edited.ts",
+            "src/deleted.ts",
+            "src/with space.ts",
+            "src/[id].ts",
+            "src/{x,y}.ts",
+            "src/!bang.ts",
+            "src/café.ts",
+            "-dash.ts",
+            "pkg/a/index.ts",
+        ];
+        for name in tracked {
+            write(root, name, "export const v = 1;\n");
+        }
+        write(root, ".gitignore", "ignored/\n");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "seed"]);
+
+        for name in [
+            "src/edited.ts",
+            "src/staged.ts",
+            "src/staged_then_edited.ts",
+            "src/with space.ts",
+            "src/[id].ts",
+            "src/{x,y}.ts",
+            "src/!bang.ts",
+            "src/café.ts",
+            "-dash.ts",
+        ] {
+            write(root, name, "export const v = 2;\n");
+        }
+        run(root, &["add", "src/staged.ts", "src/staged_then_edited.ts"]);
+        write(root, "src/staged_then_edited.ts", "export const v = 3;\n");
+        fs::remove_file(root.join("src/deleted.ts")).unwrap();
+        // Untracked: a new file in a tracked directory, one in a brand new directory, a declaration
+        // file and a source map (both skipped by discovery), a sibling emit, and an ignored file.
+        write(root, "src/brand_new.ts", "export const n = 1;\n");
+        write(root, "fresh/dir/deep/new.ts", "export const n = 1;\n");
+        write(root, "src/gen.d.ts", "export {};\n");
+        write(root, "src/gen.js.map", "{}");
+        write(root, "src/emit.ts", "export const e = 1;\n");
+        write(root, "src/emit.js", "exports.e = 1;\n");
+        write(root, "ignored/skipped.ts", "export const i = 1;\n");
+
+        let mut universe: Vec<String> = tracked.iter().map(|name| (*name).to_owned()).collect();
+        universe.extend(
+            [
+                "src/brand_new.ts",
+                "fresh/dir/deep/new.ts",
+                "src/gen.d.ts",
+                "src/gen.js.map",
+                "src/emit.ts",
+                "src/emit.js",
+                "ignored/skipped.ts",
+                "src/never_existed.ts",
+                "nowhere/at/all.ts",
+            ]
+            .map(String::from),
+        );
+        (dir, universe)
+    }
+
+    fn relative(root: &Path, paths: Vec<PathBuf>) -> BTreeSet<String> {
+        paths
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn asking_about_some_paths_gives_the_whole_tree_answer_restricted_to_them() {
+        let (dir, universe) = messy_repo();
+        let root = dir.path();
+        for discovery in [
+            DirtyDiscovery::default(),
+            DirtyDiscovery {
+                include_untracked: false,
+                ..DirtyDiscovery::default()
+            },
+        ] {
+            let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+            assert!(
+                whole.len() >= 8,
+                "the fixture must exercise many entry kinds, got {whole:?}"
+            );
+            let mut subsets: Vec<Vec<String>> = vec![universe.clone(), Vec::new()];
+            subsets.extend(universe.iter().map(|name| vec![name.clone()]));
+            subsets.extend(universe.windows(3).map(<[String]>::to_vec));
+            subsets.extend(
+                universe
+                    .iter()
+                    .step_by(2)
+                    .map(|name| vec![name.clone(), "src/clean.ts".into()]),
+            );
+            for subset in subsets {
+                let wanted: BTreeSet<String> = subset.iter().cloned().collect();
+                let expected: BTreeSet<String> = whole.intersection(&wanted).cloned().collect();
+                let answered = if subset.is_empty() {
+                    Vec::new()
+                } else {
+                    // The pathspec query itself, so a silent fallback to the whole tree cannot
+                    // make this pass.
+                    status_among(root, &discovery, &subset)
+                        .unwrap_or_else(|| panic!("the pathspec query refused {subset:?}"))
+                };
+                assert_eq!(
+                    relative(root, answered.clone()),
+                    relative(
+                        root,
+                        changed_paths_among(root, &discovery, &subset).unwrap()
+                    )
+                );
+                let among = relative(root, answered);
+                // Whatever else git volunteers, the entries for the asked-for paths must match
+                // the whole-tree answer exactly: none missing, none invented.
+                let among_wanted: BTreeSet<String> = among.intersection(&wanted).cloned().collect();
+                assert_eq!(
+                    among_wanted, expected,
+                    "untracked={} subset={subset:?}",
+                    discovery.include_untracked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_batch_past_the_pathspec_limit_still_answers() {
+        let (dir, universe) = messy_repo();
+        let root = dir.path();
+        let discovery = DirtyDiscovery::default();
+        let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+        let mut many = universe.clone();
+        many.extend((0..100).map(|n| format!("src/pad{n}.ts")));
+        let among = relative(root, changed_paths_among(root, &discovery, &many).unwrap());
+        let wanted: BTreeSet<String> = many.into_iter().collect();
+        assert_eq!(
+            among
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            whole
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_path_inside_a_nested_repository_agrees_with_the_whole_tree_query() {
+        let (dir, _) = messy_repo();
+        let root = dir.path();
+        // A repository inside the worktree: git refuses pathspecs that cross into it, and the
+        // answer must then come from the whole-tree query rather than being lost.
+        let nested = root.join("vendor/lib");
+        fs::create_dir_all(&nested).unwrap();
+        run(&nested, &["init", "-q", "."]);
+        write(&nested, "inner.ts", "export const i = 1;\n");
+        let discovery = DirtyDiscovery::default();
+        let whole = relative(root, changed_paths_with(root, &discovery).unwrap());
+        let ask = vec!["vendor/lib/inner.ts".to_owned(), "src/edited.ts".to_owned()];
+        let wanted: BTreeSet<String> = ask.iter().cloned().collect();
+        let among = relative(root, changed_paths_among(root, &discovery, &ask).unwrap());
+        assert_eq!(
+            among
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            whole
+                .intersection(&wanted)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(among.contains("src/edited.ts"));
+    }
+
+    #[test]
+    fn outside_a_repository_it_says_so_like_the_whole_tree_query() {
+        let dir = tempdir().unwrap();
+        let discovery = DirtyDiscovery::default();
+        assert!(matches!(
+            changed_paths_among(dir.path(), &discovery, &["a.ts".to_owned()]),
+            Err(GitError::NotWorktree(_))
+        ));
+        assert!(matches!(
+            changed_paths_with(dir.path(), &discovery),
+            Err(GitError::NotWorktree(_))
+        ));
+    }
+
+    /// A package of a monorepo: git prints paths from the top of the repository, not from `-C`.
+    fn monorepo() -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q", "."]);
+        write(top, "packages/app/src/a.ts", "export const a = 1;\n");
+        write(top, "other.ts", "export const other = 1;\n");
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-q", "-m", "one"]);
+        let app = top.join("packages/app");
+        (dir, app)
+    }
+
+    #[test]
+    fn a_root_below_the_top_of_the_repository_sees_its_own_paths_only() {
+        let (dir, app) = monorepo();
+        write(&app, "src/a.ts", "export const a = 2;\n");
+        write(&app, "src/new.ts", "export const fresh = 1;\n");
+        write(dir.path(), "other.ts", "export const other = 2;\n");
+        let discovery = DirtyDiscovery::default();
+        let expected = vec![app.join("src/a.ts"), app.join("src/new.ts")];
+        assert_eq!(changed_paths_with(&app, &discovery).unwrap(), expected);
+        let asked = ["src/a.ts".to_owned(), "src/new.ts".to_owned()];
+        assert_eq!(
+            changed_paths_among(&app, &discovery, &asked).unwrap(),
+            expected
+        );
+        assert_eq!(dirty_tracked_diff(&app).unwrap(), [app.join("src/a.ts")]);
+
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-q", "-m", "two"]);
+        assert_eq!(
+            changed_paths_between(&app, Some("HEAD~1"), None).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn cochanged_names_paths_from_the_root_however_the_file_is_spelled() {
+        let (dir, app) = monorepo();
+        write(&app, "src/a.ts", "export const a = 2;\n");
+        write(&app, "src/café.ts", "export const cafe = 1;\n");
+        write(dir.path(), "other.ts", "export const other = 2;\n");
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-q", "-m", "two"]);
+        let absolute = app.join("src/a.ts").to_string_lossy().into_owned();
+        for spelling in ["src/a.ts", "./src/a.ts", absolute.as_str()] {
+            let page = cochanged(&app, spelling, 10, 1, DEFAULT_MAX_COMMIT_FILES, 20, 0).unwrap();
+            assert_eq!(
+                page.entries,
+                [CoChangeEntry {
+                    file: "src/café.ts".into(),
+                    cooccurrence_count: 1,
+                    confidence_micros: 500_000,
+                }],
+                "asked as {spelling}"
+            );
+        }
+        let bounded = cochanged(&app, "src/a.ts", 10, 1, 2, 20, 0).unwrap();
+        assert!(bounded.entries.is_empty());
+        assert_eq!(bounded.commits_considered, 1);
+        assert_eq!(bounded.commits_skipped_as_bulk, 1);
+    }
+
+    #[test]
+    fn a_revision_that_looks_like_an_option_is_refused() {
+        let (dir, app) = monorepo();
+        let target = dir.path().join("written-by-git");
+        let option = format!("--output={}", target.display());
+        assert!(changed_paths_between(&app, Some(&option), None).is_err());
+        assert!(changed_paths_between(&app, Some("HEAD"), Some(&option)).is_err());
+        assert!(!target.exists());
+        assert!(!dir.path().join(format!("{option}...HEAD")).exists());
+    }
+
+    #[test]
+    fn a_relative_gitdir_is_read_from_the_directory_of_the_git_file() {
+        // A submodule's `.git` is a file whose relative `gitdir:` starts where that file is, not
+        // where the indexed root is.
+        let dir = tempdir().unwrap();
+        let submodule = dir.path().join("sub");
+        write(&submodule, ".git", "gitdir: ../modules/sub\n");
+        let git_dir = dir.path().join("modules/sub");
+        write(&git_dir, "HEAD", "ref: refs/heads/main\n");
+        write(
+            &git_dir,
+            "refs/heads/main",
+            "1111111111111111111111111111111111111111\n",
+        );
+        let root = submodule.join("packages/app");
+        fs::create_dir_all(&root).unwrap();
+        let before = metadata_fingerprint(&root);
+        write(
+            &git_dir,
+            "refs/heads/main",
+            "2222222222222222222222222222222222222222\n",
+        );
+        assert_ne!(before, metadata_fingerprint(&root));
     }
 }

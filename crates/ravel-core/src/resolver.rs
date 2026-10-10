@@ -130,7 +130,14 @@ pub struct ModuleExport {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ResolutionUniverseOverlay {
     pub files: BTreeMap<String, bool>,
-    pub symbol_definitions: BTreeMap<String, Option<Vec<SymbolDefinition>>>,
+    /// `name -> path -> every definition of name in path` after the change; an empty list means
+    /// the path no longer defines the name. Each entry replaces that path's run of the name's
+    /// sorted list and leaves every other path's run alone.
+    ///
+    /// The overlay used to carry each touched name's whole workspace-wide list. One edit to a file
+    /// declaring `get` or `execute` then serialized, compacted, and re-read every other definition
+    /// of that name -- 78MB for a one-line change in a 20k-file workspace.
+    pub symbol_definitions: BTreeMap<String, BTreeMap<String, Vec<SymbolDefinition>>>,
     pub module_exports: BTreeMap<String, Option<Vec<ModuleExport>>>,
 }
 
@@ -180,6 +187,85 @@ pub trait ResolutionLookup: Sync {
     fn symbol_definer_count(&self, name: &str) -> u32;
     fn symbol_definitions(&self, name: &str) -> LookupSlice<'_, SymbolDefinition>;
     fn module_exports(&self, path: &str) -> LookupSlice<'_, ModuleExport>;
+    /// Definitions of `name` declared in `path`. Nearly every reference asks this question, and a
+    /// name such as `get` or `execute` can have tens of thousands of definitions workspace-wide;
+    /// answering it from the full list cost O(definers) per reference (and a full clone of the
+    /// list on lookups that own their result).
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        definitions_in_path(&self.symbol_definitions(name), path).to_vec()
+    }
+}
+
+/// The contiguous run of `path` in a name's definition list.
+///
+/// Every list is kept sorted by `(path, span, qualified_name)`: `ResolutionUniverse::build` sorts
+/// it, `replace_artifact` inserts at the sorted position, and overlays replace whole per-path runs
+/// with runs sorted the same way (`apply_definition_deltas`). A binary search therefore returns
+/// exactly what a linear filter on `path` returned, in the same order.
+pub(crate) fn definitions_in_path<'a>(
+    definitions: &'a [SymbolDefinition],
+    path: &str,
+) -> &'a [SymbolDefinition] {
+    debug_assert!(
+        definitions
+            .windows(2)
+            .all(|pair| pair[0].path.as_str() <= pair[1].path.as_str()),
+        "definition lists must stay sorted by path"
+    );
+    let range = path_run(definitions, path);
+    &definitions[range]
+}
+
+fn path_run(definitions: &[SymbolDefinition], path: &str) -> std::ops::Range<usize> {
+    let start = definitions.partition_point(|definition| definition.path.as_str() < path);
+    let len = definitions[start..].partition_point(|definition| definition.path == path);
+    start..start + len
+}
+
+/// Replace each path's run of a name's sorted list with the overlay's run for that path.
+pub(crate) fn apply_definition_deltas(
+    definitions: &mut Vec<SymbolDefinition>,
+    deltas: &BTreeMap<String, Vec<SymbolDefinition>>,
+) {
+    for (path, replacement) in deltas {
+        let run = path_run(definitions, path);
+        definitions.splice(run, replacement.iter().cloned());
+    }
+}
+
+/// Apply an overlay's per-path definition runs to name-keyed lists, dropping names left empty.
+pub(crate) fn apply_definition_overlay(
+    lists: &mut BTreeMap<String, Vec<SymbolDefinition>>,
+    overlay: &BTreeMap<String, BTreeMap<String, Vec<SymbolDefinition>>>,
+) {
+    for (name, deltas) in overlay {
+        let definitions = match lists.get_mut(name) {
+            Some(definitions) => definitions,
+            None => lists.entry(name.clone()).or_default(),
+        };
+        apply_definition_deltas(definitions, deltas);
+        if definitions.is_empty() {
+            lists.remove(name);
+        }
+    }
+}
+
+/// A file's definitions grouped by name, each run in the order the universe keeps it.
+fn definitions_by_name(artifact: &FileArtifact) -> BTreeMap<&str, Vec<SymbolDefinition>> {
+    let mut by_name: BTreeMap<&str, Vec<SymbolDefinition>> = BTreeMap::new();
+    for symbol in &artifact.symbols {
+        by_name
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(SymbolDefinition::from_symbol(artifact, symbol));
+    }
+    for run in by_name.values_mut() {
+        // Same stable comparator as `ResolutionUniverse::build`; the path is constant here.
+        run.sort_by(|left, right| {
+            (left.span, &left.qualified_name).cmp(&(right.span, &right.qualified_name))
+        });
+    }
+    by_name
 }
 
 pub struct OverlayResolutionLookup<'a> {
@@ -207,17 +293,25 @@ impl ResolutionLookup for OverlayResolutionLookup<'_> {
     }
 
     fn symbol_definer_count(&self, name: &str) -> u32 {
-        match self.overlay.symbol_definitions.get(name) {
-            Some(Some(definitions)) => u32::try_from(definitions.len()).unwrap_or(u32::MAX),
-            Some(None) => 0,
-            None => self.base.symbol_definer_count(name),
-        }
+        let base = self.base.symbol_definer_count(name);
+        let Some(deltas) = self.overlay.symbol_definitions.get(name) else {
+            return base;
+        };
+        let replaced: u64 = deltas
+            .keys()
+            .map(|path| self.base.symbol_definitions_in_file(name, path).len() as u64)
+            .sum();
+        let added: u64 = deltas.values().map(|run| run.len() as u64).sum();
+        u32::try_from((u64::from(base) + added).saturating_sub(replaced)).unwrap_or(u32::MAX)
     }
 
     fn symbol_definitions(&self, name: &str) -> LookupSlice<'_, SymbolDefinition> {
         match self.overlay.symbol_definitions.get(name) {
-            Some(Some(value)) => LookupSlice::Borrowed(value),
-            Some(None) => LookupSlice::Borrowed(&[]),
+            Some(deltas) => {
+                let mut definitions = self.base.symbol_definitions(name).into_owned();
+                apply_definition_deltas(&mut definitions, deltas);
+                LookupSlice::Owned(definitions)
+            }
             None => self.base.symbol_definitions(name),
         }
     }
@@ -229,25 +323,37 @@ impl ResolutionLookup for OverlayResolutionLookup<'_> {
             None => self.base.module_exports(path),
         }
     }
+
+    fn symbol_definitions_in_file(&self, name: &str, path: &str) -> Vec<SymbolDefinition> {
+        match self
+            .overlay
+            .symbol_definitions
+            .get(name)
+            .and_then(|deltas| deltas.get(path))
+        {
+            Some(run) => run.clone(),
+            None => self.base.symbol_definitions_in_file(name, path),
+        }
+    }
 }
 
 impl ResolutionUniverseOverlay {
+    /// The overlay a set of file changes produces. Only the changed files' own runs are recorded,
+    /// so no base is consulted: the result is the same whatever else defines the names.
     pub fn from_artifact_changes<'a>(
-        base: &dyn ResolutionLookup,
         changes: impl IntoIterator<Item = (Option<&'a FileArtifact>, Option<&'a FileArtifact>)>,
     ) -> Self {
         let mut overlay = Self::default();
-        let mut old_ids: BTreeMap<String, FxHashSet<String>> = BTreeMap::new();
-        let mut new_definitions: BTreeMap<String, Vec<SymbolDefinition>> = BTreeMap::new();
         for (old, new) in changes {
             if let Some(old) = old {
                 overlay.files.insert(old.path.clone(), false);
                 overlay.module_exports.insert(old.path.clone(), None);
                 for symbol in &old.symbols {
-                    old_ids
+                    overlay
+                        .symbol_definitions
                         .entry(symbol.name.clone())
                         .or_default()
-                        .insert(symbol.id.clone());
+                        .insert(old.path.clone(), Vec::new());
                 }
             }
             if let Some(new) = new {
@@ -255,37 +361,29 @@ impl ResolutionUniverseOverlay {
                 overlay
                     .module_exports
                     .insert(new.path.clone(), Some(module_exports(new)));
-                for symbol in &new.symbols {
-                    new_definitions
-                        .entry(symbol.name.clone())
+                for (name, run) in definitions_by_name(new) {
+                    overlay
+                        .symbol_definitions
+                        .entry(name.to_owned())
                         .or_default()
-                        .push(SymbolDefinition::from_symbol(new, symbol));
+                        .insert(new.path.clone(), run);
                 }
             }
         }
-        let names: BTreeSet<_> = old_ids
-            .keys()
-            .chain(new_definitions.keys())
-            .cloned()
-            .collect();
-        for name in names {
-            let mut definitions = base.symbol_definitions(&name).into_owned();
-            if let Some(ids) = old_ids.get(&name) {
-                definitions.retain(|definition| !ids.contains(&definition.id));
-            }
-            definitions.extend(new_definitions.remove(&name).unwrap_or_default());
-            definitions.sort_by(|left, right| {
-                (&left.path, left.span, &left.qualified_name).cmp(&(
-                    &right.path,
-                    right.span,
-                    &right.qualified_name,
-                ))
-            });
-            overlay
-                .symbol_definitions
-                .insert(name, (!definitions.is_empty()).then_some(definitions));
-        }
         overlay
+    }
+
+    /// Fold a newer overlay into this one. Every entry is an absolute per-key state, so the newer
+    /// side wins key by key -- for definitions, per `(name, path)`.
+    pub(crate) fn compose(&mut self, newer: Self) {
+        self.files.extend(newer.files);
+        for (name, deltas) in newer.symbol_definitions {
+            self.symbol_definitions
+                .entry(name)
+                .or_default()
+                .extend(deltas);
+        }
+        self.module_exports.extend(newer.module_exports);
     }
 }
 
@@ -424,16 +522,24 @@ impl ResolutionUniverse {
             )
             .collect();
         self.replace_artifact(old, new);
-        for path in paths {
+        for path in &paths {
             overlay
                 .files
-                .insert(path.clone(), self.files.contains(&path));
+                .insert(path.clone(), self.files.contains(path));
         }
         for symbol in symbols {
-            overlay.symbol_definitions.insert(
-                symbol.clone(),
-                self.symbol_definitions.get(&symbol).cloned(),
-            );
+            let definitions = self
+                .symbol_definitions
+                .get(&symbol)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let deltas = overlay.symbol_definitions.entry(symbol).or_default();
+            for path in &paths {
+                deltas.insert(
+                    path.clone(),
+                    definitions_in_path(definitions, path).to_vec(),
+                );
+            }
         }
         for path in old
             .into_iter()
@@ -454,7 +560,7 @@ impl ResolutionUniverse {
                 self.files.remove(path);
             }
         }
-        apply_optional_map(&mut self.symbol_definitions, &overlay.symbol_definitions);
+        apply_definition_overlay(&mut self.symbol_definitions, &overlay.symbol_definitions);
         apply_optional_map(&mut self.module_exports, &overlay.module_exports);
     }
 
@@ -571,7 +677,11 @@ fn module_exports(artifact: &FileArtifact) -> Vec<ModuleExport> {
 /// already handles it), or when it came from a namespace import: `import * as NS` binds a module
 /// object, not a declaration, which is why namespace exports are skipped downstream too.
 fn forwarded_import(artifact: &FileArtifact, local: &str) -> Option<(String, String)> {
-    if artifact.symbols.iter().any(|symbol| symbol.name == local) {
+    if artifact
+        .symbols
+        .iter()
+        .any(|symbol| symbol.name == local && symbol.qualified_name == symbol.name)
+    {
         return None;
     }
     artifact.imports.iter().find_map(|import| {
@@ -581,6 +691,24 @@ fn forwarded_import(artifact: &FileArtifact, local: &str) -> Option<(String, Str
             .find(|binding| binding.local == local && binding.kind != ImportBindingKind::Namespace)
             .map(|binding| (binding.imported.clone(), import.specifier.clone()))
     })
+}
+
+/// Whether a binding of this kind reads from another module: `export {a} from`, `export * from`
+/// and `export * as ns from`. A declaration or default export never has a source, whatever string
+/// literal its body holds.
+fn is_reexport_kind(kind: &ExportBindingKind) -> bool {
+    matches!(
+        kind,
+        ExportBindingKind::Named | ExportBindingKind::Star | ExportBindingKind::Namespace
+    )
+}
+
+/// The module a binding re-exports from, if it is a re-export at all.
+fn reexport_source(export: &ModuleExport) -> Option<&str> {
+    export
+        .source
+        .as_deref()
+        .filter(|_| is_reexport_kind(&export.kind))
 }
 
 #[derive(Debug, Default)]
@@ -603,43 +731,61 @@ fn resolve_exported_symbol(
     }
     let mut targets = Vec::new();
     let exports = universe.module_exports(file);
-    if !exports.is_empty() {
-        for export in exports.iter() {
-            let exact = export.exported == exported_name;
-            let star = export.kind == ExportBindingKind::Star;
-            if !exact && !star {
-                continue;
-            }
-            if export.kind == ExportBindingKind::Namespace && exact {
-                // The namespace itself is a module object, not a declaration. A later member
-                // reference can resolve through the source module without fabricating a symbol.
-                continue;
-            }
-            if let Some(specifier) = export.source.as_deref() {
-                let resolution = resolve_one(root, file, specifier, universe, config);
-                if let Some(target_file) = resolution.target {
-                    let next_name = if star {
-                        exported_name
-                    } else {
-                        export.local.as_str()
-                    };
+    // ES ResolveExport: the module's own and indirect exports answer first. `export *` is only
+    // consulted when none of them names `exported_name`, and never for `default`. Adding the
+    // star targets alongside an explicit export made `export {foo} from './a'; export * from
+    // './b'` ambiguous whenever `./b` also exported `foo`, and dropped the edge.
+    let mut explicit = false;
+    for export in exports
+        .iter()
+        .filter(|export| export.kind != ExportBindingKind::Star)
+        .filter(|export| export.exported == exported_name)
+    {
+        explicit = true;
+        if export.kind == ExportBindingKind::Namespace {
+            // The namespace itself is a module object, not a declaration. A later member
+            // reference can resolve through the source module without fabricating a symbol.
+            continue;
+        }
+        match reexport_source(export) {
+            Some(specifier) => {
+                if let Some(target_file) =
+                    resolve_one(root, file, specifier, universe, config).target
+                {
                     targets.extend(resolve_exported_symbol(
                         root,
                         &target_file,
-                        next_name,
+                        &export.local,
                         universe,
                         config,
                         visited,
                     ));
                 }
-            } else {
-                targets.extend(definitions_in_file(universe, file, &export.local));
+            }
+            None => targets.extend(module_scope_definitions(universe, file, &export.local)),
+        }
+    }
+    if !explicit && exported_name != "default" {
+        for specifier in exports
+            .iter()
+            .filter(|export| export.kind == ExportBindingKind::Star)
+            .filter_map(reexport_source)
+        {
+            if let Some(target_file) = resolve_one(root, file, specifier, universe, config).target {
+                targets.extend(resolve_exported_symbol(
+                    root,
+                    &target_file,
+                    exported_name,
+                    universe,
+                    config,
+                    visited,
+                ));
             }
         }
     }
     if targets.is_empty() {
         targets.extend(
-            definitions_in_file(universe, file, exported_name)
+            module_scope_definitions(universe, file, exported_name)
                 .into_iter()
                 .filter(|definition| definition.exported),
         );
@@ -673,12 +819,21 @@ fn definitions_in_file(
     file: &str,
     name: &str,
 ) -> Vec<SymbolDefinition> {
-    universe
-        .symbol_definitions(name)
-        .iter()
-        .filter(|definition| definition.path == file)
-        .cloned()
-        .collect()
+    universe.symbol_definitions_in_file(name, file)
+}
+
+/// The declarations a module export can name: those at module scope, not members. Definitions
+/// are looked up by short name, so without this `import { work } from './a'` reached the `work`
+/// of `export namespace Tools { export function work() {} }`, and a top-level `f` beside an
+/// `X.f` member was ambiguous.
+fn module_scope_definitions(
+    universe: &dyn ResolutionLookup,
+    file: &str,
+    name: &str,
+) -> Vec<SymbolDefinition> {
+    let mut definitions = definitions_in_file(universe, file, name);
+    definitions.retain(|definition| definition.qualified_name == definition.name);
+    definitions
 }
 
 /// TypeScript overloads, accessors, and declaration merging may produce several syntax nodes for
@@ -752,12 +907,8 @@ fn find_qualified_definition_for(
     required: RequiredNamespace,
 ) -> Option<SymbolDefinition> {
     let leaf = qualified_name.rsplit('.').next().unwrap_or(qualified_name);
-    let matches: Vec<_> = universe
-        .symbol_definitions(leaf)
-        .iter()
-        .filter(|definition| definition.path == path && definition.qualified_name == qualified_name)
-        .cloned()
-        .collect();
+    let mut matches = universe.symbol_definitions_in_file(leaf, path);
+    matches.retain(|definition| definition.qualified_name == qualified_name);
     one_logical_definition_for(matches, required)
 }
 
@@ -781,6 +932,12 @@ fn visible_local_definition(
     }
     if definition.qualified_name == definition.name {
         return true;
+    }
+    // Class and interface members (and the members of an object type) are reached through
+    // `this`, an instance, or the owner itself -- never as a bare name, even inside the owner.
+    // Enum members are the exception: a later initializer names an earlier member bare.
+    if matches!(definition.kind.as_ref(), "method" | "property") {
+        return false;
     }
     let Some(source) = source else {
         return false;
@@ -1180,7 +1337,13 @@ pub fn resolve_subset_with_structural_data(
 
 pub fn resolver_fingerprint(config: &ResolverConfig) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ravel-resolver-v2\0");
+    // v3: a file's contribution also records each segment of a member reference, so an index
+    // built before that must take the rebuild tier once rather than trust its referrer sets.
+    // v4: members are no longer bare-name visible, export resolution follows ES ResolveExport,
+    // declaration files are probed and a `.js` specifier prefers its `.ts` source, and a matched
+    // `paths` pattern skips baseUrl. Edges and recorded probe paths from v3 no longer match what
+    // a fresh resolution produces, so an index built before must be rebuilt once.
+    hasher.update(b"ravel-resolver-v4\0");
     if let Ok(bytes) = bincode::serialize(config) {
         hasher.update(&bytes);
     }
@@ -1363,7 +1526,14 @@ fn resolve_artifacts_impl(
                 }
             }
             for export in &artifact.exports {
-                if let Some(specifier) = &export.specifier {
+                // `export {} from './x'` has no bindings and still names a module; an export whose
+                // bindings are all declarations or defaults never does.
+                let reads_source = export.bindings.is_empty()
+                    || export
+                        .bindings
+                        .iter()
+                        .any(|binding| is_reexport_kind(&binding.kind));
+                if let Some(specifier) = export.specifier.as_ref().filter(|_| reads_source) {
                     let resolution = resolve_one(root, &artifact.path, specifier, universe, config);
                     let (confidence, target) = match resolution.target.clone() {
                         Some(target) => (
@@ -1577,6 +1747,9 @@ fn resolve_one(
         candidates.extend(probe.existing);
         attempted_paths.extend(probe.attempted);
     }
+    // tsc consults `baseUrl` only when no `paths` pattern matched: a matched pattern whose
+    // targets are all missing is an unresolved import, not a cue to look somewhere else.
+    let mut alias_matched = false;
     if candidates.is_empty() && !specifier.starts_with('.') {
         let matched = config
             .paths
@@ -1588,6 +1761,7 @@ fn resolve_one(
                 path_alias_specificity(left).cmp(&path_alias_specificity(right))
             });
         if let Some((_, targets, capture)) = matched {
+            alias_matched = true;
             for target in targets {
                 let path = if target.contains('*') {
                     target.replace('*', &capture)
@@ -1601,6 +1775,7 @@ fn resolve_one(
         }
     }
     if candidates.is_empty()
+        && !alias_matched
         && !specifier.starts_with('.')
         && let Some(base) = &config.base_url
     {
@@ -1655,7 +1830,13 @@ fn path_alias_specificity(alias: &str) -> (bool, usize, usize) {
         })
 }
 
+/// Extensions a specifier can carry that name a JS/TS module, and so get replaced rather than
+/// appended to.
 const DEFAULT_RESOLVE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+/// Extensions appended to an extensionless specifier (and to `index`), in order. Declaration files
+/// are indexed, so `./types` must reach `types.d.ts`; TypeScript tries it right after `.tsx`.
+const DEFAULT_PROBE_EXTS: &[&str] = &["ts", "tsx", "d.ts", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 struct CandidateProbe {
     existing: Vec<String>,
@@ -1670,63 +1851,74 @@ fn file_candidates(
 ) -> CandidateProbe {
     let mut existing = Vec::new();
     let mut attempted = BTreeSet::new();
-    let normalized_base = normalize_lexical(root, base);
-    attempted.insert(normalized_base.clone());
-    if universe.contains_file(&normalized_base) {
-        existing.push(normalized_base);
-        return CandidateProbe {
-            existing,
-            attempted,
-        };
-    }
+    // Every probe up to the first hit is recorded: a file appearing at any of them later changes
+    // the answer, which is what incremental invalidation keys on.
+    let mut probe = |path: &Path| {
+        let normalized = normalize_lexical(root, path);
+        attempted.insert(normalized.clone());
+        let found = universe.contains_file(&normalized);
+        if found {
+            existing.push(normalized);
+        }
+        found
+    };
     // Iterate config extensions by reference; fall back to a static default set — no per-call
     // `Vec<String>` clone/allocation.
-    let probe = |ext: &str, existing: &mut Vec<String>, attempted: &mut BTreeSet<String>| {
-        let source_extension = base
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| DEFAULT_RESOLVE_EXTS.contains(&value));
-        let path = if source_extension {
-            base.with_extension(ext)
-        } else {
-            PathBuf::from(format!("{}.{ext}", base.to_string_lossy()))
-        };
-        let normalized = normalize_lexical(root, &path);
-        attempted.insert(normalized.clone());
-        if universe.contains_file(&normalized) {
-            existing.push(normalized);
-            true
-        } else {
-            false
+    let default_extensions = config.extensions.is_empty();
+    let extensions = || {
+        config.extensions.iter().map(String::as_str).chain(
+            DEFAULT_PROBE_EXTS
+                .iter()
+                .copied()
+                .filter(move |_| default_extensions),
+        )
+    };
+    let source_extension = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| DEFAULT_RESOLVE_EXTS.contains(value));
+    let found = match source_extension {
+        // A JS/TS extension is replaced the way TypeScript replaces it, so `./util.js` reaches
+        // `util.ts` ahead of an emitted `util.js` beside it; every other extension stays a lenient
+        // fallback after those.
+        Some(original) => {
+            let substitutions = typescript_substitutions(original);
+            substitutions
+                .iter()
+                .any(|extension| probe(&base.with_extension(extension)))
+                || extensions()
+                    .filter(|extension| !substitutions.contains(extension))
+                    .any(|extension| probe(&base.with_extension(extension)))
+        }
+        None => {
+            probe(base)
+                || extensions().any(|extension| {
+                    probe(&PathBuf::from(format!(
+                        "{}.{extension}",
+                        base.to_string_lossy()
+                    )))
+                })
         }
     };
-    if config.extensions.is_empty() {
-        for &ext in DEFAULT_RESOLVE_EXTS {
-            if probe(ext, &mut existing, &mut attempted) {
-                break;
-            }
-        }
-    } else {
-        for ext in &config.extensions {
-            if probe(ext, &mut existing, &mut attempted) {
-                break;
-            }
-        }
-    }
-    if existing.is_empty() {
-        for extension in ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"] {
-            let path = base.join(format!("index.{extension}"));
-            let normalized = normalize_lexical(root, &path);
-            attempted.insert(normalized.clone());
-            if universe.contains_file(&normalized) {
-                existing.push(normalized);
-                break;
-            }
-        }
+    if !found {
+        DEFAULT_PROBE_EXTS
+            .iter()
+            .any(|extension| probe(&base.join(format!("index.{extension}"))));
     }
     CandidateProbe {
         existing,
         attempted,
+    }
+}
+
+/// What TypeScript tries in place of a specifier's own JS/TS extension (`tryAddingExtensions`):
+/// the TypeScript source, then its declaration file, then the JavaScript file.
+fn typescript_substitutions(original: &str) -> &'static [&'static str] {
+    match original {
+        "tsx" | "jsx" => &["tsx", "ts", "d.ts", "jsx", "js"],
+        "mts" | "mjs" => &["mts", "d.mts", "mjs"],
+        "cts" | "cjs" => &["cts", "d.cts", "cjs"],
+        _ => &["ts", "tsx", "d.ts", "js", "jsx"],
     }
 }
 
@@ -1769,7 +1961,8 @@ pub fn load_tsconfig(root: &Path) -> ResolverConfig {
 pub fn load_tsconfig_reporting(root: &Path) -> LoadedResolverConfig {
     let path = root.join("tsconfig.json");
     let mut problems = Vec::new();
-    let config = load_tsconfig_recursive(root, &path, &mut BTreeSet::new(), &mut problems);
+    let config = load_tsconfig_recursive(root, &path, &mut BTreeSet::new(), &mut problems)
+        .map(|layer| layer.into_config(root));
     if path.exists() && !path.is_file() {
         // A directory named `tsconfig.json` reads as "no config" to every layer below.
         problems.push(crate::model::Diagnostic {
@@ -1800,25 +1993,96 @@ pub struct LoadedResolverConfig {
     pub problems: Vec<crate::model::Diagnostic>,
 }
 
+/// One config of an `extends` chain as tsc merges it, before `paths` are resolved. tsc keeps
+/// `paths` as written and resolves them against the *final* `baseUrl` -- or, with none, against the
+/// directory of the config that defined them -- so they can only be resolved once the whole chain
+/// is merged. Resolving them while loading each base pinned an inherited `paths` to the base's own
+/// directory even when the top config set `baseUrl`.
+#[derive(Default)]
+struct TsconfigLayer {
+    /// Root-relative and normalized, like [`ResolverConfig::base_url`].
+    base_url: Option<PathBuf>,
+    /// `paths` as written, with the directory of the config that defined them.
+    paths: Option<(BTreeMap<String, Vec<String>>, PathBuf)>,
+    extensions: Vec<String>,
+    max_candidates: usize,
+}
+
+impl TsconfigLayer {
+    fn into_config(self, root: &Path) -> ResolverConfig {
+        let base_url = self.base_url;
+        let paths = self
+            .paths
+            .map(|(raw, defined_in)| {
+                let target_base = base_url
+                    .as_ref()
+                    .map(|base| root.join(base))
+                    .unwrap_or(defined_in);
+                raw.into_iter()
+                    .map(|(alias, targets)| {
+                        let targets = targets
+                            .iter()
+                            .map(|target| {
+                                normalize_lexical(
+                                    root,
+                                    &target_base.join(substitute_config_dir(root, target)),
+                                )
+                            })
+                            .collect();
+                        (alias, targets)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ResolverConfig {
+            base_url,
+            paths,
+            extensions: self.extensions,
+            max_candidates: self.max_candidates,
+        }
+    }
+}
+
+/// tsc's `${configDir}` template: a path option starting with it is taken relative to the
+/// directory of the config being compiled -- the workspace's own `tsconfig.json` -- whichever
+/// config in the chain wrote it.
+fn substitute_config_dir(root: &Path, value: &str) -> PathBuf {
+    match value.strip_prefix("${configDir}") {
+        Some(rest) => root.join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(value),
+    }
+}
+
+/// `stack` holds the configs being loaded right now, not every config loaded so far: two bases
+/// may both extend one common config (a diamond), and only a config that reaches itself again is
+/// a cycle.
 fn load_tsconfig_recursive(
     root: &Path,
     path: &Path,
-    visited: &mut BTreeSet<PathBuf>,
+    stack: &mut BTreeSet<PathBuf>,
     problems: &mut Vec<crate::model::Diagnostic>,
-) -> Option<ResolverConfig> {
+) -> Option<TsconfigLayer> {
     let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(identity) {
+    if !stack.insert(identity.clone()) {
         return None;
     }
+    let layer = load_tsconfig_layer(root, path, stack, problems);
+    stack.remove(&identity);
+    layer
+}
+
+fn load_tsconfig_layer(
+    root: &Path,
+    path: &Path,
+    stack: &mut BTreeSet<PathBuf>,
+    problems: &mut Vec<crate::model::Diagnostic>,
+) -> Option<TsconfigLayer> {
     let text = fs::read_to_string(path).ok()?;
-    // `tsc` treats an empty file as `{}`. Reporting it as unparseable turns a harmless placeholder
-    // into a permanent hint telling the caller to fix a file that is already fine.
-    if text.trim().is_empty() {
-        return Some(ResolverConfig::default());
-    }
-    let value = parse_jsonc(&text)?;
+    // tsc drops a UTF-8 byte-order mark, which editors on Windows like to write.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    let value = parse_jsonc(text)?;
     let directory = path.parent().unwrap_or(root);
-    let mut config = ResolverConfig::default();
+    let mut config = TsconfigLayer::default();
     let inherited: Vec<_> = match value.get("extends") {
         Some(serde_json::Value::String(value)) => vec![value.as_str()],
         Some(serde_json::Value::Array(values)) => values
@@ -1837,7 +2101,7 @@ fn load_tsconfig_recursive(
         if !inherited_path.is_file() {
             inherited_path = PathBuf::from(format!("{}.json", inherited_path.to_string_lossy()));
         }
-        let base = load_tsconfig_recursive(root, &inherited_path, visited, problems);
+        let base = load_tsconfig_recursive(root, &inherited_path, stack, problems);
         if base.is_none() {
             // The aliases usually live in the base config of a monorepo, so a base that cannot be
             // read takes them all with it -- and the top file parses fine, so nothing else notices.
@@ -1855,7 +2119,7 @@ fn load_tsconfig_recursive(
             if base.base_url.is_some() {
                 config.base_url = base.base_url;
             }
-            if !base.paths.is_empty() {
+            if base.paths.is_some() {
                 config.paths = base.paths;
             }
             if !base.extensions.is_empty() {
@@ -1868,34 +2132,18 @@ fn load_tsconfig_recursive(
     if let Some(base_url) = options.get("baseUrl").and_then(|value| value.as_str()) {
         config.base_url = Some(PathBuf::from(normalize_lexical(
             root,
-            &directory.join(base_url),
+            &directory.join(substitute_config_dir(root, base_url)),
         )));
     }
     if let Some(raw_paths) = options.get("paths").and_then(|value| {
         serde_json::from_value::<BTreeMap<String, Vec<String>>>(value.clone()).ok()
     }) {
-        let target_base = config
-            .base_url
-            .as_ref()
-            .map(|base| root.join(base))
-            .unwrap_or_else(|| directory.to_path_buf());
-        config.paths = raw_paths
-            .into_iter()
-            .map(|(alias, targets)| {
-                (
-                    alias,
-                    targets
-                        .into_iter()
-                        .map(|target| normalize_lexical(root, &target_base.join(target)))
-                        .collect(),
-                )
-            })
-            .collect();
+        config.paths = Some((raw_paths, directory.to_path_buf()));
     }
     Some(config)
 }
 
-fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut without_comments = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -1988,6 +2236,12 @@ fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
         json.push(byte);
         index += 1;
     }
+    // tsc reads a config that is empty, or nothing but comments, as `{}`. Reporting it as
+    // unparseable turns a harmless placeholder into a permanent hint telling the caller to fix a
+    // file that is already fine.
+    if json.iter().all(u8::is_ascii_whitespace) {
+        return Some(serde_json::Value::Object(serde_json::Map::new()));
+    }
     serde_json::from_slice(&json).ok()
 }
 
@@ -2039,6 +2293,151 @@ mod tests {
                 .map(|problem| problem.code.as_str())
                 .collect::<Vec<_>>(),
             ["tsconfig_not_a_file"]
+        );
+    }
+
+    fn write_configs(root: &Path, files: &[(&str, &str)]) {
+        for (path, text) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_tsconfig_with_a_bom_or_only_comments_is_not_unparsed() {
+        // Editors on Windows save `tsconfig.json` with a UTF-8 byte-order mark, and a freshly
+        // generated config can be nothing but comments. tsc reads the first normally and the
+        // second as `{}`; reporting either as unparsed dropped every alias.
+        let root = tempdir().unwrap();
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    "\u{FEFF}{ \"extends\": \"./tsconfig.base.json\" }",
+                ),
+                (
+                    "tsconfig.base.json",
+                    "\u{FEFF}{ \"compilerOptions\": { \"paths\": { \"@lib/*\": [\"src/*\"] } } }",
+                ),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(
+            loaded.config.paths,
+            BTreeMap::from([("@lib/*".to_owned(), vec!["src/*".to_owned()])])
+        );
+
+        write_configs(
+            root.path(),
+            &[("tsconfig.json", "// configured later\n/* { } */\n")],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.config, ResolverConfig::default());
+    }
+
+    #[test]
+    fn two_bases_extending_one_common_config_is_not_a_cycle() {
+        // A diamond: both bases extend `common.json`. Only a config extending itself is a cycle;
+        // a global seen-set reported the second visit as unreadable and dropped what it held.
+        let root = tempdir().unwrap();
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": ["./configs/a.json", "./configs/b.json"] }"#,
+                ),
+                ("configs/a.json", r#"{ "extends": "./common.json" }"#),
+                (
+                    "configs/b.json",
+                    r#"{ "extends": "./common.json", "compilerOptions": { "baseUrl": "../src" } }"#,
+                ),
+                (
+                    "configs/common.json",
+                    r#"{ "compilerOptions": { "paths": { "@lib/*": ["lib/*"] } } }"#,
+                ),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.config.base_url, Some(PathBuf::from("src")));
+
+        // A real cycle still ends.
+        write_configs(
+            root.path(),
+            &[("configs/common.json", r#"{ "extends": "./b.json" }"#)],
+        );
+        let cyclic = load_tsconfig_reporting(root.path());
+        assert!(!cyclic.problems.is_empty());
+    }
+
+    #[test]
+    fn inherited_paths_resolve_against_the_final_base_url_or_their_own_config() {
+        // tsc keeps `paths` as written and resolves them against the merged `baseUrl`, or, with
+        // none, against the directory of the config that defined them. `${configDir}` is the
+        // directory of the config being compiled.
+        let root = tempdir().unwrap();
+        let base = r#"{ "compilerOptions": { "paths": {
+            "@lib/*": ["lib/*"],
+            "@app/*": ["${configDir}/app/*"]
+        } } }"#;
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": "./configs/base.json", "compilerOptions": { "baseUrl": "./src" } }"#,
+                ),
+                ("configs/base.json", base),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(
+            loaded.config.paths,
+            BTreeMap::from([
+                ("@app/*".to_owned(), vec!["app/*".to_owned()]),
+                ("@lib/*".to_owned(), vec!["src/lib/*".to_owned()]),
+            ])
+        );
+
+        // No baseUrl anywhere: relative to the config that holds `paths`.
+        write_configs(
+            root.path(),
+            &[("tsconfig.json", r#"{ "extends": "./configs/base.json" }"#)],
+        );
+        assert_eq!(
+            load_tsconfig(root.path()).paths,
+            BTreeMap::from([
+                ("@app/*".to_owned(), vec!["app/*".to_owned()]),
+                ("@lib/*".to_owned(), vec!["configs/lib/*".to_owned()]),
+            ])
+        );
+
+        // A baseUrl set in the base and paths set on top: the base's baseUrl still applies.
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": "./configs/with-base-url.json",
+                         "compilerOptions": { "paths": { "@x/*": ["x/*"] } } }"#,
+                ),
+                (
+                    "configs/with-base-url.json",
+                    r#"{ "compilerOptions": { "baseUrl": "${configDir}/packages" } }"#,
+                ),
+            ],
+        );
+        let loaded = load_tsconfig(root.path());
+        assert_eq!(loaded.base_url, Some(PathBuf::from("packages")));
+        assert_eq!(
+            loaded.paths,
+            BTreeMap::from([("@x/*".to_owned(), vec!["packages/x/*".to_owned()])])
         );
     }
     use super::*;
@@ -2270,7 +2669,8 @@ mod tests {
             "src/barrel.ts",
             // Imported, then republished under a different name -- no `from` on the export.
             "import { target, other as localOther } from './origin';\n\
-             export { target as PublicTarget, localOther as PublicOther };\n",
+             export { target as PublicTarget, localOther as PublicOther };\n\
+             export class Unrelated { target() {} localOther() {} }\n",
         );
         let consumer = write_artifact(
             root.path(),
@@ -2801,6 +3201,459 @@ class Child extends Base implements Shape {
                 && edge.to == "src/b.ts"
                 && matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         }));
+    }
+
+    /// Calls edges leaving the symbol with `from_id`, as `(target id, line)` pairs.
+    fn calls_from(edges: &[Edge], from_id: &str) -> Vec<String> {
+        edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.from == from_id)
+            .map(|edge| edge.to.clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_import_names_a_module_scope_declaration_never_a_namespace_member() {
+        let root = tempdir().unwrap();
+        let tools = write_artifact(
+            root.path(),
+            "src/tools.ts",
+            "export namespace Tools { export function work() {} }\n",
+        );
+        let both = write_artifact(
+            root.path(),
+            "src/both.ts",
+            "export function f() {}\nexport namespace X { export function f() {} }\n",
+        );
+        let consumer = write_artifact(
+            root.path(),
+            "src/main.ts",
+            "import { work } from './tools';\nimport { f } from './both';\n\
+             export function run() { work(); f(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (tools.path.clone(), tools.clone()),
+            (both.path.clone(), both.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "run")),
+            [symbol_id(&both, "f")]
+        );
+    }
+
+    #[test]
+    fn a_class_member_does_not_shadow_an_import_of_the_same_name() {
+        // Class and interface members are reached through `this`, an instance, or the class
+        // itself -- never as a bare name. Treating `Logger.format` as lexically visible inside
+        // `Logger` sent every `format(x)` there to the method instead of the imported function,
+        // and a wrapper method calling the import of its own name resolved to itself and vanished.
+        let root = tempdir().unwrap();
+        let formatter = write_artifact(
+            root.path(),
+            "src/fmt.ts",
+            "export function format(x: string) { return x; }",
+        );
+        let logger = write_artifact(
+            root.path(),
+            "src/logger.ts",
+            "import { format } from './fmt';\n\
+             export class Logger {\n\
+               format(x: string) { return format(x); }\n\
+               log(x: string) { return format(x); }\n\
+             }\n\
+             export interface Shape { format(x: string): string; }\n\
+             export class Shaped { run(x: string) { return format(x); } }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (formatter.path.clone(), formatter.clone()),
+            (logger.path.clone(), logger.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        let imported = symbol_id(&formatter, "format");
+        for caller in ["Logger.format", "Logger.log", "Shaped.run"] {
+            assert_eq!(
+                calls_from(&edges, &symbol_id(&logger, caller)),
+                std::slice::from_ref(&imported),
+                "{caller} calls the imported function"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enum_member_stays_visible_inside_its_own_initializers() {
+        // `B = A << 1` names `Flags.A` bare; that is the one kind of member that is in scope.
+        let flags = parse_source("src/flags.ts", b"export enum Flags { A = 1, B = A << 1 }");
+        let logger = parse_source("src/logger.ts", b"class Logger { format() {} log() {} }");
+        let symbol = |artifact: &FileArtifact, qualified: &str| {
+            artifact
+                .symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == qualified)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {qualified} in {:?}", artifact.symbols))
+        };
+        let visible = |artifact: &FileArtifact, definition: &str, from: &str| {
+            let source = symbol(artifact, from);
+            visible_local_definition(
+                &SymbolDefinition::from_symbol(artifact, &symbol(artifact, definition)),
+                Some(&source),
+                source.span,
+            )
+        };
+        assert!(visible(&flags, "Flags.A", "Flags.B"));
+        assert!(visible(&flags, "Flags.A", "Flags"));
+        assert!(!visible(&logger, "Logger.format", "Logger.log"));
+        assert!(!visible(&logger, "Logger.format", "Logger"));
+    }
+
+    #[test]
+    fn a_declaration_or_default_export_never_reads_from_another_module() {
+        // Only `export {a} from`, `export * from` and `export * as ns from` read another module. A
+        // declaration or default export has no source, whatever string literal the scanner may
+        // have picked up from its body -- following one sent `helper` to an unrelated module.
+        let root = tempdir().unwrap();
+        let unrelated = write_artifact(root.path(), "src/a.ts", "export function helper() {}");
+        let mut wrapper = write_artifact(
+            root.path(),
+            "src/b.ts",
+            "export function helper() { return load('./a'); }\n\
+             export default function main() {}\n",
+        );
+        // The guard must hold on its own, whatever the scanner records.
+        for export in &mut wrapper.exports {
+            export.specifier = Some("./a".into());
+        }
+        let consumer = write_artifact(
+            root.path(),
+            "src/c.ts",
+            "import main, { helper } from './b';\n\
+             export function run() { helper(); main(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (unrelated.path.clone(), unrelated.clone()),
+            (wrapper.path.clone(), wrapper.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        let mut calls = calls_from(&edges, &symbol_id(&consumer, "run"));
+        calls.sort();
+        assert_eq!(
+            calls,
+            [symbol_id(&wrapper, "helper"), symbol_id(&wrapper, "main")]
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.from == "src/b.ts" && edge.kind == EdgeKind::ReExport),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn explicit_exports_shadow_star_exports_and_default_never_passes_through_a_star() {
+        // ES ResolveExport: a module's own and indirect exports are consulted before `export *`,
+        // and `export *` never forwards `default`.
+        let root = tempdir().unwrap();
+        let a = write_artifact(root.path(), "src/a.ts", "export function foo() {}");
+        let b = write_artifact(
+            root.path(),
+            "src/b.ts",
+            "export function foo() {}\nexport default function fallback() {}\n",
+        );
+        let reexporting = write_artifact(
+            root.path(),
+            "src/reexporting.ts",
+            "export { foo } from './a';\nexport * from './b';\n",
+        );
+        let declaring = write_artifact(
+            root.path(),
+            "src/declaring.ts",
+            "export function foo() {}\nexport * from './b';\n",
+        );
+        let consumer = write_artifact(
+            root.path(),
+            "src/consumer.ts",
+            "import fallback, { foo } from './reexporting';\n\
+             import { foo as local } from './declaring';\n\
+             export function viaReexport() { foo(); fallback(); }\n\
+             export function viaDeclaration() { local(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (a.path.clone(), a.clone()),
+            (b.path.clone(), b.clone()),
+            (reexporting.path.clone(), reexporting.clone()),
+            (declaring.path.clone(), declaring.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "viaReexport")),
+            [symbol_id(&a, "foo")],
+            "the explicit re-export wins and `default` is not taken from the star"
+        );
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "viaDeclaration")),
+            [symbol_id(&declaring, "foo")],
+            "the local declaration wins over the star"
+        );
+    }
+
+    /// Where each of `consumer`'s imports resolved, in source order (`None` when unresolved).
+    fn import_targets(root: &Path, files: &[(&str, &str)], consumer: &str) -> Vec<Option<String>> {
+        let artifacts: BTreeMap<String, FileArtifact> = files
+            .iter()
+            .map(|(path, source)| {
+                let artifact = write_artifact(root, path, source);
+                (artifact.path.clone(), artifact)
+            })
+            .collect();
+        let universe = ResolutionUniverse::build(&artifacts, &ResolverConfig::default());
+        artifacts[consumer]
+            .imports
+            .iter()
+            .map(|import| {
+                resolve_one(
+                    root,
+                    consumer,
+                    &import.specifier,
+                    &universe,
+                    &ResolverConfig::default(),
+                )
+                .target
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declaration_files_are_probed_where_typescript_probes_them() {
+        // `.d.ts` files are indexed, so a type-only import of one has a target to resolve to.
+        let root = tempdir().unwrap();
+        let targets = import_targets(
+            root.path(),
+            &[
+                (
+                    "src/consumer.ts",
+                    "import type { W } from './types';\n\
+                     import type { W as V } from './types.js';\n\
+                     import type { M } from './m.mjs';\n\
+                     import type { C } from './c.cjs';\n\
+                     import type { L } from './lib';\n",
+                ),
+                ("src/types.d.ts", "export interface W {}"),
+                ("src/m.d.mts", "export interface M {}"),
+                ("src/c.d.cts", "export interface C {}"),
+                ("src/lib/index.d.ts", "export interface L {}"),
+            ],
+            "src/consumer.ts",
+        );
+        assert_eq!(
+            targets,
+            [
+                Some("src/types.d.ts".to_owned()),
+                Some("src/types.d.ts".to_owned()),
+                Some("src/m.d.mts".to_owned()),
+                Some("src/c.d.cts".to_owned()),
+                Some("src/lib/index.d.ts".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_js_extension_specifier_prefers_the_typescript_source_it_names() {
+        // Under TypeScript a `.js` specifier names the `.ts` file compiled to it, even when an
+        // emitted `.js` sits next to it; `.mjs` and `.cjs` name `.mts` and `.cts` first.
+        let root = tempdir().unwrap();
+        let targets = import_targets(
+            root.path(),
+            &[
+                (
+                    "src/consumer.ts",
+                    "import { u } from './util.js';\n\
+                     import { x } from './x.mjs';\n\
+                     import { y } from './y.cjs';\n\
+                     import { v } from './view.jsx';\n\
+                     import { d } from './only-ts.js';\n\
+                     import { b } from './b';\n",
+                ),
+                ("src/util.ts", "export const u = 1;"),
+                ("src/util.js", "export const u = 1;"),
+                ("src/x.ts", "export const x = 1;"),
+                ("src/x.mts", "export const x = 1;"),
+                ("src/x.mjs", "export const x = 1;"),
+                ("src/y.ts", "export const y = 1;"),
+                ("src/y.cts", "export const y = 1;"),
+                ("src/y.cjs", "export const y = 1;"),
+                ("src/view.tsx", "export const v = 1;"),
+                ("src/view.jsx", "export const v = 1;"),
+                ("src/only-ts.mts", "export const d = 1;"),
+                ("src/b.mts", "export const b = 1;"),
+            ],
+            "src/consumer.ts",
+        );
+        assert_eq!(
+            targets,
+            [
+                Some("src/util.ts".to_owned()),
+                Some("src/x.mts".to_owned()),
+                Some("src/y.cts".to_owned()),
+                Some("src/view.tsx".to_owned()),
+                // Outside TypeScript's own substitutions the other extensions remain a fallback.
+                Some("src/only-ts.mts".to_owned()),
+                Some("src/b.mts".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_matched_paths_pattern_ends_the_lookup_before_base_url() {
+        // tsc tries `baseUrl` only when no `paths` pattern matched. A matched pattern whose
+        // targets do not exist is an unresolved import (TS2307), not a cue to look elsewhere.
+        let root = tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        for (path, source) in [
+            ("src/consumer.ts", "import '@app/thing';\nimport 'plain';\n"),
+            ("@app/thing.ts", "export const stray = 1;"),
+            ("plain.ts", "export const plain = 1;"),
+        ] {
+            let artifact = write_artifact(root.path(), path, source);
+            files.insert(artifact.path.clone(), artifact);
+        }
+        let config = ResolverConfig {
+            base_url: Some(PathBuf::from(".")),
+            paths: BTreeMap::from([("@app/*".into(), vec!["src/app/*".into()])]),
+            ..ResolverConfig::default()
+        };
+        let universe = ResolutionUniverse::build(&files, &config);
+        let resolve = |specifier: &str| {
+            resolve_one(
+                root.path(),
+                "src/consumer.ts",
+                specifier,
+                &universe,
+                &config,
+            )
+            .target
+        };
+        assert_eq!(resolve("@app/thing"), None);
+        // With no pattern matching, baseUrl still applies.
+        assert_eq!(resolve("plain"), Some("plain.ts".to_owned()));
+    }
+
+    fn universe_of(files: &[(&str, &str)]) -> (BTreeMap<String, FileArtifact>, ResolutionUniverse) {
+        let artifacts: BTreeMap<String, FileArtifact> = files
+            .iter()
+            .map(|(path, source)| ((*path).to_owned(), parse_source(path, source.as_bytes())))
+            .collect();
+        let universe = ResolutionUniverse::build(&artifacts, &ResolverConfig::default());
+        (artifacts, universe)
+    }
+
+    #[test]
+    fn per_path_universe_overlays_reproduce_a_rebuilt_universe() {
+        // `run` is defined in every file, so each edit touches a name other files also define --
+        // exactly what the per-path overlay must leave alone.
+        let before = [
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}",
+            ),
+            (
+                "b.ts",
+                "export class B { run() {} }\nexport const shared = 1;",
+            ),
+            ("c.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (old_artifacts, base) = universe_of(&before);
+        let first = [
+            // `run` gains a second definition in a.ts and `shared` moves here from b.ts.
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}\nexport const shared = 2;\nfunction run3() {}",
+            ),
+            ("b.ts", "export class B { run() {} }"),
+            ("c.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (first_artifacts, first_universe) = universe_of(&first);
+        let second = [
+            (
+                "a.ts",
+                "export class A { run() {} }\nexport function run() {}\nexport const shared = 2;\nfunction run3() {}",
+            ),
+            ("b.ts", "export class B { run() {} }"),
+            // c.ts is deleted and d.ts added with the same names.
+            ("d.ts", "export class C { run() {} run2() {} }"),
+        ];
+        let (second_artifacts, second_universe) = universe_of(&second);
+
+        let first_overlay = ResolutionUniverseOverlay::from_artifact_changes(
+            ["a.ts", "b.ts"]
+                .into_iter()
+                .map(|path| (old_artifacts.get(path), first_artifacts.get(path))),
+        );
+        let second_overlay = ResolutionUniverseOverlay::from_artifact_changes(
+            ["c.ts", "d.ts"]
+                .into_iter()
+                .map(|path| (first_artifacts.get(path), second_artifacts.get(path))),
+        );
+
+        let mut applied = base.clone();
+        applied.apply_overlay(&first_overlay);
+        assert_eq!(applied, first_universe);
+        applied.apply_overlay(&second_overlay);
+        assert_eq!(applied, second_universe);
+
+        // Composition is what overlay-chain compaction stores.
+        let mut composed = first_overlay.clone();
+        composed.compose(second_overlay.clone());
+        let mut applied = base.clone();
+        applied.apply_overlay(&composed);
+        assert_eq!(applied, second_universe);
+
+        // A lookup over an unapplied overlay answers what the rebuilt universe answers.
+        let lookup = OverlayResolutionLookup::new(&first_universe, &second_overlay);
+        for name in ["run", "run2", "run3", "shared", "A", "C", "missing"] {
+            assert_eq!(
+                lookup.symbol_definer_count(name),
+                second_universe.symbol_definer_count(name),
+                "{name}"
+            );
+            assert_eq!(
+                lookup.symbol_definitions(name).to_vec(),
+                second_universe.symbol_definitions(name).to_vec(),
+                "{name}"
+            );
+            for path in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+                assert_eq!(
+                    lookup.symbol_definitions_in_file(name, path),
+                    second_universe.symbol_definitions_in_file(name, path),
+                    "{name} in {path}"
+                );
+            }
+        }
+
+        // The overlay carries only the edited files' runs, not other files' definitions.
+        assert!(
+            first_overlay.symbol_definitions["run"]
+                .keys()
+                .eq(["a.ts", "b.ts"])
+        );
+
+        // And recording replacements on an owned universe yields the same overlay content.
+        let mut owned = base;
+        let mut recorded = ResolutionUniverseOverlay::default();
+        for path in ["a.ts", "b.ts"] {
+            owned.replace_artifact_with_overlay(
+                old_artifacts.get(path),
+                first_artifacts.get(path),
+                &mut recorded,
+            );
+        }
+        assert_eq!(owned, first_universe);
+        let mut replayed = universe_of(&before).1;
+        replayed.apply_overlay(&recorded);
+        assert_eq!(replayed, first_universe);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::{analysis, engine::WorkspaceEngine, graph::QueryLimits, search::Searc
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -17,7 +17,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -61,23 +61,26 @@ impl McpToolMode {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RootRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SyncRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
     /// Explicit edited paths. Relative paths are resolved from the workspace root.
     pub paths: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ReferenceSitesRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
     /// Symbol name, qualified name, or id. A bare name is resolved.
     pub node: String,
     /// Sites per page (default 50).
     pub limit: Option<usize>,
     /// Resume offset: pass the previous page's next_cursor.
-    pub cursor: Option<usize>,
+    pub cursor: Option<PageCursor>,
     /// Path fragment that picks one definition when a bare name matches several — cheaper than
     /// copying a candidate id back. Only narrows which definition is resolved; it does not filter
     /// the sites of a symbol that already resolved.
@@ -87,6 +90,69 @@ pub struct ReferenceSitesRequest {
     /// every site. Each bucket carries `n` (edges) and `files` (distinct files).
     pub rollup: Option<String>,
 }
+/// Where a page of sites starts. A page hands out its successor as `next_cursor`, a string, and the
+/// tool asks for exactly that back; refusing the string (the offset alone was accepted, as a number)
+/// failed every request for a second page. Either spelling is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCursor(usize);
+
+impl From<PageCursor> for usize {
+    fn from(cursor: PageCursor) -> Self {
+        cursor.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PageCursor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected, Visitor};
+
+        struct Offset;
+        impl Visitor<'_> for Offset {
+            type Value = PageCursor;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("the previous page's next_cursor")
+            }
+
+            fn visit_u64<E: Error>(self, value: u64) -> Result<PageCursor, E> {
+                usize::try_from(value)
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: Error>(self, value: i64) -> Result<PageCursor, E> {
+                match u64::try_from(value) {
+                    Ok(value) => self.visit_u64(value),
+                    Err(_) => Err(E::invalid_value(Unexpected::Signed(value), &self)),
+                }
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<PageCursor, E> {
+                value
+                    .parse()
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(Offset)
+    }
+}
+
+impl schemars::JsonSchema for PageCursor {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PageCursor".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": ["string", "integer"] })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
     pub root: Option<String>,
@@ -105,8 +171,11 @@ pub struct SearchRequest {
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ExploreRequest {
+    /// Absolute workspace path; omit for the server's default.
     pub root: Option<String>,
+    /// Name, qualified name, candidate id, or natural-language terms.
     pub query: String,
+    /// Sites per direction (default 10, max 50).
     pub limit: Option<usize>,
     /// Ask for the full payload — every similar spelling and the blast-radius
     /// sample. Off by default: the concise response carries the resolved symbol,
@@ -172,12 +241,14 @@ pub struct RavelMcp {
     max_cached_roots: usize,
     mode: McpToolMode,
     default_root: Option<PathBuf>,
+    /// `default_root` with its symlinks resolved, once that has worked.
+    resolved_default_root: OnceLock<PathBuf>,
 }
 
 #[derive(Debug)]
 struct DaemonBinding {
-    client: crate::daemon::DaemonClient,
-    _lease: crate::daemon::DaemonClientLease,
+    /// The session's lease on the daemon; calls travel over its connection.
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     last_used: u64,
 }
@@ -218,7 +289,7 @@ impl Drop for EngineUse {
 }
 
 struct DaemonUse {
-    client: crate::daemon::DaemonClient,
+    lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     cache: Arc<Mutex<HashMap<String, DaemonBinding>>>,
     max_cached_roots: usize,
@@ -251,10 +322,13 @@ impl RavelMcp {
     }
 
     fn with_mode_and_root(mode: McpToolMode, default_root: Option<PathBuf>) -> Self {
-        let tool_router = match mode {
+        let mut tool_router = match mode {
             McpToolMode::Primary => Self::tool_router_primary(),
             McpToolMode::All => Self::tool_router_primary() + Self::tool_router_extended(),
         };
+        for route in tool_router.map.values_mut() {
+            compact_input_schema(&mut route.attr);
+        }
         Self {
             tool_router,
             engines: Arc::new(Mutex::new(HashMap::new())),
@@ -263,6 +337,7 @@ impl RavelMcp {
             max_cached_roots: max_cached_roots_from_env(),
             mode,
             default_root,
+            resolved_default_root: OnceLock::new(),
         }
     }
 
@@ -313,15 +388,29 @@ impl RavelMcp {
         })
     }
 
+    /// The workspace a call is about, with symlinks resolved. Resolving costs a `readlink` per path
+    /// component, so the server's default root -- the one nearly every call names -- is resolved
+    /// once rather than on every call.
+    fn call_root(&self, root: Option<&str>) -> Option<PathBuf> {
+        let resolve = |path: PathBuf| path.canonicalize().unwrap_or(path);
+        match (root, &self.default_root) {
+            (Some(root), _) => Some(resolve(PathBuf::from(root))),
+            (None, Some(default)) => Some(match self.resolved_default_root.get() {
+                Some(resolved) => resolved.clone(),
+                // Only a success is remembered: a root that does not exist yet may later.
+                None => match default.canonicalize() {
+                    Ok(resolved) => self.resolved_default_root.get_or_init(|| resolved).clone(),
+                    Err(_) => default.clone(),
+                },
+            }),
+            (None, None) => std::env::current_dir().ok().map(resolve),
+        }
+    }
+
     fn daemon_client(&self, root: Option<&str>) -> Result<DaemonUse, String> {
-        let base = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| {
-                "no workspace root: pass `root` or start the server inside one".to_owned()
-            })?;
-        let root = base.canonicalize().unwrap_or(base);
+        let root = self.call_root(root).ok_or_else(|| {
+            "no workspace root: pass `root` or start the server inside one".to_owned()
+        })?;
         let key = root.to_string_lossy().into_owned();
         let mut daemons = self.daemons.lock().unwrap();
         let tick = self.next_cache_tick();
@@ -329,7 +418,7 @@ impl RavelMcp {
             binding.last_used = tick;
             binding.active.fetch_add(1, Ordering::AcqRel);
             return Ok(DaemonUse {
-                client: binding.client.clone(),
+                lease: binding.lease.clone(),
                 active: binding.active.clone(),
                 cache: self.daemons.clone(),
                 max_cached_roots: self.max_cached_roots,
@@ -338,20 +427,20 @@ impl RavelMcp {
         evict_inactive_daemon(&mut daemons, self.max_cached_roots.saturating_sub(1));
         // Keep the cause. Collapsing it into `None` here is what turned an upgraded-binary
         // situation into "shared daemon could not be started", with no hint of the remedy.
-        let (client, lease) = crate::daemon::ensure_transient(&root)
+        let (_, lease) = crate::daemon::ensure_transient(&root)
             .map_err(|error| format!("shared daemon could not be started: {error}"))?;
+        let lease = Arc::new(lease);
         let active = Arc::new(AtomicUsize::new(1));
         daemons.insert(
             key,
             DaemonBinding {
-                client: client.clone(),
-                _lease: lease,
+                lease: lease.clone(),
                 active: active.clone(),
                 last_used: tick,
             },
         );
         Ok(DaemonUse {
-            client,
+            lease,
             active,
             cache: self.daemons.clone(),
             max_cached_roots: self.max_cached_roots,
@@ -359,34 +448,34 @@ impl RavelMcp {
     }
 
     fn forget_daemon(&self, root: Option<&str>) {
-        let Some(base) = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .or_else(|| std::env::current_dir().ok())
-        else {
+        let Some(root) = self.call_root(root) else {
             return;
         };
-        let root = base.canonicalize().unwrap_or(base);
         self.daemons
             .lock()
             .unwrap()
             .remove(root.to_string_lossy().as_ref());
     }
 
+    /// The daemon's answer as the JSON text it serialized: a tool result is that text, so it is
+    /// never parsed into a `Value` and written out again.
     fn call_daemon(
         &self,
         root: Option<&str>,
         operation: crate::daemon::DaemonOperation,
-    ) -> Result<serde_json::Value, String> {
-        let client = self.daemon_client(root)?;
-        match client.client.call(operation.clone()) {
-            Ok(value) => Ok(value),
+    ) -> Result<String, String> {
+        let session = self.daemon_client(root)?;
+        match session.lease.call_text(operation.clone()) {
+            Ok(text) => Ok(text),
             Err(error) if should_respawn_after(&error) => {
+                // Let go of the old lease before asking for a new one: a daemon that is stopping
+                // exits only once none is held.
+                drop(session);
                 self.forget_daemon(root);
                 let retry = self.daemon_client(root)?;
                 retry
-                    .client
-                    .call(operation)
+                    .lease
+                    .call_text(operation)
                     .map_err(|error| error.to_string())
             }
             Err(crate::daemon::DaemonCallError::Remote(error)) => Err(error),
@@ -399,9 +488,22 @@ impl RavelMcp {
 /// that reply like a transport failure so the client respawns instead of
 /// surfacing "daemon is shutting down" to the agent.
 fn should_respawn_after(error: &crate::daemon::DaemonCallError) -> bool {
-    match error {
-        crate::daemon::DaemonCallError::Transport(_) => true,
-        crate::daemon::DaemonCallError::Remote(message) => message.contains("shutting down"),
+    matches!(error, crate::daemon::DaemonCallError::Transport(_)) || error.is_shutting_down()
+}
+
+/// Drop schema keys a model gains nothing from. Clients hand `inputSchema` to the model as
+/// written, so every byte here is paid again in each session: `$schema` restates the dialect MCP
+/// already defaults to, and `format: "uint"` is a schemars annotation no validator acts on.
+fn compact_input_schema(tool: &mut rmcp::model::Tool) {
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    schema.remove("$schema");
+    if let Some(serde_json::Value::Object(properties)) = schema.get_mut("properties") {
+        for property in properties
+            .values_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            property.remove("format");
+        }
     }
 }
 
@@ -490,9 +592,9 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     }
                 };
                 let extensions = crate::config::effective_extensions(&engine.config);
-                let paths: Vec<_> = batch
+                let mut paths: Vec<_> = batch
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|path| {
                         crate::config::watched_path_is_indexable(
                             &engine.config,
@@ -501,8 +603,33 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                             path,
                         )
                     })
+                    .cloned()
                     .collect();
-                if batch.needs_reconcile {
+                let rules_changed = crate::watch::changes_ignore_rules(&batch);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
+                let mut needs_reconcile = batch.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                // Together they stay within the batch bound, as the paths alone always did.
+                if !needs_reconcile {
+                    match crate::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &batch,
+                        max_batch_paths.saturating_sub(paths.len()),
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    if let Err(error) = engine.index() {
+                        engine.record_update_error("watch index", &error.to_string());
+                    }
+                } else if needs_reconcile {
                     if let Err(error) = engine.reconcile() {
                         engine.record_update_error("watch index", &error.to_string());
                     }
@@ -511,6 +638,7 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         engine.record_update_error("watch sync", &error.to_string());
                     }
                 }
+                crate::release_memory();
             }
         });
 }
@@ -558,15 +686,28 @@ fn acquire_watcher_leadership(
 }
 
 // ── Primary tools (default) — fewer tools = less schema overhead ────────────
+//
+// Every tool is annotated: `readOnlyHint` lets a client's permission layer treat the queries as
+// the lookups they are (they only maintain Ravel's own index under `.ravel/`, never a source
+// file), and `openWorldHint: false` says nothing leaves the machine. Failures come back with
+// `isError` set, so the model is told the call failed instead of receiving an ordinary-looking
+// `{"error": …}` result it may read as an answer.
 
 #[tool_router(router = tool_router_primary, vis = "pub")]
 impl RavelMcp {
     #[tool(
-        description = "PRIMARY (one call → answers). Exact/qualified symbol or natural-term search, selected source, typed caller/callee sites, and bounded impact. Ambiguous names return candidates instead of guessing."
+        description = "Resolve a name, qualified name, or natural-language terms to a symbol and \
+                       return, in one call, its source excerpt, caller/callee sites (file:line) \
+                       and impact count. Ambiguous names return candidates instead of a guess.",
+        annotations(
+            title = "Explore symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> String {
+    async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(10).max(1);
-        match self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Context {
                 query: request.query.clone(),
@@ -574,67 +715,81 @@ impl RavelMcp {
                 detail: request.detail.unwrap_or(false),
                 scope: request.scope.clone(),
             },
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 
     #[tool(
-        description = "PRIMARY. Every place that references this symbol, with the file and line \
-                       of each one, the referring symbol, the edge kind, and whether the \
-                       reference is type-only. Resolved edges: never a match inside a comment or \
-                       string, never a same-named symbol from an unrelated file. This is the \
-                       \"what breaks if I change this\" answer, and it is enough to judge each \
-                       site without opening the files first — which is what makes it cheaper \
-                       than grepping a name and reading every hit. Accepts a bare name, a \
-                       qualified name, or an id. Reflects uncommitted edits. Page with \
-                       limit/cursor; `total` and `by_kind` are exact."
+        description = "Every reference to a symbol — the \"what breaks if I change it\" answer. \
+                       Each site has file, line, referring symbol, edge kind and a type-only \
+                       flag, so sites can be judged without opening files. Resolved edges: never \
+                       a comment/string match or a same-named symbol from an unrelated file. \
+                       Accepts a name, qualified name, or id; reflects uncommitted edits. Paged: \
+                       `total` and `by_kind` are exact; pass `next_cursor` as `cursor` for more.",
+        annotations(
+            title = "Callers of symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn callers_of(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+    async fn callers_of(
+        &self,
+        Parameters(request): Parameters<ReferenceSitesRequest>,
+    ) -> ToolReply {
         reference_sites_tool(self, request, true).await
     }
 
     #[tool(
-        description = "PRIMARY. What this symbol references — same shape and guarantees as \
-                       callers_of, in the other direction."
+        description = "What a symbol references — same site shape and guarantees as callers_of, \
+                       in the forward direction.",
+        annotations(
+            title = "Calls from symbol",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn calls_from(&self, Parameters(request): Parameters<ReferenceSitesRequest>) -> String {
+    async fn calls_from(
+        &self,
+        Parameters(request): Parameters<ReferenceSitesRequest>,
+    ) -> ToolReply {
         reference_sites_tool(self, request, false).await
     }
 
     #[tool(
-        description = "PRIMARY: Index status — is this workspace indexed, how much of it is \
-                       covered, and are there source files the indexer does not support. Check \
-                       at session start before relying on the other tools."
+        description = "Whether this workspace is indexed and how much of it the index covers. \
+                       Call once at session start; when `hint` says Ravel does not cover this \
+                       code, use text search.",
+        annotations(title = "Index status", read_only_hint = true, open_world_hint = false)
     )]
-    async fn status(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.call_daemon(
+    async fn status(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Status,
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 
     #[tool(
-        description = "PRIMARY: Incremental reindex. Pass edited paths for immediate, reliable sync; otherwise discovers Git-dirty files."
+        description = "Re-index after edits. Pass edited `paths` for an immediate, exact update \
+                       (untracked files included); without paths, re-scans Git-dirty files. \
+                       Writes only Ravel's index (.ravel/), never source.",
+        annotations(
+            title = "Sync index",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn sync(&self, Parameters(request): Parameters<SyncRequest>) -> String {
+    async fn sync(&self, Parameters(request): Parameters<SyncRequest>) -> ToolReply {
         let paths = request
             .paths
             .unwrap_or_default()
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        match self.call_daemon(
+        daemon_reply(self.call_daemon(
             request.root.as_deref(),
             crate::daemon::DaemonOperation::Sync { paths },
-        ) {
-            Ok(value) => value.to_string(),
-            Err(error) => error_json(error),
-        }
+        ))
     }
 }
 
@@ -642,35 +797,53 @@ impl RavelMcp {
 
 #[tool_router(router = tool_router_extended, vis = "pub")]
 impl RavelMcp {
-    #[tool(description = "Search symbols (kind: exact|prefix|fuzzy|regex|terms)")]
-    async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> String {
-        let kind = match request.kind.as_deref() {
+    #[tool(
+        description = "Search symbols (kind: exact|prefix|fuzzy|regex|terms)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> ToolReply {
+        // Anything else is refused: run as an exact search, `contains` or a misspelling came back as
+        // an ordinary-looking "nothing found". Case is forgiven; it cannot change which kind is meant.
+        let kind = match request
+            .kind
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("exact") => SearchKind::Exact,
             Some("prefix") => SearchKind::Prefix,
             Some("fuzzy") => SearchKind::Fuzzy,
             Some("regex") => SearchKind::Regex,
             Some("terms") => SearchKind::Terms,
-            _ => SearchKind::Exact,
+            Some(_) => {
+                return Err(error_json(format!(
+                    "unknown search kind `{}`; supported: exact, prefix, fuzzy, regex, terms",
+                    request.kind.unwrap_or_default()
+                )));
+            }
         };
         let limit = request.limit.unwrap_or(20).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.search(&request.query, kind, limit) {
-                Ok(hits) => serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.search(&request.query, kind, limit))
     }
 
     #[tool(
-        description = "Transitive reach: every file that can be reached from this symbol by                        following edges, or that can reach it with reverse=true. This is a walk                        over the whole graph and answers \"how far does this spread\" — for the                        places that actually reference the symbol, with lines, use callers_of."
+        description = "Transitive reach: every file that can be reached from this symbol by \
+                       following edges, or that can reach it with reverse=true. This is a walk \
+                       over the whole graph and answers \"how far does this spread\" — for the \
+                       places that actually reference the symbol, with lines, use callers_of.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn reachable(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+    async fn reachable(&self, Parameters(request): Parameters<QueryRequest>) -> ToolReply {
         let reverse = request.reverse.unwrap_or(false);
         query_tool(self, request, reverse).await
     }
 
-    #[tool(description = "Blast radius + risk scores for a symbol")]
-    async fn impact_analysis(&self, Parameters(request): Parameters<QueryRequest>) -> String {
+    #[tool(
+        description = "Blast radius + risk scores for a symbol",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn impact_analysis(&self, Parameters(request): Parameters<QueryRequest>) -> ToolReply {
         let mut limits = QueryLimits::default();
         if let Some(depth) = request.depth {
             limits.depth = depth;
@@ -678,182 +851,145 @@ impl RavelMcp {
         if let Some(nodes) = request.nodes {
             limits.nodes = nodes;
         }
-        match self.engine(request.root) {
-            Ok(engine) => match engine.impact_risk(&request.node, &limits) {
-                Ok(page) => serde_json::to_string(&page).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.impact_risk(&request.node, &limits))
+    }
+
+    #[tool(
+        description = "Graph stats (files/edges/snapshot_id)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.stats())
+    }
+
+    #[tool(
+        description = "List packages with language and path metadata",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.storage().open_file_list().map_err(tool_error)? {
+            Some(files) => json_ok(&analysis::list_packages_from_paths(
+                files.paths.iter().map(String::as_str),
+            )),
+            None => json_reply(engine.list_packages()),
         }
     }
 
-    #[tool(description = "Graph stats (files/edges/snapshot_id)")]
-    async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.stats() {
-                Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+    #[tool(
+        description = "Get detailed information about a symbol",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn node_detail(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.node_detail(&request.symbol).map_err(tool_error)? {
+            Some(symbol) => json_ok(&symbol),
+            None => Err(tool_error(format!("symbol '{}' not found", request.symbol))),
         }
     }
 
-    #[tool(description = "List packages with language and path metadata")]
-    async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.storage().open_file_list() {
-                Ok(Some(files)) => {
-                    let packages =
-                        analysis::list_packages_from_paths(files.paths.iter().map(String::as_str));
-                    serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
-                }
-                Ok(None) => match engine.list_packages() {
-                    Ok(packages) => {
-                        serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into())
-                    }
-                    Err(error) => error_json(error.to_string()),
-                },
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Get detailed information about a symbol")]
-    async fn node_detail(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.node_detail(&request.symbol) {
-                Ok(Some(sym)) => serde_json::to_string(&sym).unwrap_or_else(|_| "{}".into()),
-                Ok(None) => error_json(format!("symbol '{}' not found", request.symbol)),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "List files belonging to a package (by path prefix)")]
-    async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> String {
+    #[tool(
+        description = "List files belonging to a package (a name from list_packages)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(50).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.storage().open_file_list() {
-                Ok(Some(files)) => {
-                    serde_json::to_string(&files.in_package_limit(&request.name, limit))
-                        .unwrap_or_else(|_| "[]".into())
-                }
-                Ok(None) => match engine.files_in_package(&request.name) {
-                    Ok(files) => {
-                        serde_json::to_string(&files.into_iter().take(limit).collect::<Vec<_>>())
-                            .unwrap_or_else(|_| "[]".into())
-                    }
-                    Err(error) => error_json(error.to_string()),
-                },
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        match engine.storage().open_file_list().map_err(tool_error)? {
+            Some(files) => json_ok(&files.in_package_limit(&request.name, limit)),
+            None => {
+                let files = engine.files_in_package(&request.name).map_err(tool_error)?;
+                json_ok(&files.into_iter().take(limit).collect::<Vec<_>>())
+            }
         }
     }
 
-    #[tool(description = "Package import cycles (SCC), largest first")]
-    async fn cycles(&self, Parameters(request): Parameters<LimitRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.cycles(request.package.as_deref()) {
-                Ok(c) => serde_json::to_string(&c).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Package import cycles (SCC), largest first",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn cycles(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.cycles(request.package.as_deref()))
     }
 
-    #[tool(description = "Most depended-upon symbols; optional kind filter")]
-    async fn hubs(&self, Parameters(request): Parameters<LimitRequest>) -> String {
+    #[tool(
+        description = "Most depended-upon symbols; optional kind filter",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn hubs(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(20).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.hubs(limit, request.kind.as_deref()) {
-                Ok(h) => serde_json::to_string(&h).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.hubs(limit, request.kind.as_deref()))
     }
 
-    #[tool(description = "Symbols/files with no reverse dependencies")]
-    async fn orphans(&self, Parameters(request): Parameters<LimitRequest>) -> String {
+    #[tool(
+        description = "Symbols/files with no reverse dependencies",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn orphans(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(100).max(1);
-        match self.engine(request.root) {
-            Ok(engine) => match engine.orphans(limit) {
-                Ok(o) => serde_json::to_string(&o).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.orphans(limit))
     }
 
-    #[tool(description = "Impact of files changed between git refs")]
-    async fn diff_impact(&self, Parameters(request): Parameters<DiffImpactRequest>) -> String {
+    #[tool(
+        description = "Impact of files changed between git refs",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn diff_impact(&self, Parameters(request): Parameters<DiffImpactRequest>) -> ToolReply {
         let limits = QueryLimits {
             depth: request.depth.unwrap_or(16),
             ..Default::default()
         };
-        match self.engine(request.root) {
-            Ok(engine) => match engine.diff_impact(&request.from, request.to.as_deref(), &limits) {
-                Ok(r) => serde_json::to_string(&r).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "CI quality gate: cycles + policy findings")]
-    async fn ci_check(&self, Parameters(request): Parameters<CiRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.ci(
-                request.strict.unwrap_or(false),
-                request.cycle_threshold.unwrap_or(2),
-            ) {
-                Ok(r) => serde_json::to_string(&r).unwrap_or_else(|_| "{}".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
-    }
-
-    #[tool(description = "Export package dependency graph as GraphViz DOT")]
-    async fn export_dot(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.export_dot() {
-                Ok(dot) => serde_json::json!({"format":"dot","content":dot}).to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.diff_impact(&request.from, request.to.as_deref(), &limits))
     }
 
     #[tool(
-        description = "Validate index integrity (dangling edges, unresolved relative imports, declared boundary rules)"
+        description = "CI quality gate: cycles + policy findings",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.validate() {
-                // Bounded page + complete per-code counts: raw findings run to
-                // megabytes on big monorepos.
-                Ok(f) => serde_json::to_string(&crate::analysis::policy_report(f, 100))
-                    .unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    async fn ci_check(&self, Parameters(request): Parameters<CiRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.ci(
+            request.strict.unwrap_or(false),
+            request.cycle_threshold.unwrap_or(2),
+        ))
     }
 
     #[tool(
-        description = "Files that co-change with a path in recent git history, ranked by how \
-                       often they change *with it* rather than by raw count. Bulk commits \
-                       (mass renames, formatting) are skipped and counted separately: an empty \
-                       result with a non-zero commits_skipped_as_bulk means every commit that \
-                       touched this file was a mass edit, not that nothing co-changes with it."
+        description = "Export package dependency graph as GraphViz DOT",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.cochanged(
+    async fn export_dot(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        let dot = engine.export_dot().map_err(tool_error)?;
+        json_ok(&serde_json::json!({"format":"dot","content":dot}))
+    }
+
+    #[tool(
+        description = "Validate index integrity (dangling edges, unresolved relative imports, declared boundary rules)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        // Bounded page + complete per-code counts: raw findings run to
+        // megabytes on big monorepos.
+        let findings = engine.validate().map_err(tool_error)?;
+        json_ok(&crate::analysis::policy_report(findings, 100))
+    }
+
+    #[tool(
+        description = "Files that co-change with a path in recent git history, paged and ranked by confidence. Bulk commits are skipped and counted in commits_skipped_as_bulk.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(
+            engine.cochanged(
                 &request.file,
                 request.commits.unwrap_or(100),
                 request.min_cooccurrence.unwrap_or(2),
@@ -862,45 +998,38 @@ impl RavelMcp {
                     .unwrap_or(crate::git::DEFAULT_MAX_COMMIT_FILES),
                 request.limit.unwrap_or(20).max(1),
                 request.cursor.unwrap_or(0),
-            ) {
-                Ok(e) => serde_json::to_string(&e).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+            ),
+        )
     }
 
-    #[tool(description = "Architecture boundary violations (ravel.boundaries.toml)")]
-    async fn boundaries(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.boundaries() {
-                Ok(f) => serde_json::to_string(&f).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Architecture boundary violations (ravel.boundaries.toml)",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn boundaries(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.boundaries())
     }
 
-    #[tool(description = "Schema summary: counts by node/edge kind")]
-    async fn describe_schema(&self, Parameters(request): Parameters<RootRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.describe_schema() {
-                Ok(v) => v.to_string(),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Schema summary: counts by node/edge kind",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn describe_schema(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.describe_schema())
     }
 
-    #[tool(description = "Related test files for a source path using common naming patterns")]
-    async fn related_tests(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> String {
-        match self.engine(request.root) {
-            Ok(engine) => match engine.related_tests(&request.symbol) {
-                Ok(p) => serde_json::to_string(&p).unwrap_or_else(|_| "[]".into()),
-                Err(error) => error_json(error.to_string()),
-            },
-            Err(error) => error_json(error.to_string()),
-        }
+    #[tool(
+        description = "Related test files for a source path using common naming patterns",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn related_tests(
+        &self,
+        Parameters(request): Parameters<SymbolDetailRequest>,
+    ) -> ToolReply {
+        let engine = self.engine(request.root).map_err(tool_error)?;
+        json_reply(engine.related_tests(&request.symbol))
     }
 }
 
@@ -908,38 +1037,33 @@ async fn reference_sites_tool(
     mcp: &RavelMcp,
     request: ReferenceSitesRequest,
     reverse: bool,
-) -> String {
+) -> ToolReply {
     let limit = request.limit.unwrap_or(50).max(1);
-    let cursor = request.cursor.unwrap_or(0);
+    let cursor = request.cursor.map_or(0, usize::from);
     // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
-    // `rollup: "directory-ish"` looks like the grouping was applied and came out flat.
-    let rollup = match request.rollup.as_deref() {
-        None => None,
-        Some(value) => match crate::engine::RollupMode::parse(value) {
-            Some(mode) => Some(mode),
-            None => {
-                return error_json(format!(
-                    "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
-                ));
-            }
-        },
-    };
-    let options = crate::engine::RelationOptions {
-        scope: request.scope.as_deref(),
-        rollup,
-    };
-    match mcp.engine(request.root) {
-        Ok(engine) => {
-            match engine.reference_sites_with(&request.node, reverse, limit, cursor, options) {
-                Ok(value) => value.to_string(),
-                Err(error) => error_json(error.to_string()),
-            }
-        }
-        Err(error) => error_json(error.to_string()),
+    // `rollup: "directory-ish"` looks like the grouping was applied and came out flat. The daemon
+    // checks it too; checking here first keeps the refusal off the wire.
+    if let Some(value) = request.rollup.as_deref()
+        && crate::engine::RollupMode::parse(value).is_none()
+    {
+        return Err(error_json(format!(
+            "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
+        )));
     }
+    daemon_reply(mcp.call_daemon(
+        request.root.as_deref(),
+        crate::daemon::DaemonOperation::ReferenceSites {
+            node: request.node,
+            reverse,
+            limit,
+            cursor,
+            scope: request.scope,
+            rollup: request.rollup,
+        },
+    ))
 }
 
-async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> String {
+async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> ToolReply {
     let mut limits = QueryLimits::default();
     if let Some(depth) = request.depth {
         limits.depth = depth;
@@ -947,13 +1071,8 @@ async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> Str
     if let Some(nodes) = request.nodes {
         limits.nodes = nodes;
     }
-    match mcp.engine(request.root) {
-        Ok(engine) => match engine.query(&request.node, reverse, &limits, None) {
-            Ok(page) => serde_json::to_string(&page).unwrap_or_else(|_| "{}".into()),
-            Err(error) => error_json(error.to_string()),
-        },
-        Err(error) => error_json(error.to_string()),
-    }
+    let engine = mcp.engine(request.root).map_err(tool_error)?;
+    json_reply(engine.query(&request.node, reverse, &limits, None))
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -966,8 +1085,11 @@ impl ServerHandler for RavelMcp {
             }
             McpToolMode::All => "all tools",
         };
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            format!(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            // Without this the handshake names the MCP library ("rmcp 2.x"), which is what client
+            // UIs and logs then show for the server.
+            .with_server_info(Implementation::new("ravel", crate::VERSION).with_title("Ravel"))
+            .with_instructions(format!(
                 "Ravel answers relational questions about TypeScript/JavaScript code from a \
                  resolved graph. Mode: {mode}.\n\
                  \n\
@@ -983,19 +1105,20 @@ impl ServerHandler for RavelMcp {
                  - \"where does this literal text appear\" → grep/ripgrep. That is not a graph \
                  question and Ravel has no advantage there.\n\
                  \n\
-                 Answers include uncommitted edits: each call auto-syncs Git-dirty files against \
-                 a tracked git-dirty discovery first, so results match the working tree, not the last \
-                 commit. Pass edited paths to sync for immediate certainty after a write.\n\
+                 Answers include uncommitted edits: each call first syncs the files Git reports \
+                 as changed, so results match the working tree, not the last commit. Pass \
+                 edited paths to sync for immediate certainty after a write.\n\
                  \n\
                  Call status once at session start. It reports how much of the workspace is \
                  actually indexed — a repo whose sources Ravel does not parse can be \"indexed\" \
                  and still answer nothing, and status says so rather than looking healthy.\n\
                  \n\
                  Relation and impact results are pages with exact totals; follow next_cursor \
-                 rather than assuming a page is the whole answer.\n\
+                 rather than assuming a page is the whole answer. Every tool takes an optional \
+                 absolute `root`; pass it when the code you are asking about is not in the \
+                 server's default workspace. Ravel never edits source files.\n\
                  CLI equivalents: `ravel callers-of X`, `ravel explore X`, `ravel impact X --risk`."
-            ),
-        )
+            ))
     }
 }
 
@@ -1013,6 +1136,27 @@ pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+/// A tool's answer. `Ok` is the JSON payload; `Err` is a `{"error": …}` body that rmcp sends
+/// with `isError: true`.
+type ToolReply = Result<String, String>;
+
+fn json_ok(value: &impl serde::Serialize) -> ToolReply {
+    serde_json::to_string(value).map_err(tool_error)
+}
+
+fn json_reply<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> ToolReply {
+    json_ok(&result.map_err(tool_error)?)
+}
+
+/// A daemon answer is JSON text already, so it goes out as it came in.
+fn daemon_reply(result: Result<String, String>) -> ToolReply {
+    result.map_err(tool_error)
+}
+
+fn tool_error(error: impl std::fmt::Display) -> String {
+    error_json(error.to_string())
 }
 
 fn error_json(message: String) -> String {
@@ -1049,6 +1193,39 @@ mod tests {
         let root = PathBuf::from("/tmp/ravel-mcp-root");
         let m = RavelMcp::with_root(root.clone());
         assert_eq!(m.default_root, Some(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_default_root_is_resolved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let server = RavelMcp::with_root(link.clone());
+        let resolved = real.canonicalize().unwrap();
+
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // Resolved once: the link can go and the answer does not change, because nothing asks
+        // the filesystem again.
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(server.call_root(None), Some(resolved.clone()));
+        // A root named in the call is resolved every time.
+        assert_eq!(
+            server.call_root(Some(real.to_str().unwrap())),
+            Some(resolved)
+        );
+    }
+
+    #[test]
+    fn a_default_root_that_does_not_resolve_yet_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = dir.path().join("later");
+        let server = RavelMcp::with_root(later.clone());
+        assert_eq!(server.call_root(None), Some(later.clone()));
+        std::fs::create_dir(&later).unwrap();
+        assert_eq!(server.call_root(None), Some(later.canonicalize().unwrap()));
     }
 
     #[test]
@@ -1124,6 +1301,89 @@ mod tests {
             .expect("follower did not take over after leader exit");
         drop(replacement);
         follower.join().unwrap();
+    }
+
+    /// The answer of a tool whose work never waits (these engine calls block instead).
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the tool waited"),
+        }
+    }
+
+    #[test]
+    fn a_search_kind_that_is_not_one_is_refused_not_run_as_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.ts"),
+            "export function prefixTarget() { return 1; }\n",
+        )
+        .unwrap();
+        WorkspaceEngine::load(dir.path(), &Default::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        let server = RavelMcp::with_mode(McpToolMode::All);
+        let search = |kind: &str| {
+            ready(server.search_symbols(Parameters(SearchRequest {
+                root: Some(dir.path().to_string_lossy().into_owned()),
+                query: "prefixTarg".into(),
+                kind: Some(kind.into()),
+                limit: None,
+            })))
+        };
+
+        let found = search("prefix").unwrap();
+        assert!(found.contains("prefixTarget"), "{found}");
+        // What a model is likely to write for the same thing.
+        assert_eq!(search("Prefix").unwrap(), found);
+        // Silently searching for the exact spelling instead answered "nothing found".
+        for kind in ["contains", "substring", ""] {
+            let refused = search(kind).unwrap_err();
+            assert!(refused.contains("exact"), "{kind:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_page_cursor_is_taken_back_as_next_cursor_spells_it() {
+        let cursor = |value: serde_json::Value| {
+            serde_json::from_value::<ReferenceSitesRequest>(
+                serde_json::json!({ "node": "x", "cursor": value }),
+            )
+            .map(|request| request.cursor.map(usize::from))
+        };
+        // `next_cursor` is a string; the tool says to pass it back as `cursor`.
+        assert_eq!(cursor(serde_json::json!("50")).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::json!(50)).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::Value::Null).unwrap(), None);
+        for refused in [
+            serde_json::json!("next"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(cursor(refused.clone()).is_err(), "{refused} was accepted");
+        }
+        let absent =
+            serde_json::from_value::<ReferenceSitesRequest>(serde_json::json!({ "node": "x" }));
+        assert!(absent.unwrap().cursor.is_none());
+
+        // And clients that check arguments against the schema let either spelling through.
+        let server = RavelMcp::with_mode(McpToolMode::Primary);
+        for tool in ["callers_of", "calls_from"] {
+            let schema = &server.tool_router.map[tool].attr.input_schema;
+            let types = &schema["properties"]["cursor"]["type"];
+            for spelling in ["string", "integer"] {
+                assert!(
+                    types
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|kind| kind == spelling)),
+                    "{tool} cursor does not admit a {spelling}: {types}"
+                );
+            }
+        }
     }
 
     #[test]

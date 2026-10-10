@@ -12,8 +12,14 @@ File: `.ravel.toml` at project root (+ optional `.ravelignore`).
 | **Extensions** | `ts,tsx,mts,cts,js,jsx,mjs,cjs` via `languages = ["auto"]` | `parser.extensions = [...]` **wins** |
 | **Builtin noise dirs** | `node_modules`, `dist`, `build`, `.git`, `.ravel`, … | `ignore.use_builtin_dirs = false` and/or `ignore.dirs` |
 | **User ignore dirs** | empty | `ignore.dirs = ["storybook-static", "generated"]` |
-| **gitignore** | on | `ignore.gitignore = false` |
-| **.ravelignore** | if file exists | edit the file (gitignore syntax) |
+| **gitignore** | on, inside a git repository | `ignore.gitignore = false` |
+| **.ravelignore** | if the root has one | edit the file (gitignore syntax) |
+
+`ravel index`, `ravel sync` and the watchers apply the same rules: every `.gitignore` from a file's
+directory up to the top of its repository (above the project root too, when the root is a package
+inside a repository), deeper files first, then the repository's `.git/info/exclude`, then the
+project root's `.ravelignore`. A directory these rules exclude hides everything in it. `.ignore`
+files, the global gitignore and `.ravelignore` files below the root are not read.
 
 ## Git: optional, performance-first
 
@@ -76,7 +82,7 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false  # default fast path (tracked only); true = slower
+include_untracked = true   # new files reach auto-sync; false skips the untracked listing
 skip_sibling_emit = true
 discovery_cache_ms = 50    # reuse near-simultaneous warm MCP discovery
 queue_max_ticket_bytes = 1048576
@@ -127,6 +133,7 @@ hubs_top_k = 1000
 | `RAVEL_LOG_LEVEL` | log level |
 | `RAVEL_DAEMON_MAX_CONNECTIONS` | hard cap for all daemon connections; defaults to `max(8, CPUs * 4)` |
 | `RAVEL_DAEMON_MAX_LEASES` | hard cap for persistent MCP leases; defaults to the connection cap minus one request slot |
-| `RAVEL_DAEMON_REQUEST_TIMEOUT_MS` | handshake/request read timeout; established leases are not timed out |
+| `RAVEL_DAEMON_REQUEST_TIMEOUT_MS` | handshake/request read timeout; established leases, which also carry their session's requests, are not timed out |
 | `RAVEL_MCP_MAX_CACHED_ROOTS` | maximum cached workspace roots per MCP process; defaults to `8`; least-recently-used inactive roots are evicted |
 | `RAVEL_MCP_TOOLS` | `primary` / `all` (MCP surface) |
+| `RAVEL_WATCH_FASTPATH` | `0` makes the daemon ask git about the worktree on every query instead of trusting its file watcher when nothing has changed |

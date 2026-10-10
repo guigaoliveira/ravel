@@ -16,7 +16,7 @@ use ravel_core::{
     analysis, config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health,
     search::SearchKind,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{mem::ManuallyDrop, path::PathBuf, time::Duration};
 
 const CLI_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -67,12 +67,16 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Install agent harness files (AGENTS.md / CLAUDE.md snippet + MCP example)
-    /// Prefer `ravel install` for multi-agent MCP wiring.
+    /// Deprecated: `ravel install --location local` (add `--target claude` for `--claude`).
+    ///
+    /// Writes the same marked AGENTS.md / CLAUDE.md block as `install`, so `uninstall` can strip it.
+    #[command(hide = true)]
     Setup {
+        /// Also write the project `.mcp.json` for Claude Code.
         #[arg(long)]
         claude: bool,
-        #[arg(long)]
+        /// Accepted for compatibility; the marked block is always refreshed.
+        #[arg(long, hide = true)]
         force: bool,
     },
     /// Wire Ravel MCP into coding agents (Claude, Cursor, Codex, OpenCode, Gemini, …)
@@ -94,7 +98,7 @@ enum Command {
         /// Print MCP snippet for one agent and exit (no writes)
         #[arg(long, value_name = "AGENT")]
         print_config: Option<String>,
-        /// Skip AGENTS.md / CLAUDE.md instruction markers
+        /// Skip instruction files: AGENTS.md / CLAUDE.md markers and the `ravel` agent skill
         #[arg(long)]
         no_instructions: bool,
         /// Skip Claude mcp__ravel__* allowlist tweak
@@ -178,6 +182,7 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Blast radius: everything that depends on this symbol, transitively
     Impact {
         node: String,
         #[arg(long, default_value_t = 32)]
@@ -266,7 +271,8 @@ enum Command {
     /// ~150-token agent map (session start)
     Cheatsheet,
     /// Long-lived MCP stdio server with per-root file watching.
-    /// Default: primary tools only (explore, status, sync). Set RAVEL_MCP_TOOLS=all for full.
+    /// Default: primary tools only (explore, callers_of, calls_from, status, sync).
+    /// Set RAVEL_MCP_TOOLS=all for full.
     Mcp,
     /// Manage the shared daemon for this workspace.
     Daemon {
@@ -317,6 +323,11 @@ impl From<SearchMode> for SearchKind {
 }
 
 fn main() -> anyhow::Result<()> {
+    // mimalloc keeps the pages a sync touched committed until allocation pressure returns,
+    // and an idle daemon produces none: its RSS stayed at the sync's peak for the whole
+    // session. Collecting after each publication hands that memory back.
+    #[cfg(not(target_env = "musl"))]
+    ravel_core::set_memory_release_hook(|| unsafe { libmimalloc_sys::mi_collect(true) });
     if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::fmt()
             .with_target(false)
@@ -355,7 +366,7 @@ gitignore = true
 [sync]
 mode = "auto"              # auto | git | none
 auto = true
-include_untracked = false
+include_untracked = true
 discovery_cache_ms = 50
 skip_sibling_emit = true
 "#,
@@ -418,7 +429,7 @@ skip_sibling_emit = true
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.status()?, pretty)?;
         }
         Some(Command::Context {
@@ -439,16 +450,33 @@ skip_sibling_emit = true
                 emit_json(&value, pretty)?;
                 return Ok(());
             }
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(
                 &engine.context_with_detail(&query, limit, detail, scope.as_deref())?,
                 pretty,
             )?;
         }
-        Some(Command::Setup { claude, force }) => {
-            write_agent_setup(&root, claude, force)?;
-            println!("agent setup written under {}", root.display());
-            println!("tip: run `ravel install` to wire MCP into Claude/Cursor/Codex/…");
+        Some(Command::Setup { claude, force: _ }) => {
+            let loc = ravel_core::install::InstallLocation::Local;
+            let opts = ravel_core::install::InstallOptions {
+                targets: if claude {
+                    vec![ravel_core::install::AgentKind::Claude]
+                } else {
+                    Vec::new()
+                },
+                location: loc,
+                project_root: root.clone(),
+                ravel_bin: ravel_core::install::launch_command(
+                    loc,
+                    &ravel_core::install::resolve_ravel_bin(),
+                ),
+                write_instructions: true,
+                claude_permissions: false,
+            };
+            let report = ravel_core::install::install_agents(&opts)?;
+            emit_json(&report, pretty)?;
+            eprintln!("note: `ravel setup` is deprecated; use `ravel install --location local`");
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Install {
             target,
@@ -467,7 +495,8 @@ skip_sibling_emit = true
                     .ok_or_else(|| anyhow::anyhow!("unknown agent for --print-config"))?;
                 let loc = ravel_core::install::InstallLocation::parse(&location)
                     .map_err(anyhow::Error::msg)?;
-                print!("{}", ravel_core::install::print_config(kind, &bin, loc));
+                let command = ravel_core::install::launch_command(loc, &bin);
+                print!("{}", ravel_core::install::print_config(kind, &command, loc));
             } else {
                 let targets = ravel_core::install::AgentKind::parse_csv(&target)
                     .map_err(anyhow::Error::msg)?;
@@ -477,12 +506,13 @@ skip_sibling_emit = true
                     targets,
                     location: loc,
                     project_root: root.clone(),
-                    ravel_bin: bin,
+                    ravel_bin: ravel_core::install::launch_command(loc, &bin),
                     write_instructions: !no_instructions,
                     claude_permissions: !no_permissions,
                 };
                 let report = ravel_core::install::install_agents(&opts)?;
                 emit_json(&report, pretty)?;
+                fail_on_agent_errors(&report)?;
             }
         }
         Some(Command::Uninstall {
@@ -505,6 +535,7 @@ skip_sibling_emit = true
             };
             let report = ravel_core::install::uninstall_agents(&opts)?;
             emit_json(&report, pretty)?;
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Doctor) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -571,7 +602,7 @@ skip_sibling_emit = true
             page_size,
             cursor,
         }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             let limits = QueryLimits {
                 depth,
                 nodes,
@@ -582,11 +613,11 @@ skip_sibling_emit = true
             emit_json(&engine.query(&node, reverse, &limits, None)?, pretty)?;
         }
         Some(Command::Search { query, kind, limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.search(&query, kind.into(), limit)?, pretty)?;
         }
         Some(Command::Impact { node, depth, risk }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             let limits = QueryLimits {
                 depth,
                 ..Default::default()
@@ -594,11 +625,13 @@ skip_sibling_emit = true
             if risk {
                 emit_json(&engine.impact_risk(&node, &limits)?, pretty)?;
             } else {
-                emit_json(&engine.query(&node, false, &limits, None)?, pretty)?;
+                // The walk `--risk` scores: what depends on `node`, the blast radius of changing
+                // it. The forward walk answers the opposite question — what `node` itself needs.
+                emit_json(&engine.query(&node, true, &limits, None)?, pretty)?;
             }
         }
         Some(Command::Cycles { package, files }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             if files {
                 emit_json(&engine.file_cycles(package.as_deref())?, pretty)?;
             } else {
@@ -606,11 +639,11 @@ skip_sibling_emit = true
             }
         }
         Some(Command::Hubs { limit, kind }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.hubs(limit, kind.as_deref())?, pretty)?;
         }
         Some(Command::Orphans { limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.orphans(limit)?, pretty)?;
         }
         Some(Command::Packages) => {
@@ -716,7 +749,7 @@ skip_sibling_emit = true
             emit_json(&engine.describe_schema()?, pretty)?;
         }
         Some(Command::Stats) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
+            let engine = load_for_query(&root)?;
             emit_json(&engine.stats()?, pretty)?;
         }
         Some(Command::Watch) => {
@@ -758,10 +791,14 @@ skip_sibling_emit = true
                     Err(ravel_core::watch::WatchError::Timeout) => continue,
                     Err(error) => return Err(error.into()),
                 };
+                let rules_changed = ravel_core::watch::changes_ignore_rules(&result);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
                 let cfg = &engine.config;
-                let paths: Vec<_> = result
+                let mut paths: Vec<_> = result
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|p| {
                         ravel_core::config::watched_path_is_indexable(
                             cfg,
@@ -770,11 +807,29 @@ skip_sibling_emit = true
                             p,
                         )
                     })
+                    .cloned()
                     .collect();
-                if paths.is_empty() && !result.needs_reconcile {
+                let mut needs_reconcile = result.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                if !needs_reconcile {
+                    match ravel_core::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &result,
+                        cfg.watch.max_batch_paths.saturating_sub(paths.len()),
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if paths.is_empty() && !needs_reconcile && !rules_changed {
                     continue;
                 }
-                let stats = if result.needs_reconcile || paths.is_empty() {
+                let stats = if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    engine.index()?
+                } else if needs_reconcile || paths.is_empty() {
                     engine.reconcile()?
                 } else {
                     engine.sync(Some(&paths))?
@@ -798,10 +853,19 @@ skip_sibling_emit = true
                 emit_json(&serde_json::json!({ "running": running }), pretty)?;
             }
             DaemonAction::Stop => {
-                let stopped =
-                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?
-                        .is_some();
-                emit_json(&serde_json::json!({ "stopped": stopped }), pretty)?;
+                let reply =
+                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?;
+                // A daemon MCP sessions still lease stays for them and exits after the last one
+                // disconnects; say how many it waits for rather than claim it is gone.
+                let sessions = reply
+                    .as_ref()
+                    .and_then(|reply| reply.get("sessions"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                emit_json(
+                    &serde_json::json!({ "stopped": reply.is_some(), "sessions": sessions }),
+                    pretty,
+                )?;
             }
         },
         Some(Command::DaemonServe { transient }) => ravel_core::daemon::serve(&root, transient)?,
@@ -811,7 +875,8 @@ skip_sibling_emit = true
             }
             // Persistent MCP server with per-root file watching and Git freshness checks.
             // Staleness info is embedded in explore response via auto_synced field.
-            // Primary tools: explore, status, sync. Set RAVEL_MCP_TOOLS=all for full.
+            // Primary tools: explore, callers_of, calls_from, status, sync. Set RAVEL_MCP_TOOLS=all
+            // for full.
             eprintln!(
                 "ravel serve --mcp (persistent per-root watch; explore checks Git freshness)"
             );
@@ -822,11 +887,36 @@ skip_sibling_emit = true
     Ok(())
 }
 
+/// The report is printed either way; an agent that could not be configured also fails the run,
+/// so a script or CI step does not read a half-done install as success.
+fn fail_on_agent_errors(report: &ravel_core::install::InstallReport) -> anyhow::Result<()> {
+    match report.errors() {
+        0 => Ok(()),
+        failed => anyhow::bail!(
+            "{failed} agent(s) could not be updated; see the `error` actions in the report"
+        ),
+    }
+}
+
 fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(ravel_core::mcp::serve_stdio(Some(root.to_path_buf())))
+}
+
+/// Load the engine for a command that answers one question and exits.
+///
+/// The process is about to end, so tearing the engine down is pure cost: freeing the interned graph
+/// nodes one by one took 80M instructions (about 25ms) on a 20k-file workspace, a moment before the
+/// kernel reclaims the whole address space anyway. Only for commands that read the index: any lock or
+/// temp file an auto-sync takes is scoped to that call and gone before the answer is printed, and
+/// the read guards and mappings the caches hold are released by the OS at exit.
+fn load_for_query(root: &std::path::Path) -> anyhow::Result<ManuallyDrop<WorkspaceEngine>> {
+    Ok(ManuallyDrop::new(WorkspaceEngine::load(
+        root,
+        &Flags::default(),
+    )?))
 }
 
 /// One page of a symbol's reference sites, in one direction.
@@ -842,7 +932,7 @@ fn reference_sites(
     scope: Option<&str>,
     rollup: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let rollup = match rollup {
+    let rollup_mode = match rollup {
         None => None,
         Some(value) => Some(ravel_core::engine::RollupMode::parse(value).ok_or_else(|| {
             anyhow::anyhow!(
@@ -850,13 +940,32 @@ fn reference_sites(
             )
         })?),
     };
-    let engine = WorkspaceEngine::load(root, &Flags::default())?;
+    // A daemon that is already running holds the graph and symbol tables in memory; asking it skips
+    // loading them again for one answer, as `context` does.
+    if let Some(value) = daemon_call_if_running(
+        root,
+        ravel_core::daemon::DaemonOperation::ReferenceSites {
+            node: node.to_owned(),
+            reverse,
+            limit: page_size,
+            cursor,
+            scope: scope.map(str::to_owned),
+            rollup: rollup.map(str::to_owned),
+        },
+    )? {
+        return Ok(value);
+    }
+    let engine = load_for_query(root)?;
+    engine.prefetch_for_relations();
     Ok(engine.reference_sites_with(
         node,
         reverse,
         page_size,
         cursor,
-        ravel_core::engine::RelationOptions { scope, rollup },
+        ravel_core::engine::RelationOptions {
+            scope,
+            rollup: rollup_mode,
+        },
     )?)
 }
 
@@ -864,11 +973,25 @@ fn daemon_call_if_running(
     root: &std::path::Path,
     operation: ravel_core::daemon::DaemonOperation,
 ) -> anyhow::Result<Option<serde_json::Value>> {
+    // No runtime directory to look for a daemon in (HOME and XDG_RUNTIME_DIR unset, or it cannot
+    // be created) means none is reachable: answer in-process, as when none is running.
+    let Ok(client) = ravel_core::daemon::DaemonClient::for_root(root) else {
+        return Ok(None);
+    };
+    daemon_answer(client.call(operation))
+}
+
+/// The daemon's answer, or `None` to answer in-process instead: when it could not be reached, and
+/// when it refused the request unrun because it is stopping — a race with its idle exit, not a
+/// failure of the question.
+fn daemon_answer(
+    reply: Result<serde_json::Value, ravel_core::daemon::DaemonCallError>,
+) -> anyhow::Result<Option<serde_json::Value>> {
     use ravel_core::daemon::DaemonCallError;
-    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
-    match client.call(operation) {
+    match reply {
         Ok(value) => Ok(Some(value)),
         Err(DaemonCallError::Transport(_)) => Ok(None),
+        Err(error) if error.is_shutting_down() => Ok(None),
         Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
     }
 }
@@ -884,13 +1007,16 @@ fn ensure_daemon(
 
 fn ravel_cheatsheet() -> &'static str {
     r#"# ravel (token-cheap code graph)
+callers-of X → every reference to X with file:line (what breaks if X changes)
+calls-from X → what X references
 explore Q    → exact/qualified symbol or natural terms + source + relations (ONE call)
-sync         → reindex dirty files (auto on explore)
-serve --mcp  → persistent server (per-root watch, 3 primary tools)
+status       → indexed? how much of this repo (session start)
+sync [PATHS] → reindex edited files (queries auto-sync git-dirty files)
 search Q --kind prefix | query N --reverse | impact N --risk
-status | cycles | hubs --limit 10 | orphans --limit 10
+cycles | hubs --limit 10 | orphans --limit 10
+serve --mcp  → MCP server (5 primary tools; RAVEL_MCP_TOOLS=all for every tool)
 JSON compact default; --pretty humans only
-Edit with agent editor — ravel maps blast radius
+Edit with agent editor — ravel never writes source
 "#
 }
 
@@ -908,63 +1034,23 @@ fn emit_json(value: &impl serde::Serialize, pretty: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn write_agent_setup(root: &std::path::Path, claude: bool, force: bool) -> anyhow::Result<()> {
-    let agents = root.join("AGENTS.md");
-    let snippet = r#"
-## Ravel (code graph — prefer over grep/Read)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_core::daemon::DaemonCallError;
 
-```bash
-ravel --root . explore SYMBOL  # ONE call: search + callers + impact
-ravel --root . sync            # after edits (auto on explore)
-ravel --root . serve --mcp     # persistent MCP (stays fresh)
-```
+    #[test]
+    fn a_daemon_that_is_stopping_or_unreachable_is_answered_in_process() {
+        let refused = DaemonCallError::Remote("daemon is shutting down".into());
+        assert!(refused.is_shutting_down());
+        assert!(daemon_answer(Err(refused)).unwrap().is_none());
+        let unreachable = DaemonCallError::Transport(std::io::ErrorKind::NotFound.into());
+        assert!(daemon_answer(Err(unreachable)).unwrap().is_none());
 
-3 primary MCP tools (explore, status, sync) — schema overhead minimal.
-Full surface: `RAVEL_MCP_TOOLS=all`. Ravel does not write source files.
-"#;
-    if force || !agents.exists() {
-        if agents.exists() && force {
-            let mut existing = std::fs::read_to_string(&agents)?;
-            if !existing.contains("Ravel (code graph") {
-                existing.push_str(snippet);
-                std::fs::write(&agents, existing)?;
-            }
-        } else {
-            std::fs::write(&agents, format!("# Agent notes\n{snippet}"))?;
-        }
-    } else {
-        let mut existing = std::fs::read_to_string(&agents)?;
-        if !existing.contains("Ravel (code graph") {
-            existing.push_str(snippet);
-            std::fs::write(&agents, existing)?;
-        }
+        let failed = DaemonCallError::Remote("nothing in the index is named `x`".into());
+        let error = daemon_answer(Err(failed)).unwrap_err().to_string();
+        assert_eq!(error, "nothing in the index is named `x`");
+        let value = serde_json::json!({ "ok": true });
+        assert_eq!(daemon_answer(Ok(value.clone())).unwrap(), Some(value));
     }
-    if claude {
-        let claude_md = root.join("CLAUDE.md");
-        let block = "\n## Ravel\n\nUse `ravel --root . context <symbol>` before multi-file exploration. Run `ravel sync` after edits. Prefer ravel over raw grep for callers/impact/search.\n";
-        if claude_md.exists() {
-            let mut t = std::fs::read_to_string(&claude_md)?;
-            if !t.contains("## Ravel") {
-                t.push_str(block);
-                std::fs::write(&claude_md, t)?;
-            }
-        } else {
-            std::fs::write(&claude_md, format!("# Project\n{block}"))?;
-        }
-        let mcp_example = root.join(".ravel").join("mcp.example.json");
-        std::fs::create_dir_all(mcp_example.parent().unwrap())?;
-        std::fs::write(
-            mcp_example,
-            serde_json::json!({
-                "mcpServers": {
-                    "ravel": {
-                        "command": "ravel",
-                        "args": ["--root", root.display().to_string(), "mcp"]
-                    }
-                }
-            })
-            .to_string(),
-        )?;
-    }
-    Ok(())
 }

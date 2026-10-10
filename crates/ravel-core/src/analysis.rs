@@ -7,6 +7,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,7 +38,10 @@ pub struct ImpactReport {
     /// True when the traversal completed within budgets, so `total_affected`
     /// is the actual count rather than a saturated lower bound.
     pub exact: bool,
+    /// True when `affected` omits reached nodes ranked after this page, or the
+    /// traversal itself stopped at a budget.
     pub truncated: bool,
+    /// The budget the traversal hit, else `page_size` when only the page was cut.
     pub reason: Option<String>,
 }
 
@@ -144,43 +148,60 @@ pub fn file_cycles(graph: &GraphIndex, path_filter: Option<&str>) -> Vec<CycleIn
 }
 
 /// Impact with risk scoring from reverse BFS depths + reverse adjacency degree.
+///
+/// Every node the walk reached is scored, and the page (`limits.cursor`, `limits.page_size`) is
+/// cut from that ranking. The walk pages by name, so ranking only its first page could leave the
+/// direct dependents -- the highest risk -- out of the report entirely.
 pub fn impact_with_risk(
     graph: &GraphIndex,
     node: &str,
     limits: &QueryLimits,
 ) -> Result<ImpactReport, crate::graph::QueryError> {
-    let (page, depth_map) = graph.callers_of_with_depths(node, limits)?;
+    // The depth map covers the whole walk; a name-ordered page of it would only be discarded.
+    let walk_limits = QueryLimits {
+        page_size: 0,
+        cursor: 0,
+        ..limits.clone()
+    };
+    let (walk, depth_map) = graph.callers_of_with_depths(node, &walk_limits)?;
 
-    let mut affected = Vec::new();
-    for item in &page.items {
-        let id = graph.node_id(item);
-        let depth = id.and_then(|id| depth_map.get(&id)).copied().unwrap_or(1);
-        let in_degree = id.map(|id| graph.in_degree_id(id)).unwrap_or(0);
-        let (risk, score) = score_risk(depth, in_degree);
-        affected.push(ImpactItem {
-            symbol: item.clone(),
+    let mut ranked: Vec<(&str, usize, usize, RiskLevel, u32)> = depth_map
+        .into_iter()
+        // Depth 0 is the root itself.
+        .filter(|&(_, depth)| depth > 0)
+        .filter_map(|(id, depth)| {
+            let in_degree = graph.in_degree_id(id);
+            let (risk, score) = score_risk(depth, in_degree);
+            Some((graph.node_name(id)?, depth, in_degree, risk, score))
+        })
+        .collect();
+    // Names are unique, so the key is total and an unstable sort is deterministic.
+    ranked.sort_unstable_by_key(|&(symbol, _, _, risk, score)| {
+        (risk_rank(risk), Reverse(score), symbol)
+    });
+    let total_affected = ranked.len();
+    let start = limits.cursor.min(total_affected);
+    let end = start.saturating_add(limits.page_size).min(total_affected);
+    let more = end < total_affected;
+    let affected = ranked[start..end]
+        .iter()
+        .map(|&(symbol, depth, in_degree, risk, score)| ImpactItem {
+            symbol: symbol.to_owned(),
             depth,
             in_degree,
             risk,
             score,
-        });
-    }
-    affected.sort_by(|a, b| {
-        risk_rank(a.risk)
-            .cmp(&risk_rank(b.risk))
-            .then_with(|| b.score.cmp(&a.score))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+        })
+        .collect();
     Ok(ImpactReport {
         root: node.into(),
-        snapshot_id: page.snapshot_id,
-        // `items` is only the first bounded page; visited nodes describe the complete traversal
-        // admitted by the configured budgets.
-        total_affected: page.visited_nodes.saturating_sub(1),
-        exact: !page.truncated,
+        snapshot_id: walk.snapshot_id,
+        total_affected,
+        exact: !walk.truncated,
         affected,
-        truncated: page.truncated,
-        reason: page.reason,
+        // `affected` leaves out ranked nodes after this page as surely as a budget-cut walk does.
+        truncated: walk.truncated || more,
+        reason: walk.reason.or_else(|| more.then(|| "page_size".into())),
     })
 }
 
@@ -315,29 +336,30 @@ pub fn hubs(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
 pub fn hubs_from_graph(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
     let limit = limit.max(1);
     // Partial top-k with binary heap would be O(V log k); for k small this matters at scale.
-    use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut heap: BinaryHeap<Reverse<(usize, String, usize)>> = BinaryHeap::new();
+    // Keyed by the final order (in-degree descending, then name), so the max-heap's top is the
+    // entry the cutoff drops first: the lowest in-degree and, among those, the name sorting last.
+    // A tie at the cutoff is then decided by name, not by which node was interned first.
+    let mut heap: BinaryHeap<(Reverse<usize>, String, usize)> = BinaryHeap::new();
     for (id, name) in graph.node_entries() {
         let in_d = graph.in_degree_id(id);
         if in_d == 0 {
             continue;
         }
-        // Min-heap by in_degree among top-k (Reverse makes BinaryHeap a min-heap).
         // out_degree is only fetched when the node actually enters the heap.
         if heap.len() < limit {
-            heap.push(Reverse((in_d, name.to_owned(), graph.out_degree_id(id))));
-        } else if let Some(Reverse((min_in, _, _))) = heap.peek() {
-            if in_d > *min_in {
-                let out_d = graph.out_degree_id(id);
-                heap.pop();
-                heap.push(Reverse((in_d, name.to_owned(), out_d)));
-            }
+            heap.push((Reverse(in_d), name.to_owned(), graph.out_degree_id(id)));
+        } else if let Some((worst_in, worst_name, _)) = heap.peek()
+            && (Reverse(in_d), name) < (*worst_in, worst_name.as_str())
+        {
+            let out_d = graph.out_degree_id(id);
+            heap.pop();
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
         }
     }
     let mut entries: Vec<HubEntry> = heap
         .into_iter()
-        .map(|Reverse((in_degree, name, out_degree))| HubEntry {
+        .map(|(Reverse(in_degree), name, out_degree)| HubEntry {
             name,
             in_degree,
             out_degree,
@@ -355,23 +377,36 @@ pub fn hubs_from_graph(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
 
 /// Attach kind/path from symbol meta and optionally filter by kind substring (e.g. `class`, `injectable`).
 pub fn enrich_hubs(
-    mut hubs: Vec<HubEntry>,
+    hubs: Vec<HubEntry>,
     symbols: Option<&SymbolMetaDict>,
     kind_filter: Option<&str>,
 ) -> Vec<HubEntry> {
-    if let Some(meta) = symbols {
-        let by_id: FxHashMap<&str, &crate::model::SymbolMeta> = meta
-            .entries
+    let by_id: Option<FxHashMap<&str, &crate::model::SymbolMeta>> = symbols.map(|meta| {
+        meta.entries
             .iter()
             .chain(meta.duplicates.iter())
             .map(|e| (e.id.as_str(), e))
-            .collect();
-        for h in &mut hubs {
-            if let Some(m) = by_id.get(h.name.as_str()) {
-                h.name = m.qualified_name.clone();
-                h.kind = Some(m.kind.to_string());
-                h.path = Some(m.path.clone());
-            }
+            .collect()
+    });
+    enrich_hubs_with(
+        hubs,
+        |id| by_id.as_ref()?.get(id).map(|meta| (*meta).clone()),
+        kind_filter,
+    )
+}
+
+/// [`enrich_hubs`] against a per-id lookup, so a caller holding an indexed symbol store can annotate
+/// the hubs it returns without materializing metadata for every symbol in the workspace.
+pub fn enrich_hubs_with(
+    mut hubs: Vec<HubEntry>,
+    mut lookup: impl FnMut(&str) -> Option<crate::model::SymbolMeta>,
+    kind_filter: Option<&str>,
+) -> Vec<HubEntry> {
+    for h in &mut hubs {
+        if let Some(m) = lookup(h.name.as_str()) {
+            h.name = m.qualified_name;
+            h.kind = Some(m.kind.to_string());
+            h.path = Some(m.path);
         }
     }
     if let Some(kf) = kind_filter {
@@ -479,16 +514,7 @@ pub fn list_packages_from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) ->
 }
 
 fn package_from_path(path: &str) -> String {
-    // Single pass, no intermediate Vec: segment after the first apps|libs|packages marker.
-    let mut it = path.split('/');
-    while let Some(p) = it.next() {
-        if matches!(p, "apps" | "libs" | "packages") {
-            if let Some(next) = it.next() {
-                return next.to_owned();
-            }
-        }
-    }
-    "workspace".into()
+    crate::graph::package_name(path)
 }
 
 /// Minimal GraphViz DOT of package graph.
@@ -521,6 +547,8 @@ pub fn export_package_dot(graph: &GraphIndex) -> String {
 /// Map a source path to likely test companions using common naming conventions.
 pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
     const DEFAULT_TEST_PATTERNS: &[&str] = &[".spec.ts", ".test.ts", ".spec.js", ".test.js"];
+    /// Source extensions the defaults above do not already cover.
+    const SOURCE_ONLY_EXTENSIONS: &[&str] = &["tsx", "jsx", "mts", "cts", "mjs", "cjs"];
     let path = path.replace('\\', "/");
     // strip extension
     let stem = path
@@ -532,15 +560,20 @@ pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
         .rsplit_once('.')
         .map(|(s, _)| s.to_owned())
         .unwrap_or_else(|| base.to_owned());
-    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
+    // Empty for a root-level file: `./foo.test.ts` names the same file as `foo.test.ts`, and both
+    // passed the on-disk check, so every test was listed twice.
+    let dir = path
+        .rsplit_once('/')
+        .map(|(d, _)| format!("{d}/"))
+        .unwrap_or_default();
     let mut out = Vec::new();
     let mut apply = |pat: &str| {
         // Only extension-style patterns (`.spec.ts`). The former `{pre}.{ext}` line was
         // bit-identical to `{stem}{pat}` (pre==stem) and only survived via dedup — dropped.
         if pat.starts_with('.') {
             out.push(format!("{stem}{pat}"));
-            out.push(format!("{dir}/__tests__/{base_stem}{pat}"));
-            out.push(format!("{dir}/{base_stem}{pat}"));
+            out.push(format!("{dir}__tests__/{base_stem}{pat}"));
+            out.push(format!("{dir}{base_stem}{pat}"));
             // src→test mirrors (NestJS/Jest monorepo layout): apps/X/src/**/f.ts
             // → apps/X/test/**/f.spec.ts (and tests/).
             if let Some((prefix, suffix)) = stem.split_once("/src/") {
@@ -555,6 +588,12 @@ pub fn related_tests(path: &str, patterns: &[String]) -> Vec<String> {
     if patterns.is_empty() {
         for &pat in DEFAULT_TEST_PATTERNS {
             apply(pat);
+        }
+        // Tests are usually written in the source's own dialect: `Button.tsx` → `Button.test.tsx`.
+        let extension = base.rsplit_once('.').map(|(_, ext)| ext);
+        if let Some(ext) = extension.filter(|ext| SOURCE_ONLY_EXTENSIONS.contains(ext)) {
+            apply(&format!(".spec.{ext}"));
+            apply(&format!(".test.{ext}"));
         }
     } else {
         for pat in patterns {
@@ -717,6 +756,79 @@ mod tests {
         assert_eq!(report.total_affected, 2);
     }
 
+    /// target ← z ← a000..a104: the only direct dependent sorts after the 105 indirect ones by
+    /// name. Paging by name before ranking left `z` out of the report while it claimed to be
+    /// complete; the page has to be cut from the risk ranking of everything the walk reached.
+    #[test]
+    fn impact_page_is_cut_from_the_risk_ranking_of_every_reached_node() {
+        let mut edges = vec![edge("z", "target")];
+        edges.extend((0..105).map(|i| edge(&format!("a{i:03}"), "z")));
+        let graph = GraphIndex::from_edges(&edges, "s".into());
+
+        let report = impact_with_risk(&graph, "target", &QueryLimits::default()).unwrap();
+        assert_eq!(report.affected.len(), 100);
+        assert_eq!(report.affected[0].symbol, "z");
+        assert_eq!(report.affected[0].risk, RiskLevel::High);
+        assert_eq!(report.total_affected, 106);
+        assert!(report.exact, "the walk itself was complete");
+        assert!(report.truncated, "six reached nodes are not in `affected`");
+        assert_eq!(report.reason.as_deref(), Some("page_size"));
+
+        // The next page continues the same ranking and ends it.
+        let rest = impact_with_risk(
+            &graph,
+            "target",
+            &QueryLimits {
+                cursor: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rest: Vec<_> = rest.affected.iter().map(|i| i.symbol.as_str()).collect();
+        assert_eq!(rest, ["a099", "a100", "a101", "a102", "a103", "a104"]);
+
+        let complete = impact_with_risk(
+            &graph,
+            "target",
+            &QueryLimits {
+                page_size: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(complete.affected.len(), 106);
+        assert!(!complete.truncated);
+        assert_eq!(complete.reason, None);
+    }
+
+    /// The top-k must be the first k of the order it is reported in -- in-degree descending,
+    /// then name -- whatever order the nodes were interned in. The min-heap on (in-degree, name)
+    /// kept the first-seen of a tie at the cutoff and, when a stronger hub arrived, evicted the
+    /// tied name that sorts first instead of the one that sorts last.
+    #[test]
+    fn hubs_cut_ties_at_k_by_the_order_they_are_reported_in() {
+        let names = |hubs: Vec<HubEntry>| hubs.into_iter().map(|h| h.name).collect::<Vec<_>>();
+
+        // x, b, a all have in-degree 1 and are interned in that order.
+        let tied = GraphIndex::from_edges(
+            &[edge("p", "x"), edge("q", "b"), edge("r", "a")],
+            "s".into(),
+        );
+        assert_eq!(names(hubs_from_graph(&tied, 2)), ["a", "b"]);
+
+        // a and z tie at in-degree 1; h (in-degree 2) arrives once the heap is full.
+        let evicting = GraphIndex::from_edges(
+            &[
+                edge("p", "a"),
+                edge("q", "z"),
+                edge("r", "h"),
+                edge("s", "h"),
+            ],
+            "s".into(),
+        );
+        assert_eq!(names(hubs_from_graph(&evicting, 2)), ["h", "a"]);
+    }
+
     #[test]
     fn policy_report_bounds_findings_but_keeps_complete_counts() {
         let finding = |code: &str, n: usize| crate::policy::PolicyFinding {
@@ -757,6 +869,45 @@ mod tests {
             ),
             "missing src→test mirror candidate, got {candidates:#?}"
         );
+    }
+
+    /// A root-level file has no directory to prefix: `./foo.test.ts` named the same file as
+    /// `foo.test.ts`, and `related-tests` checks both on disk, so it listed every test twice.
+    #[test]
+    fn related_tests_for_a_root_level_file_are_listed_once() {
+        let candidates = related_tests("foo.ts", &[]);
+        assert!(
+            candidates.iter().all(|c| !c.starts_with("./")),
+            "{candidates:#?}"
+        );
+        assert!(candidates.contains(&"foo.test.ts".to_owned()));
+        assert!(candidates.contains(&"__tests__/foo.test.ts".to_owned()));
+    }
+
+    /// Tests are usually written in the source's own dialect: `Button.tsx` → `Button.test.tsx`.
+    #[test]
+    fn related_tests_follow_the_source_extension() {
+        let candidates = related_tests("src/Button.tsx", &[]);
+        for expected in [
+            "src/Button.test.tsx",
+            "src/Button.spec.tsx",
+            "src/__tests__/Button.test.tsx",
+            "test/Button.test.tsx",
+            // The defaults still apply.
+            "src/Button.test.ts",
+        ] {
+            assert!(
+                candidates.contains(&expected.to_owned()),
+                "missing {expected}, got {candidates:#?}"
+            );
+        }
+        let module = related_tests("lib/util.mjs", &[]);
+        assert!(
+            module.contains(&"lib/util.test.mjs".to_owned()),
+            "{module:#?}"
+        );
+        // A plain `.ts` source adds nothing beyond the defaults.
+        assert_eq!(related_tests("src/a.ts", &[]).len(), 16);
     }
 
     #[test]
