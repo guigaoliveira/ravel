@@ -507,6 +507,26 @@ fn extract_node(
     .flatten();
     let enclosing = scoped_owner.as_ref().or(enclosing);
 
+    // Object literals, inline object types and class expressions that no declaration names start
+    // a new member scope: a method inside them is not a member of the class whose method they sit
+    // in. `const C = class {}` keeps the owner its declarator gave it.
+    let detached_owner = (matches!(kind, "object" | "object_type")
+        || (matches!(kind, "class" | "class_expression")
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind() != "variable_declarator")))
+    .then(|| {
+        enclosing
+            .filter(|owner| owner.member_owner.is_some())
+            .cloned()
+            .map(|mut owner| {
+                owner.member_owner = None;
+                owner
+            })
+    })
+    .flatten();
+    let enclosing = detached_owner.as_ref().or(enclosing);
+
     let is_branch = matches!(
         kind,
         "if_statement"
@@ -2877,6 +2897,53 @@ class Ctl {
         );
         assert!(has_ref("Ctl.svc", "Svc", EdgeKind::TypeOf));
         assert!(has_ref("Ctl.other", "Optional", EdgeKind::Decorates));
+    }
+
+    #[test]
+    fn nested_object_literal_and_unbound_class_methods_are_not_members_of_the_enclosing_class() {
+        let artifact = parse_source(
+            "store.ts",
+            br#"
+class Store {
+  subscribe() {
+    const handle = { unsubscribe() { cleanup(); } };
+    register(class { inner() {} });
+    const Bound = class { method() {} };
+    const typed = value as { probe(): void };
+    this.unsubscribe();
+    return handle;
+  }
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for fake in ["Store.unsubscribe", "Store.inner", "Store.probe"] {
+            assert!(
+                !artifact
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.qualified_name == fake),
+                "{fake} is not a member of Store; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(has_symbol(
+            &artifact,
+            "Store.subscribe.Bound.method",
+            "method"
+        ));
+        assert!(
+            artifact
+                .symbol_refs
+                .iter()
+                .any(|reference| reference.to == "cleanup" && reference.kind == EdgeKind::Calls),
+            "{:?}",
+            artifact.symbol_refs
+        );
     }
 
     #[test]
