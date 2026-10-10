@@ -65,13 +65,9 @@ pub fn collect_manifest_entry_paths(root: &Path) -> BTreeSet<String> {
     for name in ["tsconfig.json", "tsconfig.build.json", "tsconfig.app.json"] {
         let p = root.join(name);
         if let Ok(text) = fs::read_to_string(&p) {
-            // strip comments roughly for jsonc
-            let cleaned: String = text
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Ok(json) = serde_json::from_str::<Value>(&cleaned) {
+            // The resolver's JSONC reader: block and trailing comments and trailing commas made a
+            // line filter's output unparseable, and the `files` entries were silently dropped.
+            if let Some(json) = crate::resolver::parse_jsonc(&text) {
                 if let Some(files) = json.get("files").and_then(|v| v.as_array()) {
                     for f in files {
                         if let Some(s) = f.as_str() {
@@ -256,6 +252,22 @@ mod tests {
         fs::write(dir.path().join("src/cli.ts"), "export {}").unwrap();
         let entries = collect_manifest_entry_paths(dir.path());
         assert!(entries.contains("src/lib.ts"), "{entries:?}");
+        assert!(entries.contains("src/cli.ts"), "{entries:?}");
+    }
+
+    #[test]
+    fn tsconfig_files_are_entries_despite_jsonc_comments_and_trailing_commas() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            "{ /* build */ \"files\": [\"./src/main.ts\", /* cli */ \"./src/cli.ts\",], }",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "export {}").unwrap();
+        fs::write(dir.path().join("src/cli.ts"), "export {}").unwrap();
+        let entries = collect_manifest_entry_paths(dir.path());
+        assert!(entries.contains("src/main.ts"), "{entries:?}");
         assert!(entries.contains("src/cli.ts"), "{entries:?}");
     }
 

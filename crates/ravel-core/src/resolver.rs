@@ -724,7 +724,7 @@ fn resolve_exported_symbol(
                     ));
                 }
             }
-            None => targets.extend(definitions_in_file(universe, file, &export.local)),
+            None => targets.extend(module_scope_definitions(universe, file, &export.local)),
         }
     }
     if !explicit && exported_name != "default" {
@@ -747,7 +747,7 @@ fn resolve_exported_symbol(
     }
     if targets.is_empty() {
         targets.extend(
-            definitions_in_file(universe, file, exported_name)
+            module_scope_definitions(universe, file, exported_name)
                 .into_iter()
                 .filter(|definition| definition.exported),
         );
@@ -782,6 +782,20 @@ fn definitions_in_file(
     name: &str,
 ) -> Vec<SymbolDefinition> {
     universe.symbol_definitions_in_file(name, file)
+}
+
+/// The declarations a module export can name: those at module scope, not members. Definitions
+/// are looked up by short name, so without this `import { work } from './a'` reached the `work`
+/// of `export namespace Tools { export function work() {} }`, and a top-level `f` beside an
+/// `X.f` member was ambiguous.
+fn module_scope_definitions(
+    universe: &dyn ResolutionLookup,
+    file: &str,
+    name: &str,
+) -> Vec<SymbolDefinition> {
+    let mut definitions = definitions_in_file(universe, file, name);
+    definitions.retain(|definition| definition.qualified_name == definition.name);
+    definitions
 }
 
 /// TypeScript overloads, accessors, and declaration merging may produce several syntax nodes for
@@ -2091,7 +2105,7 @@ fn load_tsconfig_layer(
     Some(config)
 }
 
-fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut without_comments = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -3103,6 +3117,37 @@ class Child extends Base implements Shape {
             .filter(|edge| edge.kind == EdgeKind::Calls && edge.from == from_id)
             .map(|edge| edge.to.clone())
             .collect()
+    }
+
+    #[test]
+    fn an_import_names_a_module_scope_declaration_never_a_namespace_member() {
+        let root = tempdir().unwrap();
+        let tools = write_artifact(
+            root.path(),
+            "src/tools.ts",
+            "export namespace Tools { export function work() {} }\n",
+        );
+        let both = write_artifact(
+            root.path(),
+            "src/both.ts",
+            "export function f() {}\nexport namespace X { export function f() {} }\n",
+        );
+        let consumer = write_artifact(
+            root.path(),
+            "src/main.ts",
+            "import { work } from './tools';\nimport { f } from './both';\n\
+             export function run() { work(); f(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (tools.path.clone(), tools.clone()),
+            (both.path.clone(), both.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "run")),
+            [symbol_id(&both, "f")]
+        );
     }
 
     #[test]
