@@ -1905,7 +1905,8 @@ pub fn load_tsconfig(root: &Path) -> ResolverConfig {
 pub fn load_tsconfig_reporting(root: &Path) -> LoadedResolverConfig {
     let path = root.join("tsconfig.json");
     let mut problems = Vec::new();
-    let config = load_tsconfig_recursive(root, &path, &mut BTreeSet::new(), &mut problems);
+    let config = load_tsconfig_recursive(root, &path, &mut BTreeSet::new(), &mut problems)
+        .map(|layer| layer.into_config(root));
     if path.exists() && !path.is_file() {
         // A directory named `tsconfig.json` reads as "no config" to every layer below.
         problems.push(crate::model::Diagnostic {
@@ -1936,25 +1937,96 @@ pub struct LoadedResolverConfig {
     pub problems: Vec<crate::model::Diagnostic>,
 }
 
+/// One config of an `extends` chain as tsc merges it, before `paths` are resolved. tsc keeps
+/// `paths` as written and resolves them against the *final* `baseUrl` -- or, with none, against the
+/// directory of the config that defined them -- so they can only be resolved once the whole chain
+/// is merged. Resolving them while loading each base pinned an inherited `paths` to the base's own
+/// directory even when the top config set `baseUrl`.
+#[derive(Default)]
+struct TsconfigLayer {
+    /// Root-relative and normalized, like [`ResolverConfig::base_url`].
+    base_url: Option<PathBuf>,
+    /// `paths` as written, with the directory of the config that defined them.
+    paths: Option<(BTreeMap<String, Vec<String>>, PathBuf)>,
+    extensions: Vec<String>,
+    max_candidates: usize,
+}
+
+impl TsconfigLayer {
+    fn into_config(self, root: &Path) -> ResolverConfig {
+        let base_url = self.base_url;
+        let paths = self
+            .paths
+            .map(|(raw, defined_in)| {
+                let target_base = base_url
+                    .as_ref()
+                    .map(|base| root.join(base))
+                    .unwrap_or(defined_in);
+                raw.into_iter()
+                    .map(|(alias, targets)| {
+                        let targets = targets
+                            .iter()
+                            .map(|target| {
+                                normalize_lexical(
+                                    root,
+                                    &target_base.join(substitute_config_dir(root, target)),
+                                )
+                            })
+                            .collect();
+                        (alias, targets)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ResolverConfig {
+            base_url,
+            paths,
+            extensions: self.extensions,
+            max_candidates: self.max_candidates,
+        }
+    }
+}
+
+/// tsc's `${configDir}` template: a path option starting with it is taken relative to the
+/// directory of the config being compiled -- the workspace's own `tsconfig.json` -- whichever
+/// config in the chain wrote it.
+fn substitute_config_dir(root: &Path, value: &str) -> PathBuf {
+    match value.strip_prefix("${configDir}") {
+        Some(rest) => root.join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(value),
+    }
+}
+
+/// `stack` holds the configs being loaded right now, not every config loaded so far: two bases
+/// may both extend one common config (a diamond), and only a config that reaches itself again is
+/// a cycle.
 fn load_tsconfig_recursive(
     root: &Path,
     path: &Path,
-    visited: &mut BTreeSet<PathBuf>,
+    stack: &mut BTreeSet<PathBuf>,
     problems: &mut Vec<crate::model::Diagnostic>,
-) -> Option<ResolverConfig> {
+) -> Option<TsconfigLayer> {
     let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(identity) {
+    if !stack.insert(identity.clone()) {
         return None;
     }
+    let layer = load_tsconfig_layer(root, path, stack, problems);
+    stack.remove(&identity);
+    layer
+}
+
+fn load_tsconfig_layer(
+    root: &Path,
+    path: &Path,
+    stack: &mut BTreeSet<PathBuf>,
+    problems: &mut Vec<crate::model::Diagnostic>,
+) -> Option<TsconfigLayer> {
     let text = fs::read_to_string(path).ok()?;
-    // `tsc` treats an empty file as `{}`. Reporting it as unparseable turns a harmless placeholder
-    // into a permanent hint telling the caller to fix a file that is already fine.
-    if text.trim().is_empty() {
-        return Some(ResolverConfig::default());
-    }
-    let value = parse_jsonc(&text)?;
+    // tsc drops a UTF-8 byte-order mark, which editors on Windows like to write.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    let value = parse_jsonc(text)?;
     let directory = path.parent().unwrap_or(root);
-    let mut config = ResolverConfig::default();
+    let mut config = TsconfigLayer::default();
     let inherited: Vec<_> = match value.get("extends") {
         Some(serde_json::Value::String(value)) => vec![value.as_str()],
         Some(serde_json::Value::Array(values)) => values
@@ -1973,7 +2045,7 @@ fn load_tsconfig_recursive(
         if !inherited_path.is_file() {
             inherited_path = PathBuf::from(format!("{}.json", inherited_path.to_string_lossy()));
         }
-        let base = load_tsconfig_recursive(root, &inherited_path, visited, problems);
+        let base = load_tsconfig_recursive(root, &inherited_path, stack, problems);
         if base.is_none() {
             // The aliases usually live in the base config of a monorepo, so a base that cannot be
             // read takes them all with it -- and the top file parses fine, so nothing else notices.
@@ -1991,7 +2063,7 @@ fn load_tsconfig_recursive(
             if base.base_url.is_some() {
                 config.base_url = base.base_url;
             }
-            if !base.paths.is_empty() {
+            if base.paths.is_some() {
                 config.paths = base.paths;
             }
             if !base.extensions.is_empty() {
@@ -2004,29 +2076,13 @@ fn load_tsconfig_recursive(
     if let Some(base_url) = options.get("baseUrl").and_then(|value| value.as_str()) {
         config.base_url = Some(PathBuf::from(normalize_lexical(
             root,
-            &directory.join(base_url),
+            &directory.join(substitute_config_dir(root, base_url)),
         )));
     }
     if let Some(raw_paths) = options.get("paths").and_then(|value| {
         serde_json::from_value::<BTreeMap<String, Vec<String>>>(value.clone()).ok()
     }) {
-        let target_base = config
-            .base_url
-            .as_ref()
-            .map(|base| root.join(base))
-            .unwrap_or_else(|| directory.to_path_buf());
-        config.paths = raw_paths
-            .into_iter()
-            .map(|(alias, targets)| {
-                (
-                    alias,
-                    targets
-                        .into_iter()
-                        .map(|target| normalize_lexical(root, &target_base.join(target)))
-                        .collect(),
-                )
-            })
-            .collect();
+        config.paths = Some((raw_paths, directory.to_path_buf()));
     }
     Some(config)
 }
@@ -2124,6 +2180,12 @@ fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
         json.push(byte);
         index += 1;
     }
+    // tsc reads a config that is empty, or nothing but comments, as `{}`. Reporting it as
+    // unparseable turns a harmless placeholder into a permanent hint telling the caller to fix a
+    // file that is already fine.
+    if json.iter().all(u8::is_ascii_whitespace) {
+        return Some(serde_json::Value::Object(serde_json::Map::new()));
+    }
     serde_json::from_slice(&json).ok()
 }
 
@@ -2175,6 +2237,151 @@ mod tests {
                 .map(|problem| problem.code.as_str())
                 .collect::<Vec<_>>(),
             ["tsconfig_not_a_file"]
+        );
+    }
+
+    fn write_configs(root: &Path, files: &[(&str, &str)]) {
+        for (path, text) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_tsconfig_with_a_bom_or_only_comments_is_not_unparsed() {
+        // Editors on Windows save `tsconfig.json` with a UTF-8 byte-order mark, and a freshly
+        // generated config can be nothing but comments. tsc reads the first normally and the
+        // second as `{}`; reporting either as unparsed dropped every alias.
+        let root = tempdir().unwrap();
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    "\u{FEFF}{ \"extends\": \"./tsconfig.base.json\" }",
+                ),
+                (
+                    "tsconfig.base.json",
+                    "\u{FEFF}{ \"compilerOptions\": { \"paths\": { \"@lib/*\": [\"src/*\"] } } }",
+                ),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(
+            loaded.config.paths,
+            BTreeMap::from([("@lib/*".to_owned(), vec!["src/*".to_owned()])])
+        );
+
+        write_configs(
+            root.path(),
+            &[("tsconfig.json", "// configured later\n/* { } */\n")],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.config, ResolverConfig::default());
+    }
+
+    #[test]
+    fn two_bases_extending_one_common_config_is_not_a_cycle() {
+        // A diamond: both bases extend `common.json`. Only a config extending itself is a cycle;
+        // a global seen-set reported the second visit as unreadable and dropped what it held.
+        let root = tempdir().unwrap();
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": ["./configs/a.json", "./configs/b.json"] }"#,
+                ),
+                ("configs/a.json", r#"{ "extends": "./common.json" }"#),
+                (
+                    "configs/b.json",
+                    r#"{ "extends": "./common.json", "compilerOptions": { "baseUrl": "../src" } }"#,
+                ),
+                (
+                    "configs/common.json",
+                    r#"{ "compilerOptions": { "paths": { "@lib/*": ["lib/*"] } } }"#,
+                ),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.config.base_url, Some(PathBuf::from("src")));
+
+        // A real cycle still ends.
+        write_configs(
+            root.path(),
+            &[("configs/common.json", r#"{ "extends": "./b.json" }"#)],
+        );
+        let cyclic = load_tsconfig_reporting(root.path());
+        assert!(!cyclic.problems.is_empty());
+    }
+
+    #[test]
+    fn inherited_paths_resolve_against_the_final_base_url_or_their_own_config() {
+        // tsc keeps `paths` as written and resolves them against the merged `baseUrl`, or, with
+        // none, against the directory of the config that defined them. `${configDir}` is the
+        // directory of the config being compiled.
+        let root = tempdir().unwrap();
+        let base = r#"{ "compilerOptions": { "paths": {
+            "@lib/*": ["lib/*"],
+            "@app/*": ["${configDir}/app/*"]
+        } } }"#;
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": "./configs/base.json", "compilerOptions": { "baseUrl": "./src" } }"#,
+                ),
+                ("configs/base.json", base),
+            ],
+        );
+        let loaded = load_tsconfig_reporting(root.path());
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(
+            loaded.config.paths,
+            BTreeMap::from([
+                ("@app/*".to_owned(), vec!["app/*".to_owned()]),
+                ("@lib/*".to_owned(), vec!["src/lib/*".to_owned()]),
+            ])
+        );
+
+        // No baseUrl anywhere: relative to the config that holds `paths`.
+        write_configs(
+            root.path(),
+            &[("tsconfig.json", r#"{ "extends": "./configs/base.json" }"#)],
+        );
+        assert_eq!(
+            load_tsconfig(root.path()).paths,
+            BTreeMap::from([
+                ("@app/*".to_owned(), vec!["app/*".to_owned()]),
+                ("@lib/*".to_owned(), vec!["configs/lib/*".to_owned()]),
+            ])
+        );
+
+        // A baseUrl set in the base and paths set on top: the base's baseUrl still applies.
+        write_configs(
+            root.path(),
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{ "extends": "./configs/with-base-url.json",
+                         "compilerOptions": { "paths": { "@x/*": ["x/*"] } } }"#,
+                ),
+                (
+                    "configs/with-base-url.json",
+                    r#"{ "compilerOptions": { "baseUrl": "${configDir}/packages" } }"#,
+                ),
+            ],
+        );
+        let loaded = load_tsconfig(root.path());
+        assert_eq!(loaded.base_url, Some(PathBuf::from("packages")));
+        assert_eq!(
+            loaded.paths,
+            BTreeMap::from([("@x/*".to_owned(), vec!["packages/x/*".to_owned()])])
         );
     }
     use super::*;
