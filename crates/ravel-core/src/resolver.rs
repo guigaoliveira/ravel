@@ -1769,7 +1769,13 @@ fn path_alias_specificity(alias: &str) -> (bool, usize, usize) {
         })
 }
 
+/// Extensions a specifier can carry that name a JS/TS module, and so get replaced rather than
+/// appended to.
 const DEFAULT_RESOLVE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+/// Extensions appended to an extensionless specifier (and to `index`), in order. Declaration files
+/// are indexed, so `./types` must reach `types.d.ts`; TypeScript tries it right after `.tsx`.
+const DEFAULT_PROBE_EXTS: &[&str] = &["ts", "tsx", "d.ts", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 struct CandidateProbe {
     existing: Vec<String>,
@@ -1784,63 +1790,74 @@ fn file_candidates(
 ) -> CandidateProbe {
     let mut existing = Vec::new();
     let mut attempted = BTreeSet::new();
-    let normalized_base = normalize_lexical(root, base);
-    attempted.insert(normalized_base.clone());
-    if universe.contains_file(&normalized_base) {
-        existing.push(normalized_base);
-        return CandidateProbe {
-            existing,
-            attempted,
-        };
-    }
+    // Every probe up to the first hit is recorded: a file appearing at any of them later changes
+    // the answer, which is what incremental invalidation keys on.
+    let mut probe = |path: &Path| {
+        let normalized = normalize_lexical(root, path);
+        attempted.insert(normalized.clone());
+        let found = universe.contains_file(&normalized);
+        if found {
+            existing.push(normalized);
+        }
+        found
+    };
     // Iterate config extensions by reference; fall back to a static default set — no per-call
     // `Vec<String>` clone/allocation.
-    let probe = |ext: &str, existing: &mut Vec<String>, attempted: &mut BTreeSet<String>| {
-        let source_extension = base
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| DEFAULT_RESOLVE_EXTS.contains(&value));
-        let path = if source_extension {
-            base.with_extension(ext)
-        } else {
-            PathBuf::from(format!("{}.{ext}", base.to_string_lossy()))
-        };
-        let normalized = normalize_lexical(root, &path);
-        attempted.insert(normalized.clone());
-        if universe.contains_file(&normalized) {
-            existing.push(normalized);
-            true
-        } else {
-            false
+    let default_extensions = config.extensions.is_empty();
+    let extensions = || {
+        config.extensions.iter().map(String::as_str).chain(
+            DEFAULT_PROBE_EXTS
+                .iter()
+                .copied()
+                .filter(move |_| default_extensions),
+        )
+    };
+    let source_extension = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| DEFAULT_RESOLVE_EXTS.contains(value));
+    let found = match source_extension {
+        // A JS/TS extension is replaced the way TypeScript replaces it, so `./util.js` reaches
+        // `util.ts` ahead of an emitted `util.js` beside it; every other extension stays a lenient
+        // fallback after those.
+        Some(original) => {
+            let substitutions = typescript_substitutions(original);
+            substitutions
+                .iter()
+                .any(|extension| probe(&base.with_extension(extension)))
+                || extensions()
+                    .filter(|extension| !substitutions.contains(extension))
+                    .any(|extension| probe(&base.with_extension(extension)))
+        }
+        None => {
+            probe(base)
+                || extensions().any(|extension| {
+                    probe(&PathBuf::from(format!(
+                        "{}.{extension}",
+                        base.to_string_lossy()
+                    )))
+                })
         }
     };
-    if config.extensions.is_empty() {
-        for &ext in DEFAULT_RESOLVE_EXTS {
-            if probe(ext, &mut existing, &mut attempted) {
-                break;
-            }
-        }
-    } else {
-        for ext in &config.extensions {
-            if probe(ext, &mut existing, &mut attempted) {
-                break;
-            }
-        }
-    }
-    if existing.is_empty() {
-        for extension in ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"] {
-            let path = base.join(format!("index.{extension}"));
-            let normalized = normalize_lexical(root, &path);
-            attempted.insert(normalized.clone());
-            if universe.contains_file(&normalized) {
-                existing.push(normalized);
-                break;
-            }
-        }
+    if !found {
+        DEFAULT_PROBE_EXTS
+            .iter()
+            .any(|extension| probe(&base.join(format!("index.{extension}"))));
     }
     CandidateProbe {
         existing,
         attempted,
+    }
+}
+
+/// What TypeScript tries in place of a specifier's own JS/TS extension (`tryAddingExtensions`):
+/// the TypeScript source, then its declaration file, then the JavaScript file.
+fn typescript_substitutions(original: &str) -> &'static [&'static str] {
+    match original {
+        "tsx" | "jsx" => &["tsx", "ts", "d.ts", "jsx", "js"],
+        "mts" | "mjs" => &["mts", "d.mts", "mjs"],
+        "cts" | "cjs" => &["cts", "d.cts", "cjs"],
+        _ => &["ts", "tsx", "d.ts", "js", "jsx"],
     }
 }
 
@@ -3026,6 +3043,112 @@ class Child extends Base implements Shape {
             calls_from(&edges, &symbol_id(&consumer, "viaDeclaration")),
             [symbol_id(&declaring, "foo")],
             "the local declaration wins over the star"
+        );
+    }
+
+    /// Where each of `consumer`'s imports resolved, in source order (`None` when unresolved).
+    fn import_targets(root: &Path, files: &[(&str, &str)], consumer: &str) -> Vec<Option<String>> {
+        let artifacts: BTreeMap<String, FileArtifact> = files
+            .iter()
+            .map(|(path, source)| {
+                let artifact = write_artifact(root, path, source);
+                (artifact.path.clone(), artifact)
+            })
+            .collect();
+        let universe = ResolutionUniverse::build(&artifacts, &ResolverConfig::default());
+        artifacts[consumer]
+            .imports
+            .iter()
+            .map(|import| {
+                resolve_one(
+                    root,
+                    consumer,
+                    &import.specifier,
+                    &universe,
+                    &ResolverConfig::default(),
+                )
+                .target
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declaration_files_are_probed_where_typescript_probes_them() {
+        // `.d.ts` files are indexed, so a type-only import of one has a target to resolve to.
+        let root = tempdir().unwrap();
+        let targets = import_targets(
+            root.path(),
+            &[
+                (
+                    "src/consumer.ts",
+                    "import type { W } from './types';\n\
+                     import type { W as V } from './types.js';\n\
+                     import type { M } from './m.mjs';\n\
+                     import type { C } from './c.cjs';\n\
+                     import type { L } from './lib';\n",
+                ),
+                ("src/types.d.ts", "export interface W {}"),
+                ("src/m.d.mts", "export interface M {}"),
+                ("src/c.d.cts", "export interface C {}"),
+                ("src/lib/index.d.ts", "export interface L {}"),
+            ],
+            "src/consumer.ts",
+        );
+        assert_eq!(
+            targets,
+            [
+                Some("src/types.d.ts".to_owned()),
+                Some("src/types.d.ts".to_owned()),
+                Some("src/m.d.mts".to_owned()),
+                Some("src/c.d.cts".to_owned()),
+                Some("src/lib/index.d.ts".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_js_extension_specifier_prefers_the_typescript_source_it_names() {
+        // Under TypeScript a `.js` specifier names the `.ts` file compiled to it, even when an
+        // emitted `.js` sits next to it; `.mjs` and `.cjs` name `.mts` and `.cts` first.
+        let root = tempdir().unwrap();
+        let targets = import_targets(
+            root.path(),
+            &[
+                (
+                    "src/consumer.ts",
+                    "import { u } from './util.js';\n\
+                     import { x } from './x.mjs';\n\
+                     import { y } from './y.cjs';\n\
+                     import { v } from './view.jsx';\n\
+                     import { d } from './only-ts.js';\n\
+                     import { b } from './b';\n",
+                ),
+                ("src/util.ts", "export const u = 1;"),
+                ("src/util.js", "export const u = 1;"),
+                ("src/x.ts", "export const x = 1;"),
+                ("src/x.mts", "export const x = 1;"),
+                ("src/x.mjs", "export const x = 1;"),
+                ("src/y.ts", "export const y = 1;"),
+                ("src/y.cts", "export const y = 1;"),
+                ("src/y.cjs", "export const y = 1;"),
+                ("src/view.tsx", "export const v = 1;"),
+                ("src/view.jsx", "export const v = 1;"),
+                ("src/only-ts.mts", "export const d = 1;"),
+                ("src/b.mts", "export const b = 1;"),
+            ],
+            "src/consumer.ts",
+        );
+        assert_eq!(
+            targets,
+            [
+                Some("src/util.ts".to_owned()),
+                Some("src/x.mts".to_owned()),
+                Some("src/y.cts".to_owned()),
+                Some("src/view.tsx".to_owned()),
+                // Outside TypeScript's own substitutions the other extensions remain a fallback.
+                Some("src/only-ts.mts".to_owned()),
+                Some("src/b.mts".to_owned()),
+            ]
         );
     }
 
