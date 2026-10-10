@@ -38,6 +38,8 @@ const DEFAULT_DAEMON_MIN_CONNECTIONS: usize = 8;
 const DEFAULT_DAEMON_CONNECTIONS_PER_CPU: usize = 4;
 const DEFAULT_DAEMON_MAX_LEASES: usize = 32;
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A daemon's answer while it drains its last connections before exiting.
+const SHUTTING_DOWN: &str = "daemon is shutting down";
 
 fn max_connections() -> usize {
     std::env::var("RAVEL_DAEMON_MAX_CONNECTIONS")
@@ -593,6 +595,14 @@ pub enum DaemonCallError {
     Remote(String),
 }
 
+impl DaemonCallError {
+    /// The daemon is about to exit. Not an answer to the question asked: it is gone in a moment,
+    /// and the caller does best to ask a fresh one.
+    pub fn is_shutting_down(&self) -> bool {
+        matches!(self, Self::Remote(message) if message == SHUTTING_DOWN)
+    }
+}
+
 fn invalid_protocol(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -631,6 +641,7 @@ pub fn serve(root: &Path, transient: bool) -> anyhow::Result<()> {
         persistent: AtomicBool::new(!transient),
         shutdown: AtomicBool::new(false),
         leases: AtomicUsize::new(0),
+        lifecycle: Mutex::new(()),
         inflight_requests: AtomicUsize::new(0),
         active_connections: AtomicUsize::new(0),
         max_connections: max_connections(),
@@ -698,10 +709,12 @@ fn spawn_bootstrap_monitor(state: Arc<DaemonState>) {
                     Ok(_) => continue,
                 }
             }
+            let lifecycle = state.lifecycle();
             if state.leases.load(Ordering::Acquire) == 0
                 && !state.persistent.load(Ordering::Acquire)
             {
                 state.shutdown.store(true, Ordering::Release);
+                drop(lifecycle);
                 wake_if_drained(&state);
             }
         });
@@ -711,12 +724,25 @@ struct DaemonState {
     persistent: AtomicBool,
     shutdown: AtomicBool,
     leases: AtomicUsize,
+    /// Held while granting or ending a lease, promoting or stopping the daemon. Each of those reads
+    /// what another changes -- a lease granted just as `stop` found none held, or `start` promoting
+    /// a daemon as its last lease ends -- and deciding them one at a time is what keeps
+    /// `shutdown` and a held lease from ever being true together.
+    lifecycle: Mutex<()>,
     inflight_requests: AtomicUsize,
     active_connections: AtomicUsize,
     max_connections: usize,
     max_leases: usize,
     request_timeout: Duration,
     wake_endpoint: LocalEndpoint,
+}
+
+impl DaemonState {
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 struct ConnectionGuard<'a>(&'a DaemonState);
@@ -943,12 +969,9 @@ fn handle_connection(
     };
     if matches!(operation, DaemonOperation::Lease) {
         let lease = match LeaseGuard::try_new(state) {
-            Some(lease) => lease,
-            None => {
-                write_frame(
-                    stream,
-                    &WireResponse::Error("daemon lease limit reached".into()),
-                )?;
+            Ok(lease) => lease,
+            Err(refusal) => {
+                write_frame(stream, &WireResponse::Error(refusal.into()))?;
                 return Ok(false);
             }
         };
@@ -964,10 +987,7 @@ fn handle_connection(
         return Ok(false);
     }
     if state.shutdown.load(Ordering::Acquire) && !matches!(operation, DaemonOperation::Shutdown) {
-        write_frame(
-            stream,
-            &WireResponse::Error("daemon is shutting down".into()),
-        )?;
+        write_frame(stream, &WireResponse::Error(SHUTTING_DOWN.into()))?;
         return Ok(false);
     }
     serve_operation(stream, engine, state, operation)
@@ -1011,10 +1031,7 @@ fn serve_lease(
             continue;
         }
         if state.shutdown.load(Ordering::Acquire) {
-            write_frame(
-                stream,
-                &WireResponse::Error("daemon is shutting down".into()),
-            )?;
+            write_frame(stream, &WireResponse::Error(SHUTTING_DOWN.into()))?;
             return Ok(());
         }
         serve_operation(stream, engine, state, operation)?;
@@ -1027,7 +1044,7 @@ fn serve_operation(
     state: &DaemonState,
     operation: DaemonOperation,
 ) -> io::Result<bool> {
-    let shutdown = matches!(operation, DaemonOperation::Shutdown);
+    let mut shutdown = false;
     let operation_kind = OperationKind::of(&operation);
     let request_guard = RequestGuard::new(state);
     let response: Result<Value, String> = match operation {
@@ -1078,10 +1095,31 @@ fn serve_operation(
         }
         DaemonOperation::Lease => unreachable!(),
         DaemonOperation::PromotePersistent => {
-            state.persistent.store(true, Ordering::Release);
-            Ok(serde_json::json!({ "persistent": true }))
+            let _lifecycle = state.lifecycle();
+            // Its last lease may have ended since the connection was let in. Promoting it now
+            // would answer `start` with a daemon that is about to exit.
+            if state.shutdown.load(Ordering::Acquire) {
+                Err(SHUTTING_DOWN.to_owned())
+            } else {
+                state.persistent.store(true, Ordering::Release);
+                Ok(serde_json::json!({ "persistent": true }))
+            }
         }
-        DaemonOperation::Shutdown => Ok(serde_json::json!({ "shutdown": true })),
+        DaemonOperation::Shutdown => {
+            let _lifecycle = state.lifecycle();
+            // `stop` undoes `start`: the daemon no longer stays for the CLI. Sessions that hold a
+            // lease keep it, exactly as they keep a transient daemon, until the last disconnects.
+            // Shutting down under them instead left a daemon that refused every call and could
+            // not exit while they were connected, and stopping it outright would only make each
+            // of them start another.
+            state.persistent.store(false, Ordering::Release);
+            let sessions = state.leases.load(Ordering::Acquire);
+            if sessions == 0 {
+                state.shutdown.store(true, Ordering::Release);
+                shutdown = true;
+            }
+            Ok(serde_json::json!({ "shutdown": true, "sessions": sessions }))
+        }
     };
     match response {
         Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
@@ -1094,7 +1132,6 @@ fn serve_operation(
         crate::release_memory();
     }
     if shutdown {
-        state.shutdown.store(true, Ordering::Release);
         drop(request_guard);
         wake_if_drained(state);
     }
@@ -1121,18 +1158,30 @@ impl OperationKind {
 struct LeaseGuard<'a>(&'a DaemonState);
 
 impl<'a> LeaseGuard<'a> {
-    fn try_new(state: &'a DaemonState) -> Option<Self> {
-        try_reserve(&state.leases, state.max_leases).then(|| Self(state))
+    /// The lease, or why it is refused.
+    fn try_new(state: &'a DaemonState) -> Result<Self, &'static str> {
+        let _lifecycle = state.lifecycle();
+        // A lease on a daemon that is on its way out would keep it from ever leaving, refusing
+        // every call meanwhile. Refused, the client starts a fresh daemon once this one is gone.
+        if state.shutdown.load(Ordering::Acquire) {
+            return Err(SHUTTING_DOWN);
+        }
+        if !try_reserve(&state.leases, state.max_leases) {
+            return Err("daemon lease limit reached");
+        }
+        Ok(Self(state))
     }
 }
 
 impl Drop for LeaseGuard<'_> {
     fn drop(&mut self) {
+        let lifecycle = self.0.lifecycle();
         if self.0.leases.fetch_sub(1, Ordering::AcqRel) == 1
             && !self.0.persistent.load(Ordering::Acquire)
         {
             self.0.shutdown.store(true, Ordering::Release);
         }
+        drop(lifecycle);
         wake_if_drained(self.0);
     }
 }
@@ -1470,6 +1519,56 @@ mod tests {
         let value = serde_json::Value::String("x".repeat(MAX_FRAME_BYTES));
         let error = write_frame(&mut Refuses, &value).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The bookkeeping of a daemon with nobody connected. Its wake endpoint leads nowhere.
+    fn idle_state(persistent: bool) -> DaemonState {
+        DaemonState {
+            persistent: AtomicBool::new(persistent),
+            shutdown: AtomicBool::new(false),
+            leases: AtomicUsize::new(0),
+            lifecycle: Mutex::new(()),
+            inflight_requests: AtomicUsize::new(0),
+            active_connections: AtomicUsize::new(0),
+            max_connections: 8,
+            max_leases: 2,
+            request_timeout: Duration::from_secs(1),
+            #[cfg(unix)]
+            wake_endpoint: LocalEndpoint::Unix(tempdir().unwrap().path().join("gone.sock")),
+            #[cfg(windows)]
+            wake_endpoint: LocalEndpoint::WindowsPipe(r"\\.\pipe\ravel-test-gone".into()),
+        }
+    }
+
+    #[test]
+    fn a_daemon_on_its_way_out_grants_no_lease() {
+        let state = idle_state(false);
+        let lease = LeaseGuard::try_new(&state).unwrap();
+        drop(lease);
+        assert!(
+            state.shutdown.load(Ordering::Acquire),
+            "a transient daemon ends with its last lease"
+        );
+        // A lease now would keep it from ever leaving while it refuses every call.
+        assert_eq!(LeaseGuard::try_new(&state).err(), Some(SHUTTING_DOWN));
+        assert_eq!(state.leases.load(Ordering::Acquire), 0);
+
+        let state = idle_state(true);
+        let _held = [
+            LeaseGuard::try_new(&state).unwrap(),
+            LeaseGuard::try_new(&state).unwrap(),
+        ];
+        assert_eq!(
+            LeaseGuard::try_new(&state).err(),
+            Some("daemon lease limit reached")
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_is_shutting_down_says_so_in_words_clients_recognise() {
+        assert!(DaemonCallError::Remote(SHUTTING_DOWN.into()).is_shutting_down());
+        assert!(!DaemonCallError::Remote("no such symbol".into()).is_shutting_down());
+        assert!(!DaemonCallError::Transport(io::Error::other(SHUTTING_DOWN)).is_shutting_down());
     }
 
     #[test]

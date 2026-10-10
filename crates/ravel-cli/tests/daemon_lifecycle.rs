@@ -466,6 +466,122 @@ fn a_lease_refuses_lifecycle_operations_and_keeps_serving() {
     assert!(daemon.wait().unwrap().success());
 }
 
+/// A daemon started the way `daemon start` starts one (not transient), killed if the test ends
+/// before it exits on its own.
+struct PersistentDaemon(std::process::Child);
+
+impl PersistentDaemon {
+    fn start(root: &Path) -> Self {
+        let daemon = Self(
+            Command::new(env!("CARGO_BIN_EXE_ravel"))
+                .arg("--root")
+                .arg(root)
+                .arg("daemon-serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let client = ravel_core::daemon::DaemonClient::for_root(root).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_ready() {
+            assert!(Instant::now() < deadline, "daemon never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon
+    }
+
+    fn exits_within(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.0.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+}
+
+impl Drop for PersistentDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn stop_leaves_the_daemon_to_its_sessions_until_the_last_one_ends() {
+    use ravel_core::daemon::DaemonOperation;
+
+    let root = indexed_workspace("stopShared");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let mut daemon = PersistentDaemon::start(root.path());
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    // An MCP session holds a lease on the daemon `daemon start` began.
+    let session = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+
+    let stop = command(binary, root.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    // Still serving everyone: the session, the CLI, and a session that joins now. A stop that
+    // shut down under the session left a daemon that refused every call and could not exit.
+    assert!(
+        session.call_text(DaemonOperation::Status).is_ok(),
+        "the session lost its daemon to `stop`"
+    );
+    assert!(
+        client.call(DaemonOperation::Status).is_ok(),
+        "the daemon refused a call after `stop`"
+    );
+    let context = command(binary, root.path(), &["context", "stopShared"]);
+    assert!(
+        context.status.success() && String::from_utf8_lossy(&context.stdout).contains("stopShared"),
+        "{}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let status = command(binary, root.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        true
+    );
+    let joined = acquire_lease_until(&client, Instant::now() + Duration::from_secs(2));
+    drop(joined);
+
+    // `start` takes it back, and then the daemon outlives the session.
+    assert!(
+        command(binary, root.path(), &["daemon", "start"])
+            .status
+            .success()
+    );
+    drop(session);
+    assert!(
+        !daemon.exits_within(Duration::from_millis(300)),
+        "a daemon started again exited with its session"
+    );
+
+    // Stopped again with a session attached, it exits once that session ends.
+    let session = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+    assert!(
+        !daemon.exits_within(Duration::from_millis(200)),
+        "`stop` ended the daemon under its session"
+    );
+    drop(session);
+    assert!(
+        daemon.exits_within(Duration::from_secs(5)),
+        "a stopped daemon outlived its last session"
+    );
+}
+
 /// Process ids of the daemons serving `root`, found the way an operator would: by command line.
 #[cfg(target_os = "linux")]
 fn daemon_pids(root: &Path) -> Vec<u32> {

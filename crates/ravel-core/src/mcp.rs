@@ -415,10 +415,7 @@ impl RavelMcp {
 /// that reply like a transport failure so the client respawns instead of
 /// surfacing "daemon is shutting down" to the agent.
 fn should_respawn_after(error: &crate::daemon::DaemonCallError) -> bool {
-    match error {
-        crate::daemon::DaemonCallError::Transport(_) => true,
-        crate::daemon::DaemonCallError::Remote(message) => message.contains("shutting down"),
-    }
+    matches!(error, crate::daemon::DaemonCallError::Transport(_)) || error.is_shutting_down()
 }
 
 /// Drop schema keys a model gains nothing from. Clients hand `inputSchema` to the model as
