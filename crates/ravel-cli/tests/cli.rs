@@ -117,3 +117,27 @@ fn impact_walks_what_depends_on_the_symbol_with_or_without_risk() {
         assert!(!answer.contains("leafHelper"), "{answer}");
     }
 }
+
+#[test]
+fn queries_answer_in_process_without_a_daemon_runtime_directory() {
+    let root = indexed_project(&[("src/main.ts", "export const answer = 42;\n")]);
+    // No variable the daemon's runtime directory can come from: there is no daemon to ask, which
+    // must not stop the question being answered here.
+    let out = Command::new(env!("CARGO_BIN_EXE_ravel"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("status")
+        .env_remove("HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("TMPDIR")
+        .env_remove("LOCALAPPDATA")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["indexed"], true);
+}

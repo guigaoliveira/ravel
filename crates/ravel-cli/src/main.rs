@@ -911,11 +911,28 @@ fn daemon_call_if_running(
     root: &std::path::Path,
     operation: ravel_core::daemon::DaemonOperation,
 ) -> anyhow::Result<Option<serde_json::Value>> {
+    // No runtime directory to look for a daemon in (HOME and XDG_RUNTIME_DIR unset, or it cannot
+    // be created) means none is reachable: answer in-process, as when none is running.
+    let Ok(client) = ravel_core::daemon::DaemonClient::for_root(root) else {
+        return Ok(None);
+    };
+    daemon_answer(client.call(operation))
+}
+
+/// What a daemon that is going away answers instead of running a request.
+const DAEMON_SHUTTING_DOWN: &str = "daemon is shutting down";
+
+/// The daemon's answer, or `None` to answer in-process instead: when it could not be reached, and
+/// when it refused the request unrun because it is stopping — a race with its idle exit, not a
+/// failure of the question.
+fn daemon_answer(
+    reply: Result<serde_json::Value, ravel_core::daemon::DaemonCallError>,
+) -> anyhow::Result<Option<serde_json::Value>> {
     use ravel_core::daemon::DaemonCallError;
-    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
-    match client.call(operation) {
+    match reply {
         Ok(value) => Ok(Some(value)),
         Err(DaemonCallError::Transport(_)) => Ok(None),
+        Err(DaemonCallError::Remote(error)) if error == DAEMON_SHUTTING_DOWN => Ok(None),
         Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
     }
 }
@@ -956,4 +973,24 @@ fn emit_json(value: &impl serde::Serialize, pretty: bool) -> anyhow::Result<()> 
     }
     out.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_core::daemon::DaemonCallError;
+
+    #[test]
+    fn a_daemon_that_is_stopping_or_unreachable_is_answered_in_process() {
+        let refused = DaemonCallError::Remote(DAEMON_SHUTTING_DOWN.into());
+        assert!(daemon_answer(Err(refused)).unwrap().is_none());
+        let unreachable = DaemonCallError::Transport(std::io::ErrorKind::NotFound.into());
+        assert!(daemon_answer(Err(unreachable)).unwrap().is_none());
+
+        let failed = DaemonCallError::Remote("nothing in the index is named `x`".into());
+        let error = daemon_answer(Err(failed)).unwrap_err().to_string();
+        assert_eq!(error, "nothing in the index is named `x`");
+        let value = serde_json::json!({ "ok": true });
+        assert_eq!(daemon_answer(Ok(value.clone())).unwrap(), Some(value));
+    }
 }
