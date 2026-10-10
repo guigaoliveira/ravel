@@ -989,9 +989,9 @@ fn spawn_daemon_watcher(
                         return;
                     }
                 };
-                let paths: Vec<_> = batch
+                let mut paths: Vec<_> = batch
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|path| {
                         crate::config::watched_path_is_indexable(
                             &engine.config,
@@ -1000,19 +1000,30 @@ fn spawn_daemon_watcher(
                             path,
                         )
                     })
+                    .cloned()
                     .collect();
-                if !batch.needs_reconcile && paths.is_empty() {
+                let mut needs_reconcile = batch.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                if !needs_reconcile {
+                    match crate::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &batch,
+                        max_batch_paths,
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if !needs_reconcile && paths.is_empty() {
                     continue;
                 }
                 let _request = RequestGuard::new(&state);
                 crate::timing::note("watch.batch", || {
-                    format!(
-                        "paths={} needs_reconcile={}",
-                        paths.len(),
-                        batch.needs_reconcile
-                    )
+                    format!("paths={} needs_reconcile={needs_reconcile}", paths.len())
                 });
-                let result = if batch.needs_reconcile {
+                let result = if needs_reconcile {
                     engine.reconcile()
                 } else {
                     engine.sync_resident(Some(&paths))

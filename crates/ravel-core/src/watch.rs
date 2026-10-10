@@ -1,7 +1,7 @@
 use blake3::Hash;
 use notify::{
     Event, EventKind, RecursiveMode, Watcher,
-    event::{CreateKind, ModifyKind},
+    event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind},
 };
 use std::{
     collections::{BTreeSet, HashMap},
@@ -20,6 +20,11 @@ use thiserror::Error;
 pub struct CoalescedChange {
     pub paths: Vec<PathBuf>,
     pub needs_reconcile: bool,
+    /// Those of `paths` that may stand for a whole directory: one created or removed, or anything
+    /// renamed (a rename does not say what moved), unless another event in the batch showed it to
+    /// be a file. The backend names such a directory alone, never what is inside it.
+    #[serde(default)]
+    pub structural: Vec<PathBuf>,
 }
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -219,6 +224,7 @@ impl PersistentWatcher {
         max_batch: Duration,
     ) -> Result<CoalescedChange, WatchError> {
         let mut paths = BTreeSet::new();
+        let mut entries = EntryKinds::default();
         let mut needs_reconcile = self.reconcile_pending.swap(false, Ordering::AcqRel);
         if !needs_reconcile {
             let first = self
@@ -229,6 +235,7 @@ impl PersistentWatcher {
                     mpsc::RecvTimeoutError::Disconnected => WatchError::Closed,
                 })?
                 .map_err(|error| WatchError::Notify(error.to_string()))?;
+            entries.note(&first);
             accumulate_event(first, &mut paths, &mut needs_reconcile, max_paths);
         }
         let started = std::time::Instant::now();
@@ -254,6 +261,7 @@ impl PersistentWatcher {
             match self.receiver.recv_timeout(wait) {
                 Ok(Ok(event)) => {
                     if !needs_reconcile {
+                        entries.note(&event);
                         accumulate_event(event, &mut paths, &mut needs_reconcile, max_paths);
                     }
                 }
@@ -276,11 +284,142 @@ impl PersistentWatcher {
                 needs_reconcile = false;
             }
         }
+        let structural = entries.structural(&paths);
         Ok(CoalescedChange {
             paths: paths.into_iter().collect(),
             needs_reconcile,
+            structural,
         })
     }
+}
+
+/// What a batch's events said about the kind of entry behind each path.
+#[derive(Default)]
+struct EntryKinds {
+    /// Named by an event that may concern a directory.
+    maybe_directories: BTreeSet<PathBuf>,
+    /// Named by an event only ever reported for a file.
+    files: BTreeSet<PathBuf>,
+}
+
+impl EntryKinds {
+    fn note(&mut self, event: &Event) {
+        let kinds = match event.kind {
+            // A directory or -- where the backend does not say (`Any`, `Other`) -- maybe one. A
+            // rename cannot say what moved.
+            EventKind::Create(CreateKind::Folder | CreateKind::Any | CreateKind::Other)
+            | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+            | EventKind::Modify(ModifyKind::Name(_)) => &mut self.maybe_directories,
+            // An editor's save renames the file, or a backup of it, and then writes or removes the
+            // file it renamed: those events settle that no directory moved.
+            EventKind::Create(CreateKind::File)
+            | EventKind::Remove(RemoveKind::File)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Access(AccessKind::Close(AccessMode::Write)) => &mut self.files,
+            _ => return,
+        };
+        kinds.extend(event.paths.iter().cloned());
+    }
+
+    /// Those of the batch's paths that may still be directories.
+    fn structural(self, paths: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+        let files = self.files;
+        self.maybe_directories
+            .into_iter()
+            .filter(|path| paths.contains(path) && !files.contains(path))
+            .collect()
+    }
+}
+
+/// The source files a batch changed without naming any of them, which an exact sync of its paths
+/// would never see: what is inside a directory created, moved or renamed into place -- the backend
+/// reports the directory alone, and a file written into a new directory before its watch exists is
+/// not reported at all -- and every indexed file under one that moved away.
+///
+/// `None` when they are more than `max_paths`, or the index cannot be read; the caller reconciles
+/// instead. A file renamed or saved through a temporary costs nothing here: only what may be a
+/// directory is looked at, and the index only for one that is gone.
+pub fn sources_behind_directories(
+    engine: &crate::engine::WorkspaceEngine,
+    ignore: &crate::config::IgnoreChain,
+    extensions: &[String],
+    batch: &CoalescedChange,
+    max_paths: usize,
+) -> Option<Vec<PathBuf>> {
+    let mut found = BTreeSet::new();
+    let mut gone = Vec::new();
+    for path in &batch.structural {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {
+                let config = &engine.config;
+                if !sources_under(path, config, ignore, extensions, max_paths, &mut found) {
+                    return None;
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(relative) = path.strip_prefix(&engine.root) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    gone.push(format!("{relative}/"));
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    if !gone.is_empty()
+        && let Some(indexed) = engine.storage().open_file_list().ok()?
+    {
+        for relative in indexed.paths {
+            if gone
+                .iter()
+                .any(|directory| relative.starts_with(directory.as_str()))
+            {
+                found.insert(engine.root.join(relative));
+                if found.len() > max_paths {
+                    return None;
+                }
+            }
+        }
+    }
+    found.retain(|path| batch.paths.binary_search(path).is_err());
+    Some(found.into_iter().collect())
+}
+
+/// Add the indexable files under `directory` to `found` as the full index walk would see them:
+/// noise and ignored trees skipped, links not followed. False once there are more than `max_paths`.
+fn sources_under(
+    directory: &Path,
+    config: &crate::config::Config,
+    ignore: &crate::config::IgnoreChain,
+    extensions: &[String],
+    max_paths: usize,
+    found: &mut BTreeSet<PathBuf>,
+) -> bool {
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                if !config.is_noise(&path) && !ignore.is_ignored(&path) {
+                    pending.push(path);
+                }
+            } else if kind.is_file()
+                && crate::config::watched_path_is_indexable(config, ignore, extensions, &path)
+            {
+                found.insert(path);
+                if found.len() > max_paths {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Name prefix of the marker files the gate creates inside the storage directory.
@@ -766,6 +905,7 @@ where
 
 pub fn coalesce(events: impl IntoIterator<Item = Event>) -> CoalescedChange {
     let mut paths = BTreeSet::new();
+    let mut entries = EntryKinds::default();
     let mut needs_reconcile = false;
     for event in events {
         if matches!(event.kind, EventKind::Other) {
@@ -776,13 +916,16 @@ pub fn coalesce(events: impl IntoIterator<Item = Event>) -> CoalescedChange {
         if is_read_only_access(&event.kind) {
             continue;
         }
+        entries.note(&event);
         for path in event.paths {
             paths.insert(path);
         }
     }
+    let structural = entries.structural(&paths);
     CoalescedChange {
         paths: paths.into_iter().collect(),
         needs_reconcile,
+        structural,
     }
 }
 
@@ -937,6 +1080,67 @@ mod tests {
         let result = coalesce([event.clone(), event]);
         assert_eq!(result.paths, vec![path]);
         assert!(!result.needs_reconcile);
+    }
+
+    #[test]
+    fn a_batch_tells_which_paths_may_be_directories() {
+        use notify::event::{DataChange, ModifyKind, RemoveKind, RenameMode};
+        let event = |kind: EventKind, paths: &[&str]| Event {
+            kind,
+            paths: paths.iter().map(PathBuf::from).collect(),
+            attrs: Default::default(),
+        };
+        let rename = || EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+
+        // A directory renamed, made, and removed: each is named alone, without what it holds.
+        let batch = coalesce([
+            event(rename(), &["src/feat", "src/feat2"]),
+            event(EventKind::Create(CreateKind::Folder), &["src/new"]),
+            event(EventKind::Remove(RemoveKind::Folder), &["src/old"]),
+        ]);
+        assert_eq!(
+            batch.structural,
+            ["src/feat", "src/feat2", "src/new", "src/old"].map(PathBuf::from)
+        );
+
+        // An editor's save: the file is renamed to a backup, written anew, and the backup removed.
+        // Nothing here is a directory, and nothing should make the watcher look for one.
+        let batch = coalesce([
+            event(rename(), &["src/a.ts", "src/a.ts~"]),
+            event(EventKind::Create(CreateKind::File), &["src/a.ts"]),
+            event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                &["src/a.ts"],
+            ),
+            event(EventKind::Remove(RemoveKind::File), &["src/a.ts~"]),
+        ]);
+        assert!(batch.structural.is_empty(), "{:?}", batch.structural);
+        assert_eq!(batch.paths, ["src/a.ts", "src/a.ts~"].map(PathBuf::from));
+    }
+
+    #[test]
+    fn a_directory_moved_inside_the_tree_is_reported_as_possibly_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("feat/deep")).unwrap();
+        std::fs::write(root.join("feat/deep/a.ts"), "export {}\n").unwrap();
+        let watcher = PersistentWatcher::new(&root, 4_096).unwrap();
+        std::fs::rename(root.join("feat"), root.join("feat2")).unwrap();
+        let batch = watcher
+            .next_batch(
+                Duration::from_millis(50),
+                Duration::from_secs(5),
+                64,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(!batch.needs_reconcile);
+        assert!(batch.structural.contains(&root.join("feat")), "{batch:?}");
+        assert!(batch.structural.contains(&root.join("feat2")), "{batch:?}");
+        assert!(
+            !batch.paths.contains(&root.join("feat2/deep/a.ts")),
+            "the backend names the directory alone: {batch:?}"
+        );
     }
 
     #[test]

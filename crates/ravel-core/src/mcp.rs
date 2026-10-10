@@ -519,9 +519,9 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     }
                 };
                 let extensions = crate::config::effective_extensions(&engine.config);
-                let paths: Vec<_> = batch
+                let mut paths: Vec<_> = batch
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|path| {
                         crate::config::watched_path_is_indexable(
                             &engine.config,
@@ -530,8 +530,23 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                             path,
                         )
                     })
+                    .cloned()
                     .collect();
-                if batch.needs_reconcile {
+                let mut needs_reconcile = batch.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                if !needs_reconcile {
+                    match crate::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &batch,
+                        max_batch_paths,
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if needs_reconcile {
                     if let Err(error) = engine.reconcile() {
                         engine.record_update_error("watch index", &error.to_string());
                     }
