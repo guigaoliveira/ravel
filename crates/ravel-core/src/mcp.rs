@@ -782,7 +782,7 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "List files belonging to a package (by path prefix)",
+        description = "List files belonging to a package (a name from list_packages)",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> ToolReply {

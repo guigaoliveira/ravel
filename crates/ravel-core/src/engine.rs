@@ -4505,15 +4505,13 @@ impl WorkspaceEngine {
             return Ok(list.in_package(package));
         }
         let snapshot = self.snapshot()?;
-        let prefix = format!("/{package}/");
-        let mut files: Vec<_> = snapshot
+        // `files` is a BTreeMap, so its keys are already sorted.
+        Ok(snapshot
             .files
             .keys()
-            .filter(|path| path.contains(&prefix))
+            .filter(|path| crate::graph::package_name(path) == package)
             .cloned()
-            .collect();
-        files.sort();
-        Ok(files)
+            .collect())
     }
     fn storage_path(&self) -> PathBuf {
         self.root.join(&self.config.storage.home)

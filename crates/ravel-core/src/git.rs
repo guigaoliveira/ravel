@@ -45,7 +45,9 @@ pub fn metadata_fingerprint(root: &Path) -> GitMetadataFingerprint {
                     if path.is_absolute() {
                         path
                     } else {
-                        root.join(path)
+                        // Relative to the `.git` file, which sits above `root` when `root` is a
+                        // directory inside a submodule or a linked worktree.
+                        dot_git.parent().unwrap_or(root).join(path)
                     }
                 })
         })
@@ -136,6 +138,25 @@ fn git_marker(root: &Path) -> Option<PathBuf> {
     root.ancestors()
         .map(|ancestor| ancestor.join(".git"))
         .find(|path| path.exists())
+}
+
+/// Where `root` sits below the top of its worktree: `packages/app` for a package in a monorepo,
+/// empty at the top. Git prints status, diff and show paths from the top whatever `-C` says.
+fn worktree_prefix(root: &Path) -> PathBuf {
+    git_marker(root)
+        .and_then(|marker| {
+            let top = marker.parent()?;
+            root.strip_prefix(top).ok().map(Path::to_path_buf)
+        })
+        .unwrap_or_default()
+}
+
+/// A path git printed (relative to the top of the worktree) made relative to `root` instead, or
+/// `None` when it lies outside `root`.
+fn relative_to_root(prefix: &Path, printed: &[u8]) -> Option<PathBuf> {
+    let printed = PathBuf::from(git_path(printed));
+    let relative = printed.strip_prefix(prefix).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
 }
 
 /// Snapshot identity that never fails on non-git trees.
@@ -278,6 +299,7 @@ fn status_among(
 /// The paths in `git status --porcelain=v1 -z` output, filtered the way discovery has always
 /// filtered them and returned sorted.
 fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Vec<PathBuf> {
+    let prefix = worktree_prefix(root);
     let mut paths = Vec::new();
     for record in stdout.split(|byte| *byte == 0) {
         if record.len() < 4 {
@@ -285,10 +307,9 @@ fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Ve
         }
         let xy = &record[..2];
         let path_part = &record[3..];
-        if path_part.is_empty() {
+        let Some(abs) = relative_to_root(&prefix, path_part).map(|path| root.join(path)) else {
             continue;
-        }
-        let abs = root.join(git_path(path_part));
+        };
         let untracked = xy == b"??";
         if untracked {
             if !discovery.include_untracked {
@@ -320,11 +341,14 @@ fn dirty_tracked_diff(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         .output()
         .map_err(|e| GitError::Operation(e.to_string()))?;
     if output.status.success() {
-        for path in output.stdout.split(|byte| *byte == 0) {
-            if !path.is_empty() {
-                paths.push(root.join(git_path(path)));
-            }
-        }
+        let prefix = worktree_prefix(root);
+        paths.extend(
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter_map(|path| relative_to_root(&prefix, path))
+                .map(|path| root.join(path)),
+        );
     }
     paths.sort();
     paths.dedup();
@@ -337,6 +361,17 @@ pub fn changed_paths_between(
     from: Option<&str>,
     to: Option<&str>,
 ) -> Result<Vec<PathBuf>, GitError> {
+    // Refs reach here from MCP clients. Git would read one that starts with `-` as an option, and
+    // `--output=<file>` writes a file. No ref name may start with `-`, so refuse it outright.
+    if let Some(option) = [from, to]
+        .into_iter()
+        .flatten()
+        .find(|r| r.starts_with('-'))
+    {
+        return Err(GitError::Operation(format!(
+            "invalid revision '{option}': a revision cannot start with '-'"
+        )));
+    }
     let mut args = vec![
         "-C".to_owned(),
         root.to_string_lossy().into_owned(),
@@ -352,6 +387,8 @@ pub fn changed_paths_between(
             args.push(format!("{from}...HEAD"));
         }
     }
+    // The range is a revision, never a path.
+    args.push("--".into());
     let output = std::process::Command::new("git")
         .args(&args)
         .output()
@@ -361,11 +398,12 @@ pub fn changed_paths_between(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    let prefix = worktree_prefix(root);
     let mut paths: Vec<_> = output
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| root.join(git_path(path)))
+        .filter_map(|path| relative_to_root(&prefix, path))
+        .map(|path| root.join(path))
         .collect();
     paths.sort();
     Ok(paths)
@@ -396,10 +434,23 @@ pub fn cochanged(
     min_cooccurrence: u32,
 ) -> Result<Vec<CoChangeEntry>, GitError> {
     let commits = commits.clamp(1, 5_000);
+    // The spelling the paths git prints get below: relative to `root`, `/`-separated, no `./`.
+    let file = {
+        let path = Path::new(file);
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     // First select commits that touched `file`. A pathspec on the later
     // `--name-only` command would hide every co-changed path and always return
     // an empty result.
     let revisions = std::process::Command::new("git")
+        // Names are literal: `[id].ts` is a file here, not a pattern.
+        .arg("--literal-pathspecs")
         .args([
             "-C",
             &root.to_string_lossy(),
@@ -407,7 +458,7 @@ pub fn cochanged(
             &format!("--max-count={commits}"),
             "--format=%H",
             "--",
-            file,
+            &file,
         ])
         .output()
         .map_err(|error| GitError::Operation(error.to_string()))?;
@@ -427,6 +478,7 @@ pub fn cochanged(
             &root.to_string_lossy(),
             "show",
             "--stdin",
+            "-z",
             "--format=format:--",
             "--name-only",
             "--no-renames",
@@ -452,19 +504,24 @@ pub fn cochanged(
     }
     use std::collections::HashMap;
     let mut counts: HashMap<String, u32> = HashMap::new();
-    let mut in_commit = false;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line == "--" {
-            in_commit = true;
+    let prefix = worktree_prefix(root);
+    // With `-z` each commit is `--\n` followed by its NUL-terminated paths, and paths are never
+    // quoted (without it, `café.ts` comes back as `"caf\303\251.ts"`). Each path appears once per
+    // commit, so counting paths counts commits.
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let record = record.strip_prefix(b"--\n").unwrap_or(record);
+        if record.is_empty() || record == b"--" {
             continue;
         }
-        if !in_commit || line.is_empty() {
+        let Some(path) = relative_to_root(&prefix, record) else {
+            continue;
+        };
+        // Git separates with `/` on every platform; the stripped remainder keeps its spelling.
+        let path = path.to_string_lossy().into_owned();
+        if path == file {
             continue;
         }
-        if line == file {
-            continue;
-        }
-        *counts.entry(line.to_owned()).or_default() += 1;
+        *counts.entry(path).or_default() += 1;
     }
     let mut entries: Vec<_> = counts
         .into_iter()
@@ -962,5 +1019,100 @@ mod among_tests {
             changed_paths_with(dir.path(), &discovery),
             Err(GitError::NotWorktree(_))
         ));
+    }
+
+    /// A package of a monorepo: git prints paths from the top of the repository, not from `-C`.
+    fn monorepo() -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q", "."]);
+        write(top, "packages/app/src/a.ts", "export const a = 1;\n");
+        write(top, "other.ts", "export const other = 1;\n");
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-q", "-m", "one"]);
+        let app = top.join("packages/app");
+        (dir, app)
+    }
+
+    #[test]
+    fn a_root_below_the_top_of_the_repository_sees_its_own_paths_only() {
+        let (dir, app) = monorepo();
+        write(&app, "src/a.ts", "export const a = 2;\n");
+        write(&app, "src/new.ts", "export const fresh = 1;\n");
+        write(dir.path(), "other.ts", "export const other = 2;\n");
+        let discovery = DirtyDiscovery::default();
+        let expected = vec![app.join("src/a.ts"), app.join("src/new.ts")];
+        assert_eq!(changed_paths_with(&app, &discovery).unwrap(), expected);
+        let asked = ["src/a.ts".to_owned(), "src/new.ts".to_owned()];
+        assert_eq!(
+            changed_paths_among(&app, &discovery, &asked).unwrap(),
+            expected
+        );
+        assert_eq!(dirty_tracked_diff(&app).unwrap(), [app.join("src/a.ts")]);
+
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-q", "-m", "two"]);
+        assert_eq!(
+            changed_paths_between(&app, Some("HEAD~1"), None).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn cochanged_names_paths_from_the_root_however_the_file_is_spelled() {
+        let (dir, app) = monorepo();
+        write(&app, "src/a.ts", "export const a = 2;\n");
+        write(&app, "src/café.ts", "export const cafe = 1;\n");
+        write(dir.path(), "other.ts", "export const other = 2;\n");
+        run(dir.path(), &["add", "-A"]);
+        run(dir.path(), &["commit", "-q", "-m", "two"]);
+        let absolute = app.join("src/a.ts").to_string_lossy().into_owned();
+        for spelling in ["src/a.ts", "./src/a.ts", absolute.as_str()] {
+            let entries = cochanged(&app, spelling, 10, 1).unwrap();
+            assert_eq!(
+                entries,
+                [CoChangeEntry {
+                    file: "src/café.ts".into(),
+                    cooccurrence_count: 1,
+                }],
+                "asked as {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revision_that_looks_like_an_option_is_refused() {
+        let (dir, app) = monorepo();
+        let target = dir.path().join("written-by-git");
+        let option = format!("--output={}", target.display());
+        assert!(changed_paths_between(&app, Some(&option), None).is_err());
+        assert!(changed_paths_between(&app, Some("HEAD"), Some(&option)).is_err());
+        assert!(!target.exists());
+        assert!(!dir.path().join(format!("{option}...HEAD")).exists());
+    }
+
+    #[test]
+    fn a_relative_gitdir_is_read_from_the_directory_of_the_git_file() {
+        // A submodule's `.git` is a file whose relative `gitdir:` starts where that file is, not
+        // where the indexed root is.
+        let dir = tempdir().unwrap();
+        let submodule = dir.path().join("sub");
+        write(&submodule, ".git", "gitdir: ../modules/sub\n");
+        let git_dir = dir.path().join("modules/sub");
+        write(&git_dir, "HEAD", "ref: refs/heads/main\n");
+        write(
+            &git_dir,
+            "refs/heads/main",
+            "1111111111111111111111111111111111111111\n",
+        );
+        let root = submodule.join("packages/app");
+        fs::create_dir_all(&root).unwrap();
+        let before = metadata_fingerprint(&root);
+        write(
+            &git_dir,
+            "refs/heads/main",
+            "2222222222222222222222222222222222222222\n",
+        );
+        assert_ne!(before, metadata_fingerprint(&root));
     }
 }

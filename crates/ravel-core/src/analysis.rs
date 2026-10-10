@@ -492,16 +492,7 @@ pub fn list_packages_from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) ->
 }
 
 fn package_from_path(path: &str) -> String {
-    // Single pass, no intermediate Vec: segment after the first apps|libs|packages marker.
-    let mut it = path.split('/');
-    while let Some(p) = it.next() {
-        if matches!(p, "apps" | "libs" | "packages") {
-            if let Some(next) = it.next() {
-                return next.to_owned();
-            }
-        }
-    }
-    "workspace".into()
+    crate::graph::package_name(path)
 }
 
 /// Minimal GraphViz DOT of package graph.

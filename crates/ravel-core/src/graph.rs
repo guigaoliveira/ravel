@@ -1195,13 +1195,21 @@ impl GraphIndex {
             .collect()
     }
 
+    /// Every package, in dependency order when the package graph is acyclic and by name when it
+    /// is not: callers enumerate packages with this, and a cycle must not hide them all.
     pub fn package_order(&self) -> Vec<String> {
         let graph = self.package_graph();
-        toposort(graph, None)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|index| graph[index].clone())
-            .collect()
+        match toposort(graph, None) {
+            Ok(order) => order
+                .into_iter()
+                .map(|index| graph[index].clone())
+                .collect(),
+            Err(_) => {
+                let mut names: Vec<String> = graph.node_weights().cloned().collect();
+                names.sort();
+                names
+            }
+        }
     }
 
     /// Package→package edges. O(P + E_pkg) — independent of symbol-node count.
@@ -1366,7 +1374,9 @@ impl GraphIndex {
                             idx
                         }
                     };
-                    if seen_edges.insert((from_index, to_index)) {
+                    // An import inside one package is not a dependency between packages. As a
+                    // self-loop it made every package "depend on" itself, and made `toposort` fail.
+                    if from_index != to_index && seen_edges.insert((from_index, to_index)) {
                         package_graph.add_edge(from_index, to_index, ());
                     }
                 }
@@ -1693,14 +1703,16 @@ fn file_name(node: &str) -> String {
         .to_owned()
 }
 
-fn package_name(path: &str) -> String {
+/// The package a file (or a `symbol://` node in it) belongs to. Every package-level answer --
+/// cycles, export, boundaries, `packages`, `files_in_package` -- must use this one definition, or
+/// a name one of them reports matches nothing in another.
+pub(crate) fn package_name(path: &str) -> String {
     let path = path
         .strip_prefix("symbol://")
         .and_then(|value| value.split_once('#').map(|(path, _)| path))
         .unwrap_or(path);
     // No intermediate Vec: return the segment after the first apps|libs|packages
-    // marker, else the first segment, else "workspace". `split` is lazy/zero-alloc.
-    let first = path.split('/').next();
+    // marker, else the first segment. `split` is lazy/zero-alloc.
     let mut scan = path.split('/');
     while let Some(part) = scan.next() {
         if matches!(part, "apps" | "libs" | "packages") {
@@ -1709,9 +1721,7 @@ fn package_name(path: &str) -> String {
             }
         }
     }
-    first
-        .map(str::to_owned)
-        .unwrap_or_else(|| "workspace".into())
+    path.split('/').next().unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]
@@ -2028,6 +2038,40 @@ mod tests {
             }),
             provenance: EdgeProvenance::Ast,
         }
+    }
+
+    /// An import edge as the resolver writes it: owned by the importing file.
+    fn import(from: &str, to: &str) -> Edge {
+        Edge {
+            source_path: Some(from.into()),
+            ..edge(from, to)
+        }
+    }
+
+    #[test]
+    fn imports_inside_a_package_are_not_dependencies_between_packages() {
+        let edges = vec![
+            import("packages/core/src/a.ts", "packages/core/src/b.ts"),
+            import("packages/web/src/main.ts", "packages/core/src/a.ts"),
+        ];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        assert_eq!(graph.package_edges(), [("web".into(), "core".into())]);
+        assert_eq!(graph.package_order(), ["web", "core"]);
+        assert!(graph.package_cycles().is_empty());
+    }
+
+    #[test]
+    fn every_package_is_listed_even_when_packages_form_a_cycle() {
+        let edges = vec![
+            import("apps/x/a.ts", "apps/y/b.ts"),
+            import("apps/y/b.ts", "apps/x/a.ts"),
+            import("apps/z/c.ts", "apps/x/a.ts"),
+        ];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        assert_eq!(graph.package_order(), ["x", "y", "z"]);
+        let dot = crate::analysis::export_package_dot(&graph);
+        assert!(dot.contains("\"x\" [fillcolor"), "{dot}");
+        assert!(dot.contains("\"z\" [style=rounded]"), "{dot}");
     }
 
     #[test]
