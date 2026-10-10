@@ -625,7 +625,7 @@ fn start_waits_out_a_daemon_that_is_shutting_down_and_starts_another() {
     let mut old = PersistentDaemon::start(root.path());
     // A connection that has not said anything yet keeps the stopped daemon draining.
     let identity = ravel_core::daemon::RootIdentity::discover(root.path()).unwrap();
-    let layout = ravel_core::daemon::RuntimeLayout::for_root(&identity).unwrap();
+    let layout = ravel_core::daemon::RuntimeLayout::locate(&identity).unwrap();
     let ravel_core::daemon::LocalEndpoint::Unix(socket) = &layout.endpoint;
     let idle = std::os::unix::net::UnixStream::connect(socket).unwrap();
     assert!(
@@ -659,6 +659,59 @@ fn start_waits_out_a_daemon_that_is_shutting_down_and_starts_another() {
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
         true,
         "no daemon took its place"
+    );
+}
+
+/// Looking for a daemon must not make or change the runtime directory a daemon would be found in:
+/// only a daemon about to serve does that. A directory that is missing, or not this process's to
+/// change, then broke every query instead of meaning "no daemon".
+#[cfg(target_os = "linux")]
+#[test]
+fn looking_for_a_daemon_leaves_the_runtime_directory_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = indexed_workspace("lookedFor");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let run = |runtime: &Path, args: &[&str]| {
+        Command::new(binary)
+            .arg("--root")
+            .arg(root.path())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .output()
+            .unwrap()
+    };
+
+    let empty = tempdir().unwrap();
+    let status = run(empty.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        false
+    );
+    assert!(
+        run(empty.path(), &["context", "lookedFor"])
+            .status
+            .success()
+    );
+    assert!(
+        !empty.path().join("ravel").exists(),
+        "a client made the runtime directory"
+    );
+
+    let shared = tempdir().unwrap();
+    let directory = shared.path().join("ravel");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(run(shared.path(), &["daemon", "status"]).status.success());
+    assert!(
+        run(shared.path(), &["context", "lookedFor"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "a client changed the runtime directory's permissions"
     );
 }
 

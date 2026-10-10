@@ -130,11 +130,27 @@ pub struct RuntimeLayout {
 }
 
 impl RuntimeLayout {
+    /// The layout a daemon about to serve `root` binds, its directory created private to this user.
     pub fn for_root(root: &RootIdentity) -> io::Result<Self> {
         Self::in_directory(runtime_base()?, root)
     }
 
     pub fn in_directory(base: PathBuf, root: &RootIdentity) -> io::Result<Self> {
+        Self::build(base, root, true)
+    }
+
+    /// Where a daemon serving `root` would be, with nothing created or changed: a client only looks.
+    /// Making the directory (and setting its permissions) to find out whether a daemon runs broke
+    /// every query where that directory was missing or not this process's to change.
+    pub fn locate(root: &RootIdentity) -> io::Result<Self> {
+        Self::locate_in(runtime_base()?, root)
+    }
+
+    pub fn locate_in(base: PathBuf, root: &RootIdentity) -> io::Result<Self> {
+        Self::build(base, root, false)
+    }
+
+    fn build(base: PathBuf, root: &RootIdentity, create: bool) -> io::Result<Self> {
         let short = root.as_str().get(..32).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid daemon root identity")
         })?;
@@ -149,15 +165,17 @@ impl RuntimeLayout {
             let directory = base.join("ravel");
             let projected = directory.join(format!("{short}.sock"));
             if projected.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
-                short_unix_runtime_directory(&base)?
+                short_unix_runtime_directory(&base, create)?
             } else {
                 directory
             }
         };
         #[cfg(not(unix))]
         let directory = base.join("ravel");
-        std::fs::create_dir_all(&directory)?;
-        restrict_runtime_directory(&directory)?;
+        if create {
+            std::fs::create_dir_all(&directory)?;
+            restrict_runtime_directory(&directory)?;
+        }
         let singleton_lock = directory.join(format!("{short}.lock"));
         #[cfg(unix)]
         let endpoint = {
@@ -183,7 +201,7 @@ impl RuntimeLayout {
 }
 
 #[cfg(unix)]
-fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
+fn short_unix_runtime_directory(base: &Path, create: bool) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     // Unix socket limits apply to the pathname passed to bind, even when the user's private
@@ -191,11 +209,17 @@ fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
     // that private runtime base; the directory is subsequently verified and restricted to 0700.
     let uid = std::fs::metadata(base)?.uid();
     let directory = PathBuf::from(format!("/tmp/ravel-{uid}"));
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&directory)?;
-    let metadata = std::fs::symlink_metadata(&directory)?;
+    if create {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+    }
+    // Verified even when only looking: a socket in a directory someone else made is not ours.
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(directory),
+        metadata => metadata?,
+    };
     if !metadata.file_type().is_dir() || metadata.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -359,7 +383,7 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn for_root(root: &Path) -> io::Result<Self> {
         let root = RootIdentity::discover(root)?;
-        let layout = RuntimeLayout::for_root(&root)?;
+        let layout = RuntimeLayout::locate(&root)?;
         Ok(Self { root, layout })
     }
 
@@ -1454,6 +1478,20 @@ mod tests {
                 .unwrap()
                 .endpoint
         );
+    }
+
+    #[test]
+    fn locating_a_daemon_creates_nothing_and_finds_where_one_would_serve() {
+        let runtime = tempdir().unwrap();
+        let root = RootIdentity::discover(tempdir().unwrap().path()).unwrap();
+        let located = RuntimeLayout::locate_in(runtime.path().into(), &root).unwrap();
+        assert!(
+            !located.directory.exists(),
+            "looking made the runtime directory"
+        );
+        let served = RuntimeLayout::in_directory(runtime.path().into(), &root).unwrap();
+        assert!(served.directory.is_dir());
+        assert_eq!(located, served);
     }
 
     #[cfg(unix)]
