@@ -104,6 +104,26 @@ impl Drop for Daemon {
     }
 }
 
+/// The daemon answers before its watcher is armed, and an edit made before then is never seen.
+/// Edit until one is.
+fn arm_watcher(root: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for round in 0.. {
+        write(
+            &root.join("src/probe.ts"),
+            &format!("export const watcherArmed = {round};\n"),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        if defined_at(root, "watcherArmed").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's watcher never saw an edit"
+        );
+    }
+}
+
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
@@ -131,23 +151,7 @@ fn files_inside_a_directory_that_moves_reach_the_index_without_git() {
     let elsewhere = tempfile::tempdir_in(root.parent().unwrap()).unwrap();
 
     let _daemon = Daemon::start(&root);
-    // The daemon answers before its watcher is armed, and an edit made before then is never
-    // seen. Edit until one is.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    for round in 0.. {
-        write(
-            &root.join("src/probe.ts"),
-            &format!("export const watcherArmed = {round};\n"),
-        );
-        std::thread::sleep(Duration::from_millis(250));
-        if defined_at(&root, "watcherArmed").is_some() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the daemon's watcher never saw an edit"
-        );
-    }
+    arm_watcher(&root);
 
     // Renamed inside the tree.
     fs::rename(root.join("src/feat"), root.join("src/feat2")).unwrap();
@@ -175,5 +179,31 @@ fn files_inside_a_directory_that_moves_reach_the_index_without_git() {
     settles(&root, "freshDeep", Some("src/fresh/deeper/still/d.ts"));
 
     // Everything else is still where it was.
+    settles(&root, "base", Some("src/base.ts"));
+}
+
+/// The watcher reads the ignore rules once. An edit to them changes which files belong in the
+/// index, and nothing else would tell a root git cannot speak for.
+#[test]
+fn an_edit_to_the_ignore_rules_reaches_the_index_without_git() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    write(&root.join("src/base.ts"), "export const base = 1;\n");
+    write(
+        &root.join("src/gen/out.ts"),
+        "export function generatedOut() { return 1; }\n",
+    );
+    write(&root.join(".ravelignore"), "src/gen/\n");
+    assert!(ravel(&root, &["index"]).status.success());
+    assert_eq!(defined_at(&root, "generatedOut"), None);
+
+    let _daemon = Daemon::start(&root);
+    arm_watcher(&root);
+
+    write(&root.join(".ravelignore"), "");
+    settles(&root, "generatedOut", Some("src/gen/out.ts"));
+
+    write(&root.join(".ravelignore"), "src/gen/\n");
+    settles(&root, "generatedOut", None);
     settles(&root, "base", Some("src/base.ts"));
 }

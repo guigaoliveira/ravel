@@ -735,6 +735,19 @@ impl WatchGate {
 
 /// The files whose contents decide which paths are ignored. Asked about every event the backend
 /// reports, so the name settles nearly all of them before the path is looked at.
+/// Whether `batch` touched a file that decides what is ignored. A watcher reads those rules once
+/// and caches them, so after such a batch it must [`IgnoreChain::forget_rules`] and index again:
+/// files the new rules admit were never reported, and those they exclude are still indexed.
+///
+/// [`IgnoreChain::forget_rules`]: crate::config::IgnoreChain::forget_rules
+pub fn changes_ignore_rules(batch: &CoalescedChange) -> bool {
+    batch.paths.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| is_ignore_rules_file(path, name))
+    })
+}
+
 fn is_ignore_rules_file(path: &Path, name: &str) -> bool {
     match name {
         ".gitignore" | ".ravelignore" => true,

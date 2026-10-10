@@ -760,10 +760,14 @@ skip_sibling_emit = true
                     Err(ravel_core::watch::WatchError::Timeout) => continue,
                     Err(error) => return Err(error.into()),
                 };
+                let rules_changed = ravel_core::watch::changes_ignore_rules(&result);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
                 let cfg = &engine.config;
-                let paths: Vec<_> = result
+                let mut paths: Vec<_> = result
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|p| {
                         ravel_core::config::watched_path_is_indexable(
                             cfg,
@@ -772,11 +776,29 @@ skip_sibling_emit = true
                             p,
                         )
                     })
+                    .cloned()
                     .collect();
-                if paths.is_empty() && !result.needs_reconcile {
+                let mut needs_reconcile = result.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                if !needs_reconcile {
+                    match ravel_core::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &result,
+                        cfg.watch.max_batch_paths.saturating_sub(paths.len()),
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if paths.is_empty() && !needs_reconcile && !rules_changed {
                     continue;
                 }
-                let stats = if result.needs_reconcile || paths.is_empty() {
+                let stats = if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    engine.index()?
+                } else if needs_reconcile || paths.is_empty() {
                     engine.reconcile()?
                 } else {
                     engine.sync(Some(&paths))?
@@ -800,10 +822,19 @@ skip_sibling_emit = true
                 emit_json(&serde_json::json!({ "running": running }), pretty)?;
             }
             DaemonAction::Stop => {
-                let stopped =
-                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?
-                        .is_some();
-                emit_json(&serde_json::json!({ "stopped": stopped }), pretty)?;
+                let reply =
+                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?;
+                // A daemon MCP sessions still lease stays for them and exits after the last one
+                // disconnects; say how many it waits for rather than claim it is gone.
+                let sessions = reply
+                    .as_ref()
+                    .and_then(|reply| reply.get("sessions"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                emit_json(
+                    &serde_json::json!({ "stopped": reply.is_some(), "sessions": sessions }),
+                    pretty,
+                )?;
             }
         },
         Some(Command::DaemonServe { transient }) => ravel_core::daemon::serve(&root, transient)?,
@@ -919,9 +950,6 @@ fn daemon_call_if_running(
     daemon_answer(client.call(operation))
 }
 
-/// What a daemon that is going away answers instead of running a request.
-const DAEMON_SHUTTING_DOWN: &str = "daemon is shutting down";
-
 /// The daemon's answer, or `None` to answer in-process instead: when it could not be reached, and
 /// when it refused the request unrun because it is stopping — a race with its idle exit, not a
 /// failure of the question.
@@ -932,7 +960,7 @@ fn daemon_answer(
     match reply {
         Ok(value) => Ok(Some(value)),
         Err(DaemonCallError::Transport(_)) => Ok(None),
-        Err(DaemonCallError::Remote(error)) if error == DAEMON_SHUTTING_DOWN => Ok(None),
+        Err(error) if error.is_shutting_down() => Ok(None),
         Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
     }
 }
@@ -982,7 +1010,8 @@ mod tests {
 
     #[test]
     fn a_daemon_that_is_stopping_or_unreachable_is_answered_in_process() {
-        let refused = DaemonCallError::Remote(DAEMON_SHUTTING_DOWN.into());
+        let refused = DaemonCallError::Remote("daemon is shutting down".into());
+        assert!(refused.is_shutting_down());
         assert!(daemon_answer(Err(refused)).unwrap().is_none());
         let unreachable = DaemonCallError::Transport(std::io::ErrorKind::NotFound.into());
         assert!(daemon_answer(Err(unreachable)).unwrap().is_none());

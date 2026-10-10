@@ -595,6 +595,10 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     })
                     .cloned()
                     .collect();
+                let rules_changed = crate::watch::changes_ignore_rules(&batch);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
                 let mut needs_reconcile = batch.needs_reconcile;
                 // A directory that appears or moves is reported alone, without the files in it.
                 // Together they stay within the batch bound, as the paths alone always did.
@@ -610,7 +614,12 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                         None => needs_reconcile = true,
                     }
                 }
-                if needs_reconcile {
+                if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    if let Err(error) = engine.index() {
+                        engine.record_update_error("watch index", &error.to_string());
+                    }
+                } else if needs_reconcile {
                     if let Err(error) = engine.reconcile() {
                         engine.record_update_error("watch index", &error.to_string());
                     }

@@ -1026,6 +1026,10 @@ fn spawn_daemon_watcher(
                     })
                     .cloned()
                     .collect();
+                let rules_changed = crate::watch::changes_ignore_rules(&batch);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
                 let mut needs_reconcile = batch.needs_reconcile;
                 // A directory that appears or moves is reported alone, without the files in it.
                 // Together they stay within the batch bound, as the paths alone always did.
@@ -1041,14 +1045,17 @@ fn spawn_daemon_watcher(
                         None => needs_reconcile = true,
                     }
                 }
-                if !needs_reconcile && paths.is_empty() {
+                if !needs_reconcile && !rules_changed && paths.is_empty() {
                     continue;
                 }
                 let _request = RequestGuard::new(&state);
                 crate::timing::note("watch.batch", || {
                     format!("paths={} needs_reconcile={needs_reconcile}", paths.len())
                 });
-                let result = if needs_reconcile {
+                let result = if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    engine.index()
+                } else if needs_reconcile {
                     engine.reconcile()
                 } else {
                     engine.sync_resident(Some(&paths))
