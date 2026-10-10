@@ -1361,10 +1361,16 @@ fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
     let specifier = node
         .child_by_field_name("source")
         .map(|source_node| unquote(node_text(source_node, source)));
+    // The `default` keyword token, not the text: decorators are children of the export statement
+    // and precede it (`@Component() export default class Foo {}`).
+    let is_default = {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| child.kind() == "default")
+    };
     let mut bindings = Vec::new();
     if let Some(declaration) = node.child_by_field_name("declaration") {
         let names = declared_names(declaration, source);
-        let is_default = text.starts_with("export default");
         for (name, name_span) in names {
             bindings.push(ExportBinding {
                 local: name.clone(),
@@ -1430,7 +1436,7 @@ fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
             span: span(node),
         });
     }
-    if bindings.is_empty() && text.starts_with("export default") {
+    if bindings.is_empty() && is_default {
         let local = node
             .child_by_field_name("value")
             .and_then(|value| expression_name(value, source))
@@ -2790,6 +2796,39 @@ type Remote = import('./remote').Thing;
                 .iter()
                 .any(|(name, _)| matches!(*name, "Dependency" | "Options"))
         );
+    }
+
+    #[test]
+    fn decorated_default_exports_keep_their_default_binding() {
+        for (source, local) in [
+            (&b"@Component({})\nexport default class Foo {}\n"[..], "Foo"),
+            (&b"@Component({})\nexport default class {}\n"[..], "default"),
+        ] {
+            let artifact = parse_source("component.ts", source);
+            assert!(
+                artifact.diagnostics.is_empty(),
+                "{:?}",
+                artifact.diagnostics
+            );
+            let bindings: Vec<_> = artifact
+                .exports
+                .iter()
+                .flat_map(|export| &export.bindings)
+                .map(|binding| {
+                    (
+                        binding.local.as_str(),
+                        binding.exported.as_str(),
+                        binding.kind.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                bindings,
+                vec![(local, "default", ExportBindingKind::Default)],
+                "{:?}",
+                artifact.exports
+            );
+        }
     }
 
     #[test]
