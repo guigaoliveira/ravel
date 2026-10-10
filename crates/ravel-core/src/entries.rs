@@ -118,22 +118,14 @@ fn walk_exports(root: &Path, pkg_dir: &Path, exports: &Value, out: &mut BTreeSet
                 walk_exports(root, pkg_dir, v, out);
             }
         }
+        // Subpath keys (`"."`, `"./cli"`) and condition keys (`"import"`, `"node"`, `"types"`, ...)
+        // nest to any depth: `{".": {"import": {"default": "./src/lib.ts"}}}`.
         Value::Object(map) => {
             for (k, v) in map {
                 if k.starts_with('#') {
                     continue; // package imports internal
                 }
-                match v {
-                    Value::String(s) => push_resolved(root, pkg_dir, s, out),
-                    Value::Object(inner) => {
-                        for field in ["import", "require", "default", "module", "node", "browser"] {
-                            if let Some(Value::String(s)) = inner.get(field) {
-                                push_resolved(root, pkg_dir, s, out);
-                            }
-                        }
-                    }
-                    _ => walk_exports(root, pkg_dir, v, out),
-                }
+                walk_exports(root, pkg_dir, v, out);
             }
         }
         _ => {}
@@ -245,6 +237,26 @@ mod tests {
             entries.iter().any(|e| e.ends_with("src/main.ts")),
             "{entries:?}"
         );
+    }
+
+    #[test]
+    fn nested_export_conditions_are_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"exports":{
+                ".":{"import":{"types":"./src/lib.d.ts","default":"./src/lib.ts"}},
+                "./cli":{"node":{"require":["./src/cli.ts"]}},
+                "./internal/*":null
+            }}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.ts"), "export {}").unwrap();
+        fs::write(dir.path().join("src/cli.ts"), "export {}").unwrap();
+        let entries = collect_manifest_entry_paths(dir.path());
+        assert!(entries.contains("src/lib.ts"), "{entries:?}");
+        assert!(entries.contains("src/cli.ts"), "{entries:?}");
     }
 
     #[test]
