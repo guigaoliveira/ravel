@@ -80,7 +80,7 @@ pub struct ReferenceSitesRequest {
     /// Sites per page (default 50).
     pub limit: Option<usize>,
     /// Resume offset: pass the previous page's next_cursor.
-    pub cursor: Option<usize>,
+    pub cursor: Option<PageCursor>,
     /// Path fragment that picks one definition when a bare name matches several — cheaper than
     /// copying a candidate id back. Only narrows which definition is resolved; it does not filter
     /// the sites of a symbol that already resolved.
@@ -90,6 +90,69 @@ pub struct ReferenceSitesRequest {
     /// every site. Each bucket carries `n` (edges) and `files` (distinct files).
     pub rollup: Option<String>,
 }
+/// Where a page of sites starts. A page hands out its successor as `next_cursor`, a string, and the
+/// tool asks for exactly that back; refusing the string (the offset alone was accepted, as a number)
+/// failed every request for a second page. Either spelling is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCursor(usize);
+
+impl From<PageCursor> for usize {
+    fn from(cursor: PageCursor) -> Self {
+        cursor.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PageCursor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected, Visitor};
+
+        struct Offset;
+        impl Visitor<'_> for Offset {
+            type Value = PageCursor;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("the previous page's next_cursor")
+            }
+
+            fn visit_u64<E: Error>(self, value: u64) -> Result<PageCursor, E> {
+                usize::try_from(value)
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: Error>(self, value: i64) -> Result<PageCursor, E> {
+                match u64::try_from(value) {
+                    Ok(value) => self.visit_u64(value),
+                    Err(_) => Err(E::invalid_value(Unexpected::Signed(value), &self)),
+                }
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<PageCursor, E> {
+                value
+                    .parse()
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(Offset)
+    }
+}
+
+impl schemars::JsonSchema for PageCursor {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PageCursor".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": ["string", "integer"] })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
     pub root: Option<String>,
@@ -935,7 +998,7 @@ async fn reference_sites_tool(
     reverse: bool,
 ) -> ToolReply {
     let limit = request.limit.unwrap_or(50).max(1);
-    let cursor = request.cursor.unwrap_or(0);
+    let cursor = request.cursor.map_or(0, usize::from);
     // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
     // `rollup: "directory-ish"` looks like the grouping was applied and came out flat. The daemon
     // checks it too; checking here first keeps the refusal off the wire.
@@ -1197,6 +1260,45 @@ mod tests {
             .expect("follower did not take over after leader exit");
         drop(replacement);
         follower.join().unwrap();
+    }
+
+    #[test]
+    fn a_page_cursor_is_taken_back_as_next_cursor_spells_it() {
+        let cursor = |value: serde_json::Value| {
+            serde_json::from_value::<ReferenceSitesRequest>(
+                serde_json::json!({ "node": "x", "cursor": value }),
+            )
+            .map(|request| request.cursor.map(usize::from))
+        };
+        // `next_cursor` is a string; the tool says to pass it back as `cursor`.
+        assert_eq!(cursor(serde_json::json!("50")).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::json!(50)).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::Value::Null).unwrap(), None);
+        for refused in [
+            serde_json::json!("next"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(cursor(refused.clone()).is_err(), "{refused} was accepted");
+        }
+        let absent =
+            serde_json::from_value::<ReferenceSitesRequest>(serde_json::json!({ "node": "x" }));
+        assert!(absent.unwrap().cursor.is_none());
+
+        // And clients that check arguments against the schema let either spelling through.
+        let server = RavelMcp::with_mode(McpToolMode::Primary);
+        for tool in ["callers_of", "calls_from"] {
+            let schema = &server.tool_router.map[tool].attr.input_schema;
+            let types = &schema["properties"]["cursor"]["type"];
+            for spelling in ["string", "integer"] {
+                assert!(
+                    types
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|kind| kind == spelling)),
+                    "{tool} cursor does not admit a {spelling}: {types}"
+                );
+            }
+        }
     }
 
     #[test]
