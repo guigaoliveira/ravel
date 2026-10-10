@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 use thiserror::Error;
@@ -2549,6 +2549,28 @@ impl FileSnapshotStorage {
     fn locator_name(id: &str) -> String {
         format!("snapshot-{id}.artifacts.loc")
     }
+
+    /// Stem for the files one publication writes whose bytes depend on the history behind it --
+    /// overlay packs, merged tiers, artifact deltas -- unique to that publication.
+    ///
+    /// The generation key is a digest of the tree's content, so undoing an edit brings an earlier
+    /// key back. Named from the key alone, such a file replaced one the current manifest still
+    /// listed: the overlay chain then composed the new records with themselves, and the artifact
+    /// deltas listed one file twice, both losing every edit before the undone one. Readers and the
+    /// shared artifact index cache take a name to mean fixed bytes, so a name is never written
+    /// twice rather than merely kept clear of the current manifest.
+    fn publication_name(generation: &str) -> String {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(generation.as_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        hasher.update(&SEQUENCE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        hasher.update(&now.as_nanos().to_le_bytes());
+        format!("{generation}.{}", &hasher.finalize().to_hex()[..16])
+    }
     /// The manifest as it is on disk right now, ignoring the mtime-keyed cache.
     fn read_manifest_uncached(&self) -> Result<Option<Manifest>, StorageError> {
         if !self.current_path().is_file() {
@@ -3058,11 +3080,12 @@ impl FileSnapshotStorage {
 
     fn write_structural_overlay_merge(
         &self,
-        generation: &str,
+        publication: &str,
         records: &StructuralOverlayRecords,
     ) -> Result<Option<String>, StorageError> {
+        // One publication merges into strictly heavier tiers, so the weight keeps its merges apart.
         let name = format!(
-            "snapshot-{generation}.structural-merge-{}.pack",
+            "snapshot-{publication}.structural-merge-{}.pack",
             records.weight
         );
         let path = self.root.join(&name);
@@ -3124,7 +3147,7 @@ impl FileSnapshotStorage {
     fn compact_structural_overlay_chain(
         &self,
         chain: &mut StructuralPackChain,
-        generation: &str,
+        publication: &str,
         mut current: StructuralOverlayRecords,
     ) -> Result<(), StorageError> {
         while chain.overlays.len() >= 2 {
@@ -3144,7 +3167,7 @@ impl FileSnapshotStorage {
                     },
                 )?,
             };
-            let Some(merged_name) = self.write_structural_overlay_merge(generation, &current)?
+            let Some(merged_name) = self.write_structural_overlay_merge(publication, &current)?
             else {
                 // The merged records would not fit under the read ceiling. Keeping the un-merged
                 // chain costs an extra hop per read; writing the merge would cost the whole index.
@@ -3170,6 +3193,7 @@ impl FileSnapshotStorage {
         &self,
         manifest: &mut Manifest,
         snapshot_id: &SnapshotId,
+        publication: &str,
         graph_overlay: &IncrementalGraphOverlay,
         universe_overlay: &ResolutionUniverseOverlay,
         reverse_overlay: &ReverseOverlaySet,
@@ -3185,8 +3209,7 @@ impl FileSnapshotStorage {
             });
         };
         let generation = snapshot_id.stable_key();
-        let sequence = chain.overlays.len();
-        let name = format!("snapshot-{generation}.structural-overlay-{sequence}.pack");
+        let name = format!("snapshot-{publication}.structural-overlay.pack");
         let path = self.root.join(&name);
         let mut writer =
             StreamingGenerationPackWriter::new(&path).map_err(|error| StorageError::Invalid {
@@ -3302,7 +3325,7 @@ impl FileSnapshotStorage {
         chain.overlays.push(name.clone());
         self.compact_structural_overlay_chain(
             chain,
-            &generation,
+            publication,
             StructuralOverlayRecords {
                 weight: 1,
                 graph: graph_overlay.clone(),
@@ -3838,7 +3861,10 @@ impl FileSnapshotStorage {
             .to_hex()
             .to_string();
         let generation = snapshot_id.stable_key();
-        let delta_name = format!("snapshot-{generation}.artifact-delta.bin");
+        let delta_name = format!(
+            "snapshot-{}.artifact-delta.bin",
+            Self::publication_name(&generation)
+        );
         if manifest.artifact_delta_weights.len() != manifest.artifact_deltas.len() {
             return Ok(None);
         }
@@ -4110,7 +4136,8 @@ impl FileSnapshotStorage {
         }
 
         let id = snapshot.id.stable_key();
-        let delta_name = format!("snapshot-{id}.artifact-delta.bin");
+        let publication = Self::publication_name(&id);
+        let delta_name = format!("snapshot-{publication}.artifact-delta.bin");
         let delta_bytes = bincode::serialize(&delta).map_err(|source| StorageError::Bincode {
             path: self.root.join(&delta_name),
             source,
@@ -4195,6 +4222,7 @@ impl FileSnapshotStorage {
                 let staged = self.stage_structural_overlay_pack(
                     &mut manifest,
                     &snapshot.id,
+                    &publication,
                     graph_overlay,
                     universe_overlay,
                     reverse_overlay,
@@ -4450,10 +4478,12 @@ impl FileSnapshotStorage {
             path: self.root.join(format!("snapshot-{id}.stats.json")),
             source,
         })?;
-        let symbol_meta_name = format!("snapshot-{id}.symbol-meta-overlay.bin");
+        // Both are composed over every overlay since the base, so they depend on history too.
+        let publication = Self::publication_name(&id);
+        let symbol_meta_name = format!("snapshot-{publication}.symbol-meta-overlay.bin");
         self.atomic_write_bincode(&self.root.join(&symbol_meta_name), &symbol_meta_overlay)?;
         let search_name = if let Some(overlay) = &search_overlay {
-            let name = format!("snapshot-{id}.search-overlay.bin");
+            let name = format!("snapshot-{publication}.search-overlay.bin");
             self.atomic_write_bincode(&self.root.join(&name), overlay)?;
             Some(name)
         } else {
@@ -4463,6 +4493,7 @@ impl FileSnapshotStorage {
         let staged = self.stage_structural_overlay_pack(
             &mut manifest,
             snapshot_id,
+            &publication,
             graph_overlay,
             universe_overlay,
             reverse_overlay,
@@ -6409,6 +6440,128 @@ mod tests {
         let reverse = &merged.reverse.shards[&0].files;
         assert!(reverse.upserts.contains_key("changed.ts"));
         assert!(!reverse.tombstones.contains("changed.ts"));
+    }
+
+    /// Undoing an edit brings an earlier generation key back. The merged tier written then used to
+    /// take the name of one the chain still held, so the chain composed the new records with
+    /// themselves and every edit before the undone one was lost.
+    #[test]
+    fn a_recurring_generation_key_keeps_the_overlays_it_chains() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+        let staged = store
+            .stage_structural_pack_base(StructuralPackBase {
+                snapshot_id: base.id.stable_key(),
+                universe: ResolutionUniverse::default(),
+                reverse: ReverseShardSet {
+                    format_version: ReverseShardSet::FORMAT_VERSION,
+                    resolver_fingerprint: String::new(),
+                    shard_bits: 0,
+                    shards: BTreeMap::new(),
+                },
+                graph: IncrementalGraphState::default(),
+            })
+            .unwrap();
+        store.attach_structural_pack_base(staged).unwrap();
+
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        // Edit f0, f1, f2 in turn, then undo f2: the tree is back to the state after f1.
+        let steps = [
+            ("f0.ts", "state-0", true),
+            ("f1.ts", "state-1", true),
+            ("f2.ts", "state-2", true),
+            ("f2.ts", "state-1", false),
+        ];
+        let mut current = base;
+        for (path, state, upsert) in steps {
+            current.id.content_state = state.into();
+            let mut graph = IncrementalGraphOverlay::default();
+            if upsert {
+                graph.file_upserts.insert(path.into(), BTreeSet::new());
+            } else {
+                graph.file_tombstones.insert(path.into());
+            }
+            assert!(
+                store
+                    .publish_structural_overlay(
+                        &current,
+                        &BTreeSet::from([path.to_owned()]),
+                        Some((&graph, &ResolutionUniverseOverlay::default(), &reverse)),
+                        false,
+                        None,
+                    )
+                    .unwrap()
+            );
+        }
+
+        let manifest = store.read_manifest().unwrap().unwrap();
+        let chain = manifest.structural_packs.unwrap();
+        let distinct: BTreeSet<_> = chain.overlays.iter().collect();
+        assert_eq!(distinct.len(), chain.overlays.len(), "{:?}", chain.overlays);
+        let composed = chain
+            .overlays
+            .iter()
+            .map(|name| store.read_structural_overlay_records(name).unwrap().graph)
+            .reduce(compose_graph_overlay)
+            .unwrap();
+        for kept in ["f0.ts", "f1.ts"] {
+            assert!(composed.file_upserts.contains_key(kept), "{composed:?}");
+        }
+        assert!(!composed.file_upserts.contains_key("f2.ts"));
+    }
+
+    /// The content-only counterpart: an undo republished the artifact delta under the name of the
+    /// heavier tier the manifest still listed, so it was listed twice and the earlier edits vanished.
+    #[test]
+    fn a_recurring_generation_key_keeps_the_artifact_deltas_it_layers() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot_with_files(6);
+        store.publish(&base).unwrap();
+        for index in 1..=5 {
+            publish_body_edit(&store, &format!("src/file-{index}.ts"), index);
+        }
+        let revert = base.files["src/file-5.ts"].clone();
+        store
+            .publish_artifact_deltas(&[("src/file-5.ts".to_owned(), revert.clone())])
+            .unwrap()
+            .unwrap();
+
+        let manifest = store.read_manifest().unwrap().unwrap();
+        let distinct: BTreeSet<_> = manifest.artifact_deltas.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            manifest.artifact_deltas.len(),
+            "{:?}",
+            manifest.artifact_deltas
+        );
+        let current = store.open_current().unwrap().unwrap();
+        for index in 1..=4 {
+            let path = format!("src/file-{index}.ts");
+            let edited = crate::scanner::parse_source(
+                &path,
+                format!("export const value = 0; // revision {index}\n").as_bytes(),
+            );
+            assert_eq!(
+                current.files[&path].source_hash, edited.source_hash,
+                "{path}"
+            );
+            assert_eq!(
+                store.open_artifact(&path).unwrap().unwrap().source_hash,
+                edited.source_hash,
+                "{path}"
+            );
+        }
+        assert_eq!(current.files["src/file-5.ts"], revert);
+        assert_eq!(current.files["src/file-0.ts"], base.files["src/file-0.ts"]);
     }
 
     fn publish_body_edit(store: &FileSnapshotStorage, path: &str, revision: usize) {
