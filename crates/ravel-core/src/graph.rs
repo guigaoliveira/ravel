@@ -660,13 +660,16 @@ impl GraphIndex {
             relation_ids.sort_unstable_by_key(&relation_key);
         }
         let edge_count = relations.len();
+        let forward = Adjacency::from_rows(forward);
+        let reverse = Adjacency::from_rows(reverse);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
 
         // Neighbor order is not required for correct query pages (items are sorted).
         Self {
             nodes,
             node_index,
-            forward: Adjacency::from_rows(forward),
-            reverse: Adjacency::from_rows(reverse),
+            forward,
+            reverse,
             edge_count,
             relations,
             forward_relation_ids: Adjacency::from_rows(forward_relation_ids),
@@ -676,10 +679,26 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id,
             package_graph: OnceLock::new(),
         }
+    }
+
+    /// Nodes no edge touches. Only a file named as the `source_path` of its symbols' edges is
+    /// interned without one. An incremental overlay never creates such a node and retires any
+    /// whose edges it removes, so a graph built in one go leaves them inactive too; otherwise
+    /// `contains_node`, `node_names` and `node_count` would depend on how the graph was built.
+    /// The name stays interned, since relations name their `source_path` through it.
+    fn edgeless_nodes(
+        node_count: usize,
+        forward: &Adjacency,
+        reverse: &Adjacency,
+    ) -> BTreeSet<u32> {
+        (0..node_count)
+            .filter(|&id| forward.list(id).is_empty() && reverse.list(id).is_empty())
+            .map(|id| id as u32)
+            .collect()
     }
 
     pub fn from_compact(compact: CompactGraph) -> Self {
@@ -697,11 +716,14 @@ impl GraphIndex {
             node_index.insert(&nodes, id as u32);
         }
         let edge_count = compact.edge_count as usize;
+        let forward = Adjacency::from_rows(compact.forward);
+        let reverse = Adjacency::from_rows(compact.reverse);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
         Self {
             nodes,
             node_index,
-            forward: Adjacency::from_rows(compact.forward),
-            reverse: Adjacency::from_rows(compact.reverse),
+            forward,
+            reverse,
             edge_count,
             relations: compact.relations,
             forward_relation_ids: Adjacency::from_rows(compact.forward_relation_ids),
@@ -711,7 +733,7 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id: compact.snapshot_id,
             package_graph: OnceLock::new(),
         }
@@ -747,11 +769,14 @@ impl GraphIndex {
         for id in 0..nodes.len() {
             node_index.insert(&nodes, id as u32);
         }
+        let forward = expand(&archived.forward_offsets, &archived.forward_values);
+        let reverse = expand(&archived.reverse_offsets, &archived.reverse_values);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
         Self {
             nodes,
             node_index,
-            forward: expand(&archived.forward_offsets, &archived.forward_values),
-            reverse: expand(&archived.reverse_offsets, &archived.reverse_values),
+            forward,
+            reverse,
             edge_count: archived.edge_count.to_native() as usize,
             relations: archived
                 .relations
@@ -774,7 +799,7 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id: archived.snapshot_id.to_string(),
             package_graph: OnceLock::new(),
         }
@@ -1903,6 +1928,46 @@ mod tests {
                 };
                 assert_eq!(left.items, right.items, "node={node} reverse={reverse}");
             }
+        }
+    }
+
+    /// A file whose only edges join its own symbols is interned as their `source_path` but no
+    /// edge touches it. An overlay never creates that node, so a graph built in one go -- fresh
+    /// or loaded from either persisted form -- must not count it as one either. Its name still
+    /// labels the relations it owns.
+    #[test]
+    fn a_node_no_edge_touches_is_absent_however_the_graph_was_built() {
+        let mut call = edge("symbol://x.ts#value:f", "symbol://x.ts#value:g");
+        call.kind = EdgeKind::Calls;
+        call.source_path = Some("x.ts".into());
+        let edges = vec![call, import("a.ts", "b.ts")];
+        let built = GraphIndex::from_edges(&edges, "snap".into());
+        let compact = built.to_compact();
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&FlatCompactGraph::from_compact(compact.clone()))
+                .unwrap();
+        let archived =
+            rkyv::access::<ArchivedFlatCompactGraph, rkyv::rancor::Error>(&bytes).unwrap();
+        let expected = [
+            "a.ts",
+            "b.ts",
+            "symbol://x.ts#value:f",
+            "symbol://x.ts#value:g",
+        ];
+        for graph in [
+            built,
+            GraphIndex::from_compact(compact),
+            GraphIndex::from_archived_flat(archived),
+        ] {
+            let mut names: Vec<&str> = graph.node_names().collect();
+            names.sort();
+            assert_eq!(names, expected);
+            assert_eq!(graph.node_count(), expected.len());
+            assert!(!graph.contains_node("x.ts"));
+            assert_eq!(graph.node_id("x.ts"), None);
+            let (sites, total) = graph.direct_relations_limit("symbol://x.ts#value:g", true, 10);
+            assert_eq!(total, 1);
+            assert_eq!(sites[0].source_path.as_deref(), Some("x.ts"));
         }
     }
 
