@@ -2199,7 +2199,7 @@ pub trait SnapshotStorage {
 pub struct FileSnapshotStorage {
     root: PathBuf,
     retention: usize,
-    manifest_cache: Mutex<Option<(std::time::SystemTime, Manifest)>>,
+    manifest_cache: Mutex<Option<(ManifestIdentity, Manifest)>>,
     /// Opened pack readers by file name. Opening one mmaps the file and decodes its
     /// whole directory — tens of thousands of entries on a large workspace — so doing
     /// it per record read made a batch of reads quadratic in the directory size.
@@ -2215,6 +2215,34 @@ pub struct FileSnapshotStorage {
     /// Whole-index decodes this handle's cache has had to do (for tests).
     #[cfg(test)]
     full_index_decodes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Which manifest file the manifest cache decoded. The mtime alone used to be the key, and coarse
+/// timestamps give two manifests written in one tick the same one: the next generation (another
+/// name), or the current one rewritten under its own name (compaction; a generation key that
+/// recurs). The inode tells apart a same-length rewrite, since manifests are replaced by rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestIdentity {
+    name: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl ManifestIdentity {
+    fn of(name: &str, metadata: &fs::Metadata) -> Self {
+        Self {
+            name: name.to_owned(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+        }
+    }
 }
 
 /// Index component ref, the overlay store its deltas were written to, the delta refs applied over
@@ -2655,7 +2683,7 @@ impl FileSnapshotStorage {
         name == LEGACY_ARTIFACT_OVERLAY_STORE
             || (name.starts_with("artifacts-") && name.ends_with(".overlay.store"))
     }
-    /// The manifest as it is on disk right now, ignoring the mtime-keyed cache.
+    /// The manifest as it is on disk right now, ignoring the cache.
     fn read_manifest_uncached(&self) -> Result<Option<Manifest>, StorageError> {
         if !self.current_path().is_file() {
             return Ok(None);
@@ -2676,26 +2704,31 @@ impl FileSnapshotStorage {
         }
         let name = fs::read_to_string(self.current_path())
             .map_err(|source| self.io(source, self.current_path()))?;
-        let path = self.root.join(name.trim());
-        if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
-            if let Ok(cache) = self.manifest_cache.lock() {
-                if let Some((cached_mtime, manifest)) = cache.as_ref() {
-                    if *cached_mtime == mtime {
-                        return Ok(Some(manifest.clone()));
-                    }
-                }
-            }
+        let name = name.trim();
+        let path = self.root.join(name);
+        // Identity and bytes come from one handle: a manifest replaced in between can no longer be
+        // cached under the identity of the one it replaced.
+        let mut file = fs::File::open(&path).map_err(|source| self.io(source, path.clone()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| self.io(source, path.clone()))?;
+        let identity = ManifestIdentity::of(name, &metadata);
+        if let Ok(cache) = self.manifest_cache.lock()
+            && let Some((cached, manifest)) = cache.as_ref()
+            && *cached == identity
+        {
+            return Ok(Some(manifest.clone()));
         }
-        let bytes = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|source| self.io(source, path.clone()))?;
         let manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(|source| StorageError::Json {
                 path: path.clone(),
                 source,
             })?;
-        if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
-            if let Ok(mut cache) = self.manifest_cache.lock() {
-                *cache = Some((mtime, manifest.clone()));
-            }
+        if let Ok(mut cache) = self.manifest_cache.lock() {
+            *cache = Some((identity, manifest.clone()));
         }
         Ok(Some(manifest))
     }
@@ -4863,10 +4896,11 @@ impl FileSnapshotStorage {
     }
 
     fn ensure_not_a_downgrade(&self) -> Result<(), StorageError> {
-        // Deliberately bypasses the manifest cache. That cache is keyed on mtime, and coarse
-        // filesystem timestamps -- Windows in particular -- can return the previous manifest for one
-        // written in the same tick. A stale read here either refuses a legitimate upgrade or lets a
-        // real downgrade through, so this one check pays for a fresh read.
+        // Deliberately bypasses the manifest cache. Its key is metadata, and coarse filesystem
+        // timestamps -- Windows in particular, which has no inode in the key -- can still match the
+        // previous manifest for one rewritten in the same tick. A stale read here either refuses a
+        // legitimate upgrade or lets a real downgrade through, so this one check pays for a fresh
+        // read.
         let Some(existing) = self.read_manifest_uncached()? else {
             return Ok(());
         };
@@ -6966,6 +7000,66 @@ mod tests {
                 .all(|error| error.to_string().contains("run `ravel index`"))
         );
     }
+    /// The manifest cache was keyed on mtime alone, taken after the bytes were read. Where
+    /// timestamps are coarse, two generations published in one tick share an mtime, and the cache
+    /// kept answering with the first.
+    #[test]
+    fn the_manifest_cache_tells_manifests_written_in_one_tick_apart() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let first = snapshot_with_files(1);
+        store.publish(&first).unwrap();
+        let first_name = store.current_generation().unwrap().unwrap();
+        let tick = fs::metadata(dir.path().join(&first_name))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            first.id
+        );
+        let in_the_same_tick = |name: &str| {
+            fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+        };
+
+        // The next generation, published by another handle.
+        let mut second = first.clone();
+        second.id.content_state = "second".into();
+        FileSnapshotStorage::new(dir.path())
+            .publish(&second)
+            .unwrap();
+        let second_name = store.current_generation().unwrap().unwrap();
+        in_the_same_tick(&second_name);
+        assert_eq!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            second.id
+        );
+
+        // The current manifest rewritten under its own name (as compaction does), same length.
+        #[cfg(unix)]
+        {
+            let path = dir.path().join(&second_name);
+            let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let flipped = if manifest.checksum.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            manifest.checksum.replace_range(..1, flipped);
+            atomic_write(&path, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+            in_the_same_tick(&second_name);
+            assert_eq!(
+                store.read_manifest().unwrap().unwrap().checksum,
+                manifest.checksum
+            );
+        }
+    }
+
     #[test]
     fn checksum_corruption_is_rejected() {
         let dir = tempdir().unwrap();
