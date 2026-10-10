@@ -853,6 +853,27 @@ fn extract_node(
         }
     }
 
+    // `export declare function f(): T;` exports what `declare` wraps.
+    if kind == "ambient_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            extract_node(
+                child,
+                path,
+                source,
+                symbols,
+                imports,
+                exports,
+                refs,
+                complexity,
+                enclosing,
+                next_nesting,
+                exported,
+            );
+        }
+        return;
+    }
+
     if matches!(
         kind,
         "lexical_declaration" | "variable_declaration" | "using_declaration"
@@ -1669,6 +1690,11 @@ fn is_parameter_property(node: Node<'_>) -> bool {
 }
 
 fn declared_names(node: Node<'_>, source: &[u8]) -> Vec<(String, Span)> {
+    if node.kind() == "ambient_declaration" {
+        return first_named_child(node)
+            .map(|declaration| declared_names(declaration, source))
+            .unwrap_or_default();
+    }
     if matches!(
         node.kind(),
         "lexical_declaration" | "variable_declaration" | "using_declaration"
@@ -2818,6 +2844,54 @@ type Remote = import('./remote').Thing;
             !relations
                 .iter()
                 .any(|(name, _)| matches!(*name, "Dependency" | "Options"))
+        );
+    }
+
+    #[test]
+    fn exported_ambient_declarations_are_exported() {
+        let artifact = parse_source(
+            "api.d.ts",
+            br#"
+export declare function f(): number;
+export declare class K { m(): void; }
+export declare const c: number;
+declare function local(): void;
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let exported = |name: &str| {
+            artifact
+                .symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .map(|symbol| symbol.exported)
+        };
+        for name in ["f", "K", "c"] {
+            assert_eq!(
+                exported(name),
+                Some(true),
+                "{name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert_eq!(exported("K.m"), Some(false));
+        assert_eq!(exported("local"), Some(false));
+        let bindings: BTreeSet<_> = artifact
+            .exports
+            .iter()
+            .flat_map(|export| &export.bindings)
+            .filter(|binding| binding.kind == ExportBindingKind::Declaration)
+            .map(|binding| binding.exported.as_str())
+            .collect();
+        assert_eq!(
+            bindings,
+            ["K", "c", "f"].into_iter().collect(),
+            "{:?}",
+            artifact.exports
         );
     }
 
