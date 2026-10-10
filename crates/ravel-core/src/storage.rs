@@ -6774,6 +6774,83 @@ mod tests {
         assert_eq!(current.files["src/file-0.ts"], base.files["src/file-0.ts"]);
     }
 
+    /// Names unique to one publication belong to the manifests that list them like any other:
+    /// once none of those is retained, GC collects them, and nothing else is left behind.
+    #[test]
+    fn per_publication_files_go_with_the_manifests_that_list_them() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let base = snapshot_with_files(2);
+        publish_packed(&store, &base);
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        let changed = BTreeSet::from(["src/file-1.ts".to_owned()]);
+        // Edits and undos, so both kinds of generation key keep recurring, and a full index halfway
+        // that ends the first chain.
+        for round in 0..24 {
+            if round == 12 {
+                let mut rebuilt = base.clone();
+                rebuilt.id.content_state = "rebuilt".into();
+                publish_packed(&store, &rebuilt);
+            }
+            if round % 3 == 2 {
+                let mut current = base.clone();
+                current.id.content_state = format!("structural-{}", round % 2);
+                let mut graph = IncrementalGraphOverlay::default();
+                graph
+                    .file_upserts
+                    .insert("src/file-1.ts".into(), BTreeSet::new());
+                assert!(
+                    store
+                        .publish_structural_overlay(
+                            &current,
+                            &changed,
+                            Some((&graph, &ResolutionUniverseOverlay::default(), &reverse)),
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                );
+            } else if round % 2 == 0 {
+                publish_body_edit(&store, "src/file-0.ts", 1);
+            } else {
+                store
+                    .publish_artifact_deltas(&[(
+                        "src/file-0.ts".to_owned(),
+                        base.files["src/file-0.ts"].clone(),
+                    )])
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        assert!(!store.gc_generations().unwrap().deferred_for_readers);
+
+        let names: BTreeSet<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "CURRENT" && !name.ends_with(".lock"))
+            .collect();
+        let manifests: Vec<_> = names
+            .iter()
+            .filter(|name| name.ends_with(".manifest.json"))
+            .collect();
+        assert!(manifests.len() <= 2, "{manifests:?}");
+        let mut listed: BTreeSet<String> = manifests.iter().map(|name| (*name).clone()).collect();
+        for name in &manifests {
+            let manifest: Manifest =
+                serde_json::from_slice(&fs::read(dir.path().join(name)).unwrap()).unwrap();
+            listed.extend(FileSnapshotStorage::manifest_component_paths(&manifest));
+        }
+        let leaked: Vec<_> = names.difference(&listed).collect();
+        assert!(leaked.is_empty(), "outlived every manifest: {leaked:?}");
+    }
+
     fn publish_body_edit(store: &FileSnapshotStorage, path: &str, revision: usize) {
         let source = format!("export const value = 0; // revision {revision}\n");
         let mut artifact = crate::scanner::parse_source(path, source.as_bytes());
