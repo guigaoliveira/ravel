@@ -655,6 +655,24 @@ fn module_exports(artifact: &FileArtifact) -> Vec<ModuleExport> {
         .collect()
 }
 
+/// Whether a binding of this kind reads from another module: `export {a} from`, `export * from`
+/// and `export * as ns from`. A declaration or default export never has a source, whatever string
+/// literal its body holds.
+fn is_reexport_kind(kind: &ExportBindingKind) -> bool {
+    matches!(
+        kind,
+        ExportBindingKind::Named | ExportBindingKind::Star | ExportBindingKind::Namespace
+    )
+}
+
+/// The module a binding re-exports from, if it is a re-export at all.
+fn reexport_source(export: &ModuleExport) -> Option<&str> {
+    export
+        .source
+        .as_deref()
+        .filter(|_| is_reexport_kind(&export.kind))
+}
+
 #[derive(Debug, Default)]
 struct ResolvedImports {
     bindings: BTreeMap<String, Vec<SymbolDefinition>>,
@@ -675,37 +693,55 @@ fn resolve_exported_symbol(
     }
     let mut targets = Vec::new();
     let exports = universe.module_exports(file);
-    if !exports.is_empty() {
-        for export in exports.iter() {
-            let exact = export.exported == exported_name;
-            let star = export.kind == ExportBindingKind::Star;
-            if !exact && !star {
-                continue;
-            }
-            if export.kind == ExportBindingKind::Namespace && exact {
-                // The namespace itself is a module object, not a declaration. A later member
-                // reference can resolve through the source module without fabricating a symbol.
-                continue;
-            }
-            if let Some(specifier) = export.source.as_deref() {
-                let resolution = resolve_one(root, file, specifier, universe, config);
-                if let Some(target_file) = resolution.target {
-                    let next_name = if star {
-                        exported_name
-                    } else {
-                        export.local.as_str()
-                    };
+    // ES ResolveExport: the module's own and indirect exports answer first. `export *` is only
+    // consulted when none of them names `exported_name`, and never for `default`. Adding the
+    // star targets alongside an explicit export made `export {foo} from './a'; export * from
+    // './b'` ambiguous whenever `./b` also exported `foo`, and dropped the edge.
+    let mut explicit = false;
+    for export in exports
+        .iter()
+        .filter(|export| export.kind != ExportBindingKind::Star)
+        .filter(|export| export.exported == exported_name)
+    {
+        explicit = true;
+        if export.kind == ExportBindingKind::Namespace {
+            // The namespace itself is a module object, not a declaration. A later member
+            // reference can resolve through the source module without fabricating a symbol.
+            continue;
+        }
+        match reexport_source(export) {
+            Some(specifier) => {
+                if let Some(target_file) =
+                    resolve_one(root, file, specifier, universe, config).target
+                {
                     targets.extend(resolve_exported_symbol(
                         root,
                         &target_file,
-                        next_name,
+                        &export.local,
                         universe,
                         config,
                         visited,
                     ));
                 }
-            } else {
-                targets.extend(definitions_in_file(universe, file, &export.local));
+            }
+            None => targets.extend(definitions_in_file(universe, file, &export.local)),
+        }
+    }
+    if !explicit && exported_name != "default" {
+        for specifier in exports
+            .iter()
+            .filter(|export| export.kind == ExportBindingKind::Star)
+            .filter_map(reexport_source)
+        {
+            if let Some(target_file) = resolve_one(root, file, specifier, universe, config).target {
+                targets.extend(resolve_exported_symbol(
+                    root,
+                    &target_file,
+                    exported_name,
+                    universe,
+                    config,
+                    visited,
+                ));
             }
         }
     }
@@ -1434,7 +1470,14 @@ fn resolve_artifacts_impl(
                 }
             }
             for export in &artifact.exports {
-                if let Some(specifier) = &export.specifier {
+                // `export {} from './x'` has no bindings and still names a module; an export whose
+                // bindings are all declarations or defaults never does.
+                let reads_source = export.bindings.is_empty()
+                    || export
+                        .bindings
+                        .iter()
+                        .any(|binding| is_reexport_kind(&binding.kind));
+                if let Some(specifier) = export.specifier.as_ref().filter(|_| reads_source) {
                     let resolution = resolve_one(root, &artifact.path, specifier, universe, config);
                     let (confidence, target) = match resolution.target.clone() {
                         Some(target) => (
@@ -2892,6 +2935,98 @@ class Child extends Base implements Shape {
         assert!(visible(&flags, "Flags.A", "Flags"));
         assert!(!visible(&logger, "Logger.format", "Logger.log"));
         assert!(!visible(&logger, "Logger.format", "Logger"));
+    }
+
+    #[test]
+    fn a_declaration_or_default_export_never_reads_from_another_module() {
+        // Only `export {a} from`, `export * from` and `export * as ns from` read another module. A
+        // declaration or default export has no source, whatever string literal the scanner may
+        // have picked up from its body -- following one sent `helper` to an unrelated module.
+        let root = tempdir().unwrap();
+        let unrelated = write_artifact(root.path(), "src/a.ts", "export function helper() {}");
+        let mut wrapper = write_artifact(
+            root.path(),
+            "src/b.ts",
+            "export function helper() { return load('./a'); }\n\
+             export default function main() {}\n",
+        );
+        // The guard must hold on its own, whatever the scanner records.
+        for export in &mut wrapper.exports {
+            export.specifier = Some("./a".into());
+        }
+        let consumer = write_artifact(
+            root.path(),
+            "src/c.ts",
+            "import main, { helper } from './b';\n\
+             export function run() { helper(); main(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (unrelated.path.clone(), unrelated.clone()),
+            (wrapper.path.clone(), wrapper.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        let mut calls = calls_from(&edges, &symbol_id(&consumer, "run"));
+        calls.sort();
+        assert_eq!(
+            calls,
+            [symbol_id(&wrapper, "helper"), symbol_id(&wrapper, "main")]
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.from == "src/b.ts" && edge.kind == EdgeKind::ReExport),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn explicit_exports_shadow_star_exports_and_default_never_passes_through_a_star() {
+        // ES ResolveExport: a module's own and indirect exports are consulted before `export *`,
+        // and `export *` never forwards `default`.
+        let root = tempdir().unwrap();
+        let a = write_artifact(root.path(), "src/a.ts", "export function foo() {}");
+        let b = write_artifact(
+            root.path(),
+            "src/b.ts",
+            "export function foo() {}\nexport default function fallback() {}\n",
+        );
+        let reexporting = write_artifact(
+            root.path(),
+            "src/reexporting.ts",
+            "export { foo } from './a';\nexport * from './b';\n",
+        );
+        let declaring = write_artifact(
+            root.path(),
+            "src/declaring.ts",
+            "export function foo() {}\nexport * from './b';\n",
+        );
+        let consumer = write_artifact(
+            root.path(),
+            "src/consumer.ts",
+            "import fallback, { foo } from './reexporting';\n\
+             import { foo as local } from './declaring';\n\
+             export function viaReexport() { foo(); fallback(); }\n\
+             export function viaDeclaration() { local(); }\n",
+        );
+        let artifacts = BTreeMap::from([
+            (a.path.clone(), a.clone()),
+            (b.path.clone(), b.clone()),
+            (reexporting.path.clone(), reexporting.clone()),
+            (declaring.path.clone(), declaring.clone()),
+            (consumer.path.clone(), consumer.clone()),
+        ]);
+        let edges = resolve_edges(root.path(), &artifacts, &ResolverConfig::default());
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "viaReexport")),
+            [symbol_id(&a, "foo")],
+            "the explicit re-export wins and `default` is not taken from the star"
+        );
+        assert_eq!(
+            calls_from(&edges, &symbol_id(&consumer, "viaDeclaration")),
+            [symbol_id(&declaring, "foo")],
+            "the local declaration wins over the star"
+        );
     }
 
     fn universe_of(files: &[(&str, &str)]) -> (BTreeMap<String, FileArtifact>, ResolutionUniverse) {
