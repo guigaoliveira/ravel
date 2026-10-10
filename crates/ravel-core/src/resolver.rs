@@ -1691,6 +1691,9 @@ fn resolve_one(
         candidates.extend(probe.existing);
         attempted_paths.extend(probe.attempted);
     }
+    // tsc consults `baseUrl` only when no `paths` pattern matched: a matched pattern whose
+    // targets are all missing is an unresolved import, not a cue to look somewhere else.
+    let mut alias_matched = false;
     if candidates.is_empty() && !specifier.starts_with('.') {
         let matched = config
             .paths
@@ -1702,6 +1705,7 @@ fn resolve_one(
                 path_alias_specificity(left).cmp(&path_alias_specificity(right))
             });
         if let Some((_, targets, capture)) = matched {
+            alias_matched = true;
             for target in targets {
                 let path = if target.contains('*') {
                     target.replace('*', &capture)
@@ -1715,6 +1719,7 @@ fn resolve_one(
         }
     }
     if candidates.is_empty()
+        && !alias_matched
         && !specifier.starts_with('.')
         && let Some(base) = &config.base_url
     {
@@ -3150,6 +3155,41 @@ class Child extends Base implements Shape {
                 Some("src/b.mts".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_matched_paths_pattern_ends_the_lookup_before_base_url() {
+        // tsc tries `baseUrl` only when no `paths` pattern matched. A matched pattern whose
+        // targets do not exist is an unresolved import (TS2307), not a cue to look elsewhere.
+        let root = tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        for (path, source) in [
+            ("src/consumer.ts", "import '@app/thing';\nimport 'plain';\n"),
+            ("@app/thing.ts", "export const stray = 1;"),
+            ("plain.ts", "export const plain = 1;"),
+        ] {
+            let artifact = write_artifact(root.path(), path, source);
+            files.insert(artifact.path.clone(), artifact);
+        }
+        let config = ResolverConfig {
+            base_url: Some(PathBuf::from(".")),
+            paths: BTreeMap::from([("@app/*".into(), vec!["src/app/*".into()])]),
+            ..ResolverConfig::default()
+        };
+        let universe = ResolutionUniverse::build(&files, &config);
+        let resolve = |specifier: &str| {
+            resolve_one(
+                root.path(),
+                "src/consumer.ts",
+                specifier,
+                &universe,
+                &config,
+            )
+            .target
+        };
+        assert_eq!(resolve("@app/thing"), None);
+        // With no pattern matching, baseUrl still applies.
+        assert_eq!(resolve("plain"), Some("plain.ts".to_owned()));
     }
 
     fn universe_of(files: &[(&str, &str)]) -> (BTreeMap<String, FileArtifact>, ResolutionUniverse) {
