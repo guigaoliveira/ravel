@@ -11,10 +11,10 @@ pre-commit:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
     unit:
       glob: "**/*.rs"
-      run: cargo test --workspace --lib
+      run: sh scripts/with-clean-git-env.sh cargo test --workspace --lib
 pre-push:
   commands:
     test:
-      run: cargo test --workspace
+      run: sh scripts/with-clean-git-env.sh cargo test --workspace
     clippy:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings

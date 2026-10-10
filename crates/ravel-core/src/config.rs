@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -690,7 +690,12 @@ fn parse_num<T: std::str::FromStr>(field: &str, value: &str) -> Result<T, Config
 }
 
 /// Coverage probes share the same paths, ignore rules and fallback budget.
-fn coverage_paths(config: &Config) -> (Box<dyn Iterator<Item = (PathBuf, usize)> + '_>, bool) {
+/// A Git enumeration has no budget, so irrelevant names can be rejected before metadata and
+/// ignore lookups. The filesystem fallback must still count every file against its budget.
+fn coverage_paths<'a>(
+    config: &'a Config,
+    relevant: impl Fn(&Path) -> bool + 'a,
+) -> (Box<dyn Iterator<Item = (PathBuf, usize)> + 'a>, bool) {
     let root = &config.project.root;
     let ignored = IgnoreChain::new(config);
     // Git's list has no budget; apply the same ignore chain as the source walk to it too.
@@ -698,6 +703,9 @@ fn coverage_paths(config: &Config) -> (Box<dyn Iterator<Item = (PathBuf, usize)>
     let budget_applies = tracked.is_none();
     let walked: Box<dyn Iterator<Item = (PathBuf, usize)> + '_> = match tracked {
         Some(paths) => Box::new(paths.into_iter().filter_map(move |path| {
+            if !relevant(&path) {
+                return None;
+            }
             let is_file = path
                 .symlink_metadata()
                 .is_ok_and(|metadata| metadata.is_file());
@@ -749,7 +757,7 @@ pub fn unsupported_source_counts(
     let mut supported_seen = 0usize;
     let mut truncated = false;
     let mut seen = 0usize;
-    let (walked, budget_applies) = coverage_paths(config);
+    let (walked, budget_applies) = coverage_paths(config, |_| true);
     let bounded = walked.take_while(|_| {
         seen += 1;
         if budget_applies && seen > budget {
@@ -837,17 +845,17 @@ pub fn component_source_count(config: &Config, budget: usize) -> usize {
 
 pub(crate) fn component_source_probe(config: &Config, budget: usize) -> (usize, bool) {
     let mut count = 0usize;
-    let (walked, budget_applies) = coverage_paths(config);
+    let is_component = |path: &Path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| COMPONENT_SOURCE_EXTENSIONS.contains(&extension))
+    };
+    let (walked, budget_applies) = coverage_paths(config, is_component);
     for (seen, (path, depth)) in walked.enumerate() {
         if budget_applies && seen >= budget {
             return (count, true);
         }
-        if path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|extension| COMPONENT_SOURCE_EXTENSIONS.contains(&extension))
-            && !config.is_noise_below_root(&path, depth)
-        {
+        if is_component(&path) && !config.is_noise_below_root(&path, depth) {
             count += 1;
         }
     }
@@ -880,7 +888,9 @@ pub struct IgnoreChain {
     /// up to and including the top of the repository holding the root. Empty when the root is the
     /// top of its repository, or in none. Fixed when the chain is built.
     ancestors: Vec<PathBuf>,
-    per_directory: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<DirectoryRules>>>,
+    // Lookup-only cache: ordering is unobservable. Tree comparisons repeatedly walk shared path
+    // prefixes for every source file; hashing visits each lookup key once.
+    per_directory: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<DirectoryRules>>>,
 }
 
 /// One directory's ignore rules, read once and cached until [`IgnoreChain::forget_rules`].
@@ -940,7 +950,7 @@ impl IgnoreChain {
             root_as_given: config.project.root.clone(),
             gitignore_enabled,
             ancestors,
-            per_directory: std::sync::Mutex::new(BTreeMap::new()),
+            per_directory: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1468,6 +1478,29 @@ mod tests {
         }
         // Not vacuous: the files that count are seen with room to spare.
         assert_eq!(component_source_count(&config, 100), 6);
+
+        // Git's complete enumeration may filter extensions early, but must agree with the full
+        // probe for tracked, deleted and untracked components even with a zero walk budget.
+        for args in [vec!["init", "-q"], vec!["add", "-A"]] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        fs::remove_file(dir.path().join("src/c.svelte")).unwrap();
+        fs::write(dir.path().join("pages/new.svelte"), "<script/>").unwrap();
+        for budget in [0, 1, 100] {
+            let (counts, _, truncated) = unsupported_source_counts(&config, budget);
+            let expected: usize = COMPONENT_SOURCE_EXTENSIONS
+                .iter()
+                .filter_map(|extension| counts.get(*extension))
+                .sum();
+            assert_eq!(expected, 6);
+            assert!(!truncated);
+            assert_eq!(component_source_probe(&config, budget), (expected, false));
+        }
     }
 
     #[test]

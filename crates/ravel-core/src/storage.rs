@@ -6225,6 +6225,24 @@ mod tests {
     use std::time::Instant;
     use tempfile::tempdir;
 
+    /// GC and compaction deliberately yield to readers. Parallel tests spawn git processes, whose
+    /// forked copies briefly retain open lock handles until exec, even after this test drops its
+    /// own guard. Wait for maintenance only where the test has released every intentional reader;
+    /// assertions that a live reader defers maintenance must still inspect the first attempt.
+    fn await_maintenance(mut completed: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !completed() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance stayed pinned by a reader"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn finish_gc(store: &FileSnapshotStorage) {
+        await_maintenance(|| !store.gc_generations().unwrap().deferred_for_readers);
+    }
     #[test]
     fn atomic_write_replaces_existing_file() {
         let dir = tempdir().unwrap();
@@ -6828,7 +6846,7 @@ mod tests {
                     .unwrap();
             }
         }
-        assert!(!store.gc_generations().unwrap().deferred_for_readers);
+        finish_gc(&store);
 
         let names: BTreeSet<String> = fs::read_dir(dir.path())
             .unwrap()
@@ -6913,8 +6931,7 @@ mod tests {
 
         // Once staging is over the barrier is down and GC is free again.
         drop(stager);
-        let after = store.gc_generations().unwrap();
-        assert!(!after.deferred_for_readers);
+        finish_gc(&store);
     }
 
     #[test]
@@ -7627,7 +7644,7 @@ mod tests {
             overlay_store_names(dir.path()),
             BTreeSet::from([recorded.clone(), LEGACY_ARTIFACT_OVERLAY_STORE.to_owned()])
         );
-        store.gc_generations().unwrap();
+        finish_gc(&store);
         assert_eq!(overlay_store_names(dir.path()).len(), 2);
         for (path, revision) in [("src/file-0.ts", 1), ("src/file-1.ts", 2)] {
             let edited = crate::scanner::parse_source(
@@ -7645,6 +7662,7 @@ mod tests {
         for revision in 3..=4 {
             publish_body_edit(&store, "src/file-0.ts", revision);
         }
+        finish_gc(&store);
         let manifest = store.read_manifest().unwrap().unwrap();
         assert_eq!(
             overlay_store_names(dir.path()),
@@ -7713,7 +7731,7 @@ mod tests {
         for revision in 1..=4 {
             publish_body_edit(&store, "src/file-0.ts", revision);
         }
-        assert!(store.compact_artifacts_if_amplified(1, 3).unwrap());
+        await_maintenance(|| store.compact_artifacts_if_amplified(1, 3).unwrap());
         assert!(
             store
                 .read_manifest()
@@ -7869,8 +7887,7 @@ mod tests {
         fs::read(store.root.join(&old_stats)).unwrap();
         drop(reader_guard);
         worker.join().unwrap();
-        let report = store.gc_generations().unwrap();
-        assert!(!report.deferred_for_readers);
+        finish_gc(&store);
         assert!(!store.root.join(old_manifest_name).exists());
         assert!(!store.root.join(old_stats).exists());
     }
@@ -7884,6 +7901,7 @@ mod tests {
             snapshot.id.content_state = format!("generation-{generation}");
             store.publish(&snapshot).unwrap();
         }
+        finish_gc(&store);
         let count_generation_entries = || {
             fs::read_dir(dir.path())
                 .unwrap()
@@ -7898,6 +7916,7 @@ mod tests {
             snapshot.id.content_state = format!("generation-{generation}");
             store.publish(&snapshot).unwrap();
         }
+        finish_gc(&store);
         let entries: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .collect::<Result<_, _>>()
