@@ -1816,6 +1816,13 @@ fn collect_scope_bindings(node: Node<'_>, source: &[u8]) -> BTreeSet<String> {
     {
         add_pattern(parameter);
     }
+    // `for (const x of xs)` declares `x`; `for (x of xs)` (no `kind`) assigns an outer binding.
+    if node.kind() == "for_in_statement"
+        && node.child_by_field_name("kind").is_some()
+        && let Some(left) = node.child_by_field_name("left")
+    {
+        add_pattern(left);
+    }
     result
 }
 
@@ -3147,6 +3154,35 @@ function outer() {
         assert!(artifact.symbol_refs.iter().any(|reference| {
             reference_owner(&artifact, reference) == "outer" && reference.to == "helper"
         }));
+    }
+
+    #[test]
+    fn for_in_and_for_of_declarations_shadow_imports() {
+        let artifact = parse_source(
+            "loops.ts",
+            br#"
+import { validate, check, pick, reset } from './v';
+function run(validators: Array<() => void>, table: object, pairs: any[]) {
+  for (const validate of validators) validate();
+  for (let check in table) check();
+  for (const [pick] of pairs) pick();
+  for (reset of validators) reset();
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let calls: BTreeSet<_> = artifact
+            .symbol_refs
+            .iter()
+            .filter(|reference| reference.kind == EdgeKind::Calls)
+            .map(|reference| reference.to.as_str())
+            .collect();
+        // `for (reset of ...)` assigns the outer binding; only a declaring head shadows.
+        assert_eq!(calls, ["reset"].into_iter().collect(), "{calls:?}");
     }
 
     #[test]
