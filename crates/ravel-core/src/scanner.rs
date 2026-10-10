@@ -1672,7 +1672,9 @@ fn collect_binding_names(node: Node<'_>, source: &[u8], result: &mut Vec<(String
                 collect_binding_names(value, source, result);
             }
         }
-        "assignment_pattern" => {
+        // `object_assignment_pattern` is a defaulted shorthand inside an object pattern
+        // (`{ data = [] }`); the bound name is on the left either way.
+        "assignment_pattern" | "object_assignment_pattern" => {
             if let Some(left) = node.child_by_field_name("left") {
                 collect_binding_names(left, source, result);
             }
@@ -2985,6 +2987,41 @@ const [first, , third = fallback] = values;
             assert!(ids.contains(reference.from_id.as_str()));
             assert!((reference.span.end_byte as usize) <= source.len());
         }
+    }
+
+    #[test]
+    fn defaulted_object_destructuring_binds_and_shadows_its_names() {
+        let artifact = parse_source(
+            "defaults.ts",
+            br#"
+import { helper } from './helper';
+function useIt() { const { data = [], nested: { deep } = {} } = useQuery(); return data; }
+function f({ helper = () => 2 }) { helper(); }
+"#,
+        );
+        assert!(
+            has_symbol(&artifact, "useIt.data", "constant"),
+            "{:?}",
+            artifact.symbols
+        );
+        assert!(has_symbol(&artifact, "useIt.deep", "constant"));
+        assert!(
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == "useIt.data"
+                    && reference.to == "useQuery"
+                    && reference.kind == EdgeKind::Calls
+            }),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(
+            !artifact
+                .symbol_refs
+                .iter()
+                .any(|reference| reference.to == "helper"),
+            "{:?}",
+            artifact.symbol_refs
+        );
     }
 
     #[test]
