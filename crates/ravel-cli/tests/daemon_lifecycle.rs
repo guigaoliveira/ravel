@@ -582,6 +582,86 @@ fn stop_leaves_the_daemon_to_its_sessions_until_the_last_one_ends() {
     );
 }
 
+#[test]
+fn a_daemon_that_cannot_start_says_why_without_waiting_out_the_deadline() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+    // A configuration the daemon refuses at startup.
+    fs::write(
+        root.path().join(".ravel.toml"),
+        "[watch]\nmax_batch_ms = 0\n",
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+
+    let start = command(binary, root.path(), &["daemon", "start"]);
+    let stderr = String::from_utf8_lossy(&start.stderr);
+    assert!(!start.status.success(), "the daemon cannot have started");
+    // The reason is only read while waiting for the daemon, so finding it here also means the
+    // wait ended when the daemon did, not at the deadline ("daemon did not become ready").
+    assert!(
+        stderr.contains("max_batch_ms"),
+        "the reason the daemon gave was lost: {stderr}"
+    );
+}
+
+/// `daemon start` while the previous daemon is still draining its connections after `stop`: it
+/// refuses with "shutting down", and is gone a moment later.
+#[cfg(unix)]
+#[test]
+fn start_waits_out_a_daemon_that_is_shutting_down_and_starts_another() {
+    /// Stops whichever daemon serves the root when the test ends, however it ends.
+    struct StopOnDrop<'a>(&'a Path);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = command(env!("CARGO_BIN_EXE_ravel"), self.0, &["daemon", "stop"]);
+        }
+    }
+
+    let root = indexed_workspace("restarted");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let _stop = StopOnDrop(root.path());
+    let mut old = PersistentDaemon::start(root.path());
+    // A connection that has not said anything yet keeps the stopped daemon draining.
+    let identity = ravel_core::daemon::RootIdentity::discover(root.path()).unwrap();
+    let layout = ravel_core::daemon::RuntimeLayout::for_root(&identity).unwrap();
+    let ravel_core::daemon::LocalEndpoint::Unix(socket) = &layout.endpoint;
+    let idle = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    match client.call(ravel_core::daemon::DaemonOperation::Status) {
+        Err(error) if error.is_shutting_down() => {}
+        other => panic!("expected a daemon still draining, got {other:?}"),
+    }
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(idle);
+    });
+
+    let start = command(binary, root.path(), &["daemon", "start"]);
+    release.join().unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        old.exits_within(Duration::from_secs(5)),
+        "the stopped daemon never left"
+    );
+    let status = command(binary, root.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        true,
+        "no daemon took its place"
+    );
+}
+
 /// Process ids of the daemons serving `root`, found the way an operator would: by command line.
 #[cfg(target_os = "linux")]
 fn daemon_pids(root: &Path) -> Vec<u32> {

@@ -34,6 +34,13 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// that is going to answer does so within a few milliseconds, then up to this ceiling.
 const DAEMON_READY_POLL: Duration = Duration::from_millis(20);
 const DAEMON_READY_POLL_FIRST: Duration = Duration::from_millis(1);
+/// How many daemons one wait may start: the first, and a few more for when the daemon that kept
+/// them from starting goes away meanwhile.
+const DAEMON_START_ATTEMPTS: usize = 4;
+/// How much of a daemon's standard error a failed start reports.
+const DAEMON_STDERR_LIMIT: u64 = 16 * 1024;
+/// What a daemon says when another one already serves its workspace.
+const ALREADY_RUNNING: &str = "a Ravel daemon already owns this workspace";
 const DEFAULT_DAEMON_MIN_CONNECTIONS: usize = 8;
 const DEFAULT_DAEMON_CONNECTIONS_PER_CPU: usize = 4;
 const DEFAULT_DAEMON_MAX_LEASES: usize = 32;
@@ -474,19 +481,20 @@ pub fn ensure_running(
     // answers `NotFound`. Two concurrent `daemon start` runs then failed with a bare
     // "The system cannot find the file specified" instead of sharing the daemon that was right
     // there. The operation itself proves reachability, so ask for it directly.
-    if transient {
-        if let Ok(lease) = client.acquire_lease() {
-            return Ok((client, Some(lease)));
+    let mut last_refusal = None;
+    let mut reachable = match reach(&client, transient) {
+        Ok(lease) => return Ok((client, lease)),
+        Err(DaemonCallError::Transport(_)) => false,
+        // The daemon answered and refused: that is a real answer, not a startup race. Unless it
+        // is only on its way out, which a fresh daemon answers once it is gone.
+        Err(error @ DaemonCallError::Remote(_)) if !transient && !error.is_shutting_down() => {
+            return Err(error);
         }
-    } else {
-        match client.call(DaemonOperation::PromotePersistent) {
-            Ok(_) => return Ok((client, None)),
-            // The daemon answered and refused: that is a real answer, not a startup race.
-            Err(error @ DaemonCallError::Remote(_)) => return Err(error),
-            // Not reachable (yet). Fall through to start one and poll.
-            Err(DaemonCallError::Transport(_)) => {}
+        Err(error) => {
+            last_refusal = Some(error);
+            true
         }
-    }
+    };
     let executable = std::env::current_exe().map_err(DaemonCallError::Transport)?;
     // A long-lived server keeps running from a deleted inode after its package is replaced on disk,
     // and the daemon endpoint is version-scoped, so it cannot borrow the new build's daemon either.
@@ -504,51 +512,132 @@ pub fn ensure_running(
             ),
         )));
     }
-    let mut child = std::process::Command::new(executable)
-        .arg("--root")
-        .arg(root)
-        .arg("daemon-serve")
-        .args(transient.then_some("--transient"))
-        .stdin(if transient {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(DaemonCallError::Transport)?;
     let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
     let mut poll = DAEMON_READY_POLL_FIRST;
-    while std::time::Instant::now() < deadline {
-        if transient {
-            if let Ok(lease) = client.acquire_lease() {
-                drop(child.stdin.take());
-                return Ok((client, Some(lease)));
+    let mut starting: Option<StartingDaemon> = None;
+    let mut starts = 0;
+    loop {
+        // Start one while nothing answers: at first, and again when the daemon that kept ours from
+        // starting -- one that was shutting down, say -- has gone without another taking its place.
+        if starting.is_none() && !reachable && starts < DAEMON_START_ATTEMPTS {
+            starting = Some(StartingDaemon::spawn(&executable, root, transient)?);
+            starts += 1;
+        }
+        match reach(&client, transient) {
+            // Dropping the child closes a transient daemon's bootstrap pipe, which only ends it
+            // while it holds no lease.
+            Ok(lease) => return Ok((client, lease)),
+            // Still coming up, or another process won singleton startup and has not armed a
+            // listener instance yet. Keep polling until the deadline.
+            Err(DaemonCallError::Transport(_)) => reachable = false,
+            Err(error @ DaemonCallError::Remote(_)) if !transient && !error.is_shutting_down() => {
+                return Err(error);
             }
-        } else {
-            match client.call(DaemonOperation::PromotePersistent) {
-                Ok(_) => return Ok((client, None)),
-                Err(error @ DaemonCallError::Remote(_)) => return Err(error),
-                // Still coming up, or another process won singleton startup and has not armed a
-                // listener instance yet. Keep polling until the deadline.
-                Err(DaemonCallError::Transport(_)) => {}
+            Err(error) => {
+                reachable = true;
+                last_refusal = Some(error);
             }
         }
-        if child
-            .try_wait()
-            .map_err(DaemonCallError::Transport)?
-            .is_some()
+        if let Some(daemon) = starting.as_mut()
+            && let Some(status) = daemon
+                .child
+                .try_wait()
+                .map_err(DaemonCallError::Transport)?
         {
-            // Another process may have won singleton startup; keep polling its endpoint.
+            let said = daemon.stderr();
+            // Losing the singleton race to another process is how concurrent starts share one
+            // daemon: keep polling its endpoint. Anything else will not come right by waiting --
+            // a configuration error, say -- and the reason is in what the daemon said.
+            if !status.success() && !said.contains(ALREADY_RUNNING) {
+                return Err(DaemonCallError::Transport(io::Error::other(
+                    if said.is_empty() {
+                        format!("the daemon exited during startup ({status})")
+                    } else {
+                        format!("the daemon exited during startup ({status}): {said}")
+                    },
+                )));
+            }
+            starting = None;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(poll);
         poll = (poll * 2).min(DAEMON_READY_POLL);
     }
     Err(DaemonCallError::Transport(io::Error::new(
         io::ErrorKind::TimedOut,
-        "daemon did not become ready",
+        match last_refusal {
+            Some(refusal) => format!("daemon did not become ready: {refusal}"),
+            None => "daemon did not become ready".to_owned(),
+        },
     )))
+}
+
+/// What the caller came for: a lease on the daemon, or (persistent) its promotion.
+fn reach(
+    client: &DaemonClient,
+    transient: bool,
+) -> Result<Option<DaemonClientLease>, DaemonCallError> {
+    if transient {
+        client.acquire_lease().map(Some)
+    } else {
+        client
+            .call(DaemonOperation::PromotePersistent)
+            .map(|_| None)
+    }
+}
+
+/// A daemon this process started, until it is serving or gone.
+struct StartingDaemon {
+    child: std::process::Child,
+    /// Its standard error. A daemon that cannot start says why there and exits; with the stream
+    /// thrown away, a configuration error looked like a daemon that was merely slow, and surfaced
+    /// seconds later as "did not become ready". A file rather than a pipe, because a daemon that
+    /// does start outlives this process and must be able to keep writing to it.
+    stderr: File,
+}
+
+impl StartingDaemon {
+    fn spawn(executable: &Path, root: &Path, transient: bool) -> Result<Self, DaemonCallError> {
+        let stderr = tempfile::tempfile().map_err(DaemonCallError::Transport)?;
+        let child = std::process::Command::new(executable)
+            .arg("--root")
+            .arg(root)
+            .arg("daemon-serve")
+            .args(transient.then_some("--transient"))
+            .stdin(if transient {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr.try_clone().map_err(DaemonCallError::Transport)?)
+            .spawn()
+            .map_err(DaemonCallError::Transport)?;
+        Ok(Self { child, stderr })
+    }
+
+    fn stderr(&mut self) -> String {
+        use std::io::Seek;
+        let mut said = String::new();
+        if self.stderr.rewind().is_ok() {
+            let _ = (&mut self.stderr)
+                .take(DAEMON_STDERR_LIMIT)
+                .read_to_string(&mut said);
+        }
+        startup_error(&said).to_owned()
+    }
+}
+
+/// The error a daemon printed on its way out, without the backtrace `RUST_BACKTRACE` adds to it.
+fn startup_error(stderr: &str) -> &str {
+    let said = stderr
+        .split("\nStack backtrace:")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    said.strip_prefix("Error: ").unwrap_or(said)
 }
 
 /// Keeps the daemon alive for as long as it is held. When the daemon is new enough it also answers
@@ -616,7 +705,7 @@ pub fn serve(root: &Path, transient: bool) -> anyhow::Result<()> {
     let identity = RootIdentity::discover(&root)?;
     let layout = RuntimeLayout::for_root(&identity)?;
     let Some(_lease) = DaemonLease::try_acquire(&layout.singleton_lock)? else {
-        anyhow::bail!("a Ravel daemon already owns this workspace");
+        anyhow::bail!(ALREADY_RUNNING);
     };
     let name = match &layout.endpoint {
         #[cfg(unix)]
@@ -1562,6 +1651,22 @@ mod tests {
             LeaseGuard::try_new(&state).err(),
             Some("daemon lease limit reached")
         );
+    }
+
+    #[test]
+    fn a_failed_start_reports_the_error_not_the_backtrace() {
+        let printed = "Error: invalid config `watch` = 0: max_batch_ms must be greater than zero\n\n\
+                       Stack backtrace:\n   0: anyhow::error\n   1: main\n";
+        assert_eq!(
+            startup_error(printed),
+            "invalid config `watch` = 0: max_batch_ms must be greater than zero"
+        );
+        let chained = "Error: daemon\n\nCaused by:\n    disk full\n";
+        assert_eq!(
+            startup_error(chained),
+            "daemon\n\nCaused by:\n    disk full"
+        );
+        assert_eq!(startup_error(""), "");
     }
 
     #[test]
