@@ -57,3 +57,63 @@ fn init_builds_a_standalone_project_index_by_default() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn indexed_project(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in files {
+        let path = root.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let index = Command::new(env!("CARGO_BIN_EXE_ravel"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    root
+}
+
+#[test]
+fn impact_walks_what_depends_on_the_symbol_with_or_without_risk() {
+    let root = indexed_project(&[
+        (
+            "src/leaf.ts",
+            "export function leafHelper() { return 1; }\n",
+        ),
+        (
+            "src/base.ts",
+            "import { leafHelper } from './leaf';\nexport function impactBase() { return leafHelper(); }\n",
+        ),
+        (
+            "src/user.ts",
+            "import { impactBase } from './base';\nexport function impactUser() { return impactBase(); }\n",
+        ),
+    ]);
+    let impact = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ravel"))
+            .arg("--root")
+            .arg(root.path())
+            .args(["impact", "impactBase"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // The blast radius of a change is what depends on the symbol, not what it depends on.
+    for answer in [impact(&[]), impact(&["--risk"])] {
+        assert!(answer.contains("impactUser"), "{answer}");
+        assert!(!answer.contains("leafHelper"), "{answer}");
+    }
+}

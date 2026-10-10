@@ -178,6 +178,7 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Blast radius: everything that depends on this symbol, transitively
     Impact {
         node: String,
         #[arg(long, default_value_t = 32)]
@@ -603,7 +604,9 @@ skip_sibling_emit = true
             if risk {
                 emit_json(&engine.impact_risk(&node, &limits)?, pretty)?;
             } else {
-                emit_json(&engine.query(&node, false, &limits, None)?, pretty)?;
+                // The walk `--risk` scores: what depends on `node`, the blast radius of changing
+                // it. The forward walk answers the opposite question — what `node` itself needs.
+                emit_json(&engine.query(&node, true, &limits, None)?, pretty)?;
             }
         }
         Some(Command::Cycles { package, files }) => {
