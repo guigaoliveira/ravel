@@ -1579,11 +1579,11 @@ fn write_project_instructions(
 ) -> anyhow::Result<()> {
     let root = opts.project_root.as_path();
     let block = agent_instruction_block();
-    let create_agents_md = opts.location == InstallLocation::Local || looks_like_project(root);
+    let in_project = opts.location == InstallLocation::Local || looks_like_project(root);
     for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
         let path = root.join(name);
         // Only create AGENTS.md automatically; append to others only if they exist.
-        if !path.exists() && (name != "AGENTS.md" || !create_agents_md) {
+        if !path.exists() && (name != "AGENTS.md" || !in_project) {
             if name == "AGENTS.md" {
                 actions.push(InstallAction {
                     agent: "instructions".into(),
@@ -1618,8 +1618,9 @@ fn write_project_instructions(
             detail: name.into(),
         });
     }
-    // Cursor project rule only if the project already uses .cursor/
-    if root.join(".cursor").is_dir() {
+    // Cursor project rule only if the project already uses .cursor/ — and only in a project: a
+    // global install run from the home directory found ~/.cursor there and wrote a rule into it.
+    if in_project && root.join(".cursor").is_dir() {
         let cursor_rule = root.join(".cursor").join("rules").join("ravel.mdc");
         if let Some(parent) = cursor_rule.parent() {
             fs::create_dir_all(parent)?;
@@ -2170,6 +2171,24 @@ b = 2
         fs::create_dir(dir.path().join(".git")).unwrap();
         write_project_instructions(&opts, &mut Vec::new()).unwrap();
         assert!(dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn global_install_outside_a_project_writes_no_cursor_rule() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".cursor")).unwrap();
+        let rule = dir.path().join(".cursor").join("rules").join("ravel.mdc");
+        let mut opts = local_opts(dir.path(), vec![]);
+        opts.location = InstallLocation::Global;
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert!(
+            !rule.exists(),
+            "a .cursor/ outside a project (~/.cursor) got a rule"
+        );
+
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        write_project_instructions(&opts, &mut Vec::new()).unwrap();
+        assert!(rule.is_file());
     }
 
     #[test]
