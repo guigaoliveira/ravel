@@ -88,7 +88,7 @@ What it writes:
 | Agent | Global config | Local config | Instructions |
 |-------|---------------|--------------|--------------|
 | Claude Code | `~/.claude.json` `mcpServers` (`$CLAUDE_CONFIG_DIR/.claude.json` when set) | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` or `$CLAUDE_CONFIG_DIR/skills/ravel/` (local: `.claude/skills/ravel/`) |
-| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if `.cursor/` exists |
+| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if the project has `.cursor/` |
 | Codex | `$CODEX_HOME/config.toml` (default `~/.codex`) | `.codex/config.toml` (trusted projects) | `AGENTS.md`; skill in `~/.agents/skills/ravel/` (local: `.agents/skills/ravel/`) |
 | OpenCode | `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME/opencode/` when set; same on macOS and Windows) | `opencode.json` | `AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` | `GEMINI.md` if present |
