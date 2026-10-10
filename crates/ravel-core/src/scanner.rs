@@ -527,24 +527,37 @@ fn extract_node(
     .flatten();
     let enclosing = detached_owner.as_ref().or(enclosing);
 
-    let is_branch = matches!(
-        kind,
-        "if_statement"
-            | "else_clause"
-            | "for_statement"
-            | "for_in_statement"
-            | "while_statement"
-            | "do_statement"
-            | "switch_case"
-            | "switch_default"
-            | "catch_clause"
-            | "ternary_expression"
-            | "conditional_type"
-    ) || matches!(kind, "binary_expression" if is_logical_binary(node));
-    if is_branch {
-        if let Some((cyc, cog)) = complexity {
+    // `else if` and `else` continue the `if` they belong to: `else if` is one more decision and
+    // `else` none, each adds one unnested cognitive point, and neither nests its body any deeper
+    // than the first branch's.
+    let else_if = kind == "if_statement"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "else_clause");
+    let is_branch = (!else_if
+        && matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_case"
+                | "switch_default"
+                | "catch_clause"
+                | "ternary_expression"
+                | "conditional_type"
+        ))
+        || matches!(kind, "binary_expression" if is_logical_binary(node));
+    if let Some((cyc, cog)) = complexity {
+        if is_branch {
             *cyc = cyc.saturating_add(1);
             *cog = cog.saturating_add(1 + nesting);
+        } else if else_if {
+            *cyc = cyc.saturating_add(1);
+            *cog = cog.saturating_add(1);
+        } else if kind == "else_clause" && !has_named_child_of_kind(node, &["if_statement"]) {
+            *cog = cog.saturating_add(1);
         }
     }
     let next_nesting = if is_branch { nesting + 1 } else { nesting };
@@ -1273,8 +1286,16 @@ fn extract_variable_declaration(
             // A destructuring initializer belongs to the declaration as a whole. Attribute it to
             // the first static binding only to avoid duplicate graph edges.
             if index == 0 {
-                let parent_comp = complexity.take();
+                // A function or class value is its own complexity unit. Any other initializer
+                // (`const x = a ? 1 : 2`) is part of the enclosing function's control flow.
+                let own_unit = matches!(symbol_kind, "function" | "class");
+                let parent_comp = if own_unit { complexity.take() } else { None };
                 let mut declaration_comp = (symbol_kind == "function").then_some((1u32, 0u32));
+                let walk_comp = if own_unit {
+                    &mut declaration_comp
+                } else {
+                    &mut *complexity
+                };
                 let value_to_walk = commonjs_specifier.is_none().then_some(value).flatten();
                 for child in [declarator.child_by_field_name("type"), value_to_walk]
                     .into_iter()
@@ -1288,7 +1309,7 @@ fn extract_variable_declaration(
                         imports,
                         exports,
                         refs,
-                        &mut declaration_comp,
+                        walk_comp,
                         Some(&owner),
                         nesting,
                         false,
@@ -1300,7 +1321,9 @@ fn extract_variable_declaration(
                         cognitive: if cog == 0 { 1 } else { cog },
                     });
                 }
-                *complexity = parent_comp;
+                if own_unit {
+                    *complexity = parent_comp;
+                }
             }
         }
     }
@@ -3332,6 +3355,41 @@ export function f(a: number) {
         assert!(c.cyclomatic >= 3, "cyclomatic={}", c.cyclomatic);
         // outer if (+1) + nested if (+1+nesting) → cognitive ≥ 3
         assert!(c.cognitive >= 3, "cognitive={}", c.cognitive);
+    }
+
+    #[test]
+    fn complexity_counts_else_if_chains_once_and_local_initializer_branches() {
+        let art = parse_source(
+            "chains.ts",
+            br#"
+export function chain(a: number) {
+  if (a > 0) { return 1; } else if (a > 1) { return 2; } else if (a > 2) { return 3; } else { return 4; }
+}
+export function nestedInElseIf(a: number) {
+  if (a > 0) {
+    return 1;
+  } else if (a > 1) {
+    if (a > 2) { return 2; }
+  }
+  return 0;
+}
+export function ternary(a: number) { const x = a ? 1 : 2; return x; }
+"#,
+        );
+        let complexity = |name: &str| {
+            let symbol = art
+                .symbols
+                .iter()
+                .find(|s| s.qualified_name == name)
+                .unwrap();
+            let c = symbol.complexity.as_ref().unwrap();
+            (c.cyclomatic, c.cognitive)
+        };
+        // Three decisions; `if`, two `else if` and `else` each add one cognitive point, unnested.
+        assert_eq!(complexity("chain"), (4, 4));
+        // The `if` in the `else if` body sits one level deep, like one in the first branch.
+        assert_eq!(complexity("nestedInElseIf"), (4, 4));
+        assert_eq!(complexity("ternary"), (2, 1));
     }
 
     #[test]
