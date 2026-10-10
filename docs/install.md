@@ -114,6 +114,11 @@ Re-running `ravel install` (after an upgrade or a move) refreshes the command an
 arguments and keeps everything else you added to the `ravel` entry: `env`,
 timeouts, tool allow-lists, per-tool approvals.
 
+A config Ravel cannot parse — JSON with comments or trailing commas, for
+example — is left untouched and reported as an `error` action naming the file,
+and the command exits non-zero once the report is printed. An empty config file
+counts as an empty object.
+
 The `AGENTS.md` block is written into the directory you run the installer from
 only when it is a project (it has `.git`, `package.json`, `tsconfig.json` or
 `jsconfig.json`) or when you pass `--location local`; a global install run from

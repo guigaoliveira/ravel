@@ -160,3 +160,44 @@ fn opencode_global_config_lives_under_xdg_config_home_on_every_platform() {
     assert!(config.is_file(), "{report}");
     assert!(!home.path().join("opencode").exists(), "{report}");
 }
+
+#[test]
+fn a_config_ravel_cannot_parse_fails_the_run_and_names_the_file() {
+    let home = tempdir().unwrap();
+    let cursor = home.path().join(".cursor").join("mcp.json");
+    let original = "{\n  // mine\n  \"mcpServers\": {}\n}\n";
+    write(&cursor, original);
+
+    let (status, report) = run(
+        sandboxed(home.path()),
+        &["install", "--target", "cursor", "--no-instructions"],
+    );
+    assert!(!status.success(), "an agent that failed must fail the run");
+    let error = report["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "error")
+        .unwrap_or_else(|| panic!("no error action: {report}"));
+    let path = cursor.display().to_string();
+    assert_eq!(error["path"], path.as_str(), "{report}");
+    assert!(
+        error["detail"].as_str().unwrap().contains(&path),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&cursor).unwrap(), original);
+}
+
+#[test]
+fn an_empty_json_config_is_an_empty_object() {
+    let home = tempdir().unwrap();
+    let cursor = home.path().join(".cursor").join("mcp.json");
+    write(&cursor, "");
+    let (status, report) = run(
+        sandboxed(home.path()),
+        &["install", "--target", "cursor", "--no-instructions"],
+    );
+    assert!(status.success(), "{report}");
+    let config = read_json(&cursor);
+    assert!(config["mcpServers"]["ravel"].is_object(), "{config}");
+}

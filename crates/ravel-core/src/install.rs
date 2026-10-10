@@ -188,6 +188,16 @@ pub struct InstallReport {
     pub next_steps: Vec<String>,
 }
 
+impl InstallReport {
+    /// How many agents could not be configured: the run reports them and then fails.
+    pub fn errors(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|action| action.action == "error")
+            .count()
+    }
+}
+
 /// Resolve this process's binary path for MCP command (stable across shells).
 pub fn resolve_ravel_bin() -> PathBuf {
     env::current_exe()
@@ -659,20 +669,18 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
         .collect();
 
     for kind in &opts.targets {
-        let result = install_one(*kind, opts, &mut actions).and_then(|()| {
-            if opts.write_instructions {
-                write_skill(*kind, opts, &mut actions)
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(e) = result {
-            actions.push(InstallAction {
-                agent: kind.id().into(),
-                path: String::new(),
-                action: "error".into(),
-                detail: e.to_string(),
+        let result = install_one(*kind, opts, &mut actions)
+            .map_err(|error| (mcp_config_path(*kind, opts), error))
+            .and_then(|()| {
+                if opts.write_instructions {
+                    write_skill(*kind, opts, &mut actions)
+                        .map_err(|error| (skill_path(*kind, opts), error))
+                } else {
+                    Ok(())
+                }
             });
+        if let Err((path, error)) = result {
+            actions.push(error_action(*kind, path, &error));
         }
     }
 
@@ -712,6 +720,20 @@ pub fn install_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
     })
 }
 
+/// One agent that could not be configured, with the file it was working on — an error with an
+/// empty path left the user to guess which of their configs to fix.
+fn error_action(kind: AgentKind, path: Option<PathBuf>, error: &anyhow::Error) -> InstallAction {
+    InstallAction {
+        agent: kind.id().into(),
+        path: path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        action: "error".into(),
+        // `{:#}` keeps the cause after the context that names the file.
+        detail: format!("{error:#}"),
+    }
+}
+
 /// Remove Ravel MCP entries + instruction markers from selected agents.
 pub fn uninstall_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> {
     let mut actions = Vec::new();
@@ -721,20 +743,18 @@ pub fn uninstall_agents(opts: &InstallOptions) -> anyhow::Result<InstallReport> 
         .collect();
 
     for kind in &opts.targets {
-        let result = uninstall_one(*kind, opts, &mut actions).and_then(|()| {
-            if opts.write_instructions {
-                remove_skill(*kind, opts, &mut actions)
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(e) = result {
-            actions.push(InstallAction {
-                agent: kind.id().into(),
-                path: String::new(),
-                action: "error".into(),
-                detail: e.to_string(),
+        let result = uninstall_one(*kind, opts, &mut actions)
+            .map_err(|error| (mcp_config_path(*kind, opts), error))
+            .and_then(|()| {
+                if opts.write_instructions {
+                    remove_skill(*kind, opts, &mut actions)
+                        .map_err(|error| (skill_path(*kind, opts), error))
+                } else {
+                    Ok(())
+                }
             });
+        if let Err((path, error)) = result {
+            actions.push(error_action(*kind, path, &error));
         }
     }
 
@@ -961,12 +981,7 @@ fn ensure_claude_allowlist(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let _lock = lock_config(path)?;
-    let text = if path.exists() {
-        fs::read_to_string(path)?
-    } else {
-        "{}".to_owned()
-    };
-    let mut root: Value = serde_json::from_str(&text)?;
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     // Guard every downcast: a settings.json that parses to a non-object (`[]`, scalar), or
     // whose `permissions`/`allow` are the wrong JSON type, must not panic — coerce instead.
     anyhow::ensure!(
@@ -1029,12 +1044,7 @@ fn upsert_json_mcp_servers(
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(path)?;
-    let mut root: Value = if path.exists() {
-        let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text)?
-    } else {
-        json!({})
-    };
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -1092,8 +1102,7 @@ fn remove_json_mcp_key(
         });
         return Ok(());
     }
-    let text = fs::read_to_string(path)?;
-    let mut root: Value = serde_json::from_str(&text)?;
+    let mut root = read_json_config(path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     if let Some(obj) = root.as_object_mut() {
         if let Some(servers) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -1387,11 +1396,8 @@ fn install_opencode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(&path)?;
-    let mut root: Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(&path)?)?
-    } else {
-        json!({ "$schema": "https://opencode.ai/config.json" })
-    };
+    let mut root = read_json_config(&path)?
+        .unwrap_or_else(|| json!({ "$schema": "https://opencode.ai/config.json" }));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -1438,7 +1444,7 @@ fn uninstall_opencode(
         });
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
         removed = mcp.remove(MCP_SERVER_NAME).is_some();
@@ -1477,11 +1483,7 @@ fn install_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
         fs::create_dir_all(parent)?;
     }
     let _lock = lock_config(&path)?;
-    let mut root: Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(&path)?)?
-    } else {
-        json!({})
-    };
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     anyhow::ensure!(
         root.is_object(),
         "{} must contain a JSON object",
@@ -1533,7 +1535,7 @@ fn uninstall_vscode(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> 
         });
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut root = read_json_config(&path)?.unwrap_or_else(|| json!({}));
     let mut removed = false;
     for key in ["servers", "mcpServers"] {
         if let Some(servers) = root.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -1701,6 +1703,32 @@ fn replace_marked_section(text: &str, replacement: &str) -> String {
     out.push_str(replacement);
     out.push_str(&text[end..]);
     out
+}
+
+/// A JSON config's contents, or `None` when there are none yet: no file, or an empty one (a
+/// `touch`, an editor's new buffer), which its agent reads as no settings at all.
+///
+/// A parse error names the file. Comments and trailing commas (JSONC, which some agents accept)
+/// are refused rather than rewritten away.
+fn read_json_config(path: &Path) -> anyhow::Result<Option<Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!("reading {}", path.display())));
+        }
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&text).map(Some).with_context(|| {
+        format!(
+            "{} is not plain JSON (comments and trailing commas are not supported), so it was \
+             left untouched; edit its `ravel` entry by hand (`ravel install --print-config` \
+             prints one)",
+            path.display()
+        )
+    })
 }
 
 fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {

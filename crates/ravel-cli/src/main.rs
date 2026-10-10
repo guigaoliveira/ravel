@@ -458,6 +458,7 @@ skip_sibling_emit = true
             let report = ravel_core::install::install_agents(&opts)?;
             emit_json(&report, pretty)?;
             eprintln!("note: `ravel setup` is deprecated; use `ravel install --location local`");
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Install {
             target,
@@ -493,6 +494,7 @@ skip_sibling_emit = true
                 };
                 let report = ravel_core::install::install_agents(&opts)?;
                 emit_json(&report, pretty)?;
+                fail_on_agent_errors(&report)?;
             }
         }
         Some(Command::Uninstall {
@@ -515,6 +517,7 @@ skip_sibling_emit = true
             };
             let report = ravel_core::install::uninstall_agents(&opts)?;
             emit_json(&report, pretty)?;
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Doctor) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -820,6 +823,17 @@ skip_sibling_emit = true
         None => emit_json(&health(), pretty)?,
     }
     Ok(())
+}
+
+/// The report is printed either way; an agent that could not be configured also fails the run,
+/// so a script or CI step does not read a half-done install as success.
+fn fail_on_agent_errors(report: &ravel_core::install::InstallReport) -> anyhow::Result<()> {
+    match report.errors() {
+        0 => Ok(()),
+        failed => anyhow::bail!(
+            "{failed} agent(s) could not be updated; see the `error` actions in the report"
+        ),
+    }
 }
 
 fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
