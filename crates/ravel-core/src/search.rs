@@ -504,12 +504,14 @@ impl DictRuntime {
                     if !cand.starts_with(&normalized) {
                         break;
                     }
+                    // Equal up to case by the same folding the match used, so `École` is an
+                    // exact hit for `école`; ASCII-only folding scored it as a mere prefix.
                     hits.push(SearchHit {
                         value: dict.names[i].clone(),
                         definition_id: None,
                         score_micros: if dict.names[i] == query {
                             SCORE_EXACT_CASE
-                        } else if dict.names[i].eq_ignore_ascii_case(query) {
+                        } else if *cand == normalized {
                             SCORE_EXACT_CASE_INSENSITIVE
                         } else if dict.names[i].starts_with(query) {
                             SCORE_PREFIX_CASE
@@ -519,7 +521,7 @@ impl DictRuntime {
                         reason: Some(
                             if dict.names[i] == query {
                                 "exact-case"
-                            } else if dict.names[i].eq_ignore_ascii_case(query) {
+                            } else if *cand == normalized {
                                 "exact-case-insensitive"
                             } else if dict.names[i].starts_with(query) {
                                 "prefix-case"
@@ -628,7 +630,7 @@ fn search_archived_dict(
         let name = dict.names[index].as_str();
         let (score_micros, reason) = if name == query {
             (SCORE_EXACT_CASE, "exact-case")
-        } else if name.eq_ignore_ascii_case(query) {
+        } else if candidate == normalized {
             (SCORE_EXACT_CASE_INSENSITIVE, "exact-case-insensitive")
         } else if name.starts_with(query) {
             (SCORE_PREFIX_CASE, "prefix-case")
@@ -1955,6 +1957,28 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         );
+    }
+
+    /// A prefix query that equals a name up to case is an exact case-insensitive match, also when
+    /// the case differs outside ASCII. Scored as a mere prefix, `École` lost to the longer `écoles`.
+    #[test]
+    fn non_ascii_case_insensitive_exact_outranks_a_longer_prefix() {
+        let dict = SymbolDict::from_names(vec!["École".into(), "écoles".into()], "s".into());
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&dict).unwrap();
+        let archived = rkyv::access::<ArchivedSymbolDict, rkyv::rancor::Error>(&bytes).unwrap();
+        let owned = SearchIndex::from_symbol_dict(dict)
+            .search("école", SearchKind::Prefix, 10)
+            .unwrap();
+        let packed = search_archived_dict(archived, "école", SearchKind::Prefix, 10).unwrap();
+        for hits in [owned, packed] {
+            assert_eq!(hits[0].value, "École", "{hits:?}");
+            assert_eq!(
+                hits[0].reason.as_deref(),
+                Some("exact-case-insensitive"),
+                "{hits:?}"
+            );
+            assert_eq!(hits[0].score_micros, SCORE_EXACT_CASE_INSENSITIVE);
+        }
     }
 
     #[test]
