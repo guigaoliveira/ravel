@@ -1767,13 +1767,16 @@ impl WorkspaceEngine {
         Ok(file)
     }
 
-    /// The `config_hash` of a snapshot id: this workspace's configuration and the resolver
-    /// configuration its edges were resolved with. Without the second, re-indexing after a tsconfig
-    /// change published different edges under the same generation, so an engine holding the old
-    /// graph saw nothing new and kept answering from it.
+    /// The `config_hash` of a snapshot id: this workspace's configuration, the extractor that
+    /// produced its artifacts, and the resolver configuration its edges were resolved with. Without
+    /// the resolver, re-indexing after a tsconfig change published different edges under the same
+    /// generation, so an engine holding the old graph saw nothing new and kept answering from it.
+    /// Without the extractor, a sync kept every unchanged file's artifact from the old extractor.
     fn snapshot_config_hash(&self, resolver: &crate::resolver::ResolverConfig) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.inner.config_hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(crate::scanner::EXTRACTOR_VERSION.as_bytes());
         hasher.update(b"\0");
         hasher.update(crate::resolver::resolver_fingerprint(resolver).as_bytes());
         hasher.finalize().to_hex().to_string()
@@ -1966,6 +1969,8 @@ impl WorkspaceEngine {
         // Resolution reads tsconfig, and a changed one re-points imports in files nobody edited.
         // Every tier below re-resolves only what changed, so after such a change the sync is a full
         // index: `sync tsconfig.json` returned the old stats as if it had applied the new aliases.
+        // A new extractor is the same: the tiers below would keep every unchanged file's old
+        // artifact.
         if storage.read_manifest()?.is_some_and(|manifest| {
             manifest.snapshot_id.config_hash
                 != self.snapshot_config_hash(&load_tsconfig(&self.root))

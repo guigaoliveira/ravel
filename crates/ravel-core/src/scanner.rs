@@ -18,7 +18,9 @@ use std::{
 use thiserror::Error;
 use tree_sitter::{Node, Parser};
 
-pub const EXTRACTOR_VERSION: &str = "ts-js-structural-v4";
+/// Part of every snapshot id: a sync after it changes re-indexes, so an index never mixes
+/// artifacts extracted by two versions. Bump it whenever extraction output changes.
+pub const EXTRACTOR_VERSION: &str = "ts-js-structural-v5";
 pub const GRAMMAR_VERSION: &str = "tree-sitter-typescript-0.23+javascript-0.25";
 static EXTRACTOR_VERSION_SHARED: LazyLock<Arc<str>> =
     LazyLock::new(|| Arc::from(EXTRACTOR_VERSION));
