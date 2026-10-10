@@ -1287,7 +1287,11 @@ pub fn resolver_fingerprint(config: &ResolverConfig) -> String {
     let mut hasher = blake3::Hasher::new();
     // v3: a file's contribution also records each segment of a member reference, so an index
     // built before that must take the rebuild tier once rather than trust its referrer sets.
-    hasher.update(b"ravel-resolver-v3\0");
+    // v4: members are no longer bare-name visible, export resolution follows ES ResolveExport,
+    // declaration files are probed and a `.js` specifier prefers its `.ts` source, and a matched
+    // `paths` pattern skips baseUrl. Edges and recorded probe paths from v3 no longer match what
+    // a fresh resolution produces, so an index built before must be rebuilt once.
+    hasher.update(b"ravel-resolver-v4\0");
     if let Ok(bytes) = bincode::serialize(config) {
         hasher.update(&bytes);
     }
