@@ -259,7 +259,6 @@ pub(crate) struct StructuralPackBase {
 /// `begin_structural_pack_base`.
 pub(crate) struct StructuralPackStager {
     generation: String,
-    name: String,
     path: PathBuf,
     writer: StreamingGenerationPackWriter,
     /// Held for as long as the in-flight `.tmp-` file exists. Generation GC deletes every
@@ -738,7 +737,6 @@ impl StructuralPackStager {
     pub(crate) fn finish(self) -> Result<StagedStructuralPack, StorageError> {
         let Self {
             generation,
-            name,
             path,
             writer,
             // Bound, not dropped: `publish` renames the temp into place, so the GC barrier has to
@@ -746,10 +744,14 @@ impl StructuralPackStager {
             _generation_guard,
         } = self;
         writer.publish().map_err(|error| StorageError::Invalid {
-            path,
+            path: path.clone(),
             message: error.to_string(),
         })?;
-        Ok(StagedStructuralPack { generation, name })
+        Ok(StagedStructuralPack {
+            generation,
+            path,
+            promoted: false,
+        })
     }
 }
 
@@ -867,9 +869,31 @@ struct GraphAdjSectionOverlay {
     reverse_changes: BTreeMap<String, BTreeMap<String, Option<u32>>>,
 }
 
+/// A finished base pack waiting for the manifest that will reference it. Removed on drop unless
+/// promoted: generation GC never collects `staged-*` (it cannot tell one a writer is about to
+/// publish from one left behind), so a publication refused after staging -- a newer index's schema,
+/// a failed rename -- used to leave a full-size pack in `.ravel` for good.
 pub(crate) struct StagedStructuralPack {
     generation: String,
-    name: String,
+    path: PathBuf,
+    promoted: bool,
+}
+
+impl StagedStructuralPack {
+    /// Rename into place; dropping it afterwards leaves the file alone.
+    fn promote(&mut self, final_path: &Path) -> io::Result<()> {
+        atomic_replace(&self.path, final_path)?;
+        self.promoted = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedStructuralPack {
+    fn drop(&mut self) {
+        if !self.promoted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub(crate) struct StructuralOverlayRecords {
@@ -2695,10 +2719,13 @@ impl FileSnapshotStorage {
         &self,
         generation: String,
     ) -> Result<StructuralPackStager, StorageError> {
+        // `publish_packed_snapshot` refuses this too, but only after the whole pack is written.
+        self.ensure_not_a_downgrade()?;
         // Keep the staged pack outside generation GC until the manifest publication that will
         // reference it has completed. `attach_structural_pack_base` atomically promotes it.
-        let name = format!("staged-{generation}.structural.pack");
-        let path = self.root.join(&name);
+        let path = self
+            .root
+            .join(format!("staged-{generation}.structural.pack"));
         // Before the writer exists: the temp is created inside `new`, so the barrier has to be up
         // first. Lock order is `update.lock` -> `generation-gc.lock`, and the caller already holds
         // the update lock.
@@ -2710,7 +2737,6 @@ impl FileSnapshotStorage {
             })?;
         Ok(StructuralPackStager {
             generation,
-            name,
             path,
             writer,
             _generation_guard: generation_guard,
@@ -2720,7 +2746,7 @@ impl FileSnapshotStorage {
     #[cfg(test)]
     pub(crate) fn attach_structural_pack_base(
         &self,
-        staged: StagedStructuralPack,
+        mut staged: StagedStructuralPack,
     ) -> Result<(), StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
         let Some(mut manifest) = self.read_manifest()? else {
@@ -2736,9 +2762,9 @@ impl FileSnapshotStorage {
             });
         }
         let final_name = format!("snapshot-{}.structural.pack", staged.generation);
-        let staged_path = self.root.join(&staged.name);
         let final_path = self.root.join(&final_name);
-        atomic_replace(&staged_path, &final_path)
+        staged
+            .promote(&final_path)
             .map_err(|source| self.io(source, final_path.clone()))?;
         sync_parent_directory(&final_path).map_err(|source| self.io(source, self.root.clone()))?;
         manifest.structural_packs = Some(StructuralPackChain {
@@ -2759,9 +2785,11 @@ impl FileSnapshotStorage {
     pub(crate) fn publish_packed_snapshot(
         &self,
         snapshot: &IndexSnapshot,
-        staged: StagedStructuralPack,
+        mut staged: StagedStructuralPack,
     ) -> Result<(), StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
+        // Checked again: another binary may have published since staging began. Any refusal from
+        // here until the promotion drops `staged`, which removes the pack.
         self.ensure_not_a_downgrade()?;
         let id = snapshot.id.stable_key();
         if staged.generation != id {
@@ -2771,9 +2799,9 @@ impl FileSnapshotStorage {
             });
         }
         let final_name = format!("snapshot-{id}.pack");
-        let staged_path = self.root.join(staged.name);
         let final_path = self.root.join(&final_name);
-        atomic_replace(&staged_path, &final_path)
+        staged
+            .promote(&final_path)
             .map_err(|source| self.io(source, final_path.clone()))?;
         sync_parent_directory(&final_path).map_err(|source| self.io(source, self.root.clone()))?;
 
@@ -6840,6 +6868,54 @@ mod tests {
         store
             .publish(&snapshot())
             .expect("rebuilding an older index forward is how an upgrade lands");
+    }
+
+    /// Generation GC never collects `staged-*`, so a full index refused after staging its base pack
+    /// used to leave the whole pack behind.
+    #[test]
+    fn a_refused_packed_publication_leaves_no_staged_pack_behind() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let first = snapshot_with_files(2);
+        publish_packed(&store, &first);
+        let mut next = first;
+        next.id.content_state = "next".into();
+        let leftovers = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("staged-"))
+                .collect::<Vec<_>>()
+        };
+        let index_becomes_newer = || {
+            let path = dir
+                .path()
+                .join(store.current_generation().unwrap().unwrap());
+            let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest.schema_version = SCHEMA_VERSION + 1;
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        };
+
+        // A newer binary publishes while this one stages: the refusal comes after the pack exists.
+        let mut stager = store
+            .begin_structural_pack_base(next.id.stable_key())
+            .unwrap();
+        stager.stage_snapshot(&next).unwrap();
+        let staged = stager.finish().unwrap();
+        assert_eq!(leftovers().len(), 1);
+        index_becomes_newer();
+        let error = store
+            .publish_packed_snapshot(&next, staged)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("newer Ravel"), "{error}");
+        assert_eq!(leftovers(), Vec::<String>::new());
+
+        // Already newer when staging would begin: refused before any of the pack is written.
+        let refused = store.begin_structural_pack_base(next.id.stable_key());
+        assert!(refused.is_err());
+        assert_eq!(leftovers(), Vec::<String>::new());
     }
 
     #[test]
