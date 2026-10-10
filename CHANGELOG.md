@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A function-by-function review of the codebase. Every fix below has a regression
+test, and a new randomized walk (`tests/incremental_walk.rs`) checks that
+incremental sync publishes what a full index would after every edit.
+
+### Upgrading
+- **The first sync after upgrading runs a full index, once.** Extraction and
+  resolution changed, and the snapshot id now covers the extractor version and
+  the tsconfig-derived resolver configuration. Sync used to keep every unchanged
+  file's old artifact, and re-indexing after a tsconfig change published new
+  edges under the old generation, so a running daemon never noticed.
+
+### Fixed — wrong or missing answers
+- **Undoing an edit no longer erases earlier edits.** Overlay packs, merged tiers
+  and artifact deltas were named from the generation key, which recurs when
+  content returns to an earlier state; a later publish overwrote files the live
+  manifest still read, and `callers-of` answered `total: 0`. Each publication now
+  names them uniquely. Packed chains also get their own artifact overlay store,
+  collected with the chain, instead of one file that grew forever.
+- **A root below the top of its repository** (a package in a monorepo) read git's
+  paths as if they were relative to itself: auto-sync never saw an edit,
+  `diff-impact` was always empty and `cochanged` named files outside the root.
+- **Incremental sync re-resolves what a full index would.** Adding or renaming a
+  member of an exported class, redeclaring a clause-exported name
+  (`export { foo }`), names forwarded by barrels (`export {…} from`, `export *`,
+  import-then-export), syncing `tsconfig.json`, and another process publishing
+  beside a daemon all left stale or missing edges.
+- **Extraction:** string literals inside exported values became fake re-export
+  sources; JavaScript classes got no `Extends` edges and their fields no symbols;
+  decorated constructor parameters (`@Inject() private svc`), decorated
+  `export default class`, `export declare`, defaulted destructuring
+  (`{ a = 1 }`, also through `require`) and for-of bindings were missed; object
+  literal methods became members of the enclosing class; exports inside
+  namespaces counted as file exports.
+- **Resolution:** class members shadowed imports of the same name; explicit
+  exports did not shadow `export *`, and `default` passed through it; imports
+  reached namespace members; `.d.ts` files were never probed and `./x.js`
+  preferred the emitted file over its TypeScript source; tsconfig `extends`
+  diamonds, inherited `paths`, `${configDir}`, a BOM or a comment-only file were
+  mishandled; a matched `paths` pattern still fell back to `baseUrl`.
+- **One ignore rule set** for `ravel index`, `sync` and the watchers. Anchored
+  `.ravelignore` patterns (`src/gen/`) now work in `ravel index`; `.ignore` files
+  and nested `.ravelignore` files are not read anywhere (see
+  [configuration](docs/config.md)). Watchers re-read the rules when they change,
+  and dirty discovery applies them, so an ignored tracked file no longer warns on
+  every answer. One unreadable directory no longer fails the whole index.
+- **Watchers index the files of a directory** that is created, renamed or moved,
+  and keep hearing when `debounce_ms` exceeds `max_batch_ms`.
+- **Analysis:** `impact` ranks everything reached before paging (the direct
+  dependents could be missing); `diff-impact` ranks across all changed files;
+  packages no longer depend on themselves (false `boundaries` findings, empty
+  `export`); `packages` and `files_in_package` name packages as the graph does;
+  hub ties, non-ASCII exact matches, depth truncation in cycles, `context`
+  candidate truncation and `related-tests` duplicates are fixed.
+
+### Changed
+- `ravel impact X` without `--risk` walks what depends on `X`, as `--risk` and
+  the MCP tool always did, instead of what `X` depends on.
+- `ravel daemon stop` with MCP sessions attached leaves the daemon to them until
+  the last disconnects (`"sessions": N`), instead of wedging it.
+- `install`, `uninstall` and `setup` exit non-zero, and name the file, when an
+  agent could not be configured.
+
+### Fixed — install, CLI, daemon and MCP
+- Codex: `ravel install`/`uninstall` deleted the `[[tables]]` and indented
+  tables that followed `[mcp_servers.ravel]`; a rewrite that would change any
+  other setting is now refused.
+- `--location local` no longer edits the global Windsurf config; OpenCode's user
+  config is written where OpenCode reads it on every platform;
+  `CLAUDE_CONFIG_DIR` is honoured; symlinked configs are written through the
+  link with their mode; reinstalling no longer adds a blank line to agent
+  instruction files; the Cursor rule is written only inside a project.
+- `diff-impact` refuses a revision starting with `-`, which git read as an
+  option (`--output=<file>` wrote a file from a read-only tool).
+- The CLI answers in-process when no daemon runtime directory exists; looking for
+  a daemon no longer creates or chmods one; a daemon that fails to start says
+  why at once; a reply too large for a frame is refused with an error.
+- MCP accepts a page's `next_cursor` back as `cursor`, and refuses an unknown
+  `search_symbols` kind instead of searching exactly.
+- `RAVEL_TIMING=0` (or `false`, `off`, empty) leaves timing off.
+
 ## [1.19.0] - 2026-10-09
 
 The calls an agent makes every turn got cheaper in CPU and memory, with every
