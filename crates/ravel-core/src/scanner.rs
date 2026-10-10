@@ -1609,6 +1609,14 @@ fn commonjs_import_bindings(pattern: Node<'_>, source: &[u8]) -> Vec<ImportBindi
             let mut bindings = Vec::new();
             let mut cursor = pattern.walk();
             for child in pattern.named_children(&mut cursor) {
+                // `{ a = 1 }` binds `a` exactly as `{ a }` does; the default is only a fallback.
+                let child = match child.kind() {
+                    "object_assignment_pattern" => match child.child_by_field_name("left") {
+                        Some(left) => left,
+                        None => continue,
+                    },
+                    _ => child,
+                };
                 match child.kind() {
                     "shorthand_property_identifier_pattern" => {
                         let name = node_text(child, source).to_owned();
@@ -2559,6 +2567,20 @@ export default Service;
                 .iter()
                 .any(|symbol| { matches!(symbol.name.as_str(), "Shape" | "Id" | "State") })
         );
+    }
+
+    #[test]
+    fn commonjs_destructuring_with_a_default_binds_the_name() {
+        let artifact = parse_source(
+            "legacy.cjs",
+            b"const { Service = null, helper: alias = noop } = require('./services');\n",
+        );
+        let bindings: Vec<_> = artifact.imports[0]
+            .bindings
+            .iter()
+            .map(|binding| (binding.imported.as_str(), binding.local.as_str()))
+            .collect();
+        assert_eq!(bindings, [("Service", "Service"), ("helper", "alias")]);
     }
 
     #[test]
