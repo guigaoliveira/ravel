@@ -916,3 +916,135 @@ fn artifact_delta_exposes_current_symbol_complexity_to_context() {
     let detail = engine.node_detail("calculate").unwrap().unwrap();
     assert_eq!(detail.complexity.unwrap().cyclomatic, 2);
 }
+
+/// Index `start`, apply `edits` and sync the edited paths; the published state must equal a full
+/// index of the edited tree.
+fn assert_edit_matches_full_index(scenario: &str, start: &[(&str, &str)], edits: &[(&str, &str)]) {
+    let incremental = tempdir().unwrap();
+    for (path, text) in start {
+        write(incremental.path(), path, text);
+    }
+    let incremental_engine = engine(incremental.path());
+    incremental_engine.index().unwrap();
+    for (path, text) in edits {
+        write(incremental.path(), path, text);
+    }
+    let edited: Vec<PathBuf> = edits
+        .iter()
+        .map(|(path, _)| incremental.path().join(path))
+        .collect();
+    incremental_engine.sync(Some(&edited)).unwrap();
+
+    let full = tempdir().unwrap();
+    for (path, text) in start.iter().chain(edits) {
+        write(full.path(), path, text);
+    }
+    let full_engine = engine(full.path());
+    full_engine.index().unwrap();
+    assert_eq!(
+        fingerprint(&incremental_engine),
+        fingerprint(&full_engine),
+        "sync != full index for scenario: {scenario}"
+    );
+}
+
+/// The files that use a class member resolve through the class: adding, renaming or removing the
+/// member changes what they resolve to although no exported declaration changed.
+#[test]
+fn sync_re_resolves_users_of_a_changed_member() {
+    let start = [
+        (
+            "src/a.ts",
+            "export class Svc {\n  static create() { return 1; }\n}\n",
+        ),
+        (
+            "src/main.ts",
+            "import { Svc } from './a';\nexport function run() { return Svc.make(); }\n",
+        ),
+    ];
+    assert_edit_matches_full_index(
+        "add a static method",
+        &start,
+        &[(
+            "src/a.ts",
+            "export class Svc {\n  static create() { return 1; }\n  static make() { return 2; }\n}\n",
+        )],
+    );
+    assert_edit_matches_full_index(
+        "rename a static method a caller uses",
+        &[
+            start[0],
+            (
+                "src/main.ts",
+                "import { Svc } from './a';\nexport function run() { return Svc.create(); }\n",
+            ),
+        ],
+        &[(
+            "src/a.ts",
+            "export class Svc {\n  static make() { return 2; }\n}\n",
+        )],
+    );
+}
+
+/// `export { foo }` publishes a declaration that is not itself marked exported.
+#[test]
+fn sync_re_resolves_importers_of_a_clause_exported_declaration() {
+    assert_edit_matches_full_index(
+        "a clause-exported function becomes an interface",
+        &[
+            (
+                "src/a.ts",
+                "function foo() { return 1; }\nexport { foo };\n",
+            ),
+            (
+                "src/main.ts",
+                "import { foo } from './a';\nexport const value = foo();\n",
+            ),
+        ],
+        &[("src/a.ts", "interface foo { x: number }\nexport { foo };\n")],
+    );
+}
+
+/// Importers of a barrel bind names through it without importing the file that changed.
+#[test]
+fn sync_follows_a_changed_name_through_re_exports() {
+    let added = "export function x() { return 1; }\nexport function y() { return 2; }\n";
+    let importer = (
+        "src/c.ts",
+        "import { y } from './b';\nexport const value = y();\n",
+    );
+    for (scenario, barrel) in [
+        ("named re-export", "export { x, y } from './a';\n"),
+        ("star re-export", "export * from './a';\n"),
+        (
+            "imported then exported",
+            "import { y } from './a';\nexport { y };\n",
+        ),
+    ] {
+        assert_edit_matches_full_index(
+            scenario,
+            &[
+                ("src/a.ts", "export function x() { return 1; }\n"),
+                ("src/b.ts", barrel),
+                importer,
+            ],
+            &[("src/a.ts", added)],
+        );
+    }
+    assert_edit_matches_full_index(
+        "a rename two barrels away",
+        &[
+            ("src/a.ts", added),
+            ("src/b.ts", "export * from './a';\n"),
+            ("src/c.ts", "export { y } from './b';\n"),
+            (
+                "src/d.ts",
+                "import { y } from './c';\nexport const value = y();\n",
+            ),
+        ],
+        &[(
+            "src/a.ts",
+            "export function x() { return 1; }\nexport function w() { return 2; }\n",
+        )],
+    );
+}

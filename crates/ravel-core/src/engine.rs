@@ -929,16 +929,42 @@ fn symbol_name_set_changed<'a>(
     })
 }
 
+/// The symbols of `artifact` another file can resolve to: exported declarations, their members
+/// (`Svc.make` is reached through `Svc`), and locals an export clause names (`export { foo }`,
+/// `export default foo`). Filtering on `exported` alone saw only the first kind, so adding,
+/// renaming or removing a static method, or redeclaring a clause-exported function, re-resolved
+/// none of the files that use it, and they kept edges to symbols that no longer existed.
+fn public_symbols(
+    artifact: &crate::model::FileArtifact,
+) -> impl Iterator<Item = &crate::model::Symbol> {
+    let root = |qualified: &str| qualified.split('.').next().unwrap_or(qualified).to_owned();
+    let roots: BTreeSet<String> = artifact
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.exported)
+        .map(|symbol| root(&symbol.qualified_name))
+        .chain(
+            artifact
+                .exports
+                .iter()
+                .filter(|export| export.specifier.is_none())
+                .flat_map(|export| &export.bindings)
+                .map(|binding| binding.local.clone()),
+        )
+        .collect();
+    artifact
+        .symbols
+        .iter()
+        .filter(move |symbol| symbol.exported || roots.contains(&root(&symbol.qualified_name)))
+}
+
 fn public_resolution_contract_changed(
     old: Option<&crate::model::FileArtifact>,
     new: Option<&crate::model::FileArtifact>,
 ) -> bool {
     match (old, new) {
         (Some(old), Some(new)) => {
-            let same_symbols = old
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.exported)
+            let same_symbols = public_symbols(old)
                 .map(|symbol| {
                     (
                         symbol.id.as_str(),
@@ -947,18 +973,14 @@ fn public_resolution_contract_changed(
                         symbol.kind.as_ref(),
                     )
                 })
-                .eq(new
-                    .symbols
-                    .iter()
-                    .filter(|symbol| symbol.exported)
-                    .map(|symbol| {
-                        (
-                            symbol.id.as_str(),
-                            symbol.name.as_str(),
-                            symbol.qualified_name.as_str(),
-                            symbol.kind.as_ref(),
-                        )
-                    }));
+                .eq(public_symbols(new).map(|symbol| {
+                    (
+                        symbol.id.as_str(),
+                        symbol.name.as_str(),
+                        symbol.qualified_name.as_str(),
+                        symbol.kind.as_ref(),
+                    )
+                }));
             let same_exports = old
                 .exports
                 .iter()
@@ -1010,10 +1032,7 @@ fn changed_export_names(
     new: Option<&crate::model::FileArtifact>,
 ) -> ContractChange {
     fn symbol_keys(artifact: &crate::model::FileArtifact) -> BTreeMap<String, String> {
-        artifact
-            .symbols
-            .iter()
-            .filter(|symbol| symbol.exported)
+        public_symbols(artifact)
             .map(|symbol| {
                 (
                     format!(
@@ -1114,6 +1133,53 @@ fn imports_depend_on_names(
                 ExportBindingKind::Star | ExportBindingKind::Namespace
             ) && names.contains(&binding.local)
         })
+}
+
+/// The names `artifact` exports on behalf of another module whose `names` changed: a named
+/// re-export of one of them (under its alias), each of them but `default` through `export *`, the
+/// namespace through `export * as ns`, and an imported one exported again (`import { y } from
+/// './a'; export { y }`). The importers of `artifact` bind those names through it, so they are as
+/// affected as the importers of the module that changed.
+fn forwarded_names(
+    artifact: &crate::model::FileArtifact,
+    names: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    use crate::model::{ExportBindingKind, ImportBindingKind};
+    let imported_locals: BTreeSet<&str> = artifact
+        .imports
+        .iter()
+        .flat_map(|import| &import.bindings)
+        .filter(|binding| match binding.kind {
+            ImportBindingKind::Namespace | ImportBindingKind::ImportEquals => true,
+            ImportBindingKind::Default => names.contains("default"),
+            ImportBindingKind::Named => names.contains(&binding.imported),
+        })
+        .map(|binding| binding.local.as_str())
+        .collect();
+    let mut forwarded = BTreeSet::new();
+    for export in &artifact.exports {
+        for binding in &export.bindings {
+            if export.specifier.is_none() {
+                if imported_locals.contains(binding.local.as_str()) {
+                    forwarded.insert(binding.exported.clone());
+                }
+                continue;
+            }
+            match binding.kind {
+                ExportBindingKind::Star => {
+                    forwarded.extend(names.iter().filter(|name| *name != "default").cloned());
+                }
+                ExportBindingKind::Namespace => {
+                    forwarded.insert(binding.exported.clone());
+                }
+                _ if names.contains(&binding.local) => {
+                    forwarded.insert(binding.exported.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    forwarded
 }
 
 /// Shared, cloneable workspace engine with in-memory snapshot and graph caching.
@@ -2277,35 +2343,91 @@ impl WorkspaceEngine {
         > = std::cell::RefCell::new(BTreeMap::new());
         let mut open_failed = false;
         let mut skipped_importers = 0usize;
-        let mut affected = reader.affected_files(
-            contract_changed_paths
-                .iter()
-                .map(|(path, all)| (path.as_str(), *all)),
-            changed_symbols.iter().map(String::as_str),
-            |importer| {
-                if changed_paths.contains(importer) {
-                    return true;
-                }
+        // A file that re-exports a changed name passes the change on: its importers bind the name
+        // through it, yet they do not import the file that changed. Each such re-exporter is a
+        // contract change of the names it forwards, so the search repeats until it finds no new
+        // one -- a barrel's importers were left with edges to symbols that had moved or gone.
+        /// Past this many barrel levels the full rebuild tier is the cheaper answer.
+        const MAX_FORWARDING_ROUNDS: usize = 16;
+        // Runs `look` on the artifact at `path`, if there is one, opening it once for every round
+        // and for the subset below.
+        let with_artifact =
+            |path: &str,
+             open_failed: &mut bool,
+             look: &mut dyn FnMut(&crate::model::FileArtifact)| {
                 let mut opened = opened_artifacts.borrow_mut();
-                let artifact = match opened.entry(importer.to_owned()) {
+                let artifact = match opened.entry(path.to_owned()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        match storage.open_artifact(importer) {
+                        match storage.open_artifact(path) {
                             Ok(artifact) => entry.insert(artifact),
                             Err(_) => {
-                                open_failed = true;
-                                return true;
+                                *open_failed = true;
+                                return;
                             }
                         }
                     }
                 };
-                let depends = artifact
-                    .as_ref()
-                    .is_none_or(|artifact| imports_depend_on_names(artifact, &changed_symbols));
-                skipped_importers += usize::from(!depends);
-                depends
-            },
-        );
+                if let Some(artifact) = artifact {
+                    look(artifact);
+                }
+            };
+        let mut rounds = 0;
+        let mut affected = loop {
+            let mut forwarders: Vec<(String, BTreeSet<String>)> = Vec::new();
+            let affected = reader.affected_files(
+                contract_changed_paths
+                    .iter()
+                    .map(|(path, all)| (path.as_str(), *all)),
+                changed_symbols.iter().map(String::as_str),
+                |importer| {
+                    if changed_paths.contains(importer) {
+                        return true;
+                    }
+                    let mut depends = true;
+                    with_artifact(importer, &mut open_failed, &mut |artifact| {
+                        let forwarded = forwarded_names(artifact, &changed_symbols);
+                        if !forwarded.is_empty() {
+                            forwarders.push((importer.to_owned(), forwarded));
+                        }
+                        depends = imports_depend_on_names(artifact, &changed_symbols);
+                    });
+                    skipped_importers += usize::from(!depends);
+                    depends
+                },
+            );
+            // Importers taken whole (`all`) never reach the filter above; look at them here.
+            for path in &affected {
+                if changed_paths.contains(path) || contract_changed_paths.contains_key(path) {
+                    continue;
+                }
+                with_artifact(path, &mut open_failed, &mut |artifact| {
+                    let forwarded = forwarded_names(artifact, &changed_symbols);
+                    if !forwarded.is_empty() {
+                        forwarders.push((path.clone(), forwarded));
+                    }
+                });
+            }
+            let mut grew = false;
+            for (path, forwarded) in forwarders {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    contract_changed_paths.entry(path)
+                {
+                    entry.insert(false);
+                    grew = true;
+                }
+                for name in forwarded {
+                    grew |= changed_symbols.insert(name);
+                }
+            }
+            if !grew || open_failed {
+                break affected;
+            }
+            rounds += 1;
+            if rounds > MAX_FORWARDING_ROUNDS {
+                return Ok(None);
+            }
+        };
         affected.extend(changed_paths.iter().cloned());
         crate::timing::stage("delta.affected_files", affected_start, || {
             format!(
