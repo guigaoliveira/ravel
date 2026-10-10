@@ -275,9 +275,20 @@ fn status_among(
         .then(|| parse_porcelain(root, discovery, &output.stdout))
 }
 
+/// The directory git reports `status` and `diff` paths relative to: the top of the worktree that
+/// holds `root`. That is `root` itself only when the workspace is the whole repository; for a
+/// package inside a monorepo, joining git's paths onto `root` named files that do not exist.
+fn worktree_top(root: &Path) -> PathBuf {
+    git_marker(root)
+        .and_then(|marker| marker.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
 /// The paths in `git status --porcelain=v1 -z` output, filtered the way discovery has always
 /// filtered them and returned sorted.
 fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Vec<PathBuf> {
+    // Porcelain paths are relative to the repository top, whatever `-C` says.
+    let top = worktree_top(root);
     let mut paths = Vec::new();
     for record in stdout.split(|byte| *byte == 0) {
         if record.len() < 4 {
@@ -288,7 +299,11 @@ fn parse_porcelain(root: &Path, discovery: &DirtyDiscovery, stdout: &[u8]) -> Ve
         if path_part.is_empty() {
             continue;
         }
-        let abs = root.join(git_path(path_part));
+        let abs = top.join(git_path(path_part));
+        // A workspace below the top is told about the whole repository; only its own files count.
+        if !abs.starts_with(root) {
+            continue;
+        }
         let untracked = xy == b"??";
         if untracked {
             if !discovery.include_untracked {
@@ -320,9 +335,15 @@ fn dirty_tracked_diff(root: &Path) -> Result<Vec<PathBuf>, GitError> {
         .output()
         .map_err(|e| GitError::Operation(e.to_string()))?;
     if output.status.success() {
+        // Relative to the repository top, like the porcelain listing this stands in for.
+        let top = worktree_top(root);
         for path in output.stdout.split(|byte| *byte == 0) {
-            if !path.is_empty() {
-                paths.push(root.join(git_path(path)));
+            if path.is_empty() {
+                continue;
+            }
+            let abs = top.join(git_path(path));
+            if abs.starts_with(root) {
+                paths.push(abs);
             }
         }
     }
@@ -361,11 +382,14 @@ pub fn changed_paths_between(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    // `git diff --name-only` names paths from the repository top, like `status`.
+    let top = worktree_top(root);
     let mut paths: Vec<_> = output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| root.join(git_path(path)))
+        .map(|path| top.join(git_path(path)))
+        .filter(|path| path.starts_with(root))
         .collect();
     paths.sort();
     Ok(paths)
@@ -948,6 +972,58 @@ mod among_tests {
                 .collect::<BTreeSet<_>>()
         );
         assert!(among.contains("src/edited.ts"));
+    }
+
+    /// A workspace that is a package inside a bigger repository: git reports paths from the
+    /// repository top, and both queries must still name the workspace's own files, and only those.
+    #[test]
+    fn a_workspace_below_the_repository_top_gets_its_own_paths() {
+        let dir = tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q", "."]);
+        write(top, "pkg/src/a.ts", "export const v = 1;\n");
+        write(top, "outside.ts", "export const v = 1;\n");
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-qm", "seed"]);
+        write(top, "pkg/src/a.ts", "export const v = 2;\n");
+        write(top, "outside.ts", "export const v = 2;\n");
+        write(top, "pkg/src/new.ts", "export const n = 1;\n");
+        let root = top.join("pkg");
+        let discovery = DirtyDiscovery::default();
+        let expected: BTreeSet<String> = ["src/a.ts", "src/new.ts"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            relative(&root, changed_paths_with(&root, &discovery).unwrap()),
+            expected
+        );
+        let ask = vec!["src/a.ts".to_owned(), "src/new.ts".to_owned()];
+        assert_eq!(
+            relative(
+                &root,
+                status_among(&root, &discovery, &ask).expect("the pathspec query answers")
+            ),
+            expected
+        );
+        let tracked_only = DirtyDiscovery {
+            include_untracked: false,
+            ..DirtyDiscovery::default()
+        };
+        assert_eq!(
+            relative(&root, dirty_tracked_diff(&root).unwrap()),
+            relative(&root, changed_paths_with(&root, &tracked_only).unwrap())
+        );
+        // A committed change, seen through `diff-impact`'s range query.
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-qm", "edit"]);
+        assert_eq!(
+            relative(
+                &root,
+                changed_paths_between(&root, Some("HEAD~1"), None).unwrap()
+            ),
+            expected
+        );
     }
 
     #[test]
