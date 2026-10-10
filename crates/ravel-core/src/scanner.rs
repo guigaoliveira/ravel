@@ -799,6 +799,14 @@ fn extract_node(
                 push_heritage(node, source, from, EdgeKind::Extends, refs);
                 return;
             }
+            // tree-sitter-javascript has no `extends_clause`: its heritage is `extends <expression>`
+            // directly. The expression is still walked below, so a computed base (`Mixin(Base)`)
+            // keeps its call edge.
+            "class_heritage"
+                if !has_named_child_of_kind(node, &["extends_clause", "implements_clause"]) =>
+            {
+                push_heritage(node, source, from, EdgeKind::Extends, refs);
+            }
             "implements_clause" => {
                 push_heritage(node, source, from, EdgeKind::Implements, refs);
                 return;
@@ -1982,6 +1990,12 @@ fn first_static_child_name(node: Node<'_>, source: &[u8]) -> Option<String> {
         .find_map(|child| static_name(child, source))
 }
 
+fn has_named_child_of_kind(node: Node<'_>, kinds: &[&str]) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| kinds.contains(&child.kind()))
+}
+
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
@@ -2770,6 +2784,34 @@ type Remote = import('./remote').Thing;
                 .iter()
                 .any(|(name, _)| matches!(*name, "Dependency" | "Options"))
         );
+    }
+
+    #[test]
+    fn javascript_class_heritage_emits_extends_edges() {
+        let artifact = parse_source(
+            "classes.jsx",
+            b"class Child extends Base {}\nclass Other extends ns.Base {}\nconst Mixed = class extends Mixin(Base) {};",
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let has_ref = |from: &str, to: &str, kind: EdgeKind| {
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == from
+                    && reference.to == to
+                    && reference.kind == kind
+            })
+        };
+        assert!(
+            has_ref("Child", "Base", EdgeKind::Extends),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(has_ref("Other", "ns.Base", EdgeKind::Extends));
+        // A computed base has no static name, but the call that computes it is still a consumer.
+        assert!(has_ref("Mixed", "Mixin", EdgeKind::Calls));
     }
 
     #[test]
