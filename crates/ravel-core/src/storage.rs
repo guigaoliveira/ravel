@@ -3757,10 +3757,15 @@ impl FileSnapshotStorage {
         self.read_artifact_at(&index, &location).map(Some)
     }
 
+    /// Write every artifact of `snapshot` into a fresh store, index and locator. `overrides` and
+    /// `tombstones` are recorded as given: the paths whose artifact differs from the manifest's
+    /// payload, and the ones of those deleted since -- empty when `snapshot` is the payload.
     fn write_initial_artifact_store(
         &self,
         id: &str,
         snapshot: &IndexSnapshot,
+        overrides: BTreeSet<String>,
+        tombstones: BTreeSet<String>,
     ) -> Result<(String, String, String, [u8; 32]), StorageError> {
         let store_path = self.artifact_store_path(id);
         let store_tmp = store_path.with_extension(format!("store.tmp-{}", std::process::id()));
@@ -3775,8 +3780,8 @@ impl FileSnapshotStorage {
                 .to_string_lossy()
                 .into_owned(),
             entries: BTreeMap::new(),
-            overrides: BTreeSet::new(),
-            tombstones: BTreeSet::new(),
+            overrides,
+            tombstones,
             state: [0; 32],
         };
         let mut locator_entries = Vec::with_capacity(snapshot.files.len());
@@ -4725,9 +4730,22 @@ impl FileSnapshotStorage {
             files,
             edges: Vec::new(),
         };
+        // The payload still holds the base revisions, so the compacted index has to keep saying
+        // which paths differ from it. That set depends on the history, not only on the content,
+        // so the files are named per publication like any other history-dependent file.
+        let ArtifactIndex {
+            overrides,
+            tombstones,
+            ..
+        } = index;
         let generation = manifest.snapshot_id.stable_key();
-        let (artifact_index, artifact_store, artifact_locator, artifact_state) =
-            self.write_initial_artifact_store(&format!("{generation}-compact"), &compact_snapshot)?;
+        let (artifact_index, artifact_store, artifact_locator, artifact_state) = self
+            .write_initial_artifact_store(
+                &format!("{}-compact", Self::publication_name(&generation)),
+                &compact_snapshot,
+                overrides,
+                tombstones,
+            )?;
         manifest.artifact_index = Some(artifact_index);
         manifest.artifact_store = Some(artifact_store);
         manifest.artifact_locator = Some(artifact_locator);
@@ -5640,7 +5658,8 @@ impl SnapshotStorage for FileSnapshotStorage {
         };
         let artifact_task = || {
             let t = std::time::Instant::now();
-            let out = self.write_initial_artifact_store(&id, snapshot);
+            let out =
+                self.write_initial_artifact_store(&id, snapshot, BTreeSet::new(), BTreeSet::new());
             crate::timing::stage("publish.artifact_store", t, String::new);
             out
         };
@@ -7310,6 +7329,55 @@ mod tests {
             b"export const value = 0; // revision 64\n",
         );
         assert_eq!(artifact.source_hash, expected.source_hash);
+    }
+
+    /// Compaction folds the deltas into a fresh artifact index but leaves the payload -- the base's
+    /// full snapshot -- in place. The new index forgot which paths differ from that payload, so
+    /// `open_current` answered each edited file with its base revision and kept deleted ones.
+    #[test]
+    fn compaction_keeps_the_edits_and_deletions_layered_over_the_payload() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot_with_files(3);
+        store.publish(&base).unwrap();
+        let mut current = base.clone();
+        current.files.remove("src/file-2.ts");
+        current.id.content_state = "file-2 deleted".into();
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &current,
+                    &BTreeSet::from(["src/file-2.ts".to_owned()]),
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        for revision in 1..=4 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        assert!(store.compact_artifacts_if_amplified(1, 3).unwrap());
+        assert!(
+            store
+                .read_manifest()
+                .unwrap()
+                .unwrap()
+                .artifact_deltas
+                .is_empty()
+        );
+
+        let snapshot = store.open_current().unwrap().unwrap();
+        let edited = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 4\n",
+        );
+        assert_eq!(
+            snapshot.files["src/file-0.ts"].source_hash,
+            edited.source_hash
+        );
+        assert!(!snapshot.files.contains_key("src/file-2.ts"));
+        assert_eq!(snapshot.files["src/file-1.ts"], base.files["src/file-1.ts"]);
     }
 
     #[test]
