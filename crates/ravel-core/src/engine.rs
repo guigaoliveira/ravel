@@ -725,6 +725,21 @@ enum NodeResolution {
     NotFound,
 }
 
+/// `path` relative to `root`, spelled the way a full walk spells it: `/`-separated, with no `.` or
+/// empty segments. `./src/a.ts`, `src//a.ts` and the absolute path are one file, and spelled
+/// verbatim the first two entered the index as a second copy of it. `None` outside `root`.
+fn workspace_relative(root: &Path, path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.strip_prefix(root).ok()?.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// The path embedded in a symbol id (`symbol://<path>#<kind>:<qualified>`). Used to group outgoing
 /// relations by where the referenced symbol lives rather than by the caller's own file.
 fn symbol_id_path(id: &str) -> Option<&str> {
@@ -1713,6 +1728,11 @@ impl WorkspaceEngine {
     }
 
     fn sync_unlocked(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        // Another process may have published since this engine last looked -- a CLI `ravel index`
+        // beside a daemon does. The caches below are advanced by the delta this sync publishes, so
+        // they must hold the generation it starts from; advanced from an older one they stayed
+        // wrong for good, because the publication then marked them current.
+        self.refresh_external_generation()?;
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let extensions = crate::config::effective_extensions(&self.config);
         if let Some(paths) = only_paths {
@@ -1772,11 +1792,7 @@ impl WorkspaceEngine {
                         if absolute.exists() {
                             return None;
                         }
-                        let rel = absolute
-                            .strip_prefix(&self.root)
-                            .unwrap_or(absolute.as_path())
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let rel = workspace_relative(&self.root, &absolute)?;
                         Some((path, rel))
                     })
                     .collect();
@@ -2633,9 +2649,6 @@ impl WorkspaceEngine {
         if paths.is_empty() {
             return Ok((true, Vec::new()));
         }
-        let root_str = self.root.to_string_lossy().replace('\\', "/");
-        let root_str = root_str.replace("/./", "/");
-        let root_str = root_str.trim_end_matches('/').to_owned();
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         // Reading a batch of edited files is independent per path. `collect` on an
         // indexed parallel iterator keeps input order, so the prepared list stays
@@ -2650,12 +2663,7 @@ impl WorkspaceEngine {
                     } else {
                         self.root.join(path)
                     };
-                    let path_str = path.to_string_lossy().replace('\\', "/");
-                    let Some(rel) = path_str.strip_prefix(&root_str).and_then(|relative| {
-                        let relative = relative.trim_start_matches('/');
-                        (!relative.starts_with("../") && relative != "..")
-                            .then_some(relative.to_owned())
-                    }) else {
+                    let Some(rel) = workspace_relative(&self.root, &path) else {
                         return Err(EngineError::PathOutsideWorkspace {
                             root: self.root.clone(),
                             path,
@@ -2681,6 +2689,13 @@ impl WorkspaceEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         };
+        // `src/a.ts` and `/root/src/a.ts` in one batch are one file. Prepared twice, its old and
+        // new hashes went into the content state twice and cancelled out.
+        let mut seen = BTreeSet::new();
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, relative, ..)| seen.insert(relative.clone()))
+            .collect();
         let generation_started = std::time::Instant::now();
         let has_generation = storage.current_generation()?.is_some();
         crate::timing::stage(
@@ -4611,20 +4626,33 @@ impl WorkspaceEngine {
         }
         let asked = std::time::Instant::now();
         let discovery = self.dirty_discovery();
-        let extensions = crate::config::effective_extensions(&self.config);
-        let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| {
-                self.config.is_source_with_extensions(p, &extensions) && !self.config.is_noise(p)
-            })
-            .collect();
+        let paths = self.indexable_sources(
+            crate::git::changed_paths_with(&self.root, &discovery).unwrap_or_default(),
+        );
         *self.inner.dirty_cache.lock().unwrap() = Some(DirtyListing {
             asked,
             kept: std::time::Instant::now(),
             paths: paths.clone(),
         });
         paths
+    }
+
+    /// The members of `paths` a full index would collect. Git lists every tracked file it sees
+    /// changed, whatever `.ravelignore` or a later `.gitignore` says; filtered by extension and noise
+    /// alone, such a file asked for a sync that then refused it, on every query, and each answer
+    /// carried that refusal as a warning.
+    fn indexable_sources(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        if paths.is_empty() {
+            return paths;
+        }
+        let extensions = crate::config::effective_extensions(&self.config);
+        let ignore = crate::config::IgnoreChain::new(&self.config);
+        paths
+            .into_iter()
+            .filter(|path| {
+                crate::config::watched_path_is_indexable(&self.config, &ignore, &extensions, path)
+            })
+            .collect()
     }
 
     fn dirty_discovery(&self) -> crate::git::DirtyDiscovery {
@@ -4664,18 +4692,15 @@ impl WorkspaceEngine {
                     .collect();
             }
         }
-        let extensions = crate::config::effective_extensions(&self.config);
         let wanted: Vec<String> = relative.iter().cloned().collect();
-        crate::git::changed_paths_among(&self.root, &self.dirty_discovery(), &wanted)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|path| {
-                self.config.is_source_with_extensions(path, &extensions)
-                    && !self.config.is_noise(path)
-            })
-            .map(|path| workspace_relative(&path))
-            .filter(|path| relative.contains(path))
-            .collect()
+        self.indexable_sources(
+            crate::git::changed_paths_among(&self.root, &self.dirty_discovery(), &wanted)
+                .unwrap_or_default(),
+        )
+        .into_iter()
+        .map(|path| workspace_relative(&path))
+        .filter(|path| relative.contains(path))
+        .collect()
     }
 
     /// Fast freshness: dirty discovery (git if present) + hash-sidecar no-op.
@@ -4788,6 +4813,7 @@ impl WorkspaceEngine {
         };
         crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
+        let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let mut need_sync = false;
         let mut settled: BTreeSet<String> = BTreeSet::new();
         for path in &dirty {
@@ -4809,7 +4835,17 @@ impl WorkspaceEngine {
                     break;
                 }
                 Some(old) => {
-                    let Ok(bytes) = std::fs::read(path) else {
+                    let bytes = std::fs::metadata(path)
+                        .ok()
+                        .filter(|metadata| metadata.len() <= max_bytes)
+                        .and_then(|_| std::fs::read(path).ok());
+                    let Some(bytes) = bytes else {
+                        // Over the size limit or unreadable. When the index already holds it that
+                        // way (an empty hash), a sync could only write the same artifact again --
+                        // and hashing the file against "" asked for one on every query.
+                        if old.is_empty() {
+                            continue;
+                        }
                         need_sync = true;
                         break;
                     };
@@ -5036,6 +5072,65 @@ mod resident_sync_tests {
                 .iter()
                 .any(|relation| relation["kind"] == "Calls")
         );
+    }
+
+    #[test]
+    fn a_sync_after_another_process_published_starts_from_that_publication() {
+        // The resident engine (a daemon's) holds a warm graph. Another process (a CLI `ravel
+        // index`) publishes a caller of `answer` without going through it.
+        let (root, resident, _service) = fixture();
+        let warm = resident.graph().unwrap();
+        drop(warm);
+        std::fs::write(
+            root.path().join("caller.ts"),
+            "import { answer } from './service';\nexport const again = answer();\n",
+        )
+        .unwrap();
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+
+        // The resident engine's next sync must build on that publication.
+        let other = root.path().join("other.ts");
+        std::fs::write(&other, "export const unrelated = 1;\n").unwrap();
+        resident.sync_resident(Some(&[other])).unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let names = |engine: &WorkspaceEngine| {
+            let graph = engine.graph().unwrap();
+            (
+                graph.edge_count(),
+                graph
+                    .node_names()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>(),
+            )
+        };
+        assert_eq!(names(&resident), names(&fresh));
+        assert!(names(&resident).1.contains("caller.ts"));
+    }
+
+    #[test]
+    fn every_spelling_of_a_path_syncs_the_one_file() {
+        let (root, engine, service) = fixture();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const second = 2;\n",
+        )
+        .unwrap();
+        let stats = engine
+            .sync(Some(&[
+                PathBuf::from("./service.ts"),
+                PathBuf::from(".//service.ts"),
+                service.clone(),
+            ]))
+            .unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert_eq!(stats, fresh.index().unwrap());
+        let found = engine.search_raw("second", SearchKind::Exact, 10).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]
@@ -5844,6 +5939,45 @@ mod dirty_record_tests {
             format!("export const {} = {value};\n", &name[..1]),
         )
         .unwrap();
+    }
+
+    /// A tracked file that an ignore file excludes is outside the index, so editing it is not a
+    /// change the index has to absorb.
+    #[test]
+    fn a_tracked_file_the_ignore_files_exclude_is_not_dirty() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("legacy")).unwrap();
+        std::fs::write(root.join("legacy/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join(".ravelignore"), "legacy/\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "legacy"]);
+        let indexed = engine.index().unwrap();
+        assert_eq!(indexed.files, 3);
+
+        std::fs::write(root.join("legacy/x.ts"), "export const x = 2;\n").unwrap();
+        assert_eq!(engine.auto_sync_if_dirty().unwrap(), None);
+        assert_eq!(engine.last_update_error(), None);
+        assert_eq!(engine.sync(None).unwrap(), indexed);
+    }
+
+    /// A dirty file over the size limit is indexed once, with its diagnostic. Its content can never
+    /// reach the index, so it must not look changed to every query after that.
+    #[test]
+    fn a_dirty_file_too_large_to_index_is_synced_once() {
+        let (dir, mut engine) = fixture();
+        engine.config.parser.max_file_size_kb = 1;
+        std::fs::write(
+            dir.path().join("big.ts"),
+            format!("export const big = '{}';\n", "x".repeat(3000)),
+        )
+        .unwrap();
+        assert!(engine.auto_sync_if_dirty().unwrap().is_some());
+        let published = engine.storage().current_generation().unwrap();
+        for _ in 0..2 {
+            assert_eq!(engine.auto_sync_if_dirty().unwrap(), None);
+        }
+        assert_eq!(engine.storage().current_generation().unwrap(), published);
     }
 
     /// The record carries exactly the synced paths that are still uncommitted, however many other
