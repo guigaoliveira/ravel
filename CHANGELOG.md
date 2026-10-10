@@ -42,6 +42,19 @@ with `scripts/ab_verify.py`.
   site, so a late page of a hub costs what the first does.
 - `sync` of an unchanged file −49% and of a content-only edit −64% instructions.
 
+### Fixed
+- **A workspace inside a bigger repository saw no edits.** Git names changed paths
+  from the repository top, and they were joined onto the workspace root, so with
+  `--root repo/pkg` auto-sync never noticed an edit, `sync` without paths synced
+  nothing and `diff-impact` reported nothing. Paths are now resolved from the
+  worktree top, and those outside the workspace are left out.
+- **macOS: a cold `context` could hang for good.** Readers queued behind the
+  generation GC's exclusive lock were not all woken when it let go, so the
+  daemon could stop answering. Shared index locks no longer wait in the kernel's
+  queue.
+- `callers-of` / `calls-from` answer locally when the daemon they reach is
+  shutting down, instead of failing.
+
 ## [1.18.0] - 2026-10-07
 
 This release is about the two harnesses most MCP sessions run in — Claude Code and
