@@ -4129,6 +4129,16 @@ impl WorkspaceEngine {
         if graph.contains_node(node) {
             return NodeResolution::Resolved(node.to_owned());
         }
+        // An indexed file that no edge touches -- it imports nothing and nothing imports it -- is
+        // not a graph node, but it exists: "nothing depends on it" is the answer, not "no such name".
+        if self
+            .file_hashes_cached()
+            .ok()
+            .flatten()
+            .is_some_and(|hashes| hashes.contains(node))
+        {
+            return NodeResolution::Resolved(node.to_owned());
+        }
         let Ok(Some(runtime)) = self.symbol_meta_runtime() else {
             return NodeResolution::NotFound;
         };
@@ -5064,9 +5074,17 @@ impl WorkspaceEngine {
         let paths = crate::git::changed_paths_between(&self.root, Some(from_ref), _to_ref)
             .map_err(|e| EngineError::Git(e.to_string()))?;
         let graph = self.graph()?;
+        // Each changed file's whole ranking is merged, then ranked and paged once. Merging each
+        // file's first page instead dropped whatever ranked below it there, however high it
+        // ranked overall, and counted only what was kept.
+        let walk_limits = QueryLimits {
+            cursor: 0,
+            page_size: usize::MAX,
+            ..limits.clone()
+        };
         let mut merged: std::collections::BTreeMap<String, analysis::ImpactItem> =
             std::collections::BTreeMap::new();
-        let mut truncated = false;
+        let mut walk_truncated = false;
         let mut reason = None;
         let snapshot_id = graph.snapshot_id().to_owned();
         for path in paths {
@@ -5076,8 +5094,8 @@ impl WorkspaceEngine {
             if !graph.contains_node(&path_str) {
                 continue;
             }
-            let report = analysis::impact_with_risk(&graph, &path_str, limits)?;
-            truncated |= report.truncated;
+            let report = analysis::impact_with_risk(&graph, &path_str, &walk_limits)?;
+            walk_truncated |= !report.exact;
             if report.reason.is_some() {
                 reason = report.reason;
             }
@@ -5092,16 +5110,28 @@ impl WorkspaceEngine {
                     .or_insert(item);
             }
         }
-        // `merged` is a BTreeMap keyed by symbol → `into_values()` is already symbol-sorted.
-        let affected: Vec<_> = merged.into_values().collect();
+        let mut affected: Vec<_> = merged.into_values().collect();
+        affected.sort_by(|a, b| {
+            (a.risk, std::cmp::Reverse(a.score), &a.symbol).cmp(&(
+                b.risk,
+                std::cmp::Reverse(b.score),
+                &b.symbol,
+            ))
+        });
+        let total_affected = affected.len();
+        let start = limits.cursor.min(total_affected);
+        let end = start.saturating_add(limits.page_size).min(total_affected);
+        let more = end < total_affected;
+        affected.truncate(end);
+        affected.drain(..start);
         Ok(ImpactReport {
             root: format!("diff:{from_ref}"),
             snapshot_id,
-            total_affected: affected.len(),
-            exact: !truncated,
+            total_affected,
+            exact: !walk_truncated,
             affected,
-            truncated,
-            reason,
+            truncated: walk_truncated || more,
+            reason: reason.or_else(|| more.then(|| "page_size".into())),
         })
     }
 
@@ -6146,6 +6176,92 @@ mod context_candidate_tests {
         let context = engine.context("qux", 1).unwrap();
         assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(context["truncation"]["candidates"], true, "{context:#}");
+    }
+}
+
+#[cfg(test)]
+mod diff_impact_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// target ← z ← a0..a4: the diff touches `target`, whose only direct dependent is `z`.
+    #[test]
+    fn a_diff_is_ranked_and_counted_whole_before_it_is_paged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("target.ts"), "export const t = 1;\n").unwrap();
+        std::fs::write(
+            root.join("z.ts"),
+            "import { t } from './target';\nexport const z = t;\n",
+        )
+        .unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                root.join(format!("a{i}.ts")),
+                "import { z } from './z';\nexport const a = z;\n",
+            )
+            .unwrap();
+        }
+        git(root, &["init", "-q", "."]);
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "one"]);
+        std::fs::write(root.join("target.ts"), "export const t = 2;\n").unwrap();
+        git(root, &["commit", "-qam", "two"]);
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let limits = QueryLimits {
+            page_size: 2,
+            ..Default::default()
+        };
+        let report = engine.diff_impact("HEAD~1", None, &limits).unwrap();
+        assert_eq!(report.total_affected, 6, "{report:?}");
+        assert_eq!(report.affected.len(), 2);
+        assert_eq!(report.affected[0].symbol, "z.ts");
+        assert!(report.exact);
+        assert!(report.truncated);
+    }
+}
+
+#[cfg(test)]
+mod edgeless_file_tests {
+    use super::*;
+
+    #[test]
+    fn an_indexed_file_no_edge_touches_resolves_to_itself() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("x.ts"),
+            "function g() { return 1; }\nexport function f() { return g(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("lone.ts"), "export const lone = 1;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let graph = engine.graph().unwrap();
+        for file in ["x.ts", "lone.ts"] {
+            assert!(
+                matches!(
+                    engine.resolve_graph_node_outcome(&graph, file, None),
+                    NodeResolution::Resolved(ref id) if id == file
+                ),
+                "{file}"
+            );
+        }
+        assert!(matches!(
+            engine.resolve_graph_node_outcome(&graph, "missing.ts", None),
+            NodeResolution::NotFound
+        ));
     }
 }
 
