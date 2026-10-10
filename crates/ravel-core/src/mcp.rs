@@ -597,13 +597,14 @@ fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<Ato
                     .collect();
                 let mut needs_reconcile = batch.needs_reconcile;
                 // A directory that appears or moves is reported alone, without the files in it.
+                // Together they stay within the batch bound, as the paths alone always did.
                 if !needs_reconcile {
                     match crate::watch::sources_behind_directories(
                         &engine,
                         &batch_ignore,
                         &extensions,
                         &batch,
-                        max_batch_paths,
+                        max_batch_paths.saturating_sub(paths.len()),
                     ) {
                         Some(unnamed) => paths.extend(unnamed),
                         None => needs_reconcile = true,
