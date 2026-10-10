@@ -84,3 +84,47 @@ fn codex_install_and_uninstall_keep_the_tables_after_the_ravel_entry() {
     kept(&text);
     assert!(!text.contains("[mcp_servers.ravel]"), "{text}");
 }
+
+#[test]
+fn a_local_install_never_touches_the_global_windsurf_config() {
+    let home = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let windsurf = home
+        .path()
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
+    let original = r#"{"mcpServers":{"ravel":{"command":"/abs/ravel","args":["serve","--mcp"]}}}"#;
+    write(&windsurf, original);
+    let root = project.path().to_str().unwrap();
+
+    for verb in ["install", "uninstall"] {
+        let (status, report) = run(
+            sandboxed(home.path()),
+            &[
+                "--root",
+                root,
+                verb,
+                "--target",
+                "windsurf",
+                "--location",
+                "local",
+                "--no-instructions",
+            ],
+        );
+        assert!(status.success(), "{verb}: {report}");
+        assert_eq!(
+            fs::read_to_string(&windsurf).unwrap(),
+            original,
+            "{verb} --location local rewrote the user's global Windsurf config"
+        );
+        assert!(
+            report["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["agent"] == "windsurf" && action["action"] == "skip"),
+            "{verb}: {report}"
+        );
+    }
+}

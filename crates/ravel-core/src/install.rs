@@ -769,6 +769,10 @@ fn install_one(
             actions,
             "mcpServers",
         ),
+        AgentKind::Windsurf if opts.location == InstallLocation::Local => {
+            windsurf_has_no_project_config(actions);
+            Ok(())
+        }
         AgentKind::Windsurf => {
             install_json_mcp_servers(kind, &windsurf_mcp_path(), opts, actions, "mcpServers")
         }
@@ -800,6 +804,10 @@ fn uninstall_one(
         AgentKind::OpenCode => uninstall_opencode(opts, actions),
         AgentKind::Gemini => {
             remove_json_mcp_key(kind, &gemini_settings_path(opts), actions, "mcpServers")
+        }
+        AgentKind::Windsurf if opts.location == InstallLocation::Local => {
+            windsurf_has_no_project_config(actions);
+            Ok(())
         }
         AgentKind::Windsurf => {
             remove_json_mcp_key(kind, &windsurf_mcp_path(), actions, "mcpServers")
@@ -836,6 +844,18 @@ fn windsurf_mcp_path() -> PathBuf {
         .join(".codeium")
         .join("windsurf")
         .join("mcp_config.json")
+}
+
+/// Windsurf reads MCP servers from its user config only. A project install going there anyway
+/// rewrote the user's entry with the project's launch command (often a bare `ravel`), and a
+/// project uninstall removed it.
+fn windsurf_has_no_project_config(actions: &mut Vec<InstallAction>) {
+    actions.push(InstallAction {
+        agent: AgentKind::Windsurf.id().into(),
+        path: String::new(),
+        action: "skip".into(),
+        detail: "Windsurf has no project MCP config; use --location global".into(),
+    });
 }
 
 fn claude_global_path() -> PathBuf {
