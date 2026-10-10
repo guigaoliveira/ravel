@@ -1348,10 +1348,11 @@ fn collect_import_clause(
 fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
     let text = node_text(node, source).trim_start();
     let type_only = has_leading_keywords(text, &["export", "type"]);
+    // Both grammars put a `from` clause's module in the `source` field. Any other string in the
+    // statement belongs to an exported value (`export const URL = '...'`), not to a re-export.
     let specifier = node
         .child_by_field_name("source")
-        .map(|source_node| unquote(node_text(source_node, source)))
-        .or_else(|| last_string(node, source));
+        .map(|source_node| unquote(node_text(source_node, source)));
     let mut bindings = Vec::new();
     if let Some(declaration) = node.child_by_field_name("declaration") {
         let names = declared_names(declaration, source);
@@ -2667,6 +2668,37 @@ export /* public surface */ type
         assert!(artifact.exports.iter().any(|export| {
             export.specifier.as_deref() == Some("./types.js") && export.type_only
         }));
+    }
+
+    #[test]
+    fn exported_values_do_not_reexport_the_string_literals_they_contain() {
+        let artifact = parse_source(
+            "constants.tsx",
+            br#"
+export const API_URL = 'https://api.example.com';
+export const DOCS = './a';
+export default function Widget() { return <div className="box" />; }
+export default 'label';
+export { real } from './real';
+export * from "./all";
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let specifiers: Vec<_> = artifact
+            .exports
+            .iter()
+            .map(|export| export.specifier.as_deref())
+            .collect();
+        assert_eq!(
+            specifiers,
+            vec![None, None, None, None, Some("./real"), Some("./all")],
+            "{:?}",
+            artifact.exports
+        );
     }
 
     #[test]
