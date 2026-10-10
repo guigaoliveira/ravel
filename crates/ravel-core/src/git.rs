@@ -1255,6 +1255,58 @@ mod among_tests {
         assert!(among.contains("src/edited.ts"));
     }
 
+    /// A workspace that is a package inside a bigger repository: git reports paths from the
+    /// repository top, and both queries must still name the workspace's own files, and only those.
+    #[test]
+    fn a_workspace_below_the_repository_top_gets_its_own_paths() {
+        let dir = tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q", "."]);
+        write(top, "pkg/src/a.ts", "export const v = 1;\n");
+        write(top, "outside.ts", "export const v = 1;\n");
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-qm", "seed"]);
+        write(top, "pkg/src/a.ts", "export const v = 2;\n");
+        write(top, "outside.ts", "export const v = 2;\n");
+        write(top, "pkg/src/new.ts", "export const n = 1;\n");
+        let root = top.join("pkg");
+        let discovery = DirtyDiscovery::default();
+        let expected: BTreeSet<String> = ["src/a.ts", "src/new.ts"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            relative(&root, changed_paths_with(&root, &discovery).unwrap()),
+            expected
+        );
+        let ask = vec!["src/a.ts".to_owned(), "src/new.ts".to_owned()];
+        assert_eq!(
+            relative(
+                &root,
+                status_among(&root, &discovery, &ask).expect("the pathspec query answers")
+            ),
+            expected
+        );
+        let tracked_only = DirtyDiscovery {
+            include_untracked: false,
+            ..DirtyDiscovery::default()
+        };
+        assert_eq!(
+            relative(&root, dirty_tracked_diff(&root).unwrap()),
+            relative(&root, changed_paths_with(&root, &tracked_only).unwrap())
+        );
+        // A committed change, seen through `diff-impact`'s range query.
+        run(top, &["add", "-A"]);
+        run(top, &["commit", "-qm", "edit"]);
+        assert_eq!(
+            relative(
+                &root,
+                changed_paths_between(&root, Some("HEAD~1"), None).unwrap()
+            ),
+            expected
+        );
+    }
+
     #[test]
     fn outside_a_repository_it_says_so_like_the_whole_tree_query() {
         let dir = tempdir().unwrap();

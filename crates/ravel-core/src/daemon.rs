@@ -976,6 +976,7 @@ fn spawn_daemon_watcher(
             let event_ignore = std::sync::Arc::new(crate::config::IgnoreChain::new(&engine.config));
             let batch_ignore = event_ignore.clone();
             let cookie_dir = storage_root.clone();
+            let noise_config = watch_config.clone();
             let watcher = match crate::watch::PersistentWatcher::new_gated(
                 &root,
                 queue_capacity,
@@ -988,6 +989,7 @@ fn spawn_daemon_watcher(
                         path,
                     )
                 },
+                move |relative| noise_config.is_noise_relative(relative),
             ) {
                 Ok(watcher) => watcher,
                 Err(error) => {

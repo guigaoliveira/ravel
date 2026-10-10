@@ -116,16 +116,20 @@ impl PersistentWatcher {
 
     /// [`Self::new_filtered`] that also keeps a [`WatchGate`] up to date, so a query can learn
     /// that nothing relevant changed without asking git. `cookie_dir` must lie inside `root`.
+    /// `noise_dir` answers, for a directory relative to `root`, whether the relevance filter drops
+    /// everything below it (see [`WatchGate::ignore_rules_below`]).
     pub(crate) fn new_gated<F>(
         root: &Path,
         queue_capacity: usize,
         cookie_dir: &Path,
         path_is_relevant: F,
+        noise_dir: impl Fn(&Path) -> bool + Send + Sync + 'static,
     ) -> Result<Self, WatchError>
     where
         F: Fn(&Path) -> bool + Send + Sync + 'static,
     {
         let gate = WatchGate::new(root, cookie_dir);
+        gate.ignore_rules_below(noise_dir);
         Self::build(root, queue_capacity, path_is_relevant, Some(gate))
     }
 
@@ -467,6 +471,7 @@ const STRUCTURE_SETTLE: Duration = Duration::from_secs(2);
 /// different index generation than the one that was checked, or simply time. In each case the
 /// caller runs the full check it always ran.
 pub struct WatchGate {
+    root: PathBuf,
     cookie_dir: PathBuf,
     /// Whether the filesystem is one where this process hears about every change made to it.
     trusted: bool,
@@ -482,7 +487,12 @@ pub struct WatchGate {
     next_cookie: AtomicU32,
     barrier_failures: AtomicU32,
     mark: Mutex<Option<CleanMark>>,
+    /// Which directories, relative to `root`, nothing below is ever relevant in. A rules file
+    /// there cannot change what the relevance filter keeps. Unset, every rules file counts.
+    noise_dir: std::sync::OnceLock<NoiseDir>,
 }
+
+type NoiseDir = Box<dyn Fn(&Path) -> bool + Send + Sync>;
 
 impl std::fmt::Debug for WatchGate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -579,6 +589,7 @@ impl WatchGate {
             }
         }
         Arc::new(Self {
+            root: root.to_path_buf(),
             cookie_dir: cookie_dir.to_path_buf(),
             trusted,
             timing,
@@ -590,7 +601,35 @@ impl WatchGate {
             next_cookie: AtomicU32::new(0),
             barrier_failures: AtomicU32::new(0),
             mark: Mutex::new(None),
+            noise_dir: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Tell the gate which directories (relative to the root) the relevance filter drops whole.
+    /// `npm install` writes packages that ship their own `.gitignore` under `node_modules`; each
+    /// of those used to turn the gate off for the life of the process, though no rule below a
+    /// directory the filter drops can make a file relevant again.
+    pub(crate) fn ignore_rules_below(
+        &self,
+        noise_dir: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) {
+        let _ = self.noise_dir.set(Box::new(noise_dir));
+    }
+
+    /// Whether a change to this rules file can alter what the relevance filter keeps. Only a
+    /// `.gitignore`/`.ravelignore` provably inside a dropped directory cannot; `.git/info/exclude`
+    /// lives under `.git` and always can, and a path the root does not prefix is not vouched for.
+    fn rules_can_apply(&self, path: &Path, name: &str) -> bool {
+        if name == "exclude" {
+            return true;
+        }
+        let Some(noise_dir) = self.noise_dir.get() else {
+            return true;
+        };
+        !path
+            .parent()
+            .and_then(|directory| directory.strip_prefix(&self.root).ok())
+            .is_some_and(noise_dir)
     }
 
     /// Whether the gate can ever vouch for this tree (right filesystem, not switched off).
@@ -619,13 +658,18 @@ impl WatchGate {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if name.starts_with(COOKIE_PREFIX) {
+            // Only the markers in the gate's own directory: a workspace file that merely shares the
+            // prefix is a change like any other, and swallowing it would let a quiet verdict hide it.
+            if name.starts_with(COOKIE_PREFIX) && path.parent() == Some(self.cookie_dir.as_path()) {
                 ours = true;
                 if let Some(cookie) = lock(&self.cookies).get(name) {
                     *lock(&cookie.seen) = true;
                     cookie.arrived.notify_all();
                 }
-            } else if is_ignore_rules_file(path, name) && !is_read_only_access(&event.kind) {
+            } else if is_ignore_rules_file(path, name)
+                && !is_read_only_access(&event.kind)
+                && self.rules_can_apply(path, name)
+            {
                 // The relevance filter keeps the ignore rules it first read for as long as the
                 // watcher lives, so after one of them changes it may be dropping events for files
                 // that are now listed. Only a full check can speak for the tree from here on.
@@ -1806,6 +1850,47 @@ mod tests {
             assert!(!gate.absorb(&event(write(), path)));
         }
         assert!(gate.usable());
+    }
+
+    /// A package's own `.gitignore` under `node_modules` is below a directory the relevance filter
+    /// drops whole, so `npm install` must not end the gate; the workspace's own rules still do.
+    #[test]
+    fn rules_files_below_a_dropped_directory_leave_the_gate_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let storage = root.join(".ravel");
+        std::fs::create_dir_all(&storage).unwrap();
+        let config = crate::config::Config::default();
+        let fresh = || {
+            let gate = WatchGate::with_timing(&root, &storage, Timing::default());
+            let config = config.clone();
+            gate.ignore_rules_below(move |relative| config.is_noise_relative(relative));
+            gate
+        };
+        if !fresh().is_trusted() {
+            return;
+        }
+        let write = |path: &str| {
+            Ok(Event {
+                kind: EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                paths: vec![root.join(path)],
+                attrs: Default::default(),
+            })
+        };
+        let gate = fresh();
+        for path in [
+            "node_modules/left-pad/.gitignore",
+            "packages/web/node_modules/esbuild/.gitignore",
+            "dist/.ravelignore",
+        ] {
+            assert!(!gate.absorb(&write(path)));
+            assert!(gate.usable(), "{path} cannot make anything relevant");
+        }
+        for path in [".gitignore", "packages/web/.gitignore", ".git/info/exclude"] {
+            let gate = fresh();
+            assert!(!gate.absorb(&write(path)));
+            assert!(!gate.usable(), "writing {path} changes what is ignored");
+        }
     }
 
     #[test]
