@@ -765,6 +765,12 @@ fn source_walk(config: &Config) -> ignore::Walk {
         .follow_links(false);
     let custom = root.join(".ravelignore");
     if custom.is_file() {
+        // `add_ignore` anchors the file's patterns at the walk's current directory, the process's
+        // own unless told otherwise. Anchored at the root they mean what they say: `src/gen/`
+        // matched nothing, while sync and the watchers, which anchor at the root, excluded it.
+        if root.is_absolute() {
+            builder.current_dir(root);
+        }
         builder.add_ignore(custom);
     }
     // Pruning a noise directory, instead of filtering every file under it, keeps the walk out of
@@ -1748,6 +1754,49 @@ mod tests {
                 chain.is_ignored(&root.join(relative)),
                 !kept,
                 "the chain on {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anchored_ravelignore_pattern_means_the_same_to_the_walk_and_the_chain() {
+        // Patterns are relative to the root whatever directory the process runs in. The walk
+        // anchored them at the working directory, so `src/gen/` excluded nothing from the index
+        // while sync and the watchers excluded it.
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write_tree(
+            &root,
+            &[
+                (".ravelignore", "src/gen/\n/top.ts\n"),
+                ("src/gen/out.ts", "export {}"),
+                ("src/top.ts", "export {}"),
+                ("gen/kept.ts", "export {}"),
+                ("top.ts", "export {}"),
+            ],
+        );
+        let mut config = Config::default();
+        config.project.root = root.clone();
+        let discovered: Vec<_> = discover_files(&config)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            discovered,
+            [Path::new("gen/kept.ts"), Path::new("src/top.ts")]
+        );
+        let chain = IgnoreChain::new(&config);
+        for (relative, ignored) in [
+            ("src/gen/out.ts", true),
+            ("top.ts", true),
+            ("gen/kept.ts", false),
+            ("src/top.ts", false),
+        ] {
+            assert_eq!(
+                chain.is_ignored(&root.join(relative)),
+                ignored,
+                "{relative}"
             );
         }
     }
