@@ -336,29 +336,30 @@ pub fn hubs(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
 pub fn hubs_from_graph(graph: &GraphIndex, limit: usize) -> Vec<HubEntry> {
     let limit = limit.max(1);
     // Partial top-k with binary heap would be O(V log k); for k small this matters at scale.
-    use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let mut heap: BinaryHeap<Reverse<(usize, String, usize)>> = BinaryHeap::new();
+    // Keyed by the final order (in-degree descending, then name), so the max-heap's top is the
+    // entry the cutoff drops first: the lowest in-degree and, among those, the name sorting last.
+    // A tie at the cutoff is then decided by name, not by which node was interned first.
+    let mut heap: BinaryHeap<(Reverse<usize>, String, usize)> = BinaryHeap::new();
     for (id, name) in graph.node_entries() {
         let in_d = graph.in_degree_id(id);
         if in_d == 0 {
             continue;
         }
-        // Min-heap by in_degree among top-k (Reverse makes BinaryHeap a min-heap).
         // out_degree is only fetched when the node actually enters the heap.
         if heap.len() < limit {
-            heap.push(Reverse((in_d, name.to_owned(), graph.out_degree_id(id))));
-        } else if let Some(Reverse((min_in, _, _))) = heap.peek() {
-            if in_d > *min_in {
-                let out_d = graph.out_degree_id(id);
-                heap.pop();
-                heap.push(Reverse((in_d, name.to_owned(), out_d)));
-            }
+            heap.push((Reverse(in_d), name.to_owned(), graph.out_degree_id(id)));
+        } else if let Some((worst_in, worst_name, _)) = heap.peek()
+            && (Reverse(in_d), name) < (*worst_in, worst_name.as_str())
+        {
+            let out_d = graph.out_degree_id(id);
+            heap.pop();
+            heap.push((Reverse(in_d), name.to_owned(), out_d));
         }
     }
     let mut entries: Vec<HubEntry> = heap
         .into_iter()
-        .map(|Reverse((in_degree, name, out_degree))| HubEntry {
+        .map(|(Reverse(in_degree), name, out_degree)| HubEntry {
             name,
             in_degree,
             out_degree,
@@ -798,6 +799,34 @@ mod tests {
         assert_eq!(complete.affected.len(), 106);
         assert!(!complete.truncated);
         assert_eq!(complete.reason, None);
+    }
+
+    /// The top-k must be the first k of the order it is reported in -- in-degree descending,
+    /// then name -- whatever order the nodes were interned in. The min-heap on (in-degree, name)
+    /// kept the first-seen of a tie at the cutoff and, when a stronger hub arrived, evicted the
+    /// tied name that sorts first instead of the one that sorts last.
+    #[test]
+    fn hubs_cut_ties_at_k_by_the_order_they_are_reported_in() {
+        let names = |hubs: Vec<HubEntry>| hubs.into_iter().map(|h| h.name).collect::<Vec<_>>();
+
+        // x, b, a all have in-degree 1 and are interned in that order.
+        let tied = GraphIndex::from_edges(
+            &[edge("p", "x"), edge("q", "b"), edge("r", "a")],
+            "s".into(),
+        );
+        assert_eq!(names(hubs_from_graph(&tied, 2)), ["a", "b"]);
+
+        // a and z tie at in-degree 1; h (in-degree 2) arrives once the heap is full.
+        let evicting = GraphIndex::from_edges(
+            &[
+                edge("p", "a"),
+                edge("q", "z"),
+                edge("r", "h"),
+                edge("s", "h"),
+            ],
+            "s".into(),
+        );
+        assert_eq!(names(hubs_from_graph(&evicting, 2)), ["h", "a"]);
     }
 
     #[test]
