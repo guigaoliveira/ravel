@@ -1440,13 +1440,15 @@ impl GraphIndex {
                 reason = Some("deadline".into());
                 break;
             }
+            // A node reached again past the limit (a cycle back to the root) cuts nothing, so the
+            // visited check runs first: only an unvisited node beyond the limit is a truncation.
+            if seen.contains(&current) {
+                continue;
+            }
             if depth > limits.depth {
                 truncated = true;
                 reason = Some("depth".into());
                 break;
-            }
-            if seen.contains(&current) {
-                continue;
             }
             // Enforce hard budgets before admitting work. The previous post-insert checks
             // reported `visited_nodes = limit + 1` / `visited_edges = limit + 1`.
@@ -2085,6 +2087,27 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.visited_nodes, 1);
         assert_eq!(graph.package_cycles().len(), 1);
+    }
+
+    /// Only a node the walk has not reached can be cut by the depth limit. `a ↔ b` at depth 1
+    /// queues `a` again one level past the limit; that cut nothing and is not a truncation.
+    #[test]
+    fn depth_limit_truncates_only_when_an_unvisited_node_lies_beyond_it() {
+        let cycle = GraphIndex::from_edges(&[edge("a", "b"), edge("b", "a")], "s".into());
+        let limits = QueryLimits {
+            depth: 1,
+            ..Default::default()
+        };
+        let page = cycle.callers_of("a", &limits, None).unwrap();
+        assert_eq!(page.items, ["b"]);
+        assert!(!page.truncated, "{page:?}");
+        assert_eq!(page.reason, None);
+
+        let chain = GraphIndex::from_edges(&[edge("b", "a"), edge("c", "b")], "s".into());
+        let page = chain.callers_of("a", &limits, None).unwrap();
+        assert_eq!(page.items, ["b"]);
+        assert!(page.truncated, "{page:?}");
+        assert_eq!(page.reason.as_deref(), Some("depth"));
     }
 
     #[test]
