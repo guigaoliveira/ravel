@@ -1710,13 +1710,36 @@ fn write_json_pretty(path: &Path, value: &Value) -> anyhow::Result<()> {
 
 fn write_text_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
+    let path = &symlink_target(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(text.as_bytes())?;
+    // The temporary file is created owner-only; a rewrite keeps the mode the file already had.
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(tmp.path(), metadata.permissions())?;
+    }
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// The file a config path names once symlinks are followed.
+///
+/// Renaming over a symlink replaces the link itself, so a config a dotfile manager links into
+/// place became a regular file here and the managed copy silently stopped being the one in use.
+/// The rename goes to where the link points instead, still atomically.
+fn symlink_target(path: &Path) -> PathBuf {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return path.to_path_buf();
+    }
+    fs::canonicalize(path)
+        // A dangling link: create the file it names.
+        .or_else(|_| {
+            fs::read_link(path)
+                .map(|target| path.parent().unwrap_or_else(|| Path::new(".")).join(target))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The MCP config file `ravel install` writes for an agent at a location, when it has one.
@@ -1834,6 +1857,48 @@ mod tests {
         let v2: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(v2["mcpServers"].get("ravel").is_none());
         assert!(v2["mcpServers"].get("other").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through_the_link_and_keeps_its_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("dotfiles").join("mcp.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("home").join("mcp.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink("../dotfiles/mcp.json", &link).unwrap();
+
+        upsert_json_mcp_servers(&link, Path::new("/usr/bin/ravel"), true).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let v: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["ravel"]["command"], "/usr/bin/ravel");
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+
+        // A link whose target does not exist yet gets that target created.
+        let dangling = dir.path().join("home").join("settings.json");
+        symlink("../dotfiles/settings.json", &dangling).unwrap();
+        write_text_atomic(&dangling, "{}\n").unwrap();
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("dotfiles/settings.json")).unwrap(),
+            "{}\n"
+        );
     }
 
     #[test]
