@@ -1,6 +1,7 @@
 //! Cross-agent install: detect coding agents and wire Ravel MCP + instruction snippets.
 //! Agent setup UX: auto-detection, global/local scope, and printable config.
 
+use anyhow::Context;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -8,6 +9,7 @@ use std::{
     ffi::OsStr,
     fs,
     fs::{File, OpenOptions},
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -1108,22 +1110,18 @@ fn install_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> any
     } else {
         String::new()
     };
-    let existing: toml::Table = if text.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        text.parse()?
-    };
-    let block = format!("\n{}", codex_server_table(&existing, &opts.ravel_bin)?);
-    if text.contains("[mcp_servers.ravel]") {
-        // Replace existing block (simple line-based strip until next [section)
-        text = replace_toml_table(&text, "mcp_servers.ravel", &block);
+    let existing = parse_codex_config(&path, &text)?;
+    let server = codex_server_entry(&existing, &opts.ravel_bin);
+    let block = format!("\n{}", codex_server_table(&server)?);
+    if toml_table_range(&text, CODEX_RAVEL_TABLE).is_some() {
+        text = replace_toml_table(&text, CODEX_RAVEL_TABLE, &block);
     } else {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(block.trim_start());
     }
-    toml::from_str::<toml::Value>(&text)?;
+    ensure_only_ravel_changed(&path, existing, &text, Some(server))?;
     write_text_atomic(&path, &text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
@@ -1147,8 +1145,8 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         return Ok(());
     }
     let text = fs::read_to_string(&path)?;
-    toml::from_str::<toml::Value>(&text)?;
-    if !text.contains("[mcp_servers.ravel]") {
+    let existing = parse_codex_config(&path, &text)?;
+    if toml_table_range(&text, CODEX_RAVEL_TABLE).is_none() {
         actions.push(InstallAction {
             agent: "codex".into(),
             path: path.display().to_string(),
@@ -1157,10 +1155,8 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
         });
         return Ok(());
     }
-    let new_text = replace_toml_table(&text, "mcp_servers.ravel", "");
-    if !new_text.trim().is_empty() {
-        toml::from_str::<toml::Value>(&new_text)?;
-    }
+    let new_text = replace_toml_table(&text, CODEX_RAVEL_TABLE, "");
+    ensure_only_ravel_changed(&path, existing, &new_text, None)?;
     write_text_atomic(&path, &new_text)?;
     actions.push(InstallAction {
         agent: "codex".into(),
@@ -1178,7 +1174,7 @@ fn uninstall_codex(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> a
 /// environment, so `RAVEL_MCP_TOOLS=all` only arrives this way), a timeout, a tool allow-list, a
 /// per-tool approval. Comments inside this one table do not survive the rewrite; the rest of the
 /// file is left byte-for-byte.
-fn codex_server_table(existing: &toml::Table, ravel_bin: &Path) -> anyhow::Result<String> {
+fn codex_server_entry(existing: &toml::Table, ravel_bin: &Path) -> toml::Table {
     let mut server = existing
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
@@ -1194,66 +1190,154 @@ fn codex_server_table(existing: &toml::Table, ravel_bin: &Path) -> anyhow::Resul
         "args".into(),
         toml::Value::Array(vec!["serve".into(), "--mcp".into()]),
     );
+    server
+}
+
+/// The `[mcp_servers.ravel]` block for `server`, as TOML text.
+fn codex_server_table(server: &toml::Table) -> anyhow::Result<String> {
     let mut servers = toml::Table::new();
-    servers.insert(MCP_SERVER_NAME.into(), toml::Value::Table(server));
+    servers.insert(MCP_SERVER_NAME.into(), toml::Value::Table(server.clone()));
     let mut root = toml::Table::new();
     root.insert("mcp_servers".into(), toml::Value::Table(servers));
     Ok(toml::to_string(&root)?)
 }
 
-/// Replace or remove a TOML table `[name]` including nested keys until next top-level `[`.
-fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
-    let header = format!("[{table}]");
-    let Some(start) = text.find(&header) else {
-        return format!(
-            "{text}{}",
-            if replacement.is_empty() {
-                ""
-            } else {
-                replacement
-            }
-        );
-    };
-    // Find previous newline start of header line
-    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let after = &text[start + header.len()..];
-    let mut end = text.len();
-    for (i, line) in after.split_inclusive('\n').scan(0usize, |acc, l| {
-        let at = *acc;
-        *acc += l.len();
-        Some((at, l))
-    }) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            // only if it's a new table header at column 0-ish of original...
-            // after is relative; check absolute
-            let abs = start + header.len() + i;
-            if text[abs..].starts_with('[') {
-                // nested tables look like [mcp_servers.ravel.tools.x]
-                let rest = &text[abs + 1..];
-                let name_end = rest.find(']').unwrap_or(0);
-                let name = &rest[..name_end];
-                if !name.starts_with(&format!("{table}.")) && name != table {
-                    end = abs;
-                    break;
-                }
-            }
-        }
-        let _ = line;
+const CODEX_RAVEL_TABLE: &str = "mcp_servers.ravel";
+
+fn parse_codex_config(path: &Path, text: &str) -> anyhow::Result<toml::Table> {
+    if text.trim().is_empty() {
+        return Ok(toml::Table::new());
     }
+    text.parse()
+        .with_context(|| format!("{} is not valid TOML", path.display()))
+}
+
+/// Refuse a rewrite of the Codex config that changes anything but the `ravel` server.
+///
+/// The block is cut out as text, which keeps every other byte of the file — comments included —
+/// but means a layout the cut misreads would drop the user's settings and still leave valid
+/// TOML. Comparing the parsed result with what the edit is meant to produce turns that into an
+/// error and an untouched file.
+fn ensure_only_ravel_changed(
+    path: &Path,
+    before: toml::Table,
+    after: &str,
+    server: Option<toml::Table>,
+) -> anyhow::Result<()> {
+    let after = parse_codex_config(path, after).ok();
+    let mut expected = before;
+    let servers = expected
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(servers) = servers.as_table_mut() {
+        match server {
+            Some(server) => servers.insert(MCP_SERVER_NAME.into(), toml::Value::Table(server)),
+            None => servers.remove(MCP_SERVER_NAME),
+        };
+    }
+    anyhow::ensure!(
+        after.is_some_and(|after| without_empty_servers(after) == without_empty_servers(expected)),
+        "{} could not be rewritten without changing settings other than [{CODEX_RAVEL_TABLE}]; \
+         left untouched — edit it by hand (`ravel install --print-config codex` prints the entry)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// An `mcp_servers` table left empty is the same config as none: the header that declared it
+/// may have been `[mcp_servers.ravel]` itself.
+fn without_empty_servers(mut config: toml::Table) -> toml::Table {
+    if config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty)
+    {
+        config.remove("mcp_servers");
+    }
+    config
+}
+
+/// The table a TOML header line opens — `[a.b]` or `[[a.b]]`, at any indentation — as its key
+/// path, and whether it is an array of tables. `None` for any other line.
+///
+/// The line goes through the TOML parser on its own, so quoting and spacing inside the brackets
+/// read the way Codex reads them, and the row of a multi-line array that merely starts with a
+/// bracket is not taken for a header.
+fn toml_header(line: &str) -> Option<(Vec<String>, bool)> {
+    let line = line.trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+    let mut table: toml::Table = line.parse().ok()?;
+    let mut path = Vec::new();
+    loop {
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, value) = table.into_iter().next()?;
+        path.push(key);
+        match value {
+            toml::Value::Table(inner) if !inner.is_empty() => table = inner,
+            toml::Value::Table(_) => return Some((path, false)),
+            toml::Value::Array(_) => return Some((path, true)),
+            _ => return None,
+        }
+    }
+}
+
+/// Where the `[table]` block sits in `text`: from its header line to the next header that opens
+/// anything but one of its own sub-tables. Every header ends it — indented ones, and `[[array]]`
+/// tables too — and comment lines directly above that next header stay with it.
+fn toml_table_range(text: &str, table: &str) -> Option<Range<usize>> {
+    let path: Vec<&str> = table.split('.').collect();
+    let under_table = |header: &[String]| {
+        header.len() > path.len() && header.iter().zip(&path).all(|(a, b)| a == b)
+    };
+    let mut lines = text.split_inclusive('\n').scan(0, |at, line| {
+        let start = *at;
+        *at += line.len();
+        Some((start, line))
+    });
+    let (start, _) = lines.by_ref().find(|(_, line)| {
+        toml_header(line).is_some_and(|(header, array)| {
+            !array && header.len() == path.len() && header.iter().zip(&path).all(|(a, b)| a == b)
+        })
+    })?;
+    let mut comments_from = None;
+    for (at, line) in lines {
+        if let Some((header, _)) = toml_header(line) {
+            if !under_table(&header) {
+                return Some(start..comments_from.unwrap_or(at));
+            }
+            comments_from = None;
+        } else if line.trim_start().starts_with('#') {
+            comments_from.get_or_insert(at);
+        } else {
+            comments_from = None;
+        }
+    }
+    Some(start..text.len())
+}
+
+/// Replace or remove the `[table]` block [`toml_table_range`] finds; append `replacement` when
+/// there is none.
+fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
+    let Some(range) = toml_table_range(text, table) else {
+        return format!("{text}{replacement}");
+    };
     let mut out = String::new();
-    out.push_str(&text[..line_start]);
+    out.push_str(&text[..range.start]);
     if !replacement.is_empty() {
         out.push_str(replacement.trim_start_matches('\n'));
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        // The blank line that separated the old table from the next one went with it.
-        if text[end..].starts_with('[') {
+        // The blank line that separated the old table from what follows went with it.
+        if range.end < text.len() {
             out.push('\n');
         }
     }
-    out.push_str(&text[end..]);
+    out.push_str(&text[range.end..]);
     out
 }
 
@@ -1823,6 +1907,52 @@ b = 2
         let gone = replace_toml_table(&next, "mcp_servers.ravel", "");
         assert!(!gone.contains("[mcp_servers.ravel]"));
         assert!(gone.contains("[mcp_servers.other]"));
+    }
+
+    #[test]
+    fn the_codex_block_ends_at_any_header_but_its_own_sub_tables() {
+        let rest = "[[hooks]]\nname = \"keep-me\"\n\n# github\n  [mcp_servers.github]\n  \
+                    env = { TOKEN = \"t\" }\n";
+        let text = format!(
+            "[ mcp_servers . ravel ]  # mine\ncommand = \"old\"\n\n\
+             [mcp_servers.ravel.tools.sync]\napproval_mode = \"approve\"\n\n{rest}"
+        );
+        assert_eq!(replace_toml_table(&text, CODEX_RAVEL_TABLE, ""), rest);
+
+        let replaced = replace_toml_table(&text, CODEX_RAVEL_TABLE, "\n[mcp_servers.ravel]\n");
+        assert_eq!(replaced, format!("[mcp_servers.ravel]\n\n{rest}"));
+
+        // Neither a commented-out header nor the row of a multi-line array opens a table.
+        let text = "# [mcp_servers.ravel]\nmatrix = [\n  [1, 2],\n  [\"a\"]\n]\n";
+        assert!(toml_table_range(text, CODEX_RAVEL_TABLE).is_none());
+        assert_eq!(
+            toml_header("  [[a.\"b c\"]] # x"),
+            Some((vec!["a".into(), "b c".into()], true))
+        );
+        assert_eq!(toml_header("  [1, 2],"), None);
+    }
+
+    #[test]
+    fn a_codex_rewrite_that_changes_other_settings_is_refused() {
+        let path = Path::new("config.toml");
+        let before: toml::Table = "model = \"m\"\n[mcp_servers.ravel]\ncommand = \"x\"\n\
+                                   [[hooks]]\nname = \"keep-me\"\n"
+            .parse()
+            .unwrap();
+        assert!(
+            ensure_only_ravel_changed(
+                path,
+                before.clone(),
+                "model = \"m\"\n[[hooks]]\nname = \"keep-me\"\n",
+                None
+            )
+            .is_ok()
+        );
+        let error = ensure_only_ravel_changed(path, before.clone(), "model = \"m\"\n", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config.toml"), "{error}");
+        assert!(ensure_only_ravel_changed(path, before, "model = \"", None).is_err());
     }
 
     #[test]
