@@ -80,6 +80,11 @@ pub(crate) const SCHEMA_VERSION: u32 = 17;
 /// other: a reader that predates this finds no `meta/universe` in a new overlay and falls back to a
 /// tier that republishes a fresh base, and this reader does the same for an old overlay.
 const UNIVERSE_OVERLAY_KEY: &str = "meta/universe2";
+/// The one overlay store every packed chain used to share. Nothing referenced it, so no GC ever
+/// collected it and it grew with every sync for the life of the workspace. Chains now record a
+/// store of their own (`Manifest::artifact_overlay_store`); this one is still appended to by a
+/// chain that already wrote to it, and collected once no retained manifest can reference it.
+const LEGACY_ARTIFACT_OVERLAY_STORE: &str = "artifacts.overlay.store";
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -212,6 +217,12 @@ pub struct Manifest {
     pub artifact_delta_weights: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_store: Option<String>,
+    /// Append-only file the artifact deltas over a packed `artifact_store` write changed artifacts
+    /// to: one per chain, so generation GC collects it with the last manifest that layers over it.
+    /// Absent on a packed manifest with deltas when they went to [`LEGACY_ARTIFACT_OVERLAY_STORE`]
+    /// -- written before this was recorded, or by a binary that drops the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_overlay_store: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_locator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2171,7 +2182,7 @@ pub struct FileSnapshotStorage {
     /// Packs are immutable once published, so a reader stays valid for its name.
     pack_readers: Mutex<std::collections::HashMap<String, Arc<GenerationPackReader>>>,
     /// Decoded artifact index, keyed by the component refs it was decoded from.
-    /// Those refs are content-addressed, so a matching key means identical bytes.
+    /// Those refs never name two different contents, so a matching key means identical bytes.
     /// Per-path lookups used to decode the whole index — tens of thousands of
     /// entries — once for every path asked about.
     artifact_index_cache: Arc<Mutex<Option<CachedArtifactIndex>>>,
@@ -2182,8 +2193,14 @@ pub struct FileSnapshotStorage {
     full_index_decodes: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Index component ref, the delta refs applied over it, and the decoded result.
-type CachedArtifactIndex = (String, Vec<String>, Option<Arc<ArtifactIndex>>);
+/// Index component ref, the overlay store its deltas were written to, the delta refs applied over
+/// it, and the decoded result.
+type CachedArtifactIndex = (
+    String,
+    Option<String>,
+    Vec<String>,
+    Option<Arc<ArtifactIndex>>,
+);
 
 /// A decoded artifact index that outlives the storage handle it was decoded through.
 ///
@@ -2340,6 +2357,10 @@ impl FileSnapshotStorage {
         for (_, _, manifest) in manifests.iter().take(keep) {
             reachable.extend(Self::manifest_component_paths(manifest));
         }
+        let overlay_stores_collectible = !manifests
+            .iter()
+            .take(keep)
+            .any(|(_, _, manifest)| Self::has_unrecorded_overlay_store(manifest));
         let mut report = GenerationGcReport {
             retained_manifests: retained_manifests.len(),
             ..GenerationGcReport::default()
@@ -2351,7 +2372,8 @@ impl FileSnapshotStorage {
             let name = entry.file_name().to_string_lossy().into_owned();
             let generation_artifact = name.starts_with("snapshot-")
                 || name.starts_with("store.tmp-")
-                || name.contains(".tmp-");
+                || name.contains(".tmp-")
+                || (overlay_stores_collectible && Self::is_artifact_overlay_store(&name));
             if !generation_artifact || reachable.contains(&name) {
                 continue;
             }
@@ -2394,6 +2416,7 @@ impl FileSnapshotStorage {
             manifest.hubs.as_deref(),
             manifest.artifact_index.as_deref(),
             manifest.artifact_store.as_deref(),
+            manifest.artifact_overlay_store.as_deref(),
             manifest.artifact_locator.as_deref(),
         ]
         .into_iter()
@@ -2570,6 +2593,43 @@ impl FileSnapshotStorage {
             .unwrap_or_default();
         hasher.update(&now.as_nanos().to_le_bytes());
         format!("{generation}.{}", &hasher.finalize().to_hex()[..16])
+    }
+
+    /// The store the next artifact delta over a packed base appends to, recorded in `manifest`
+    /// when its chain starts. Deliberately not named `snapshot-*`: a binary that predates the field
+    /// would otherwise collect it as unreachable while the chain still reads from it.
+    fn artifact_overlay_store(manifest: &mut Manifest) -> String {
+        if let Some(name) = &manifest.artifact_overlay_store {
+            return name.clone();
+        }
+        if !manifest.artifact_deltas.is_empty() {
+            // The chain already wrote to the shared store without recording it; keep it there.
+            return LEGACY_ARTIFACT_OVERLAY_STORE.to_owned();
+        }
+        let generation = manifest.snapshot_id.stable_key();
+        let name = format!(
+            "artifacts-{}.overlay.store",
+            Self::publication_name(&generation)
+        );
+        manifest.artifact_overlay_store = Some(name.clone());
+        name
+    }
+
+    /// A packed manifest with deltas but no recorded overlay store: they went to the legacy store,
+    /// or a binary that drops the field published over a chain that had one. Which overlay stores
+    /// it still reads from is then unknown without decoding its deltas.
+    fn has_unrecorded_overlay_store(manifest: &Manifest) -> bool {
+        manifest.artifact_overlay_store.is_none()
+            && !manifest.artifact_deltas.is_empty()
+            && manifest
+                .artifact_store
+                .as_deref()
+                .is_some_and(|store| store.contains('#'))
+    }
+
+    fn is_artifact_overlay_store(name: &str) -> bool {
+        name == LEGACY_ARTIFACT_OVERLAY_STORE
+            || (name.starts_with("artifacts-") && name.ends_with(".overlay.store"))
     }
     /// The manifest as it is on disk right now, ignoring the mtime-keyed cache.
     fn read_manifest_uncached(&self) -> Result<Option<Manifest>, StorageError> {
@@ -2767,6 +2827,7 @@ impl FileSnapshotStorage {
             artifact_deltas: Vec::new(),
             artifact_delta_weights: Vec::new(),
             artifact_store: Some(reference("artifact/")),
+            artifact_overlay_store: None,
             artifact_locator: None,
             artifact_state: Some(artifact_state),
             artifact_live_bytes: Some(artifact_live_bytes),
@@ -3401,7 +3462,8 @@ impl FileSnapshotStorage {
     ///
     /// Callers that resolve one path at a time (artifact loads, source-hash
     /// probes) otherwise decode the entire index per path. The key is the index
-    /// component ref plus the delta refs applied on top; all are content-addressed,
+    /// component ref plus the delta refs applied on top; the first names one
+    /// generation's bytes and a delta ref is never reused (`publication_name`),
     /// so an equal key guarantees equal bytes and a new generation misses.
     fn cached_artifact_index(
         &self,
@@ -3410,27 +3472,36 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.artifact_index.as_ref() else {
             return Ok(None);
         };
+        let overlay_store = &manifest.artifact_overlay_store;
         let carried = {
             let mut slot = self.artifact_index_cache.lock().unwrap();
             match slot.as_ref() {
-                Some((cached_name, cached_deltas, cached))
+                Some((cached_name, _, cached_deltas, cached))
                     if cached_name == name && *cached_deltas == manifest.artifact_deltas =>
                 {
                     return Ok(cached.clone());
                 }
                 // Emptied while it is brought up to date, so that a lone owner changes it in
-                // place instead of copying it.
-                Some((cached_name, _, Some(_))) if cached_name == name => slot.take(),
+                // place instead of copying it. Only within one chain: a base republished under the
+                // same name starts another overlay store, and entries carried over from the old
+                // chain would point into one that GC has since collected.
+                Some((cached_name, cached_store, applied, Some(_)))
+                    if cached_name == name
+                        && (cached_store == overlay_store || applied.is_empty()) =>
+                {
+                    slot.take()
+                }
                 _ => None,
             }
         };
-        if let Some((_, applied, Some(mut cached))) = carried
+        if let Some((_, _, applied, Some(mut cached))) = carried
             && let Some(expected) = manifest.artifact_state
             && let Some(index) =
                 self.carry_artifact_index_forward(manifest, &applied, &mut cached, expected)?
         {
             *self.artifact_index_cache.lock().unwrap() = Some((
                 name.clone(),
+                overlay_store.clone(),
                 manifest.artifact_deltas.clone(),
                 Some(Arc::clone(&index)),
             ));
@@ -3442,6 +3513,7 @@ impl FileSnapshotStorage {
         let index = self.read_artifact_index(manifest)?.map(Arc::new);
         *self.artifact_index_cache.lock().unwrap() = Some((
             name.clone(),
+            overlay_store.clone(),
             manifest.artifact_deltas.clone(),
             index.clone(),
         ));
@@ -3787,7 +3859,7 @@ impl FileSnapshotStorage {
                 })?;
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -4034,7 +4106,7 @@ impl FileSnapshotStorage {
         let payload_id = self.payload_snapshot_id(&manifest).clone();
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -4360,7 +4432,7 @@ impl FileSnapshotStorage {
         let payload_id = self.payload_snapshot_id(&manifest).clone();
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -5611,6 +5683,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             artifact_deltas: Vec::new(),
             artifact_delta_weights: Vec::new(),
             artifact_store: Some(artifact_store),
+            artifact_overlay_store: None,
             artifact_locator: Some(artifact_locator),
             artifact_state: Some(artifact_state),
             artifact_live_bytes: Some(artifact_live_bytes),
@@ -6954,6 +7027,180 @@ mod tests {
         }
     }
 
+    /// The packed base `ravel index` publishes, without the structural sections a sync reads.
+    fn publish_packed(store: &FileSnapshotStorage, snapshot: &IndexSnapshot) {
+        let mut stager = store
+            .begin_structural_pack_base(snapshot.id.stable_key())
+            .unwrap();
+        stager.stage_snapshot(snapshot).unwrap();
+        let staged = stager.finish().unwrap();
+        store.publish_packed_snapshot(snapshot, staged).unwrap();
+    }
+
+    fn overlay_store_names(path: &Path) -> BTreeSet<String> {
+        fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with("overlay.store"))
+            .collect()
+    }
+
+    fn overlay_store_bytes(path: &Path) -> u64 {
+        overlay_store_names(path)
+            .iter()
+            .map(|name| fs::metadata(path.join(name)).unwrap().len())
+            .sum()
+    }
+
+    /// Every sync over a packed base appended to one `artifacts.overlay.store` that no manifest
+    /// named, so no GC collected it and no full index reset it: it grew for the life of the
+    /// workspace.
+    #[test]
+    fn a_packed_chains_overlay_store_is_collected_with_the_chain() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let mut base = snapshot_with_files(4);
+        publish_packed(&store, &base);
+        for revision in 1..=12 {
+            publish_body_edit(&store, &format!("src/file-{}.ts", revision % 4), revision);
+        }
+        let first_chain = overlay_store_bytes(dir.path());
+        assert!(first_chain > 0);
+
+        base.id.content_state = "rebuilt".into();
+        publish_packed(&store, &base);
+        for revision in 13..=15 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        let second_chain = overlay_store_bytes(dir.path());
+        assert!(
+            second_chain < first_chain,
+            "the first chain's store outlived it: {first_chain} -> {second_chain} bytes in {:?}",
+            overlay_store_names(dir.path())
+        );
+        let manifest = store.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([manifest.artifact_overlay_store.unwrap()])
+        );
+        let edited = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 15\n",
+        );
+        let current = store.open_current().unwrap().unwrap();
+        assert_eq!(
+            current.files["src/file-0.ts"].source_hash,
+            edited.source_hash
+        );
+        assert_eq!(current.files["src/file-1.ts"], base.files["src/file-1.ts"]);
+    }
+
+    /// A decoded index is carried forward only within the chain it was decoded from. A base
+    /// republished under the same name (the tree is back to an indexed state) starts another
+    /// overlay store; an entry carried over from the old chain pointed into a store GC collects.
+    #[test]
+    fn a_shared_artifact_index_is_not_carried_into_a_republished_base() {
+        let dir = tempdir().unwrap();
+        let writer = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let base = snapshot_with_files(3);
+        publish_packed(&writer, &base);
+        let shared = SharedArtifactIndex::default();
+        let sharing = || {
+            FileSnapshotStorage::with_retention(dir.path(), 2).with_shared_artifact_index(&shared)
+        };
+
+        // Edit and revert file-1: its entry now lives in this chain's overlay store.
+        publish_body_edit(&writer, "src/file-1.ts", 1);
+        writer
+            .publish_artifact_deltas(&[(
+                "src/file-1.ts".to_owned(),
+                base.files["src/file-1.ts"].clone(),
+            )])
+            .unwrap()
+            .unwrap();
+        let manifest = writer.read_manifest().unwrap().unwrap();
+        sharing().cached_artifact_index(&manifest).unwrap().unwrap();
+
+        publish_packed(&writer, &base);
+        for revision in 2..=3 {
+            publish_body_edit(&writer, "src/file-2.ts", revision);
+        }
+        let reader = sharing();
+        assert_eq!(
+            reader.open_artifact("src/file-1.ts").unwrap().unwrap(),
+            base.files["src/file-1.ts"]
+        );
+        let manifest = writer.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            *reader.cached_artifact_index(&manifest).unwrap().unwrap(),
+            FileSnapshotStorage::new(dir.path())
+                .read_artifact_index(&manifest)
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    /// A manifest with deltas that does not name its overlay store -- written before the field
+    /// existed, or by a binary that drops it -- may read from any of them, so GC keeps them all
+    /// for as long as one is retained, and collects them once none is.
+    #[test]
+    fn overlay_stores_outlive_a_retained_manifest_that_does_not_name_its_own() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let mut base = snapshot_with_files(2);
+        publish_packed(&store, &base);
+        publish_body_edit(&store, "src/file-0.ts", 1);
+        let recorded = store
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .artifact_overlay_store
+            .unwrap();
+
+        // Stand in for an older binary rewriting the manifest without the field.
+        let current = dir
+            .path()
+            .join(store.current_generation().unwrap().unwrap());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_overlay_store");
+        fs::write(&current, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        store.clear_manifest_cache();
+        // The chain keeps writing where its unrecorded deltas went.
+        publish_body_edit(&store, "src/file-1.ts", 2);
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([recorded.clone(), LEGACY_ARTIFACT_OVERLAY_STORE.to_owned()])
+        );
+        store.gc_generations().unwrap();
+        assert_eq!(overlay_store_names(dir.path()).len(), 2);
+        for (path, revision) in [("src/file-0.ts", 1), ("src/file-1.ts", 2)] {
+            let edited = crate::scanner::parse_source(
+                path,
+                format!("export const value = 0; // revision {revision}\n").as_bytes(),
+            );
+            assert_eq!(
+                store.open_artifact(path).unwrap().unwrap().source_hash,
+                edited.source_hash
+            );
+        }
+
+        base.id.content_state = "rebuilt".into();
+        publish_packed(&store, &base);
+        for revision in 3..=4 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        let manifest = store.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([manifest.artifact_overlay_store.unwrap()])
+        );
+    }
+
     #[test]
     fn artifact_store_amplification_compacts_and_respects_retention() {
         let dir = tempdir().unwrap();
@@ -7186,6 +7433,7 @@ mod tests {
             artifact_deltas: vec!["snapshot-overlay.pack#artifact/delta".into()],
             artifact_delta_weights: vec![1],
             artifact_store: None,
+            artifact_overlay_store: None,
             artifact_locator: None,
             artifact_state: None,
             artifact_live_bytes: None,
