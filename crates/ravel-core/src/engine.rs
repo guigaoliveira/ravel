@@ -129,6 +129,10 @@ struct EngineInner {
     /// Most recent background/explicit update failure. Queries may keep serving the last
     /// complete snapshot, but agents must be told that freshness is no longer guaranteed.
     last_update_error: Mutex<Option<String>>,
+    /// A doubt only a full index settles (a lost dirty record). Kept apart from
+    /// `last_update_error` because the sync that raises it then succeeds, and a successful sync
+    /// clears that one: the warning was erased before any answer could carry it.
+    needs_reindex: Mutex<Option<String>>,
     /// `CURRENT` generation observed by this process. Each MCP client may run its own server.
     observed_generation: Mutex<Option<String>>,
     structural_cache: Mutex<Option<(String, Arc<StructuralPackReader>)>>,
@@ -1142,6 +1146,7 @@ impl WorkspaceEngine {
                 dirty_cache: Mutex::new(None),
                 update_lock: Mutex::new(()),
                 last_update_error: Mutex::new(None),
+                needs_reindex: Mutex::new(None),
                 observed_generation: Mutex::new(None),
                 structural_cache: Mutex::new(None),
                 maintenance_scheduled: AtomicBool::new(false),
@@ -1236,6 +1241,9 @@ impl WorkspaceEngine {
         let result = self.index_unlocked();
         crate::timing::stage("index.total", index_start, String::new);
         self.finish_update("index", &result);
+        if result.is_ok() {
+            *self.inner.needs_reindex.lock().unwrap() = None;
+        }
         result
     }
 
@@ -1396,12 +1404,10 @@ impl WorkspaceEngine {
                 // A truncated record silently meaning "nothing was ever synced dirty" restores the
                 // exact phantom-edit state this mechanism exists to prevent. Say so, and drop the
                 // unusable file so the next sync starts a clean record.
-                self.record_update_error(
-                    "dirty-synced record",
-                    &format!(
-                        "{error}; re-run `ravel index` to be certain the index matches the tree"
-                    ),
-                );
+                *self.inner.needs_reindex.lock().unwrap() = Some(format!(
+                    "dirty-synced record: {error}; re-run `ravel index` to be certain the index \
+                     matches the tree"
+                ));
                 let _ = std::fs::remove_file(&path);
                 BTreeSet::new()
             }
@@ -1643,7 +1649,12 @@ impl WorkspaceEngine {
     }
 
     fn last_update_error(&self) -> Option<String> {
-        self.inner.last_update_error.lock().unwrap().clone()
+        self.inner
+            .last_update_error
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.inner.needs_reindex.lock().unwrap().clone())
     }
 
     fn acquire_workspace_update_lock(&self) -> Result<File, EngineError> {
@@ -3490,7 +3501,19 @@ impl WorkspaceEngine {
             probe_entries_for += 1;
             let (entries, total) = symbol_runtime.entries_for(&hit.value, remaining);
             if total > entries.len() {
-                let omitted = total - entries.len();
+                // Count only definitions no earlier step holds. The exact identity or an earlier
+                // hit may already have counted some this probe leaves out, and counting them again
+                // reported a lone definition as one shown of two.
+                let returned_counted = entries
+                    .iter()
+                    .filter(|entry| seen_ids.contains(&entry.id))
+                    .count();
+                let counted_elsewhere = candidate_counts
+                    .get(&hit.value)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(returned_counted);
+                let omitted = (total - entries.len()).saturating_sub(counted_elsewhere);
                 candidate_total += omitted;
                 *candidate_counts.entry(hit.value.clone()).or_default() += omitted;
             }
@@ -5971,6 +5994,40 @@ mod resolver_config_tests {
 }
 
 #[cfg(test)]
+mod context_candidate_tests {
+    use super::*;
+
+    fn engine_with(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            std::fs::write(root.path().join(name), text).unwrap();
+        }
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    #[test]
+    fn a_lone_definition_is_not_reported_as_truncated() {
+        let (_root, engine) = engine_with(&[("a.ts", "export function qux() { return 1; }\n")]);
+        let context = engine.context("qux", 1).unwrap();
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(context["truncation"]["candidates"], false, "{context:#}");
+    }
+
+    #[test]
+    fn definitions_past_the_limit_are_still_reported_as_truncated() {
+        let (_root, engine) = engine_with(&[
+            ("a.ts", "export function qux() { return 1; }\n"),
+            ("b.ts", "export function qux() { return 2; }\n"),
+        ]);
+        let context = engine.context("qux", 1).unwrap();
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(context["truncation"]["candidates"], true, "{context:#}");
+    }
+}
+
+#[cfg(test)]
 mod dirty_record_tests {
     use super::*;
 
@@ -6103,6 +6160,27 @@ mod dirty_record_tests {
             .sync(Some(&[root.join("fresh.ts"), root.join("c.ts")]))
             .unwrap();
         assert_eq!(record(&engine), ["c.ts", "fresh.ts"]);
+    }
+
+    /// A lost record leaves the index unverifiable until a full index. The warning must outlive the
+    /// sync that discovered the loss -- that sync succeeds -- and go away once `index` has run.
+    #[test]
+    fn a_lost_dirty_record_is_reported_until_a_full_index() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        std::fs::write(engine.dirty_synced_path(), b"[\"a.t").unwrap();
+
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        let warning = engine.last_update_error().expect("the loss is reported");
+        assert!(warning.contains("re-run `ravel index`"), "{warning}");
+        engine.sync(Some(&[root.join("c.ts")])).unwrap();
+        assert!(engine.last_update_error().is_some());
+
+        engine.index().unwrap();
+        assert_eq!(engine.last_update_error(), None);
     }
 
     /// A record that did not change is not written again: it costs two fsyncs and the file on
