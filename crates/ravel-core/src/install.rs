@@ -269,9 +269,7 @@ fn agent_looks_installed(kind: AgentKind) -> bool {
     let home = home_dir();
     match kind {
         AgentKind::Claude => {
-            which_ok("claude")
-                || home.join(".claude.json").exists()
-                || home.join(".claude").is_dir()
+            which_ok("claude") || claude_global_path().exists() || claude_home().is_dir()
         }
         AgentKind::Cursor => {
             which_ok("cursor")
@@ -324,6 +322,19 @@ fn codex_home() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".codex"))
 }
 
+/// `$CLAUDE_CONFIG_DIR`, when set to something.
+fn claude_config_dir() -> Option<PathBuf> {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where Claude Code keeps its user settings and skills: `$CLAUDE_CONFIG_DIR`, defaulting to
+/// `~/.claude`, the same relocation [`codex_home`] follows for Codex.
+fn claude_home() -> PathBuf {
+    claude_config_dir().unwrap_or_else(|| home_dir().join(".claude"))
+}
+
 fn dirs_config() -> PathBuf {
     if cfg!(target_os = "macos") {
         home_dir().join("Library").join("Application Support")
@@ -366,7 +377,7 @@ pub fn print_config(kind: AgentKind, ravel_bin: &Path, location: InstallLocation
     match kind {
         AgentKind::Claude => match location {
             InstallLocation::Global => format!(
-                r#"# ~/.claude.json  (mcpServers key)
+                r#"# ~/.claude.json  (mcpServers key; $CLAUDE_CONFIG_DIR/.claude.json when set)
 # or: claude mcp add --scope user ravel -- {cmd_shell} serve --mcp
 {{
   "mcpServers": {{
@@ -597,7 +608,7 @@ otherwise run the CLI, which prints compact JSON.
 /// Where each agent loads user-level and project-level skills from, for agents that read them.
 fn skill_path(kind: AgentKind, opts: &InstallOptions) -> Option<PathBuf> {
     let base = match (kind, opts.location) {
-        (AgentKind::Claude, InstallLocation::Global) => home_dir().join(".claude"),
+        (AgentKind::Claude, InstallLocation::Global) => claude_home(),
         (AgentKind::Claude, InstallLocation::Local) => opts.project_root.join(".claude"),
         // `~/.agents/skills` is the user location Codex documents; `$CODEX_HOME/skills` is kept only
         // for compatibility.
@@ -885,8 +896,18 @@ fn windsurf_has_no_project_config(actions: &mut Vec<InstallAction>) {
     });
 }
 
+/// Claude Code's user config, resolved as Claude Code resolves it: a legacy `.config.json` in
+/// the config home wins when present; otherwise `.claude.json` in `$CLAUDE_CONFIG_DIR` when that
+/// is set, else in the home directory. Writing `~/.claude.json` regardless left a relocated
+/// install unwired.
 fn claude_global_path() -> PathBuf {
-    home_dir().join(".claude.json")
+    let legacy = claude_home().join(".config.json");
+    if legacy.exists() {
+        return legacy;
+    }
+    claude_config_dir()
+        .unwrap_or_else(home_dir)
+        .join(".claude.json")
 }
 
 fn claude_local_path(opts: &InstallOptions) -> PathBuf {
@@ -915,7 +936,7 @@ fn install_claude(opts: &InstallOptions, actions: &mut Vec<InstallAction>) -> an
     }
 
     if opts.claude_permissions && opts.location == InstallLocation::Global {
-        let settings = home_dir().join(".claude").join("settings.json");
+        let settings = claude_home().join("settings.json");
         if let Err(e) = ensure_claude_allowlist(&settings) {
             actions.push(InstallAction {
                 agent: "claude".into(),

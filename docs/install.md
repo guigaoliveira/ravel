@@ -87,7 +87,7 @@ What it writes:
 
 | Agent | Global config | Local config | Instructions |
 |-------|---------------|--------------|--------------|
-| Claude Code | `~/.claude.json` `mcpServers` | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` (local: `.claude/skills/ravel/`) |
+| Claude Code | `~/.claude.json` `mcpServers` (`$CLAUDE_CONFIG_DIR/.claude.json` when set) | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` or `$CLAUDE_CONFIG_DIR/skills/ravel/` (local: `.claude/skills/ravel/`) |
 | Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if `.cursor/` exists |
 | Codex | `$CODEX_HOME/config.toml` (default `~/.codex`) | `.codex/config.toml` (trusted projects) | `AGENTS.md`; skill in `~/.agents/skills/ravel/` (local: `.agents/skills/ravel/`) |
 | OpenCode | `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME/opencode/` when set; same on macOS and Windows) | `opencode.json` | `AGENTS.md` |
@@ -133,7 +133,8 @@ equivalent `claude mcp add` / `codex mcp add` one-liner.
 Claude Code specifics:
 
 - A global install adds `mcp__ravel__*` to the `permissions.allow` list in
-  `~/.claude/settings.json`, creating the file when Claude Code has not written
+  `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that is
+  set), creating the file when Claude Code has not written
   one yet, so Ravel's tools run without a prompt per call. `--no-permissions`
   skips it. Project installs do not touch permissions: a
   `.claude/settings.local.json` created by anything other than Claude Code is

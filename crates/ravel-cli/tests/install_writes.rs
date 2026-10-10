@@ -201,3 +201,31 @@ fn an_empty_json_config_is_an_empty_object() {
     let config = read_json(&cursor);
     assert!(config["mcpServers"]["ravel"].is_object(), "{config}");
 }
+
+#[test]
+fn claude_files_follow_claude_config_dir() {
+    let home = tempdir().unwrap();
+    let config_dir = home.path().join("claude-work");
+    fs::create_dir(&config_dir).unwrap();
+    let mut command = sandboxed(home.path());
+    command.env("CLAUDE_CONFIG_DIR", &config_dir);
+    let (status, report) = run(command, &["install", "--target", "claude"]);
+    assert!(status.success(), "{report}");
+
+    let config = read_json(&config_dir.join(".claude.json"));
+    assert!(config["mcpServers"]["ravel"].is_object(), "{config}");
+    let settings = read_json(&config_dir.join("settings.json"));
+    assert_eq!(settings["permissions"]["allow"][0], "mcp__ravel__*");
+    assert!(config_dir.join("skills/ravel/SKILL.md").is_file());
+    assert!(!home.path().join(".claude.json").exists());
+    assert!(!home.path().join(".claude").exists());
+
+    // Claude Code still reads a legacy `.config.json` in its config home first, when there is one.
+    let legacy = config_dir.join(".config.json");
+    write(&legacy, "{}");
+    let mut command = sandboxed(home.path());
+    command.env("CLAUDE_CONFIG_DIR", &config_dir);
+    let (status, report) = run(command, &["install", "--target", "claude"]);
+    assert!(status.success(), "{report}");
+    assert!(read_json(&legacy)["mcpServers"]["ravel"].is_object());
+}
