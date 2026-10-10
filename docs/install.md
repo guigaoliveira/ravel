@@ -90,7 +90,7 @@ What it writes:
 | Claude Code | `~/.claude.json` `mcpServers` | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` (local: `.claude/skills/ravel/`) |
 | Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if `.cursor/` exists |
 | Codex | `$CODEX_HOME/config.toml` (default `~/.codex`) | `.codex/config.toml` (trusted projects) | `AGENTS.md`; skill in `~/.agents/skills/ravel/` (local: `.agents/skills/ravel/`) |
-| OpenCode | `~/.config/opencode/opencode.json` | `opencode.json` | `AGENTS.md` |
+| OpenCode | `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME/opencode/` when set; same on macOS and Windows) | `opencode.json` | `AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` | `GEMINI.md` if present |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | — | — |
 | VS Code | user `mcp.json` | `.vscode/mcp.json` | — |

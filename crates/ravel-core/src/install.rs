@@ -271,7 +271,7 @@ fn agent_looks_installed(kind: AgentKind) -> bool {
         AgentKind::Codex => which_ok("codex") || codex_home().is_dir(),
         AgentKind::OpenCode => {
             which_ok("opencode")
-                || home.join(".config").join("opencode").is_dir()
+                || opencode_global_dir().is_dir()
                 || home.join(".opencode").is_dir()
         }
         AgentKind::Gemini => which_ok("gemini") || home.join(".gemini").is_dir(),
@@ -322,10 +322,17 @@ fn dirs_config() -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
     } else {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".config"))
+        xdg_config_home()
     }
+}
+
+/// `$XDG_CONFIG_HOME`, or `~/.config` when it is unset or empty — the spec treats the two alike,
+/// and an empty value taken literally put configs under the current directory.
+fn xdg_config_home() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
 }
 
 /// MCP entry shared by Claude / Cursor / Gemini / Windsurf / VS Code style JSON.
@@ -424,7 +431,7 @@ args = ["serve", "--mcp"]
 }}
 "#,
             if location == InstallLocation::Global {
-                "~/.config/opencode/opencode.json"
+                "~/.config/opencode/opencode.json ($XDG_CONFIG_HOME/opencode/opencode.json when set)"
             } else {
                 "opencode.json"
             }
@@ -1361,9 +1368,15 @@ fn replace_toml_table(text: &str, table: &str, replacement: &str) -> String {
     out
 }
 
+/// OpenCode resolves its user config the XDG way on every platform, macOS and Windows included —
+/// not under Application Support or `%APPDATA%`, where a write would go unread.
+fn opencode_global_dir() -> PathBuf {
+    xdg_config_home().join("opencode")
+}
+
 fn opencode_config_path(opts: &InstallOptions) -> PathBuf {
     match opts.location {
-        InstallLocation::Global => dirs_config().join("opencode").join("opencode.json"),
+        InstallLocation::Global => opencode_global_dir().join("opencode.json"),
         InstallLocation::Local => opts.project_root.join("opencode.json"),
     }
 }

@@ -45,6 +45,10 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
 #[test]
 fn codex_install_and_uninstall_keep_the_tables_after_the_ravel_entry() {
     let home = tempdir().unwrap();
@@ -127,4 +131,32 @@ fn a_local_install_never_touches_the_global_windsurf_config() {
             "{verb}: {report}"
         );
     }
+}
+
+#[test]
+fn opencode_global_config_lives_under_xdg_config_home_on_every_platform() {
+    let home = tempdir().unwrap();
+    let xdg = home.path().join("xdg");
+    let mut command = sandboxed(home.path());
+    command.env("XDG_CONFIG_HOME", &xdg);
+    let (status, report) = run(
+        command,
+        &["install", "--target", "opencode", "--no-instructions"],
+    );
+    assert!(status.success(), "{report}");
+    let config = read_json(&xdg.join("opencode").join("opencode.json"));
+    assert!(config["mcp"]["ravel"].is_object(), "{config}");
+
+    // An empty XDG_CONFIG_HOME is unset (XDG Base Directory spec), not the current directory.
+    let home = tempdir().unwrap();
+    let mut command = sandboxed(home.path());
+    command.env("XDG_CONFIG_HOME", "");
+    let (status, report) = run(
+        command,
+        &["install", "--target", "opencode", "--no-instructions"],
+    );
+    assert!(status.success(), "{report}");
+    let config = home.path().join(".config/opencode/opencode.json");
+    assert!(config.is_file(), "{report}");
+    assert!(!home.path().join("opencode").exists(), "{report}");
 }
