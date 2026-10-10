@@ -976,7 +976,10 @@ fn extract_node(
                 .and_then(|owner| owner.member_owner.as_ref())
                 .is_some())
     {
-        let name_node = node.child_by_field_name("name");
+        // tree-sitter-javascript names a class field `property`, not `name`.
+        let name_node = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"));
         let static_name = name_node
             .and_then(|name| static_name(name, source))
             .or_else(|| exported.then(|| "default".to_owned()));
@@ -2874,6 +2877,35 @@ class Ctl {
         );
         assert!(has_ref("Ctl.svc", "Svc", EdgeKind::TypeOf));
         assert!(has_ref("Ctl.other", "Optional", EdgeKind::Decorates));
+    }
+
+    #[test]
+    fn javascript_class_fields_are_members() {
+        let artifact = parse_source(
+            "widget.jsx",
+            b"class W { handleClick = () => new Base(); static count = 0; #secret = 1; }",
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for name in ["W.handleClick", "W.count", "W.#secret"] {
+            assert!(
+                has_symbol(&artifact, name, "property"),
+                "missing {name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == "W.handleClick"
+                    && reference.to == "Base"
+                    && reference.kind == EdgeKind::Instantiates
+            }),
+            "{:?}",
+            artifact.symbol_refs
+        );
     }
 
     #[test]
