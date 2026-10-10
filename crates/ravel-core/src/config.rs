@@ -74,8 +74,14 @@ pub struct ParserConfig {
 /// Ignore / noise configuration. Layered:
 /// 1. Built-in dir names (node_modules, dist, …) unless `use_builtin_dirs = false`
 /// 2. `dirs` extras from user
-/// 3. `.gitignore` when `gitignore = true` (via walk builder)
-/// 4. `.ravelignore` if present
+/// 3. When `gitignore = true`, inside a git repository: every `.gitignore` from a file's directory
+///    up to the top of the repository (above the project root too), deepest first, then the
+///    repository's `.git/info/exclude`
+/// 4. The project root's `.ravelignore` if present (gitignore syntax), below the git rules
+///
+/// `.ignore` files, global gitignore and `.ravelignore` files below the root are not read. The index
+/// walk and the single-path check behind `sync` and the watchers ([`IgnoreChain`]) apply exactly
+/// these rules, and a directory they exclude hides everything in it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct IgnoreConfig {
@@ -706,7 +712,7 @@ pub fn unsupported_source_counts(
     let mut supported_seen = 0usize;
     let mut truncated = false;
     let mut seen = 0usize;
-    for entry in coverage_walk(config).flatten() {
+    for entry in source_walk(config).flatten() {
         seen += 1;
         if seen > budget {
             truncated = true;
@@ -734,12 +740,25 @@ pub fn unsupported_source_counts(
     (counts, supported_seen, truncated)
 }
 
-/// The walk behind the coverage probes: hidden files included, gitignore honoured, links not followed.
-fn coverage_walk(config: &Config) -> ignore::Walk {
+/// The walk behind `ravel index` and the coverage probes: hidden files included, links not
+/// followed, noise directories pruned rather than descended into, and exactly the ignore rules
+/// [`IgnoreChain`] applies to a single path:
+///
+/// - `.gitignore` files, inside a repository only, from the path's directory up to the top of the
+///   repository -- including those above the root when the root is a package inside it -- with the
+///   deeper file winning;
+/// - that repository's `.git/info/exclude`, below every `.gitignore`;
+/// - the root `.ravelignore`, below both.
+///
+/// `.ignore` files, global gitignore and `.ravelignore` files below the root are not read. A
+/// directory these rules exclude hides everything in it, as in git.
+fn source_walk(config: &Config) -> ignore::Walk {
     let root = &config.project.root;
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
+        .ignore(false)
+        .parents(true)
         .git_ignore(config.ignore.gitignore)
         .git_global(false)
         .git_exclude(config.ignore.gitignore)
@@ -748,6 +767,18 @@ fn coverage_walk(config: &Config) -> ignore::Walk {
     if custom.is_file() {
         builder.add_ignore(custom);
     }
+    // Pruning a noise directory, instead of filtering every file under it, keeps the walk out of
+    // `node_modules` altogether -- and away from whatever in there it cannot read.
+    let use_builtin = config.ignore.use_builtin_dirs;
+    let extra_dirs = config.ignore.dirs.clone();
+    builder.filter_entry(move |entry| {
+        entry.depth() == 0
+            || !is_noise_component(
+                std::path::Component::Normal(entry.file_name()),
+                use_builtin,
+                &extra_dirs,
+            )
+    });
     builder.build()
 }
 
@@ -761,7 +792,7 @@ fn coverage_walk(config: &Config) -> ignore::Walk {
 pub fn component_source_count(config: &Config, budget: usize) -> usize {
     let mut count = 0usize;
     let mut seen = 0usize;
-    for entry in coverage_walk(config).flatten() {
+    for entry in source_walk(config).flatten() {
         seen += 1;
         if seen > budget {
             break;
@@ -788,6 +819,12 @@ pub fn component_source_count(config: &Config, budget: usize) -> usize {
 ///
 /// Deliberately pure pattern matching rather than asking the walk whether it would collect the file:
 /// a *deleted* path is gone from the filesystem, and the watcher still has to process its removal.
+///
+/// It applies exactly the rules of the index walk ([`source_walk`]), with the walk's precedence:
+/// `.gitignore` files inside a repository up to its top (above the root too), the repository's
+/// `info/exclude` below them, the root `.ravelignore` below both, and a directory those rules
+/// exclude hiding everything under it. Any rule one side honours and the other does not makes the
+/// index depend on whether `ravel index` or `ravel sync` ran last.
 pub struct IgnoreChain {
     /// Canonical form, used to build the matchers.
     root: PathBuf,
@@ -798,8 +835,41 @@ pub struct IgnoreChain {
     /// "outside the workspace" on both platforms: the filter went inert while Linux stayed green.
     root_as_given: PathBuf,
     gitignore_enabled: bool,
-    per_directory:
-        std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<ignore::gitignore::Gitignore>>>,
+    /// The directories above the root whose rules the walk consults, nearest first: every ancestor
+    /// up to and including the top of the repository holding the root. Empty when the root is the
+    /// top of its repository, or in none. Fixed when the chain is built.
+    ancestors: Vec<PathBuf>,
+    per_directory: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<DirectoryRules>>>,
+}
+
+/// One directory's ignore rules, read once and cached until [`IgnoreChain::forget_rules`].
+struct DirectoryRules {
+    gitignore: ignore::gitignore::Gitignore,
+    /// `info/exclude` of the repository whose top this directory is.
+    exclude: ignore::gitignore::Gitignore,
+    /// The top of a repository (holds `.git` or `.jj`): rules above it never apply below it.
+    is_repository: bool,
+    /// The root's `.ravelignore`; empty in every other directory.
+    ravelignore: ignore::gitignore::Gitignore,
+}
+
+/// What the walk takes for the top of a repository.
+fn is_repository_top(directory: &Path) -> bool {
+    directory.join(".git").exists() || directory.join(".jj").exists()
+}
+
+/// The directory holding `info/exclude` for the repository whose `.git` is `marker`: `.git`
+/// itself, or -- for a linked worktree, whose `.git` is a file -- the common directory it points
+/// to. A submodule's `.git` file names no common directory, and the walk reads no exclude for it.
+fn git_common_dir(marker: &Path) -> Option<PathBuf> {
+    if marker.is_dir() {
+        return Some(marker.to_path_buf());
+    }
+    let pointer = fs::read_to_string(marker).ok()?;
+    let git_dir = PathBuf::from(pointer.lines().next()?.strip_prefix("gitdir: ")?);
+    let git_dir = marker.parent()?.join(git_dir);
+    let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    Some(git_dir.join(common.lines().next()?))
 }
 
 impl IgnoreChain {
@@ -809,19 +879,31 @@ impl IgnoreChain {
             .root
             .canonicalize()
             .unwrap_or_else(|_| config.project.root.clone());
-        // `WalkBuilder` only honours gitignore inside a repository; matching that keeps the two in
-        // step. Applying the rules anyway would invert the bug -- a workspace with no git but a
-        // stray `.gitignore` would drop files the index collects.
-        let gitignore_enabled = config.ignore.gitignore && crate::git::is_git_repo(&root);
+        let gitignore_enabled = config.ignore.gitignore;
+        // The walk reads the `.gitignore` of every directory above the root up to the top of the
+        // repository, and none outside a repository.
+        let mut ancestors = Vec::new();
+        if gitignore_enabled && !is_repository_top(&root) {
+            for ancestor in root.ancestors().skip(1) {
+                ancestors.push(ancestor.to_path_buf());
+                if is_repository_top(ancestor) {
+                    break;
+                }
+            }
+            if !ancestors.last().is_some_and(|top| is_repository_top(top)) {
+                ancestors.clear();
+            }
+        }
         Self {
             root,
             root_as_given: config.project.root.clone(),
             gitignore_enabled,
+            ancestors,
             per_directory: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn matcher_for(&self, directory: &Path) -> std::sync::Arc<ignore::gitignore::Gitignore> {
+    fn rules_for(&self, directory: &Path) -> std::sync::Arc<DirectoryRules> {
         if let Some(cached) = self
             .per_directory
             .lock()
@@ -830,27 +912,77 @@ impl IgnoreChain {
         {
             return cached.clone();
         }
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(directory);
-        if self.gitignore_enabled {
-            builder.add(directory.join(".gitignore"));
-            if directory == self.root {
-                builder.add(directory.join(".git/info/exclude"));
+        let read = |file: Option<PathBuf>| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(directory);
+            if let Some(file) = file.filter(|file| file.is_file()) {
+                // Like the walk, keep the lines that parse when others in the file do not.
+                let _ = builder.add(file);
             }
-        }
-        let custom = directory.join(".ravelignore");
-        if custom.is_file() {
-            builder.add(custom);
-        }
-        let matcher = std::sync::Arc::new(
             builder
                 .build()
-                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()),
-        );
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        };
+        let marker = directory.join(".git");
+        let has_git = self.gitignore_enabled && marker.exists();
+        let rules = std::sync::Arc::new(DirectoryRules {
+            gitignore: read(self.gitignore_enabled.then(|| directory.join(".gitignore"))),
+            exclude: read(
+                has_git
+                    .then(|| git_common_dir(&marker))
+                    .flatten()
+                    .map(|common| common.join("info/exclude")),
+            ),
+            is_repository: self.gitignore_enabled && (has_git || directory.join(".jj").exists()),
+            ravelignore: read((directory == self.root).then(|| directory.join(".ravelignore"))),
+        });
         self.per_directory
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(directory.to_path_buf(), matcher.clone());
-        matcher
+            .insert(directory.to_path_buf(), rules.clone());
+        rules
+    }
+
+    /// Drop every cached rule file, so the next check reads them again. A long-lived chain (a
+    /// watcher's) calls this when a `.gitignore`, `.ravelignore` or `info/exclude` changes;
+    /// otherwise it keeps answering with the rules it first read.
+    pub fn forget_rules(&self) {
+        self.per_directory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// The walk's verdict on `path` given the rules of its own directory and every directory above
+    /// it, innermost first.
+    fn excludes<'a>(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        applicable: impl Iterator<Item = &'a std::sync::Arc<DirectoryRules>> + Clone,
+        root: &DirectoryRules,
+    ) -> bool {
+        let mut gitignore = ignore::Match::None;
+        let mut exclude = ignore::Match::None;
+        // Gitignore rules count only inside a repository, deepest first, up to its top.
+        let in_repository =
+            !self.ancestors.is_empty() || applicable.clone().any(|rules| rules.is_repository);
+        if self.gitignore_enabled && in_repository {
+            for rules in applicable {
+                if gitignore.is_none() {
+                    gitignore = rules.gitignore.matched(path, is_dir);
+                }
+                if exclude.is_none() {
+                    exclude = rules.exclude.matched(path, is_dir);
+                }
+                if rules.is_repository {
+                    break;
+                }
+            }
+        }
+        gitignore
+            .or(exclude)
+            .or(root.ravelignore.matched(path, is_dir))
+            .is_ignore()
     }
 
     pub fn is_ignored(&self, path: &Path) -> bool {
@@ -886,29 +1018,40 @@ impl IgnoreChain {
             // Outside the workspace: not this workspace's call to make.
             return false;
         };
-        let relative = relative.as_path();
-        // Re-spell the path onto the canonical root before matching. The matchers are built from
-        // canonical directories, and `ignore` *panics* ("path is expected to be under the root") when
-        // handed a path outside the matcher root -- so passing the incoming spelling through would
-        // turn a symlinked workspace into a crash rather than a wrong answer.
-        let absolute = self.root.join(relative);
-        // Deepest rules win in git, and a negation there can re-include a path an outer file
-        // excluded, so walk inward-out and stop at the first decisive verdict.
-        let mut directories: Vec<PathBuf> = Vec::new();
-        let mut current = relative.parent();
-        while let Some(parent) = current {
-            directories.push(self.root.join(parent));
-            current = parent.parent();
+        let names: Vec<_> = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let Some((_, parents)) = names.split_last() else {
+            return false;
+        };
+        // Every path below is re-spelled onto the canonical root: the matchers are built from
+        // canonical directories, and a path outside a matcher's root matches nothing there.
+        // The rules of the root and of each directory down to the path's own, outermost first.
+        let mut directory = self.root.clone();
+        let mut inside = Vec::with_capacity(names.len());
+        inside.push(self.rules_for(&directory));
+        for name in parents {
+            directory.push(name);
+            inside.push(self.rules_for(&directory));
         }
-        if directories.is_empty() {
-            directories.push(self.root.clone());
-        }
-        for directory in directories {
-            let matcher = self.matcher_for(&directory);
-            match matcher.matched_path_or_any_parents(&absolute, false) {
-                ignore::Match::Ignore(_) => return true,
-                ignore::Match::Whitelist(_) => return false,
-                ignore::Match::None => {}
+        let above: Vec<_> = self
+            .ancestors
+            .iter()
+            .map(|directory| self.rules_for(directory))
+            .collect();
+        // Top down, the way the walk visits: a directory it prunes hides everything below it, even
+        // a file a deeper rule re-includes. At each level the deepest rule wins.
+        let mut candidate = self.root.clone();
+        for (depth, name) in names.iter().enumerate() {
+            candidate.push(name);
+            let is_dir = depth + 1 < names.len();
+            let applicable = inside[..=depth].iter().rev().chain(&above);
+            if self.excludes(&candidate, is_dir, applicable, &inside[0]) {
+                return true;
             }
         }
         false
@@ -945,42 +1088,44 @@ pub fn watched_path_is_indexable(
 
 pub fn discover_files(config: &Config) -> Result<Vec<PathBuf>, ConfigError> {
     let root = &config.project.root;
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .git_ignore(config.ignore.gitignore)
-        .git_global(false)
-        .git_exclude(config.ignore.gitignore)
-        .follow_links(false);
-    // Soft ignores: gitignore + optional .ravelignore. Hard filter: noise dirs.
-    let custom = root.join(".ravelignore");
-    if custom.is_file() {
-        builder.add_ignore(custom);
-    }
     // Compute the eligible extension set ONCE, not per file (was a fresh Vec<String> per path).
     let exts = effective_extensions(config);
     let mut files = Vec::new();
-    for entry in builder.build() {
-        let entry = entry.map_err(|source| ConfigError::Read {
-            path: root.clone(),
-            source: std::io::Error::other(source.to_string()),
-        })?;
-        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            let path = entry.into_path();
-            if is_eligible(&path, config, &exts) {
-                files.push(path);
+    let mut skipped = 0usize;
+    let mut first_skipped = None;
+    for entry in source_walk(config) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // The root itself unreadable or missing would index nothing, and an empty answer is
+            // not a smaller one: that stays an error.
+            Err(source) if source.depth() == Some(0) => {
+                return Err(ConfigError::Read {
+                    path: root.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                });
             }
+            // Anything deeper -- a directory owned by another user, a malformed ignore file -- costs
+            // only what it holds. Failing the whole walk over it made `ravel index` unusable.
+            Err(source) => {
+                skipped += 1;
+                first_skipped.get_or_insert(source);
+                continue;
+            }
+        };
+        // Noise directories were pruned by the walk; only the extension is left to check.
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && ext_matches(entry.path(), &exts)
+        {
+            files.push(entry.into_path());
         }
+    }
+    if let Some(first) = first_skipped {
+        eprintln!(
+            "ravel: skipped {skipped} unreadable path(s) under {} while discovering sources; first: {first}",
+            root.display()
+        );
     }
     files.sort();
     Ok(files)
-}
-
-fn is_eligible(path: &Path, config: &Config, exts: &[String]) -> bool {
-    if config.is_noise(path) {
-        return false;
-    }
-    ext_matches(path, exts)
 }
 
 /// Lowercased file-extension membership test against a precomputed set.
@@ -1460,5 +1605,165 @@ mod tests {
             !IgnoreChain::new(&config).is_ignored(&source),
             "the watcher must keep it too"
         );
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (relative, text) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_unreadable_entry_does_not_fail_the_whole_discovery() {
+        // A single entry the walk cannot read -- a cache directory owned by another user, a
+        // malformed ignore file above the root -- used to fail `ravel index` outright.
+        let outer = tempdir().unwrap();
+        // An invalid glob in an ancestor's `.gitignore` is an error the walk reports up front (an
+        // unclosed `[` is not: gitignore reads it literally).
+        write_tree(
+            outer.path(),
+            &[(".gitignore", "[z-a]\n"), ("ws/src/a.ts", "export {}")],
+        );
+        let root = outer.path().join("ws");
+        #[cfg(unix)]
+        let locked = {
+            use std::os::unix::fs::PermissionsExt;
+            // Unreadable to anyone but root; root reads it anyway, so this half only bites as a
+            // regular user, which is where the bug was seen.
+            let locked = root.join("src/locked");
+            write_tree(&root, &[("src/locked/b.ts", "export {}")]);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            locked
+        };
+        let mut config = Config::default();
+        config.project.root = root.clone();
+        let discovered = discover_files(&config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let discovered = discovered.expect("an unreadable entry is skipped, not fatal");
+        assert!(
+            discovered.iter().any(|path| path.ends_with("src/a.ts")),
+            "{discovered:?}"
+        );
+
+        // The root itself unreadable is still an error: an empty answer is not a smaller one.
+        config.project.root = outer.path().join("missing");
+        assert!(discover_files(&config).is_err());
+    }
+
+    #[test]
+    fn the_walk_prunes_noise_directories_instead_of_descending_into_them() {
+        let dir = tempdir().unwrap();
+        noisy_tree(dir.path());
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        config.ignore.dirs = vec!["generated".to_owned()];
+        let visited: Vec<_> = source_walk(&config)
+            .flatten()
+            .map(|entry| entry.into_path())
+            .collect();
+        assert!(
+            visited.iter().any(|path| path.ends_with("src/ok.ts")),
+            "{visited:?}"
+        );
+        for path in &visited {
+            assert!(
+                !config.is_noise(path),
+                "the walk entered a noise directory: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_index_walk_and_the_single_path_chain_apply_the_same_rules() {
+        // `ravel sync` and the watchers ask the chain about one path; `ravel index` walks. Every
+        // rule one honours and the other does not makes the index depend on which ran last.
+        let repo = tempdir().unwrap();
+        let root = repo.path().join("packages/web");
+        write_tree(
+            repo.path(),
+            &[
+                // Above the root, inside the repository: the walk honours both.
+                (".gitignore", "packages/web/generated/\n"),
+                (".git/info/exclude", "excluded.ts\n"),
+            ],
+        );
+        write_tree(
+            &root,
+            &[
+                // Only the root `.ravelignore` counts, below the gitignore rules.
+                (
+                    ".ravelignore",
+                    "vendored/\n!vendored/reincluded.ts\nprecedence.ts\nskipped.ts\n",
+                ),
+                (".gitignore", "!src/precedence.ts\n"),
+                // `.ignore` files and nested `.ravelignore` files are not ignore rules here.
+                (".ignore", "dot-ignore.ts\n"),
+                ("src/nested/.ravelignore", "local.ts\n"),
+                ("src/ok.ts", "export {}"),
+                ("src/skipped.ts", "export {}"),
+                ("src/excluded.ts", "export {}"),
+                ("src/dot-ignore.ts", "export {}"),
+                ("src/nested/local.ts", "export {}"),
+                ("src/precedence.ts", "export {}"),
+                ("generated/gen.ts", "export {}"),
+                ("vendored/reincluded.ts", "export {}"),
+            ],
+        );
+        let mut config = Config::default();
+        config.project.root = root.clone();
+        let discovered: std::collections::BTreeSet<_> = discover_files(&config)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        let chain = IgnoreChain::new(&config);
+        let expected_kept = [
+            "src/ok.ts",
+            "src/dot-ignore.ts",
+            "src/nested/local.ts",
+            "src/precedence.ts",
+        ];
+        let expected_dropped = [
+            "src/skipped.ts",
+            "src/excluded.ts",
+            "generated/gen.ts",
+            // A pruned directory hides a file re-included inside it, as in git.
+            "vendored/reincluded.ts",
+        ];
+        for relative in expected_kept.iter().chain(&expected_dropped) {
+            let kept = expected_kept.contains(relative);
+            assert_eq!(
+                discovered.contains(Path::new(relative)),
+                kept,
+                "the walk on {relative}: {discovered:?}"
+            );
+            assert_eq!(
+                chain.is_ignored(&root.join(relative)),
+                !kept,
+                "the chain on {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_lived_chain_sees_edited_rules_once_told_to_forget_them() {
+        let dir = tempdir().unwrap();
+        write_tree(dir.path(), &[(".git/HEAD", ""), ("src/a.ts", "export {}")]);
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        let chain = IgnoreChain::new(&config);
+        let source = dir.path().join("src/a.ts");
+        assert!(!chain.is_ignored(&source));
+        fs::write(dir.path().join(".gitignore"), "src/\n").unwrap();
+        fs::write(dir.path().join(".ravelignore"), "other/\n").unwrap();
+        chain.forget_rules();
+        assert!(chain.is_ignored(&source));
     }
 }
