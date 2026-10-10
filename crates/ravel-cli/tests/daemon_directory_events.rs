@@ -131,12 +131,23 @@ fn files_inside_a_directory_that_moves_reach_the_index_without_git() {
     let elsewhere = tempfile::tempdir_in(root.parent().unwrap()).unwrap();
 
     let _daemon = Daemon::start(&root);
-    // An edit is only seen once the watcher is armed; wait for it to see one.
-    write(
-        &root.join("src/probe.ts"),
-        "export const watcherArmed = 1;\n",
-    );
-    settles(&root, "watcherArmed", Some("src/probe.ts"));
+    // The daemon answers before its watcher is armed, and an edit made before then is never
+    // seen. Edit until one is.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for round in 0.. {
+        write(
+            &root.join("src/probe.ts"),
+            &format!("export const watcherArmed = {round};\n"),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        if defined_at(&root, "watcherArmed").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's watcher never saw an edit"
+        );
+    }
 
     // Renamed inside the tree.
     fs::rename(root.join("src/feat"), root.join("src/feat2")).unwrap();
