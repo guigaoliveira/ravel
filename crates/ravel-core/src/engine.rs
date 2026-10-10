@@ -188,11 +188,19 @@ impl PackedSymbolMetaBackend {
         if self.removed_digests.is_empty() {
             return;
         }
+        // Hashed once per lookup, not once per removed location: a name with thousands of
+        // locations against an overlay with hundreds of entries was that product in hashes.
+        let mut readded: Option<FxHashSet<[u8; 32]>> = None;
         locations.retain(|location| {
             !self.removed_digests.contains(&location.id_digest)
-                || self.upserts.values().any(|entry| {
-                    blake3::hash(entry.id.as_bytes()).as_bytes() == &location.id_digest
-                })
+                || readded
+                    .get_or_insert_with(|| {
+                        self.upserts
+                            .values()
+                            .map(|entry| *blake3::hash(entry.id.as_bytes()).as_bytes())
+                            .collect()
+                    })
+                    .contains(&location.id_digest)
         });
     }
 
@@ -436,59 +444,49 @@ impl SymbolMetaRuntime {
     }
 
     fn get_by_id(&self, id: &str) -> Option<crate::model::SymbolMeta> {
-        match &self.backend {
-            SymbolMetaBackend::Owned(dict) => dict.get_by_id(id).cloned(),
-            SymbolMetaBackend::Packed(packed) => {
-                if let Some(entry) = packed.upserts.get(id) {
-                    return Some(entry.clone());
-                }
-                if packed.removed_ids.contains(id) {
-                    return None;
-                }
-                // Binary search inside the archive and own only the entry that
-                // matched, instead of decoding every entry in the shard to reach it.
-                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |archived| {
-                    let start = archived
-                        .entries
-                        .partition_point(|entry| entry.id.as_str() < id);
-                    archived.entries[start..]
-                        .iter()
-                        .take_while(|entry| entry.id.as_str() == id)
-                        .last()
-                        .and_then(|entry| {
-                            rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(
-                                entry,
-                            )
-                            .ok()
-                        })
-                })?
-            }
-        }
+        self.read_by_id(id, Clone::clone, |entry| {
+            rkyv::deserialize::<crate::model::SymbolMeta, rkyv::rancor::Error>(entry).ok()
+        })
     }
 
     /// `get_by_id(id).map(|entry| entry.qualified_name)` without decoding the rest of the entry:
     /// a page of reference sites names every site this way and reads nothing else.
     fn qualified_name_by_id(&self, id: &str) -> Option<String> {
+        self.read_by_id(
+            id,
+            |entry| entry.qualified_name.clone(),
+            |entry| Some(entry.qualified_name.as_str().to_owned()),
+        )
+    }
+
+    /// The definition `id` names, read through `owned` when it is held decoded (the owned
+    /// dictionary or an overlay) and through `archived` when it is still in the archive.
+    fn read_by_id<T>(
+        &self,
+        id: &str,
+        owned: impl FnOnce(&crate::model::SymbolMeta) -> T,
+        archived: impl FnOnce(&crate::model::ArchivedSymbolMeta) -> Option<T>,
+    ) -> Option<T> {
         match &self.backend {
-            SymbolMetaBackend::Owned(dict) => {
-                dict.get_by_id(id).map(|entry| entry.qualified_name.clone())
-            }
+            SymbolMetaBackend::Owned(dict) => dict.get_by_id(id).map(owned),
             SymbolMetaBackend::Packed(packed) => {
                 if let Some(entry) = packed.upserts.get(id) {
-                    return Some(entry.qualified_name.clone());
+                    return Some(owned(entry));
                 }
                 if packed.removed_ids.contains(id) {
                     return None;
                 }
-                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |archived| {
-                    let start = archived
+                // Binary search inside the archive and read only the entry that matched, instead
+                // of decoding every entry in the shard to reach it.
+                self.with_id_shard(Self::shard_id(id, packed.index.shard_bits), |shard| {
+                    let start = shard
                         .entries
                         .partition_point(|entry| entry.id.as_str() < id);
-                    archived.entries[start..]
+                    shard.entries[start..]
                         .iter()
                         .take_while(|entry| entry.id.as_str() == id)
                         .last()
-                        .map(|entry| entry.qualified_name.as_str().to_owned())
+                        .and_then(archived)
                 })?
             }
         }
@@ -2982,9 +2980,13 @@ impl WorkspaceEngine {
     /// them or from the sync. Started first, it overlaps the `git status` the sync waits on and
     /// the cold index loads. A resident engine already holds the answer and spawns nothing.
     fn prefetch_coverage_probe(&self) -> Option<std::thread::JoinHandle<()>> {
-        if self.inner.component_sources.lock().unwrap().is_some()
-            || self.inner.unsupported_sources.lock().unwrap().is_some()
-        {
+        // `try_lock`: a walk in progress holds its cache for as long as it runs, and waiting on it
+        // here would put the whole walk in front of the sync this is meant to overlap. Someone
+        // walking is someone filling the cache, so there is nothing to start either way.
+        fn filled<T>(cache: &Mutex<Option<T>>) -> bool {
+            cache.try_lock().map_or(true, |cache| cache.is_some())
+        }
+        if filled(&self.inner.component_sources) || filled(&self.inner.unsupported_sources) {
             return None;
         }
         let engine = self.clone();
@@ -3013,13 +3015,34 @@ impl WorkspaceEngine {
         Ok((hits, term_hits))
     }
 
+    /// Whether the graph and the symbol metadata are both already loaded. Each cache is looked at
+    /// on its own, so neither is held while waiting for the other.
+    fn context_inputs_resident(&self) -> bool {
+        let graph = self.inner.graph_cache.lock().unwrap().is_some();
+        graph && self.inner.symbol_meta_cache.lock().unwrap().is_some()
+    }
+
+    /// [`Self::graph`], timed as a `context` worker.
+    fn context_worker_graph(&self) -> Result<Arc<GraphIndex>, EngineError> {
+        let started = std::time::Instant::now();
+        let opened = self.graph();
+        crate::timing::stage("context.worker_graph", started, String::new);
+        opened
+    }
+
+    /// [`Self::symbol_meta_runtime`], timed as a `context` worker.
+    fn context_worker_symbol_meta(&self) -> Result<Option<Arc<SymbolMetaRuntime>>, EngineError> {
+        let started = std::time::Instant::now();
+        let runtime = self.symbol_meta_runtime();
+        crate::timing::stage("context.worker_symbol_meta", started, String::new);
+        runtime
+    }
+
     /// Everything `context` reads from the index once it is up to date, loaded in parallel.
     fn context_inputs(&self, query: &str, limit: usize) -> ContextInputs {
         // A resident engine answers from its caches, which is cheaper than starting two threads
         // to do it. The threads exist to overlap the cold loads with the searches.
-        let resident = self.inner.graph_cache.lock().unwrap().is_some()
-            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
-        if resident {
+        if self.context_inputs_resident() {
             let graph = self.graph();
             let symbol_runtime = self.symbol_meta_runtime();
             return ContextInputs {
@@ -3029,18 +3052,8 @@ impl WorkspaceEngine {
             };
         }
         std::thread::scope(|scope| {
-            let graph = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let opened = self.graph();
-                crate::timing::stage("context.worker_graph", started, String::new);
-                opened
-            });
-            let symbol_runtime = scope.spawn(|| {
-                let started = std::time::Instant::now();
-                let runtime = self.symbol_meta_runtime();
-                crate::timing::stage("context.worker_symbol_meta", started, String::new);
-                runtime
-            });
+            let graph = scope.spawn(|| self.context_worker_graph());
+            let symbol_runtime = scope.spawn(|| self.context_worker_symbol_meta());
             let searches = self.context_searches(query, limit);
             ContextInputs {
                 searches,
@@ -3063,42 +3076,38 @@ impl WorkspaceEngine {
     /// let it load -- and the loads, the slowest part of a cold call, are done by the time git
     /// answers. When the sync does publish a generation the result is discarded by `settle`.
     fn speculate_context_inputs(&self, query: &str, limit: usize) -> Option<SpeculatedInputs> {
-        let resident = self.inner.graph_cache.lock().unwrap().is_some()
-            && self.inner.symbol_meta_cache.lock().unwrap().is_some();
-        if resident || !self.config.sync.auto {
+        if !self.config.sync.auto || self.context_inputs_resident() {
             return None;
         }
         let generation = self.storage().current_generation().ok().flatten();
-        let engine = Arc::new(self.clone());
-        let owned_query = query.to_owned();
-        let graph = {
-            let engine = Arc::clone(&engine);
+        fn spawn<T: Send + 'static>(
+            name: &str,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> Option<std::thread::JoinHandle<T>> {
             std::thread::Builder::new()
-                .name("ravel-ctx-graph".into())
-                .spawn(move || {
-                    let started = std::time::Instant::now();
-                    let opened = engine.graph();
-                    crate::timing::stage("context.worker_graph", started, String::new);
-                    opened
-                })
-                .ok()?
+                .name(name.into())
+                .spawn(work)
+                .ok()
+        }
+        // Engine clones share their caches, so each thread takes its own.
+        let engine = self.clone();
+        let graph = spawn("ravel-ctx-graph", move || engine.context_worker_graph())?;
+        let engine = self.clone();
+        let Some(symbol_runtime) = spawn("ravel-ctx-symbols", move || {
+            engine.context_worker_symbol_meta()
+        }) else {
+            // Never leave a started load running past the call that started it.
+            let _ = graph.join();
+            return None;
         };
-        let symbol_runtime = {
-            let engine = Arc::clone(&engine);
-            std::thread::Builder::new()
-                .name("ravel-ctx-symbols".into())
-                .spawn(move || {
-                    let started = std::time::Instant::now();
-                    let runtime = engine.symbol_meta_runtime();
-                    crate::timing::stage("context.worker_symbol_meta", started, String::new);
-                    runtime
-                })
-                .ok()?
+        let (engine, query) = (self.clone(), query.to_owned());
+        let Some(searches) = spawn("ravel-ctx-search", move || {
+            engine.context_searches(&query, limit)
+        }) else {
+            let _ = graph.join();
+            let _ = symbol_runtime.join();
+            return None;
         };
-        let searches = std::thread::Builder::new()
-            .name("ravel-ctx-search".into())
-            .spawn(move || engine.context_searches(&owned_query, limit))
-            .ok()?;
         Some(SpeculatedInputs {
             generation,
             graph,
@@ -3305,7 +3314,17 @@ impl WorkspaceEngine {
         let limit = limit.clamp(1, CONTEXT_RELATION_LIMIT_MAX);
         let coverage_walk = self.prefetch_coverage_probe();
         let speculation = self.speculate_context_inputs(query, limit);
-        let synced = self.auto_sync_if_dirty()?;
+        let synced = match self.auto_sync_if_dirty() {
+            Ok(synced) => synced,
+            Err(error) => {
+                // Joined before the error goes up, as `settle` promises on the way that succeeds:
+                // none of the loads may outlive this call holding the generation it opened.
+                if let Some(speculation) = speculation {
+                    let _ = speculation.settle(self);
+                }
+                return Err(error);
+            }
+        };
         let after_sync = std::time::Instant::now();
         crate::timing::stage("context.sync", context_started, String::new);
         let ContextInputs {
@@ -4588,16 +4607,17 @@ impl WorkspaceEngine {
     /// Discover dirty source paths according to `[sync]` config.
     /// Empty when mode=none, no git available, or clean tree. Never requires git to exist.
     pub fn discover_dirty_sources(&self) -> Vec<PathBuf> {
-        self.dirty_listing(None)
+        self.dirty_listing(None).unwrap_or_default()
     }
 
     /// [`Self::discover_dirty_sources`], except that a remembered listing answers only if git was
     /// asked at or after `not_before`: a caller that has just learned of an edit cannot be handed a
-    /// listing from before it.
-    fn dirty_listing(&self, not_before: Option<std::time::Instant>) -> Vec<PathBuf> {
+    /// listing from before it. `None` when git could not answer, which is not the same as "clean":
+    /// a check that records its verdict must not record one from a listing it never got.
+    fn dirty_listing(&self, not_before: Option<std::time::Instant>) -> Option<Vec<PathBuf>> {
         // mode=none or auto without .git → empty (caller uses explicit paths / watch).
         if !self.config.sync_allows_git() || !self.is_git_repo_cached() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         // Same-tick MCP: reuse dirty list ~50ms (not a perf SLA — avoids double git spawn).
         {
@@ -4607,15 +4627,16 @@ impl WorkspaceEngine {
                     < std::time::Duration::from_millis(self.config.sync.discovery_cache_ms)
                     && not_before.is_none_or(|floor| listing.asked >= floor)
                 {
-                    return listing.paths.clone();
+                    return Some(listing.paths.clone());
                 }
             }
         }
         let asked = std::time::Instant::now();
         let discovery = self.dirty_discovery();
         let extensions = crate::config::effective_extensions(&self.config);
+        // A failed listing is not remembered: for the next few milliseconds it would read as clean.
         let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
-            .unwrap_or_default()
+            .ok()?
             .into_iter()
             .filter(|p| {
                 self.config.is_source_with_extensions(p, &extensions) && !self.config.is_noise(p)
@@ -4626,7 +4647,7 @@ impl WorkspaceEngine {
             kept: std::time::Instant::now(),
             paths: paths.clone(),
         });
-        paths
+        Some(paths)
     }
 
     fn dirty_discovery(&self) -> crate::git::DirtyDiscovery {
@@ -4755,7 +4776,12 @@ impl WorkspaceEngine {
         // there is nothing to compare it against — loading it before knowing whether
         // any path is dirty charged every query for work no query needed.
         let dirty_started = std::time::Instant::now();
-        let mut dirty = self.dirty_listing(listed_after);
+        // Whether git answered. When it did not, whatever follows can still sync what is known
+        // to be suspect, but cannot vouch for the tree.
+        let (mut dirty, listed) = match self.dirty_listing(listed_after) {
+            Some(dirty) => (dirty, true),
+            None => (Vec::new(), false),
+        };
         // A path the index absorbed while it was dirty stays suspect until its content matches what
         // the index holds, even once git calls the tree clean.
         let recorded = self.dirty_synced();
@@ -4780,7 +4806,7 @@ impl WorkspaceEngine {
             format!("paths={}", dirty.len())
         });
         if dirty.is_empty() {
-            return Ok((None, true));
+            return Ok((None, listed));
         }
         // Without hash sidecar, skip auto-sync (forces one `ravel index` for new layout).
         // Prevents accidental full-snapshot open on every search.
@@ -4836,10 +4862,10 @@ impl WorkspaceEngine {
             }
         }
         if !need_sync {
-            return Ok((None, true));
+            return Ok((None, listed));
         }
         match self.sync(Some(&dirty)) {
-            Ok(s) => Ok((Some(s), true)),
+            Ok(s) => Ok((Some(s), listed)),
             // Keep serving the last complete snapshot; context/status expose the warning.
             Err(_) => Ok((None, false)),
         }
