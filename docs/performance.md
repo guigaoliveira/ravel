@@ -19,6 +19,9 @@ cheaper than a full rebuild.
 | Git optional (`mode = auto`) | No git → zero discovery cost |
 | Shared per-root daemon | MCP sessions reuse one watcher, engine cache, and serialized writer |
 | Watcher-gated freshness check | A daemon skips the whole-worktree `git status` while its watcher has seen nothing change since the last check found the index current |
+| Exact symbol-ID exploration | Resolve `symbol://...` directly without scanning lexical postings |
+| Generation-keyed diagnostics | Reuse successful bounded diagnostic reads until the published generation or requested limit changes |
+| Content-keyed explicit sync checks | Reuse up to 256 path results while source content, permissions, symlink targets, HEAD, Git index and repository control files agree |
 | Resident-only structural acceleration | Avoid global acceleration-pack hydration when a cold exact fallback is cheaper |
 
 On the 21k-file stress corpus used during the 1.1.0 work, no-op and content-only
@@ -46,6 +49,19 @@ VM shares are not trusted), or the last full check is more than 60 s old. Any ch
 not -- ends the quiet, so a log file that grows inside the workspace keeps every query on the full
 check. `RAVEL_WATCH_FASTPATH=0` turns the shortcut off. CLI commands that do not go through a daemon
 are unaffected.
+
+Each daemon attaches its own observer before waiting for background-writer leadership. An older
+process holding `watch.lock` therefore does not disable freshness checks in a newer daemon.
+Followers defer source paths in a bounded set and replay them after taking leadership; overflow
+requires a rebuild so already-committed edits cannot disappear from the backlog.
+
+`explore` treats a `symbol://...` query as an identity lookup. It returns the requested definition
+and its relations, or an explicit missing-ID warning. Bare names, qualified names and natural
+language queries retain lexical search. This also avoids loading the lexical index in sessions
+that only use exact IDs and relationship tools.
+
+See [the agent-query measurements](../reports/perf-agent-query-hot-path.md) for the measured
+latency, memory and validation boundaries of these changes.
 
 ## Out of the hot path
 
