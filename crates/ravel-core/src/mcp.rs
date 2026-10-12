@@ -4,7 +4,7 @@
 //! Default = **primary** tool set only (`explore`, `status`, `sync`).
 //! Set `RAVEL_MCP_TOOLS=all` for the full surface.
 
-use crate::{analysis, engine::WorkspaceEngine, graph::QueryLimits, search::SearchKind};
+use crate::{graph::QueryLimits, query::WorkspaceQuery, search::SearchKind};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -14,14 +14,11 @@ use rmcp::{
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    ops::Deref,
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    thread,
-    time::Duration,
 };
 
 const DEFAULT_MCP_MAX_CACHED_ROOTS: usize = 8;
@@ -162,7 +159,6 @@ pub struct CoChangeRequest {
 #[derive(Debug)]
 pub struct RavelMcp {
     tool_router: ToolRouter<Self>,
-    engines: Arc<Mutex<HashMap<String, EngineBinding>>>,
     daemons: Arc<Mutex<HashMap<String, DaemonBinding>>>,
     cache_clock: AtomicU64,
     max_cached_roots: usize,
@@ -178,41 +174,6 @@ struct DaemonBinding {
     lease: Arc<crate::daemon::DaemonClientLease>,
     active: Arc<AtomicUsize>,
     last_used: u64,
-}
-
-#[derive(Debug)]
-struct EngineBinding {
-    engine: Arc<WorkspaceEngine>,
-    stop_watcher: Arc<AtomicBool>,
-    active: Arc<AtomicUsize>,
-    last_used: u64,
-}
-
-impl Drop for EngineBinding {
-    fn drop(&mut self) {
-        self.stop_watcher.store(true, Ordering::Release);
-    }
-}
-
-struct EngineUse {
-    engine: Arc<WorkspaceEngine>,
-    active: Arc<AtomicUsize>,
-    cache: Arc<Mutex<HashMap<String, EngineBinding>>>,
-    max_cached_roots: usize,
-}
-
-impl Deref for EngineUse {
-    type Target = WorkspaceEngine;
-    fn deref(&self) -> &Self::Target {
-        &self.engine
-    }
-}
-
-impl Drop for EngineUse {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        evict_inactive_engine(&mut self.cache.lock().unwrap(), self.max_cached_roots);
-    }
 }
 
 struct DaemonUse {
@@ -258,7 +219,6 @@ impl RavelMcp {
         }
         Self {
             tool_router,
-            engines: Arc::new(Mutex::new(HashMap::new())),
             daemons: Arc::new(Mutex::new(HashMap::new())),
             cache_clock: AtomicU64::new(0),
             max_cached_roots: max_cached_roots_from_env(),
@@ -270,49 +230,6 @@ impl RavelMcp {
 
     fn next_cache_tick(&self) -> u64 {
         self.cache_clock.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn engine(&self, root: Option<String>) -> anyhow::Result<EngineUse> {
-        let base = root
-            .map(PathBuf::from)
-            .or_else(|| self.default_root.clone())
-            .unwrap_or(std::env::current_dir()?);
-        // Keep the original path when canonicalize fails — collapsing every failure to "."
-        // would alias distinct roots onto one cache entry.
-        let root = base.canonicalize().unwrap_or(base);
-        let key = root.to_string_lossy().into_owned();
-        let mut engines = self.engines.lock().unwrap();
-        let tick = self.next_cache_tick();
-        if let Some(binding) = engines.get_mut(&key) {
-            binding.last_used = tick;
-            binding.active.fetch_add(1, Ordering::AcqRel);
-            return Ok(EngineUse {
-                engine: binding.engine.clone(),
-                active: binding.active.clone(),
-                cache: self.engines.clone(),
-                max_cached_roots: self.max_cached_roots,
-            });
-        }
-        evict_inactive_engine(&mut engines, self.max_cached_roots.saturating_sub(1));
-        let engine = Arc::new(WorkspaceEngine::load(&root, &Default::default())?);
-        let active = Arc::new(AtomicUsize::new(1));
-        let stop_watcher = Arc::new(AtomicBool::new(false));
-        spawn_root_watcher(root, engine.clone(), stop_watcher.clone());
-        engines.insert(
-            key,
-            EngineBinding {
-                engine: engine.clone(),
-                stop_watcher,
-                active: active.clone(),
-                last_used: tick,
-            },
-        );
-        Ok(EngineUse {
-            engine,
-            active,
-            cache: self.engines.clone(),
-            max_cached_roots: self.max_cached_roots,
-        })
     }
 
     /// The workspace a call is about, with symlinks resolved. Resolving costs a `readlink` per path
@@ -372,6 +289,10 @@ impl RavelMcp {
             cache: self.daemons.clone(),
             max_cached_roots: self.max_cached_roots,
         })
+    }
+
+    fn call_query(&self, root: Option<&str>, query: WorkspaceQuery) -> ToolReply {
+        daemon_reply(self.call_daemon(root, crate::daemon::DaemonOperation::Analysis(query)))
     }
 
     fn forget_daemon(&self, root: Option<&str>) {
@@ -447,147 +368,6 @@ fn evict_inactive_daemon(cache: &mut HashMap<String, DaemonBinding>, target_len:
         let Some(key) = candidate else { break };
         cache.remove(&key);
     }
-}
-
-fn evict_inactive_engine(cache: &mut HashMap<String, EngineBinding>, target_len: usize) {
-    while cache.len() > target_len {
-        let candidate = cache
-            .iter()
-            .filter(|(_, value)| value.active.load(Ordering::Acquire) == 0)
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone());
-        let Some(key) = candidate else { break };
-        cache.remove(&key);
-    }
-}
-
-fn spawn_root_watcher(root: PathBuf, engine: Arc<WorkspaceEngine>, stop: Arc<AtomicBool>) {
-    if !root.is_dir() || engine.config.sync.mode == "none" {
-        return;
-    }
-    let debounce = Duration::from_millis(engine.config.watch.debounce_ms);
-    let max_batch = Duration::from_millis(engine.config.watch.max_batch_ms);
-    let max_batch_paths = engine.config.watch.max_batch_paths;
-    let queue_capacity = engine.config.watch.queue_capacity;
-    let watch_config = engine.config.clone();
-    let storage_root = root.join(&engine.config.storage.home);
-    let _ = thread::Builder::new()
-        .name("ravel-mcp-watch".into())
-        .spawn(move || {
-            // MCP clients normally launch one stdio server each. Keep exactly one filesystem
-            // watcher per workspace across those processes; the blocking followers take over
-            // automatically when the leader exits and the OS releases its file lock.
-            let _watch_leader = match acquire_watcher_leadership(&root, &engine, &stop) {
-                Some(lock) => lock,
-                None => return,
-            };
-            // Same question the shared daemon's watcher asks, answered by the same code: an event
-            // from a gitignored tree must never reach the index from either watcher.
-            let event_ignore = std::sync::Arc::new(crate::config::IgnoreChain::new(&engine.config));
-            let batch_ignore = event_ignore.clone();
-            let watcher = match crate::watch::PersistentWatcher::new_filtered(
-                &root,
-                queue_capacity,
-                move |path| {
-                    crate::config::watch_event_is_relevant(
-                        &watch_config,
-                        &event_ignore,
-                        &storage_root,
-                        path,
-                    )
-                },
-            ) {
-                Ok(watcher) => watcher,
-                Err(error) => {
-                    engine.record_update_error("watch", &error.to_string());
-                    return;
-                }
-            };
-            while !stop.load(Ordering::Acquire) {
-                let batch = match watcher.next_batch(
-                    debounce,
-                    Duration::from_secs(1),
-                    max_batch_paths,
-                    max_batch,
-                ) {
-                    Ok(batch) => batch,
-                    Err(crate::watch::WatchError::Timeout) => continue,
-                    Err(crate::watch::WatchError::Closed) => {
-                        engine.record_update_error("watch", "watch channel closed");
-                        return;
-                    }
-                    Err(error) => {
-                        engine.record_update_error("watch", &error.to_string());
-                        return;
-                    }
-                };
-                let extensions = crate::config::effective_extensions(&engine.config);
-                let paths: Vec<_> = batch
-                    .paths
-                    .into_iter()
-                    .filter(|path| {
-                        crate::config::watched_path_is_indexable(
-                            &engine.config,
-                            &batch_ignore,
-                            &extensions,
-                            path,
-                        )
-                    })
-                    .collect();
-                if batch.needs_reconcile {
-                    if let Err(error) = engine.reconcile() {
-                        engine.record_update_error("watch index", &error.to_string());
-                    }
-                } else if !paths.is_empty() {
-                    if let Err(error) = engine.sync(Some(&paths)) {
-                        engine.record_update_error("watch sync", &error.to_string());
-                    }
-                }
-                crate::release_memory();
-            }
-        });
-}
-
-fn acquire_watcher_leadership(
-    root: &std::path::Path,
-    engine: &WorkspaceEngine,
-    stop: &AtomicBool,
-) -> Option<std::fs::File> {
-    use fs4::fs_std::FileExt;
-    use std::fs::OpenOptions;
-
-    let storage = root.join(&engine.config.storage.home);
-    if let Err(error) = std::fs::create_dir_all(&storage) {
-        engine.record_update_error("watch leader", &error.to_string());
-        return None;
-    }
-    let file = match OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(storage.join("watch.lock"))
-    {
-        Ok(file) => file,
-        Err(error) => {
-            engine.record_update_error("watch leader", &error.to_string());
-            return None;
-        }
-    };
-    while !stop.load(Ordering::Acquire) {
-        match file.try_lock_exclusive() {
-            Ok(true) => return Some(file),
-            Ok(false) => thread::sleep(Duration::from_millis(100)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                engine.record_update_error("watch leader", &error.to_string());
-                return None;
-            }
-        }
-    }
-    None
 }
 
 // ── Primary tools (default) — fewer tools = less schema overhead ────────────
@@ -713,9 +493,14 @@ impl RavelMcp {
             Some("terms") => SearchKind::Terms,
             _ => SearchKind::Exact,
         };
-        let limit = request.limit.unwrap_or(20).max(1);
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.search(&request.query, kind, limit))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Search {
+                query: request.query,
+                kind,
+                limit: request.limit.unwrap_or(20).max(1),
+            },
+        )
     }
 
     #[tool(
@@ -735,15 +520,17 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn impact_analysis(&self, Parameters(request): Parameters<QueryRequest>) -> ToolReply {
-        let mut limits = QueryLimits::default();
-        if let Some(depth) = request.depth {
-            limits.depth = depth;
-        }
-        if let Some(nodes) = request.nodes {
-            limits.nodes = nodes;
-        }
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.impact_risk(&request.node, &limits))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Impact {
+                node: request.node,
+                limits: QueryLimits {
+                    depth: request.depth.unwrap_or(32),
+                    nodes: request.nodes.unwrap_or(10_000),
+                    ..Default::default()
+                },
+            },
+        )
     }
 
     #[tool(
@@ -751,8 +538,7 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn graph_stats(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.stats())
+        self.call_query(request.root.as_deref(), WorkspaceQuery::Stats)
     }
 
     #[tool(
@@ -760,13 +546,7 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn packages(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        match engine.storage().open_file_list().map_err(tool_error)? {
-            Some(files) => json_ok(&analysis::list_packages_from_paths(
-                files.paths.iter().map(String::as_str),
-            )),
-            None => json_reply(engine.list_packages()),
-        }
+        self.call_query(request.root.as_deref(), WorkspaceQuery::Packages)
     }
 
     #[tool(
@@ -774,11 +554,12 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn node_detail(&self, Parameters(request): Parameters<SymbolDetailRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        match engine.node_detail(&request.symbol).map_err(tool_error)? {
-            Some(symbol) => json_ok(&symbol),
-            None => Err(tool_error(format!("symbol '{}' not found", request.symbol))),
-        }
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::NodeDetail {
+                symbol: request.symbol,
+            },
+        )
     }
 
     #[tool(
@@ -786,15 +567,13 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> ToolReply {
-        let limit = request.limit.unwrap_or(50).max(1);
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        match engine.storage().open_file_list().map_err(tool_error)? {
-            Some(files) => json_ok(&files.in_package_limit(&request.name, limit)),
-            None => {
-                let files = engine.files_in_package(&request.name).map_err(tool_error)?;
-                json_ok(&files.into_iter().take(limit).collect::<Vec<_>>())
-            }
-        }
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::FilesInPackage {
+                name: request.name,
+                limit: request.limit.unwrap_or(50).max(1),
+            },
+        )
     }
 
     #[tool(
@@ -802,8 +581,13 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn cycles(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.cycles(request.package.as_deref()))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Cycles {
+                package: request.package,
+                files: false,
+            },
+        )
     }
 
     #[tool(
@@ -811,9 +595,13 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn hubs(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
-        let limit = request.limit.unwrap_or(20).max(1);
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.hubs(limit, request.kind.as_deref()))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Hubs {
+                limit: request.limit.unwrap_or(20).max(1),
+                kind: request.kind,
+            },
+        )
     }
 
     #[tool(
@@ -821,9 +609,12 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn orphans(&self, Parameters(request): Parameters<LimitRequest>) -> ToolReply {
-        let limit = request.limit.unwrap_or(100).max(1);
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.orphans(limit))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Orphans {
+                limit: request.limit.unwrap_or(100).max(1),
+            },
+        )
     }
 
     #[tool(
@@ -831,12 +622,17 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn diff_impact(&self, Parameters(request): Parameters<DiffImpactRequest>) -> ToolReply {
-        let limits = QueryLimits {
-            depth: request.depth.unwrap_or(16),
-            ..Default::default()
-        };
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.diff_impact(&request.from, request.to.as_deref(), &limits))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::DiffImpact {
+                from: request.from,
+                to: request.to,
+                limits: QueryLimits {
+                    depth: request.depth.unwrap_or(16),
+                    ..Default::default()
+                },
+            },
+        )
     }
 
     #[tool(
@@ -844,11 +640,13 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn ci_check(&self, Parameters(request): Parameters<CiRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.ci(
-            request.strict.unwrap_or(false),
-            request.cycle_threshold.unwrap_or(2),
-        ))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Ci {
+                strict: request.strict.unwrap_or(false),
+                cycle_threshold: request.cycle_threshold.unwrap_or(2),
+            },
+        )
     }
 
     #[tool(
@@ -856,9 +654,7 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn export_dot(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        let dot = engine.export_dot().map_err(tool_error)?;
-        json_ok(&serde_json::json!({"format":"dot","content":dot}))
+        self.call_query(request.root.as_deref(), WorkspaceQuery::ExportDot)
     }
 
     #[tool(
@@ -866,11 +662,10 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn validate_index(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        // Bounded page + complete per-code counts: raw findings run to
-        // megabytes on big monorepos.
-        let findings = engine.validate().map_err(tool_error)?;
-        json_ok(&crate::analysis::policy_report(findings, 100))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Validate { limit: 100 },
+        )
     }
 
     #[tool(
@@ -878,12 +673,14 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.cochanged(
-            &request.file,
-            request.commits.unwrap_or(100),
-            request.min_cooccurrence.unwrap_or(2),
-        ))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::Cochanged {
+                file: request.file,
+                commits: request.commits.unwrap_or(100),
+                min_cooccurrence: request.min_cooccurrence.unwrap_or(2),
+            },
+        )
     }
 
     #[tool(
@@ -891,8 +688,7 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn boundaries(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.boundaries())
+        self.call_query(request.root.as_deref(), WorkspaceQuery::Boundaries)
     }
 
     #[tool(
@@ -900,8 +696,7 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn describe_schema(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.describe_schema())
+        self.call_query(request.root.as_deref(), WorkspaceQuery::Schema)
     }
 
     #[tool(
@@ -912,8 +707,12 @@ impl RavelMcp {
         &self,
         Parameters(request): Parameters<SymbolDetailRequest>,
     ) -> ToolReply {
-        let engine = self.engine(request.root).map_err(tool_error)?;
-        json_reply(engine.related_tests(&request.symbol))
+        self.call_query(
+            request.root.as_deref(),
+            WorkspaceQuery::RelatedTests {
+                path: request.symbol,
+            },
+        )
     }
 }
 
@@ -955,8 +754,14 @@ async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> Too
     if let Some(nodes) = request.nodes {
         limits.nodes = nodes;
     }
-    let engine = mcp.engine(request.root).map_err(tool_error)?;
-    json_reply(engine.query(&request.node, reverse, &limits, None))
+    mcp.call_query(
+        request.root.as_deref(),
+        WorkspaceQuery::Reachable {
+            node: request.node,
+            reverse,
+            limits,
+        },
+    )
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1026,14 +831,6 @@ pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
 /// with `isError: true`.
 type ToolReply = Result<String, String>;
 
-fn json_ok(value: &impl serde::Serialize) -> ToolReply {
-    serde_json::to_string(value).map_err(tool_error)
-}
-
-fn json_reply<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> ToolReply {
-    json_ok(&result.map_err(tool_error)?)
-}
-
 /// A daemon answer is JSON text already, so it goes out as it came in.
 fn daemon_reply(result: Result<String, String>) -> ToolReply {
     result.map_err(tool_error)
@@ -1053,6 +850,7 @@ fn error_json(message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn mcp_mode_defaults_to_primary() {
@@ -1122,42 +920,6 @@ mod tests {
         assert_eq!(
             parse_max_cached_roots(Some("invalid")),
             DEFAULT_MCP_MAX_CACHED_ROOTS
-        );
-    }
-
-    #[test]
-    fn engine_cache_evicts_oldest_inactive_binding_and_stops_its_watcher() {
-        fn binding(root: &std::path::Path, last_used: u64, active: usize) -> EngineBinding {
-            EngineBinding {
-                engine: Arc::new(WorkspaceEngine::load(root, &Default::default()).unwrap()),
-                stop_watcher: Arc::new(AtomicBool::new(false)),
-                active: Arc::new(AtomicUsize::new(active)),
-                last_used,
-            }
-        }
-
-        let first_root = tempfile::tempdir().unwrap();
-        let busy_root = tempfile::tempdir().unwrap();
-        let newest_root = tempfile::tempdir().unwrap();
-        let first = binding(first_root.path(), 1, 0);
-        let first_stop = first.stop_watcher.clone();
-        let mut cache = HashMap::from([
-            ("first".to_owned(), first),
-            ("busy".to_owned(), binding(busy_root.path(), 0, 1)),
-            ("newest".to_owned(), binding(newest_root.path(), 2, 0)),
-        ]);
-
-        evict_inactive_engine(&mut cache, 2);
-
-        assert_eq!(cache.len(), 2);
-        assert!(!cache.contains_key("first"));
-        assert!(
-            cache.contains_key("busy"),
-            "an active binding must not be evicted"
-        );
-        assert!(
-            first_stop.load(Ordering::Acquire),
-            "eviction must stop the root watcher"
         );
     }
 

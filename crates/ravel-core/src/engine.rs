@@ -3182,6 +3182,21 @@ impl WorkspaceEngine {
     /// could see it: the reason was collapsed into an unlabelled `parse_errors` integer. Reading the
     /// snapshot is only worth it when something actually failed, so the count gates the load.
     pub fn status(&self) -> Result<serde_json::Value, EngineError> {
+        let coverage_walk = self
+            .inner
+            .unsupported_sources
+            .try_lock()
+            .ok()
+            .filter(|cache| cache.is_none())
+            .and_then(|_| {
+                let engine = self.clone();
+                std::thread::Builder::new()
+                    .name("ravel-status-coverage".into())
+                    .spawn(move || {
+                        engine.unsupported_sources_cached();
+                    })
+                    .ok()
+            });
         // Cheap: one file read, and it is the difference between "healthy" and "every aliased
         // import silently resolves to nothing".
         let config_problems = crate::resolver::load_tsconfig_reporting(&self.root).problems;
@@ -3210,18 +3225,6 @@ impl WorkspaceEngine {
         let has = (stats_present || graph_present) && schema_matches;
         let home = self.root.join(&self.config.storage.home);
         let git = self.is_git_repo_cached();
-        // Bounded walk, cached: enough to tell "indexed and covers this workspace"
-        // from "indexed and covers three files of it".
-        let mark = std::time::Instant::now();
-        let unsupported = self.unsupported_sources_cached();
-        crate::timing::stage("status.coverage", mark, String::new);
-        let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
-        let (unsupported_counts, supported_seen, walk_truncated) = unsupported.as_ref();
-        let unsupported_total: usize = unsupported_counts.values().sum();
-        let dominant_unsupported = unsupported_counts
-            .iter()
-            .max_by_key(|(_, count)| **count)
-            .map(|(extension, count)| (extension.clone(), *count));
         // What the index costs on disk, and why. Retention keeps whole generations
         // so an in-flight reader never has its mmap pulled out from under it, which
         // means the footprint is a multiple of one index — surprising enough to be
@@ -3239,6 +3242,21 @@ impl WorkspaceEngine {
             self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT)
         };
         crate::timing::stage("status.diagnostics", mark, String::new);
+        if let Some(walk) = coverage_walk {
+            let _ = walk.join();
+        }
+        // Bounded walk, cached: enough to tell "indexed and covers this workspace"
+        // from "indexed and covers three files of it".
+        let mark = std::time::Instant::now();
+        let unsupported = self.unsupported_sources_cached();
+        crate::timing::stage("status.coverage", mark, String::new);
+        let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
+        let (unsupported_counts, supported_seen, walk_truncated) = unsupported.as_ref();
+        let unsupported_total: usize = unsupported_counts.values().sum();
+        let dominant_unsupported = unsupported_counts
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(extension, count)| (extension.clone(), *count));
         Ok(serde_json::json!({
             "root": self.root,
             "indexed": has,

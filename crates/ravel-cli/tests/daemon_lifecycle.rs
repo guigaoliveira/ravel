@@ -430,6 +430,53 @@ fn a_lease_answers_queries_without_taking_another_connection() {
         })
         .unwrap();
     assert!(context.contains("leaseBase"), "{context}");
+    use ravel_core::{graph::QueryLimits, query::WorkspaceQuery, search::SearchKind};
+    let search = || WorkspaceQuery::Search {
+        query: "leaseBase".into(),
+        kind: SearchKind::Exact,
+        limit: 20,
+    };
+    let hits: Value = serde_json::from_str(
+        &lease
+            .call_text(DaemonOperation::Analysis(search()))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hits[0]["value"], "leaseBase");
+    for query in [
+        WorkspaceQuery::Impact {
+            node: "leaseBase".into(),
+            limits: QueryLimits::default(),
+        },
+        WorkspaceQuery::Cycles {
+            package: None,
+            files: false,
+        },
+        WorkspaceQuery::Hubs {
+            limit: 20,
+            kind: None,
+        },
+    ] {
+        let value = lease.call_text(DaemonOperation::Analysis(query)).unwrap();
+        assert!(serde_json::from_str::<Value>(&value).is_ok(), "{value}");
+    }
+    fs::write(
+        root.path().join("src/base.ts"),
+        "export const replacement = 2;\n",
+    )
+    .unwrap();
+    lease
+        .call_text(DaemonOperation::Sync {
+            paths: vec!["src/base.ts".into()],
+        })
+        .unwrap();
+    let hits: Value = serde_json::from_str(
+        &lease
+            .call_text(DaemonOperation::Analysis(search()))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(hits.as_array().unwrap().is_empty(), "{hits}");
     assert!(
         client.call(DaemonOperation::Status).is_err(),
         "the lease should have used the daemon's only connection"

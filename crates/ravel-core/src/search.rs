@@ -18,7 +18,7 @@ const FUZZY_MAX_DISTANCE: usize = 2;
 const SCORE_FUZZY_EXACT: u64 = 900_000;
 const SCORE_FUZZY_DISTANCE_PENALTY: u64 = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SearchKind {
     Exact,
     Prefix,

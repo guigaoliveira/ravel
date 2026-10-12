@@ -20,7 +20,7 @@ use std::{
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 /// First minor version whose lease connection also answers query operations (see
 /// [`DaemonClientLease::call_text`]). A client talking to an older daemon connects per call.
 const LEASE_CALLS_MINOR: u16 = 2;
@@ -323,9 +323,21 @@ pub enum DaemonOperation {
         #[serde(default)]
         rollup: Option<String>,
     },
+    Analysis(crate::query::WorkspaceQuery),
     Lease,
     PromotePersistent,
     Shutdown,
+}
+
+impl DaemonOperation {
+    fn check_support(&self, server_minor: u16) -> Result<(), DaemonCallError> {
+        if matches!(self, Self::Analysis(_)) && server_minor < 3 {
+            return Err(DaemonCallError::Remote(
+                "shared daemon does not support extended queries; restart it with `ravel daemon stop` and retry".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,7 +388,8 @@ impl DaemonClient {
         &self,
         operation: DaemonOperation,
     ) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
-        let (mut stream, _) = self.connect_and_handshake()?;
+        let (mut stream, server) = self.connect_and_handshake()?;
+        operation.check_support(server.protocol_minor)?;
         write_frame(&mut stream, &WireRequest::Operation(operation))
             .map_err(DaemonCallError::Transport)?;
         Ok(stream)
@@ -391,6 +404,7 @@ impl DaemonClient {
                 client: self.clone(),
                 stream: Mutex::new(Some(stream)),
                 serves_calls: server.protocol_minor >= LEASE_CALLS_MINOR,
+                protocol_minor: server.protocol_minor,
             }),
             WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
             WireResponse::Hello(_) => Err(DaemonCallError::Transport(invalid_protocol(
@@ -559,12 +573,14 @@ pub struct DaemonClientLease {
     /// cannot carry another. The holder is told, and starts a new lease.
     stream: Mutex<Option<interprocess::local_socket::Stream>>,
     serves_calls: bool,
+    protocol_minor: u16,
 }
 
 impl DaemonClientLease {
     /// [`DaemonClient::call_text`] over the lease connection. A daemon that predates operations
     /// on a lease is asked over an ordinary connection per call, as before.
     pub fn call_text(&self, operation: DaemonOperation) -> Result<String, DaemonCallError> {
+        operation.check_support(self.protocol_minor)?;
         if !self.serves_calls {
             return self.client.call_text(operation);
         }
@@ -1037,6 +1053,7 @@ fn serve_lease(
                 | DaemonOperation::Context { .. }
                 | DaemonOperation::Sync { .. }
                 | DaemonOperation::ReferenceSites { .. }
+                | DaemonOperation::Analysis(_)
         ) {
             write_frame(
                 stream,
@@ -1110,6 +1127,7 @@ fn serve_operation(
                     .map_err(|error| error.to_string())
             })
         }
+        DaemonOperation::Analysis(query) => query.execute(engine),
         DaemonOperation::Lease => unreachable!(),
         DaemonOperation::PromotePersistent => {
             state.persistent.store(true, Ordering::Release);
@@ -1146,7 +1164,9 @@ impl OperationKind {
     fn of(operation: &DaemonOperation) -> Self {
         match operation {
             DaemonOperation::Sync { .. } => Self::Sync,
-            DaemonOperation::Context { .. } | DaemonOperation::ReferenceSites { .. } => Self::Query,
+            DaemonOperation::Context { .. }
+            | DaemonOperation::ReferenceSites { .. }
+            | DaemonOperation::Analysis(_) => Self::Query,
             _ => Self::Other,
         }
     }
@@ -1399,6 +1419,16 @@ mod tests {
     #[test]
     fn follower_rebuilds_after_its_deferred_paths_overflow() {
         observer_while_another_writer_holds_leadership(1);
+    }
+
+    #[test]
+    fn extended_queries_require_capability_without_rejecting_primary_calls() {
+        let query = DaemonOperation::Analysis(crate::query::WorkspaceQuery::Stats);
+        assert!(
+            matches!(query.check_support(2), Err(DaemonCallError::Remote(message)) if message.contains("restart"))
+        );
+        assert!(query.check_support(3).is_ok());
+        assert!(DaemonOperation::Status.check_support(2).is_ok());
     }
 
     #[test]
