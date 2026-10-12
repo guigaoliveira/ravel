@@ -20,7 +20,7 @@ use std::{
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 /// First minor version whose lease connection also answers query operations (see
 /// [`DaemonClientLease::call_text`]). A client talking to an older daemon connects per call.
 const LEASE_CALLS_MINOR: u16 = 2;
@@ -323,9 +323,21 @@ pub enum DaemonOperation {
         #[serde(default)]
         rollup: Option<String>,
     },
+    Analysis(crate::query::WorkspaceQuery),
     Lease,
     PromotePersistent,
     Shutdown,
+}
+
+impl DaemonOperation {
+    fn check_support(&self, server_minor: u16) -> Result<(), DaemonCallError> {
+        if matches!(self, Self::Analysis(_)) && server_minor < 3 {
+            return Err(DaemonCallError::Remote(
+                "shared daemon does not support extended queries; restart it with `ravel daemon stop` and retry".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,7 +388,8 @@ impl DaemonClient {
         &self,
         operation: DaemonOperation,
     ) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
-        let (mut stream, _) = self.connect_and_handshake()?;
+        let (mut stream, server) = self.connect_and_handshake()?;
+        operation.check_support(server.protocol_minor)?;
         write_frame(&mut stream, &WireRequest::Operation(operation))
             .map_err(DaemonCallError::Transport)?;
         Ok(stream)
@@ -391,6 +404,7 @@ impl DaemonClient {
                 client: self.clone(),
                 stream: Mutex::new(Some(stream)),
                 serves_calls: server.protocol_minor >= LEASE_CALLS_MINOR,
+                protocol_minor: server.protocol_minor,
             }),
             WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
             WireResponse::Hello(_) => Err(DaemonCallError::Transport(invalid_protocol(
@@ -559,12 +573,14 @@ pub struct DaemonClientLease {
     /// cannot carry another. The holder is told, and starts a new lease.
     stream: Mutex<Option<interprocess::local_socket::Stream>>,
     serves_calls: bool,
+    protocol_minor: u16,
 }
 
 impl DaemonClientLease {
     /// [`DaemonClient::call_text`] over the lease connection. A daemon that predates operations
     /// on a lease is asked over an ordinary connection per call, as before.
     pub fn call_text(&self, operation: DaemonOperation) -> Result<String, DaemonCallError> {
+        operation.check_support(self.protocol_minor)?;
         if !self.serves_calls {
             return self.client.call_text(operation);
         }
@@ -802,9 +818,9 @@ fn spawn_daemon_watcher(
     root: PathBuf,
     engine: Arc<crate::engine::WorkspaceEngine>,
     state: Arc<DaemonState>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     if !root.is_dir() || engine.config.sync.mode == "none" {
-        return;
+        return None;
     }
     let debounce = Duration::from_millis(engine.config.watch.debounce_ms);
     let max_batch = Duration::from_millis(engine.config.watch.max_batch_ms);
@@ -812,22 +828,17 @@ fn spawn_daemon_watcher(
     let queue_capacity = engine.config.watch.queue_capacity;
     let watch_config = engine.config.clone();
     let storage_root = root.join(&engine.config.storage.home);
-    let _ = std::thread::Builder::new()
+    let mut watch_leader =
+        match crate::watch::try_acquire_leadership(&root, &engine.config.storage.home) {
+            Ok(leader) => leader,
+            Err(error) => {
+                engine.record_update_error("daemon watch leader", &error.to_string());
+                return None;
+            }
+        };
+    std::thread::Builder::new()
         .name("ravel-daemon-watch".into())
         .spawn(move || {
-            let _watch_leader = loop {
-                if state.shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                match crate::watch::try_acquire_leadership(&root, &engine.config.storage.home) {
-                    Ok(Some(leader)) => break leader,
-                    Ok(None) => std::thread::sleep(WATCH_STOP_POLL_INTERVAL),
-                    Err(error) => {
-                        engine.record_update_error("daemon watch leader", &error.to_string());
-                        return;
-                    }
-                }
-            };
             // The full index walks with gitignore applied, so the watcher has to as well. Without
             // it the two paths disagree about what belongs in the workspace and a single filesystem
             // event drags in files `ravel index` deliberately skipped.
@@ -861,7 +872,18 @@ fn spawn_daemon_watcher(
                 engine.attach_watch_gate(gate);
             }
             let extensions = crate::config::effective_extensions(&engine.config);
+            let mut deferred = std::collections::BTreeSet::new();
+            let mut deferred_overflow = false;
             while !state.shutdown.load(Ordering::Acquire) {
+                if watch_leader.is_none() {
+                    match crate::watch::try_acquire_leadership(&root, &engine.config.storage.home) {
+                        Ok(leader) => watch_leader = leader,
+                        Err(error) => {
+                            engine.record_update_error("daemon watch leader", &error.to_string());
+                            return;
+                        }
+                    }
+                }
                 let batch = match watcher.next_batch(
                     debounce,
                     WATCH_STOP_POLL_INTERVAL,
@@ -869,14 +891,17 @@ fn spawn_daemon_watcher(
                     max_batch,
                 ) {
                     Ok(batch) => batch,
-                    Err(crate::watch::WatchError::Timeout) => continue,
+                    Err(crate::watch::WatchError::Timeout) => crate::watch::CoalescedChange {
+                        paths: Vec::new(),
+                        needs_reconcile: false,
+                    },
                     Err(crate::watch::WatchError::Closed) => return,
                     Err(error) => {
                         engine.record_update_error("daemon watch", &error.to_string());
                         return;
                     }
                 };
-                let paths: Vec<_> = batch
+                let mut paths: std::collections::BTreeSet<_> = batch
                     .paths
                     .into_iter()
                     .filter(|path| {
@@ -888,9 +913,21 @@ fn spawn_daemon_watcher(
                         )
                     })
                     .collect();
-                if !batch.needs_reconcile && paths.is_empty() {
+                if watch_leader.is_none() {
+                    if !deferred_overflow {
+                        deferred.extend(paths);
+                        if batch.needs_reconcile || deferred.len() > max_batch_paths.max(1) {
+                            deferred.clear();
+                            deferred_overflow = true;
+                        }
+                    }
                     continue;
                 }
+                paths.append(&mut deferred);
+                if !batch.needs_reconcile && !deferred_overflow && paths.is_empty() {
+                    continue;
+                }
+                let paths: Vec<_> = paths.into_iter().collect();
                 let _request = RequestGuard::new(&state);
                 crate::timing::note("watch.batch", || {
                     format!(
@@ -899,17 +936,28 @@ fn spawn_daemon_watcher(
                         batch.needs_reconcile
                     )
                 });
-                let result = if batch.needs_reconcile {
-                    engine.reconcile()
+                let result = if deferred_overflow {
+                    engine.index()
+                } else if batch.needs_reconcile {
+                    if paths.is_empty() {
+                        engine.reconcile()
+                    } else {
+                        engine
+                            .sync_resident(Some(&paths))
+                            .and_then(|_| engine.reconcile())
+                    }
                 } else {
                     engine.sync_resident(Some(&paths))
                 };
                 if let Err(error) = result {
                     engine.record_update_error("daemon watch update", &error.to_string());
+                } else {
+                    deferred_overflow = false;
                 }
                 crate::release_memory();
             }
-        });
+        })
+        .ok()
 }
 
 fn handle_connection(
@@ -1005,6 +1053,7 @@ fn serve_lease(
                 | DaemonOperation::Context { .. }
                 | DaemonOperation::Sync { .. }
                 | DaemonOperation::ReferenceSites { .. }
+                | DaemonOperation::Analysis(_)
         ) {
             write_frame(
                 stream,
@@ -1078,6 +1127,7 @@ fn serve_operation(
                     .map_err(|error| error.to_string())
             })
         }
+        DaemonOperation::Analysis(query) => query.execute(engine),
         DaemonOperation::Lease => unreachable!(),
         DaemonOperation::PromotePersistent => {
             state.persistent.store(true, Ordering::Release);
@@ -1114,7 +1164,9 @@ impl OperationKind {
     fn of(operation: &DaemonOperation) -> Self {
         match operation {
             DaemonOperation::Sync { .. } => Self::Sync,
-            DaemonOperation::Context { .. } | DaemonOperation::ReferenceSites { .. } => Self::Query,
+            DaemonOperation::Context { .. }
+            | DaemonOperation::ReferenceSites { .. }
+            | DaemonOperation::Analysis(_) => Self::Query,
             _ => Self::Other,
         }
     }
@@ -1237,6 +1289,147 @@ fn reply_text(mut payload: Vec<u8>) -> Result<String, DaemonCallError> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    struct WatcherTest {
+        state: Arc<DaemonState>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WatcherTest {
+        fn drop(&mut self) {
+            self.state.shutdown.store(true, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn observer_while_another_writer_holds_leadership(max_paths: usize) {
+        use crate::{config::Flags, engine::WorkspaceEngine, search::SearchKind};
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "commit.gpgsign=false"
+                    ])
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        std::fs::write(root.join("a.ts"), "export const beforeA = 1;\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export const beforeB = 1;\n").unwrap();
+        std::fs::write(root.join(".gitignore"), ".ravel/\n").unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "seed"]);
+        let mut engine = WorkspaceEngine::load(&root, &Flags::default()).unwrap();
+        engine.config.watch.debounce_ms = 10;
+        engine.config.watch.max_batch_ms = 30;
+        engine.config.watch.max_batch_paths = max_paths;
+        engine.index().unwrap();
+        let engine = Arc::new(engine);
+        let generation = engine.storage().current_generation().unwrap();
+        let leader = crate::watch::acquire_leadership(&root, &engine.config.storage.home).unwrap();
+        let runtime = tempdir().unwrap();
+        let identity = RootIdentity::discover(&root).unwrap();
+        let layout = RuntimeLayout::in_directory(runtime.path().into(), &identity).unwrap();
+        let state = Arc::new(DaemonState {
+            persistent: AtomicBool::new(true),
+            shutdown: AtomicBool::new(false),
+            leases: AtomicUsize::new(0),
+            inflight_requests: AtomicUsize::new(0),
+            active_connections: AtomicUsize::new(0),
+            max_connections: 8,
+            max_leases: 8,
+            request_timeout: Duration::from_secs(10),
+            wake_endpoint: layout.endpoint,
+        });
+        let thread = spawn_daemon_watcher(root.clone(), engine.clone(), state.clone()).unwrap();
+        let _watcher = WatcherTest {
+            state,
+            thread: Some(thread),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let gate = loop {
+            if let Some(gate) = engine.attached_watch_gate() {
+                break gate;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer never attached while writer lock was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if gate.is_trusted() {
+            while engine.quiet_checks() == 0 {
+                engine.auto_sync_if_dirty().unwrap();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "observer could not vouch for quiet"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+        std::fs::write(root.join("a.ts"), "export const afterA = 2;\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export const afterB = 2;\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "edit"]);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            engine.storage().current_generation().unwrap(),
+            generation,
+            "follower must not publish"
+        );
+        drop(leader);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if engine.storage().current_generation().unwrap() != generation {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deferred committed edits were lost on takeover"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for name in ["afterA", "afterB"] {
+            assert!(
+                engine
+                    .search_raw(name, SearchKind::Exact, 10)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.value == name)
+            );
+        }
+    }
+
+    #[test]
+    fn follower_observes_before_leadership_and_replays_committed_edits() {
+        observer_while_another_writer_holds_leadership(128);
+    }
+
+    #[test]
+    fn follower_rebuilds_after_its_deferred_paths_overflow() {
+        observer_while_another_writer_holds_leadership(1);
+    }
+
+    #[test]
+    fn extended_queries_require_capability_without_rejecting_primary_calls() {
+        let query = DaemonOperation::Analysis(crate::query::WorkspaceQuery::Stats);
+        assert!(
+            matches!(query.check_support(2), Err(DaemonCallError::Remote(message)) if message.contains("restart"))
+        );
+        assert!(query.check_support(3).is_ok());
+        assert!(DaemonOperation::Status.check_support(2).is_ok());
+    }
 
     #[test]
     fn root_identity_is_stable_and_distinguishes_worktrees() {

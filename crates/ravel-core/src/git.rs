@@ -23,6 +23,39 @@ pub struct WorktreeIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitMetadataFingerprint(blake3::Hash);
 
+fn git_directory(root: &Path) -> Option<PathBuf> {
+    let marker = git_marker(root)?;
+    if marker.is_dir() {
+        return Some(marker);
+    }
+    let text = std::fs::read_to_string(&marker).ok()?;
+    let path = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        marker.parent()?.join(path)
+    })
+}
+
+pub(crate) fn status_fingerprint(root: &Path) -> Option<GitMetadataFingerprint> {
+    let directory = git_directory(root)?;
+    let common = std::fs::read_to_string(directory.join("commondir"))
+        .ok()
+        .map(|value| directory.join(value.trim()))
+        .unwrap_or_else(|| directory.clone());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(metadata_fingerprint(root).0.as_bytes());
+    for path in [
+        directory.join("index"),
+        directory.join("config.worktree"),
+        common.join("config"),
+        common.join("info/exclude"),
+    ] {
+        hash_control_file(&mut hasher, &path);
+    }
+    Some(GitMetadataFingerprint(hasher.finalize()))
+}
+
 /// Cheap identity invalidation key. It reads only the small Git control files that can change
 /// HEAD identity; it never spawns Git or walks the worktree.
 pub fn metadata_fingerprint(root: &Path) -> GitMetadataFingerprint {

@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ravel_core::{
-    analysis, config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health,
+    config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health, query::WorkspaceQuery,
     search::SearchKind,
 };
 use std::{mem::ManuallyDrop, path::PathBuf, time::Duration};
@@ -529,8 +529,10 @@ skip_sibling_emit = true
             )?;
         }
         Some(Command::RelatedTests { path }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.related_tests(&path)?, pretty)?;
+            emit_json(
+                &workspace_query(&root, WorkspaceQuery::RelatedTests { path })?,
+                pretty,
+            )?;
         }
         Some(Command::CallersOf {
             node,
@@ -580,81 +582,110 @@ skip_sibling_emit = true
             page_size,
             cursor,
         }) => {
-            let engine = load_for_query(&root)?;
-            let limits = QueryLimits {
-                depth,
-                nodes,
-                page_size,
-                cursor,
-                ..Default::default()
-            };
-            emit_json(&engine.query(&node, reverse, &limits, None)?, pretty)?;
+            emit_json(
+                &workspace_query(
+                    &root,
+                    WorkspaceQuery::Reachable {
+                        node,
+                        reverse,
+                        limits: QueryLimits {
+                            depth,
+                            nodes,
+                            page_size,
+                            cursor,
+                            ..Default::default()
+                        },
+                    },
+                )?,
+                pretty,
+            )?;
         }
         Some(Command::Search { query, kind, limit }) => {
-            let engine = load_for_query(&root)?;
-            emit_json(&engine.search(&query, kind.into(), limit)?, pretty)?;
+            emit_json(
+                &workspace_query(
+                    &root,
+                    WorkspaceQuery::Search {
+                        query,
+                        kind: kind.into(),
+                        limit,
+                    },
+                )?,
+                pretty,
+            )?;
         }
         Some(Command::Impact { node, depth, risk }) => {
-            let engine = load_for_query(&root)?;
             let limits = QueryLimits {
                 depth,
                 ..Default::default()
             };
-            if risk {
-                emit_json(&engine.impact_risk(&node, &limits)?, pretty)?;
+            let query = if risk {
+                WorkspaceQuery::Impact { node, limits }
             } else {
-                emit_json(&engine.query(&node, false, &limits, None)?, pretty)?;
-            }
+                WorkspaceQuery::Reachable {
+                    node,
+                    reverse: false,
+                    limits,
+                }
+            };
+            emit_json(&workspace_query(&root, query)?, pretty)?;
         }
         Some(Command::Cycles { package, files }) => {
-            let engine = load_for_query(&root)?;
-            if files {
-                emit_json(&engine.file_cycles(package.as_deref())?, pretty)?;
-            } else {
-                emit_json(&engine.cycles(package.as_deref())?, pretty)?;
-            }
+            emit_json(
+                &workspace_query(&root, WorkspaceQuery::Cycles { package, files })?,
+                pretty,
+            )?;
         }
         Some(Command::Hubs { limit, kind }) => {
-            let engine = load_for_query(&root)?;
-            emit_json(&engine.hubs(limit, kind.as_deref())?, pretty)?;
+            emit_json(
+                &workspace_query(&root, WorkspaceQuery::Hubs { limit, kind })?,
+                pretty,
+            )?;
         }
         Some(Command::Orphans { limit }) => {
-            let engine = load_for_query(&root)?;
-            emit_json(&engine.orphans(limit)?, pretty)?;
+            emit_json(
+                &workspace_query(&root, WorkspaceQuery::Orphans { limit })?,
+                pretty,
+            )?;
         }
         Some(Command::Packages) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            let packages = match engine.storage().open_file_list()? {
-                Some(files) => {
-                    analysis::list_packages_from_paths(files.paths.iter().map(String::as_str))
-                }
-                None => engine.list_packages()?,
-            };
-            emit_json(&packages, pretty)?;
+            emit_json(&workspace_query(&root, WorkspaceQuery::Packages)?, pretty)?;
         }
         Some(Command::DiffImpact { from, to, depth }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            let limits = QueryLimits {
-                depth,
-                ..Default::default()
-            };
-            emit_json(&engine.diff_impact(&from, to.as_deref(), &limits)?, pretty)?;
+            emit_json(
+                &workspace_query(
+                    &root,
+                    WorkspaceQuery::DiffImpact {
+                        from,
+                        to,
+                        limits: QueryLimits {
+                            depth,
+                            ..Default::default()
+                        },
+                    },
+                )?,
+                pretty,
+            )?;
         }
         Some(Command::Export { format, scope }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             if format != "dot" || scope != "package" {
                 anyhow::bail!("only --format dot --scope package is supported currently");
             }
-            print!("{}", engine.export_dot()?);
+            let result = workspace_query(&root, WorkspaceQuery::ExportDot)?;
+            print!("{}", result["content"].as_str().unwrap_or_default());
         }
         Some(Command::Ci {
             strict,
             cycle_threshold,
         }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            let report = engine.ci(strict, cycle_threshold)?;
+            let report = workspace_query(
+                &root,
+                WorkspaceQuery::Ci {
+                    strict,
+                    cycle_threshold,
+                },
+            )?;
             emit_json(&report, pretty)?;
-            if !report.passed {
+            if report["passed"] == false {
                 std::process::exit(1);
             }
         }
@@ -663,14 +694,21 @@ skip_sibling_emit = true
             commits,
             min_cooccurrence,
         }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.cochanged(&file, commits, min_cooccurrence)?, pretty)?;
+            emit_json(
+                &workspace_query(
+                    &root,
+                    WorkspaceQuery::Cochanged {
+                        file,
+                        commits,
+                        min_cooccurrence,
+                    },
+                )?,
+                pretty,
+            )?;
         }
         Some(Command::Validate { limit }) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            let findings = engine.validate()?;
-            let report = ravel_core::analysis::policy_report(findings, limit);
-            let total = report.total;
+            let report = workspace_query(&root, WorkspaceQuery::Validate { limit })?;
+            let total = report["total"].as_u64().unwrap_or(0);
             emit_json(&report, pretty)?;
             if total > 0 {
                 anyhow::bail!("index validation failed with {total} finding(s)");
@@ -704,16 +742,13 @@ skip_sibling_emit = true
             )?;
         }
         Some(Command::Boundaries) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.boundaries()?, pretty)?;
+            emit_json(&workspace_query(&root, WorkspaceQuery::Boundaries)?, pretty)?;
         }
         Some(Command::Schema) => {
-            let engine = WorkspaceEngine::load(&root, &Flags::default())?;
-            emit_json(&engine.describe_schema()?, pretty)?;
+            emit_json(&workspace_query(&root, WorkspaceQuery::Schema)?, pretty)?;
         }
         Some(Command::Stats) => {
-            let engine = load_for_query(&root)?;
-            emit_json(&engine.stats()?, pretty)?;
+            emit_json(&workspace_query(&root, WorkspaceQuery::Stats)?, pretty)?;
         }
         Some(Command::Watch) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -888,6 +923,20 @@ fn reference_sites(
             rollup: rollup_mode,
         },
     )?)
+}
+
+fn workspace_query(
+    root: &std::path::Path,
+    query: WorkspaceQuery,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(value) = daemon_call_if_running(
+        root,
+        ravel_core::daemon::DaemonOperation::Analysis(query.clone()),
+    )? {
+        return Ok(value);
+    }
+    let engine = load_for_query(root)?;
+    query.execute(&engine).map_err(anyhow::Error::msg)
 }
 
 fn daemon_call_if_running(
