@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-10-12
+
+### Performance
+- Primary and extended MCP tools share the workspace daemon, resident caches,
+  graph and watcher instead of creating a separate engine per client.
+- CLI analysis commands reuse a running daemon and retain a local fallback.
+- Exact symbol IDs bypass lexical scans; bounded diagnostics and unchanged
+  content/Git checks are cached with generation and freshness invalidation.
+- Cold status overlaps coverage scanning with diagnostic reads.
+
+### Fixed
+- Graph analyses sync dirty sources before answering, and filesystem observation
+  remains active independently of background-writer leadership.
+- Extended queries report an actionable compatibility error for older daemons.
+
 ## [1.19.0] - 2026-10-09
 
 The calls an agent makes every turn got cheaper in CPU and memory, with every
