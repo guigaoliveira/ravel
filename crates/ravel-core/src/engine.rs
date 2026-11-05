@@ -3241,6 +3241,20 @@ impl WorkspaceEngine {
         } else {
             self.file_diagnostics(STATUS_DIAGNOSTIC_LIMIT)
         };
+        let failed_files = stats.as_ref().map_or(0, |stats| stats.parse_errors);
+        // tree-sitter recovers around a syntax error, so such a file keeps every symbol and edge
+        // outside the broken span; only read, size and grammar failures drop a whole file. Decided
+        // from the named diagnostics, so it holds only when they cover every failed file.
+        let only_recovered_syntax_errors = failed_files > 0
+            && diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic["path"].as_str())
+                .collect::<FxHashSet<_>>()
+                .len()
+                == failed_files
+            && diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["code"] == "syntax_error");
         crate::timing::stage("status.diagnostics", mark, String::new);
         if let Some(walk) = coverage_walk {
             let _ = walk.join();
@@ -3328,12 +3342,11 @@ impl WorkspaceEngine {
                 // Named before anything about freshness: an index built with an unparsed tsconfig is
                 // internally consistent and quietly missing every aliased edge.
                 format!("{} Fix it and run `ravel index`.", problem.message)
-            } else if stats.as_ref().is_some_and(|stats| stats.parse_errors > 0) {
+            } else if failed_files > 0 && !only_recovered_syntax_errors {
                 // Named before freshness: those files contribute no symbols and no edges, so every
                 // answer about what they contain is short by however much they held.
-                let failed = stats.as_ref().map_or(0, |stats| stats.parse_errors);
                 format!(
-                    "Index ready, but {failed} file(s) could not be read or parsed — their symbols and edges are missing. See `diagnostics`."
+                    "Index ready, but {failed_files} file(s) could not be read or parsed — their symbols and edges are missing. See `diagnostics`."
                 )
             } else if let Some((extension, count)) = dominant_unsupported
                 // Compared against what the *same* bounded pass saw, not against the unbounded index
@@ -3345,6 +3358,10 @@ impl WorkspaceEngine {
                 // "index ready" here will read an almost-empty graph as "no callers".
                 format!(
                     "Indexed {indexed_files} file(s), but {count} .{extension} file(s) here are not parsed (Ravel covers TypeScript/JavaScript). Graph answers apply only to the indexed part — use text search for the rest."
+                )
+            } else if only_recovered_syntax_errors {
+                format!(
+                    "Index ready. {failed_files} file(s) have a syntax error the parser recovered from — symbols and edges inside the broken span may be missing. See `diagnostics`."
                 )
             } else if !self.config.sync.auto {
                 "Index ready. Auto-sync off. Use `ravel sync <paths>` or `watch`.".to_owned()
@@ -7420,6 +7437,49 @@ mod agent_context_tests {
         std::fs::write(&grown, small).unwrap();
         engine.sync(Some(std::slice::from_ref(&grown))).unwrap();
         assert!(diagnostics(&engine).is_empty());
+    }
+
+    #[test]
+    fn status_does_not_call_a_recovered_syntax_error_a_missing_file() {
+        // tree-sitter-typescript 0.23 rejects `typeof import()` as a call's first type argument,
+        // the Vitest `importOriginal` idiom, yet still yields every other symbol in the file.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/mocked.ts"),
+            "export async function keptAfterError() {\n  \
+             const actual = await importOriginal<typeof import('axios')>();\n  \
+             return actual;\n}\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let status = engine.status().unwrap();
+        assert_eq!(status["diagnostics"][0]["code"], "syntax_error", "{status}");
+        let hint = status["hint"].as_str().unwrap();
+        assert!(hint.contains("recovered"), "{hint}");
+        assert!(!hint.contains("are missing"), "{hint}");
+        assert!(
+            engine
+                .search("keptAfterError", SearchKind::Exact, 5)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.value == "keptAfterError")
+        );
+
+        let limit = engine.config.parser.max_file_size_kb.saturating_mul(1024) as usize;
+        let oversized = root.path().join("src/oversized.ts");
+        std::fs::write(&oversized, "// pad\n".repeat(limit / 7 + 1)).unwrap();
+        engine.sync(Some(std::slice::from_ref(&oversized))).unwrap();
+        let hint = engine.status().unwrap()["hint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            hint.contains("2 file(s) could not be read or parsed"),
+            "{hint}"
+        );
     }
 
     #[test]
