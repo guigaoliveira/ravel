@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.3] - 2026-11-05
+
 ### Fixed
 - `status` no longer reports files with a recovered syntax error as missing
   their symbols and edges, and that note no longer hides the unsupported-files
