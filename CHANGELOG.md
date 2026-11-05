@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interrupting the terminal job that spawned it (Ctrl+Z, Ctrl+C) no longer
   stops it for every other client.
 - Clients give up on a daemon that does not answer the handshake within 5s
-  instead of waiting forever; `ravel mcp` no longer hangs at startup behind a
-  stopped daemon.
+  instead of waiting forever.
+- `ravel mcp` answers `initialize` right away and connects to the daemon in the
+  background, so a slow or stopped daemon no longer makes MCP clients drop the
+  server at startup (Claude Code gives up after 30s).
 
 ## [1.20.0] - 2026-10-12
 
