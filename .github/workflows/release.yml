@@ -221,12 +221,11 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: https://registry.npmjs.org
-      - name: Require NPM_TOKEN
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: test -n "$NPM_TOKEN" || { echo "::error::NPM_TOKEN is required for a stable release"; exit 1; }
+      # Trusted publishing (OIDC via id-token: write) needs npm 11.5.1 or newer.
+      - name: Upgrade npm
+        run: npm install -g npm@^11.5.1
       - name: Sync package version to tag
         working-directory: npm
         env:
@@ -235,8 +234,6 @@ jobs:
       - name: Publish to npm
         working-directory: npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-github:
     needs: publish
