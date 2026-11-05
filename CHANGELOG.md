@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `status` no longer reports files with a recovered syntax error as missing
+  their symbols and edges, and that note no longer hides the unsupported-files
+  warning. tree-sitter-typescript 0.23 rejects `f<typeof import('m')>()`
+  (tree-sitter/tree-sitter-typescript#367), the Vitest `importOriginal` idiom,
+  but indexes the rest of such a file.
+
 ## [1.20.2] - 2026-11-05
 
 ### Changed
