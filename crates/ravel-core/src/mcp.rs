@@ -812,13 +812,14 @@ impl ServerHandler for RavelMcp {
 }
 
 pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
-    let server = match default_root {
+    let server = Arc::new(match default_root {
         Some(root) => RavelMcp::with_root(root),
         None => RavelMcp::new(),
-    };
-    // Establish the default-root lease while stdio is alive. Tool calls remain lazy for any
-    // additional roots, but the primary workspace daemon is ready before the MCP client asks.
-    drop(server.daemon_client(None));
+    });
+    // Warm the default-root lease beside the handshake, not before it: a slow or wedged daemon
+    // must not hold up `initialize`, which MCP clients time out (Claude Code after 30s).
+    let warm = server.clone();
+    std::thread::spawn(move || drop(warm.daemon_client(None)));
     server
         .serve(rmcp::transport::stdio())
         .await?
