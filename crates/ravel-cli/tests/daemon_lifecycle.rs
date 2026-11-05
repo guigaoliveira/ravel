@@ -748,3 +748,64 @@ fn a_stopped_daemon_does_not_hang_clients() {
         false
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_answers_initialize_while_its_daemon_is_stopped() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let root = tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let pid = started_daemon(binary, root.path()).to_string();
+    let signal = |name: &str| {
+        assert!(
+            Command::new("kill")
+                .args([name, &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    signal("-STOP");
+
+    let mut mcp = Command::new(binary)
+        .arg("--root")
+        .arg(root.path())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = mcp.stdout.take().unwrap();
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stdin = mcp.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"1"}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let reply = lines.recv_timeout(Duration::from_secs(2));
+
+    drop(stdin);
+    signal("-CONT");
+    mcp.wait().unwrap();
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+
+    let reply: Value =
+        serde_json::from_str(&reply.expect("`initialize` waited on the daemon")).unwrap();
+    assert_eq!(reply["id"], 1);
+    assert!(reply["result"]["serverInfo"].is_object(), "{reply}");
+}
