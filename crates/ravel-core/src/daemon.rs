@@ -34,6 +34,10 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// that is going to answer does so within a few milliseconds, then up to this ceiling.
 const DAEMON_READY_POLL: Duration = Duration::from_millis(20);
 const DAEMON_READY_POLL_FIRST: Duration = Duration::from_millis(1);
+/// How long a client waits for the hello and the lease reply. A daemon answers both from the
+/// connection's own thread within milliseconds; one that does not (stopped by a terminal's job
+/// control, or wedged) must not hang every client that queues behind it.
+const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MIN_CONNECTIONS: usize = 8;
 const DEFAULT_DAEMON_CONNECTIONS_PER_CPU: usize = 4;
 const DEFAULT_DAEMON_MAX_LEASES: usize = 32;
@@ -390,6 +394,8 @@ impl DaemonClient {
     ) -> Result<interprocess::local_socket::Stream, DaemonCallError> {
         let (mut stream, server) = self.connect_and_handshake()?;
         operation.check_support(server.protocol_minor)?;
+        // Analysis operations may legitimately run longer than a handshake.
+        set_request_read_timeout(&stream, None);
         write_frame(&mut stream, &WireRequest::Operation(operation))
             .map_err(DaemonCallError::Transport)?;
         Ok(stream)
@@ -400,12 +406,15 @@ impl DaemonClient {
         write_frame(&mut stream, &WireRequest::Operation(DaemonOperation::Lease))
             .map_err(DaemonCallError::Transport)?;
         match read_frame::<WireResponse>(&mut stream).map_err(DaemonCallError::Transport)? {
-            WireResponse::Value(_) => Ok(DaemonClientLease {
-                client: self.clone(),
-                stream: Mutex::new(Some(stream)),
-                serves_calls: server.protocol_minor >= LEASE_CALLS_MINOR,
-                protocol_minor: server.protocol_minor,
-            }),
+            WireResponse::Value(_) => {
+                set_request_read_timeout(&stream, None);
+                Ok(DaemonClientLease {
+                    client: self.clone(),
+                    stream: Mutex::new(Some(stream)),
+                    serves_calls: server.protocol_minor >= LEASE_CALLS_MINOR,
+                    protocol_minor: server.protocol_minor,
+                })
+            }
             WireResponse::Error(error) => Err(DaemonCallError::Remote(error)),
             WireResponse::Hello(_) => Err(DaemonCallError::Transport(invalid_protocol(
                 "unexpected daemon hello",
@@ -413,6 +422,9 @@ impl DaemonClient {
         }
     }
 
+    /// Connects and exchanges hellos. The returned stream still carries
+    /// [`DAEMON_HANDSHAKE_TIMEOUT`] as its read timeout; callers clear it once the daemon has
+    /// proven responsive.
     fn connect_and_handshake(
         &self,
     ) -> Result<(interprocess::local_socket::Stream, ServerHello), DaemonCallError> {
@@ -435,6 +447,7 @@ impl DaemonClient {
                 LocalSocketStream::connect(name).map_err(DaemonCallError::Transport)?
             }
         };
+        set_request_read_timeout(&stream, Some(DAEMON_HANDSHAKE_TIMEOUT));
         write_frame(
             &mut stream,
             &WireRequest::Hello(ClientHello::current(self.root.clone())),
@@ -516,7 +529,12 @@ pub fn ensure_running(
             ),
         )));
     }
-    let mut child = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    // Own process group: the daemon outlives and is shared beyond the client that spawned it, so
+    // the terminal's job control for that client (Ctrl+Z, Ctrl+C) must not stop or kill it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
         .arg("--root")
         .arg(root)
         .arg("daemon-serve")

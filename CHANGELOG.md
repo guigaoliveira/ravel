@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The shared daemon starts in its own process group, so suspending or
+  interrupting the terminal job that spawned it (Ctrl+Z, Ctrl+C) no longer
+  stops it for every other client.
+- Clients give up on a daemon that does not answer the handshake within 5s
+  instead of waiting forever; `ravel mcp` no longer hangs at startup behind a
+  stopped daemon.
+
 ## [1.20.0] - 2026-10-12
 
 ### Performance
