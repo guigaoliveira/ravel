@@ -652,3 +652,99 @@ fn an_mcp_session_recovers_when_its_daemon_is_killed() {
     drop(session);
     mcp.wait().unwrap();
 }
+
+/// Process group of `pid`, from `/proc/<pid>/stat` (the field after state and ppid).
+#[cfg(target_os = "linux")]
+fn process_group(pid: &str) -> u32 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after_name = &stat[stat.rfind(')').unwrap() + 1..];
+    after_name
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn started_daemon(binary: &str, root: &Path) -> u32 {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/base.ts"), "export const base = 1;\n").unwrap();
+    assert!(command(binary, root, &["index"]).status.success());
+    assert!(command(binary, root, &["daemon", "start"]).status.success());
+    let pids = daemon_pids(root);
+    assert_eq!(pids.len(), 1, "expected one daemon, found {pids:?}");
+    pids[0]
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_runs_in_its_own_process_group() {
+    let root = tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let pid = started_daemon(binary, root.path());
+
+    let group = process_group(&pid.to_string());
+    let ours = process_group("self");
+    assert_eq!(group, pid, "daemon should lead its own process group");
+    assert_ne!(
+        group, ours,
+        "daemon shares the spawning terminal job's process group"
+    );
+
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stopped_daemon_does_not_hang_clients() {
+    let root = tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let pid = started_daemon(binary, root.path()).to_string();
+    let signal = |name: &str| {
+        assert!(
+            Command::new("kill")
+                .args([name, &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    signal("-STOP");
+
+    let mut status = Command::new(binary)
+        .arg("--root")
+        .arg(root.path())
+        .args(["daemon", "status"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let finished = loop {
+        if status.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            status.kill().unwrap();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = status.wait_with_output().unwrap();
+    signal("-CONT");
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+
+    assert!(finished, "`daemon status` hung on a stopped daemon");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["running"],
+        false
+    );
+}
