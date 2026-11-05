@@ -6919,11 +6919,19 @@ mod tests {
             sent.send(result).unwrap();
         });
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut writer_done = false;
         while store.current_generation().unwrap().as_deref() == Some(&old_manifest_name) {
             match received.try_recv() {
                 Ok(result) => {
                     result.unwrap();
-                    panic!("writer completed without advancing CURRENT");
+                    // The writer may advance CURRENT and finish between the loop check and here.
+                    assert_ne!(
+                        store.current_generation().unwrap().as_deref(),
+                        Some(old_manifest_name.as_str()),
+                        "writer completed without advancing CURRENT"
+                    );
+                    writer_done = true;
+                    break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     panic!("writer disconnected before advancing CURRENT");
@@ -6933,10 +6941,12 @@ mod tests {
             assert!(Instant::now() < deadline, "writer did not advance CURRENT");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        received
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        if !writer_done {
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        }
         assert!(store.root.join(&old_stats).is_file());
         fs::read(store.root.join(&old_stats)).unwrap();
         drop(reader_guard);
