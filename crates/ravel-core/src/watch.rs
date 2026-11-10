@@ -1335,10 +1335,9 @@ mod tests {
         assert!(elapsed < Duration::from_millis(250));
     }
 
-    // The quiet period is now capped at half a batch so that it can always be observed, which
-    // makes "the storm is still going" depend on events arriving closer together than that.
-    // FSEvents coalesces repeated writes to one file, leaving gaps the watcher rightly reads as
-    // quiet, so the first half of this test cannot hold there.
+    // A quiet period is always observable within a batch now, so "the storm is still going"
+    // depends on events arriving closer together than that period. FSEvents coalesces repeated
+    // writes to one file into deliveries whose spacing this test does not control.
     #[test]
     #[cfg_attr(
         target_os = "macos",
@@ -1353,8 +1352,11 @@ mod tests {
         })
         .unwrap();
         watcher.reconcile_pending.store(true, Ordering::Release);
+        // The storm outlasts the batch and its writes land far closer together than the quiet
+        // period, so a scheduler that stalls the writer for a few milliseconds cannot make the
+        // stream look quiet. With a quiet period of 10ms it could, and did on a loaded runner.
         let producer = std::thread::spawn(move || {
-            for index in 0..60 {
+            for index in 0..400 {
                 std::fs::write(&watched, index.to_string()).unwrap();
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -1362,10 +1364,10 @@ mod tests {
 
         let during_storm = watcher
             .next_batch(
-                Duration::from_millis(30),
+                Duration::from_millis(150),
                 Duration::from_secs(1),
                 64,
-                Duration::from_millis(20),
+                Duration::from_millis(200),
             )
             .unwrap();
         assert!(!during_storm.needs_reconcile);
