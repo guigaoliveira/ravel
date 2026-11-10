@@ -18,6 +18,10 @@ import subprocess
 import sys
 import time
 
+# These scripts parse and compare the JSON; queries print compact text unless asked.
+# The variable rather than `--json`, so a binary from before the flag still runs.
+os.environ["RAVEL_FORMAT"] = "json"
+
 binary, src, work, label = sys.argv[1:5]
 rest = sys.argv[5:]
 index_runs = 1

@@ -12,6 +12,10 @@ belong to this machine; compare two binaries on the same root.
 """
 import json, os, subprocess, sys, time, glob
 
+# These scripts parse and compare the JSON; queries print compact text unless asked.
+# The variable rather than `--json`, so a binary from before the flag still runs.
+os.environ["RAVEL_FORMAT"] = "json"
+
 def rss_tree(root_pid):
     """Sum of RSS (MB) for root_pid and all descendants, plus per-process list."""
     procs = {}

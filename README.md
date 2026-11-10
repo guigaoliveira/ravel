@@ -66,7 +66,11 @@ ravel diff-impact HEAD~1              # impact of a Git diff
 ravel sync path/to/file.ts            # fastest explicit sync after an edit
 ```
 
-Output is compact JSON by default. Add `--pretty` for humans. Use
+Queries answer in a compact text written to be cheap for an agent to read: a path is
+printed once per file, a shared directory once per group of files, and each reference as
+`line Kind symbol`. On a 24.6k-file monorepo that is about 58% fewer tokens than
+the JSON, and less than half of what `rg -n` prints for the same name. Pass `--json` (or set
+`RAVEL_FORMAT=json`) for the JSON — scripts should; `--pretty` indents it. Use
 `--root /absolute/path` for another project. MCP watches each requested root
 automatically unless `sync.mode = "none"`. In CLI-only workflows, `search`, `query`, and `context` auto-sync
 Git changes; use `ravel sync <paths>` after known edits or `ravel watch` for

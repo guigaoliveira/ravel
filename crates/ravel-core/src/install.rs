@@ -516,8 +516,8 @@ ravel sync path/to/edited.ts   # after a write, for immediate certainty
 Answers reflect **uncommitted edits**: every call first syncs the files Git reports as changed,
 so results match the working tree rather than the last commit.
 
-Relation and impact results are pages carrying exact totals — follow `next_cursor` instead
-of treating one page as the whole answer.
+Relation and impact results are pages carrying exact totals — when an answer says
+`more: cursor N`, pass that cursor instead of treating one page as the whole answer.
 
 `status` tells you when Ravel does not apply: a repo whose sources it cannot parse reports
 its real coverage instead of looking healthy. Ravel never writes source files — edit with
@@ -551,7 +551,10 @@ allowed-tools: Bash(ravel status *) Bash(ravel explore *) Bash(ravel context *) 
 # Ravel
 
 Pick the tool by the question. When the `ravel` MCP server is connected, call its tools;
-otherwise run the CLI, which prints compact JSON.
+otherwise run the CLI. Both answer in compact text: a line ending in `/` names a directory and
+the indented lines under it are its files; a site reads `line Kind symbol` (the symbol on the other
+end of the edge), and a line starting with `!` is a warning. Scripts
+get the same answers as JSON with `--json` (or `RAVEL_FORMAT=json`).
 
 | Question | MCP tool | CLI |
 |---|---|---|
@@ -561,14 +564,15 @@ otherwise run the CLI, which prints compact JSON.
 | Is this repo indexed, and how much of it | `status` | `ravel status` |
 | Where does this literal text appear | — | `grep` / `rg`: not a graph question |
 
-- Run `status` once per session. When its `hint` says the code is not covered (sources Ravel
+- Run `status` once per session. When it says the code is not covered (sources Ravel
   does not parse), use text search instead.
 - Answers include uncommitted edits. Right after writing a file, `sync` its path
   (`ravel sync path/to/file.ts`) for immediate certainty.
-- A bare name that matches several definitions returns `candidates`: re-query with a candidate
-  `id`, or narrow with `scope` (`--scope path/fragment`).
-- Relation results are pages with exact `total`s. Follow `next_cursor` (`--cursor N`) instead of
-  treating one page as the whole answer; `rollup: "dir"` (`--rollup dir`) counts per directory.
+- A bare name that matches several definitions returns its candidates, one id per line:
+  re-query with one id, or narrow with `scope` (`--scope path/fragment`).
+- Relation results are pages with exact totals. When the header says `more: cursor N`, pass it
+  (`--cursor N`) instead of treating one page as the whole answer; `rollup: "dir"`
+  (`--rollup dir`) counts per directory.
 - For another project, pass `root` (MCP) or append `--root /abs/path` (CLI).
 - Ravel never edits source files; edit with your own tools.
 "#

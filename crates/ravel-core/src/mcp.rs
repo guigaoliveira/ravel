@@ -76,7 +76,7 @@ pub struct ReferenceSitesRequest {
     pub node: String,
     /// Sites per page (default 50).
     pub limit: Option<usize>,
-    /// Resume offset: pass the previous page's next_cursor.
+    /// Resume offset: the N of the previous page's `more: cursor N`.
     pub cursor: Option<usize>,
     /// Path fragment that picks one definition when a bare name matches several — cheaper than
     /// copying a candidate id back. Only narrows which definition is resolved; it does not filter
@@ -84,7 +84,7 @@ pub struct ReferenceSitesRequest {
     pub scope: Option<String>,
     /// `dir`, or `dir:N` for N directory levels: return counts per directory prefix instead of the
     /// site list. Answers "where is this concentrated" in one bounded response rather than paging
-    /// every site. Each bucket carries `n` (edges) and `files` (distinct files).
+    /// every site. Each bucket carries its edge count and its count of distinct files.
     pub rollup: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -166,6 +166,8 @@ pub struct RavelMcp {
     default_root: Option<PathBuf>,
     /// `default_root` with its symlinks resolved, once that has worked.
     resolved_default_root: OnceLock<PathBuf>,
+    /// How answers are spelled: compact text unless `RAVEL_FORMAT=json` asks for the JSON.
+    format: crate::render::Format,
 }
 
 #[derive(Debug)]
@@ -225,6 +227,7 @@ impl RavelMcp {
             mode,
             default_root,
             resolved_default_root: OnceLock::new(),
+            format: crate::render::Format::from_env(),
         }
     }
 
@@ -292,7 +295,29 @@ impl RavelMcp {
     }
 
     fn call_query(&self, root: Option<&str>, query: WorkspaceQuery) -> ToolReply {
-        daemon_reply(self.call_daemon(root, crate::daemon::DaemonOperation::Analysis(query)))
+        let view = query.view();
+        self.reply(
+            view,
+            self.call_daemon(root, crate::daemon::DaemonOperation::Analysis(query)),
+        )
+    }
+
+    /// A daemon answer on its way to the client. As JSON it goes out as it came in, never parsed
+    /// and written again; as text it is parsed once to be respelled, which is the cheap side of
+    /// the trade — the client pays for every token of the result, on every call.
+    fn reply(
+        &self,
+        view: Option<crate::render::View>,
+        result: Result<String, String>,
+    ) -> ToolReply {
+        let json = result.map_err(tool_error)?;
+        let (crate::render::Format::Text, Some(view)) = (self.format, view) else {
+            return Ok(json);
+        };
+        Ok(serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|value| crate::render::text(view, &value))
+            .unwrap_or(json))
     }
 
     fn forget_daemon(&self, root: Option<&str>) {
@@ -392,14 +417,17 @@ impl RavelMcp {
     )]
     async fn explore(&self, Parameters(request): Parameters<ExploreRequest>) -> ToolReply {
         let limit = request.limit.unwrap_or(10).max(1);
-        daemon_reply(self.call_daemon(
-            request.root.as_deref(),
-            crate::daemon::DaemonOperation::Context {
-                query: request.query.clone(),
-                limit,
-                detail: request.detail.unwrap_or(false),
-            },
-        ))
+        self.reply(
+            Some(crate::render::View::Explore),
+            self.call_daemon(
+                request.root.as_deref(),
+                crate::daemon::DaemonOperation::Context {
+                    query: request.query.clone(),
+                    limit,
+                    detail: request.detail.unwrap_or(false),
+                },
+            ),
+        )
     }
 
     #[tool(
@@ -408,7 +436,8 @@ impl RavelMcp {
                        flag, so sites can be judged without opening files. Resolved edges: never \
                        a comment/string match or a same-named symbol from an unrelated file. \
                        Accepts a name, qualified name, or id; reflects uncommitted edits. Paged: \
-                       `total` and `by_kind` are exact; pass `next_cursor` as `cursor` for more.",
+                       the total and per-kind counts are exact; when the answer says \
+                       `more: cursor N`, pass N as `cursor`.",
         annotations(
             title = "Callers of symbol",
             read_only_hint = true,
@@ -440,15 +469,18 @@ impl RavelMcp {
 
     #[tool(
         description = "Whether this workspace is indexed and how much of it the index covers. \
-                       Call once at session start; when `hint` says Ravel does not cover this \
+                       Call once at session start; when it says Ravel does not cover this \
                        code, use text search.",
         annotations(title = "Index status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self, Parameters(request): Parameters<RootRequest>) -> ToolReply {
-        daemon_reply(self.call_daemon(
-            request.root.as_deref(),
-            crate::daemon::DaemonOperation::Status,
-        ))
+        self.reply(
+            Some(crate::render::View::Status),
+            self.call_daemon(
+                request.root.as_deref(),
+                crate::daemon::DaemonOperation::Status,
+            ),
+        )
     }
 
     #[tool(
@@ -470,10 +502,13 @@ impl RavelMcp {
             .into_iter()
             .map(PathBuf::from)
             .collect();
-        daemon_reply(self.call_daemon(
-            request.root.as_deref(),
-            crate::daemon::DaemonOperation::Sync { paths },
-        ))
+        self.reply(
+            Some(crate::render::View::Stats),
+            self.call_daemon(
+                request.root.as_deref(),
+                crate::daemon::DaemonOperation::Sync { paths },
+            ),
+        )
     }
 }
 
@@ -733,17 +768,20 @@ async fn reference_sites_tool(
             "unknown rollup `{value}`; supported: dir, or dir:N with N from 1 to 10"
         )));
     }
-    daemon_reply(mcp.call_daemon(
-        request.root.as_deref(),
-        crate::daemon::DaemonOperation::ReferenceSites {
-            node: request.node,
-            reverse,
-            limit,
-            cursor,
-            scope: request.scope,
-            rollup: request.rollup,
-        },
-    ))
+    mcp.reply(
+        Some(crate::render::View::Relations),
+        mcp.call_daemon(
+            request.root.as_deref(),
+            crate::daemon::DaemonOperation::ReferenceSites {
+                node: request.node,
+                reverse,
+                limit,
+                cursor,
+                scope: request.scope,
+                rollup: request.rollup,
+            },
+        ),
+    )
 }
 
 async fn query_tool(mcp: &RavelMcp, request: QueryRequest, reverse: bool) -> ToolReply {
@@ -802,8 +840,12 @@ impl ServerHandler for RavelMcp {
                  actually indexed — a repo whose sources Ravel does not parse can be \"indexed\" \
                  and still answer nothing, and status says so rather than looking healthy.\n\
                  \n\
-                 Relation and impact results are pages with exact totals; follow next_cursor \
-                 rather than assuming a page is the whole answer. Every tool takes an optional \
+                 Answers are compact text, not JSON: a line ending in `/` names a directory and \
+                 the indented lines under it are its files; a site reads `line Kind \
+                 symbol` (the symbol on the other end of the edge), and lines starting with `!` \
+                 are warnings. Relation and impact \
+                 results are pages with exact totals; when one says `more: cursor N`, pass N as \
+                 cursor rather than assuming a page is the whole answer. Every tool takes an optional \
                  absolute `root`; pass it when the code you are asking about is not in the \
                  server's default workspace. Ravel never edits source files.\n\
                  CLI equivalents: `ravel callers-of X`, `ravel explore X`, `ravel impact X --risk`."
@@ -828,14 +870,9 @@ pub async fn serve_stdio(default_root: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A tool's answer. `Ok` is the JSON payload; `Err` is a `{"error": …}` body that rmcp sends
-/// with `isError: true`.
+/// A tool's answer. `Ok` is the payload, as compact text or as JSON (see `RavelMcp::reply`);
+/// `Err` is a `{"error": …}` body that rmcp sends with `isError: true`.
 type ToolReply = Result<String, String>;
-
-/// A daemon answer is JSON text already, so it goes out as it came in.
-fn daemon_reply(result: Result<String, String>) -> ToolReply {
-    result.map_err(tool_error)
-}
 
 fn tool_error(error: impl std::fmt::Display) -> String {
     error_json(error.to_string())

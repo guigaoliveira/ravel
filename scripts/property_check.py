@@ -12,10 +12,15 @@ Usage: property_check.py <ravel-bin> <corpus-root>   (exit 1 on any failure)
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# These scripts parse and compare the JSON; queries print compact text unless asked.
+# The variable rather than `--json`, so a binary from before the flag still runs.
+os.environ["RAVEL_FORMAT"] = "json"
 
 def run(binary, root, args):
     proc = subprocess.run([binary, "--root", str(root), *args],

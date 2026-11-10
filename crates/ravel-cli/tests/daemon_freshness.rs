@@ -35,7 +35,7 @@ fn ravel(root: &Path, args: &[&str]) -> std::process::Output {
 
 /// Whether `context SYMBOL` finds a definition with exactly that name.
 fn defined(root: &Path, symbol: &str) -> bool {
-    let output = ravel(root, &["context", symbol]);
+    let output = ravel(root, &["context", symbol, "--json"]);
     assert!(
         output.status.success(),
         "context {symbol} failed: {}",

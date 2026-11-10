@@ -24,7 +24,7 @@ fn git(root: &Path, args: &[&str]) {
 
 fn calls_to_fmt(root: &Path) -> u64 {
     let output = Command::new(env!("CARGO_BIN_EXE_ravel"))
-        .args(["callers-of", "fmt", "--root"])
+        .args(["callers-of", "fmt", "--json", "--root"])
         .arg(root)
         .output()
         .expect("callers-of must run");

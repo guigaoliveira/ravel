@@ -64,6 +64,32 @@ pub enum WorkspaceQuery {
 }
 
 impl WorkspaceQuery {
+    /// How this query's answer reads as text, for the ones an agent asks often enough that the
+    /// spelling matters. The rest stay JSON: they are reports for scripts and CI.
+    pub fn view(&self) -> Option<crate::render::View> {
+        use crate::render::View;
+        match self {
+            Self::Search { .. } => Some(View::Search),
+            Self::Reachable { .. } => Some(View::Reachable),
+            Self::Impact { .. } => Some(View::Impact),
+            Self::Stats => Some(View::Stats),
+            Self::Cycles { .. } => Some(View::Cycles),
+            Self::Hubs { .. } => Some(View::Hubs),
+            Self::Orphans { .. } => Some(View::Names),
+            Self::Cochanged { .. } => Some(View::Cochanged),
+            Self::RelatedTests { .. } => Some(View::Paths),
+            Self::Packages
+            | Self::NodeDetail { .. }
+            | Self::FilesInPackage { .. }
+            | Self::DiffImpact { .. }
+            | Self::Ci { .. }
+            | Self::ExportDot
+            | Self::Validate { .. }
+            | Self::Boundaries
+            | Self::Schema => None,
+        }
+    }
+
     pub fn execute(&self, engine: &WorkspaceEngine) -> Result<Value, String> {
         fn encode<T: Serialize, E: std::fmt::Display>(
             result: Result<T, E>,

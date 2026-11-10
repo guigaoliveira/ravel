@@ -22,6 +22,7 @@ fn mcp_stdio_speaks_protocol() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ravel"))
         .args(["--root", tmp.to_str().unwrap(), "mcp"])
+        .env_remove("RAVEL_FORMAT")
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -174,14 +175,9 @@ fn mcp_stdio_speaks_protocol() {
     let status_text = call["result"]["content"][0]["text"]
         .as_str()
         .expect("status tool should return text content");
-    let status: serde_json::Value =
-        serde_json::from_str(status_text).expect("status tool should return JSON text");
-    let actual_root = status["root"]
-        .as_str()
-        .map(std::path::PathBuf::from)
-        .expect("status should include its root");
+    // Tool results are the compact text an agent reads, not JSON it would pay to skim.
     assert!(
-        actual_root == expected_root,
+        status_text.contains(&format!("@ {}: ", expected_root.display())),
         "MCP did not use the CLI --root default: {status_text}"
     );
 
@@ -193,7 +189,7 @@ fn mcp_stdio_speaks_protocol() {
         .as_str()
         .expect("sync tool should return text content");
     assert!(
-        sync_text.contains("\"files\":1"),
+        sync_text.contains("index: 1 files"),
         "MCP explicit sync did not index the new file: {sync_text}"
     );
 
@@ -203,9 +199,7 @@ fn mcp_stdio_speaks_protocol() {
     let explore_text = explore_call["result"]["content"][0]["text"]
         .as_str()
         .expect("explore tool should return text content");
-    let explore: serde_json::Value =
-        serde_json::from_str(explore_text).expect("explore should return JSON text");
-    assert_eq!(explore["detail"]["name"], "fresh", "{explore_text}");
+    assert!(explore_text.starts_with("fresh: "), "{explore_text}");
 
     // A refused call must be flagged as one: an `{"error": …}` body under `isError: false` reads to
     // the model like an ordinary answer.

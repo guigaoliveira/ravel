@@ -1,3 +1,9 @@
+# Git exports its own location to every hook it runs: from a linked worktree GIT_DIR and
+# GIT_INDEX_FILE point at the real repository. The tests build throwaway repositories in temp
+# directories and shell out to `git` there, and with those variables inherited every one of those
+# commands lands in the repository being committed instead: a `git commit` in a worktree left the
+# branch five test commits ("seed", "initial", ...) ahead and the index describing a fixture.
+# Each test command therefore starts from an environment without them.
 pre-commit:
   # Clippy and tests share Cargo's target directory. Running them concurrently
   # makes cold local builds contend for CPU, disk, and Cargo locks.
@@ -11,10 +17,10 @@ pre-commit:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
     unit:
       glob: "**/*.rs"
-      run: cargo test --workspace --lib
+      run: env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY cargo test --workspace --lib
 pre-push:
   commands:
     test:
-      run: cargo test --workspace
+      run: env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY cargo test --workspace
     clippy:
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
