@@ -7551,6 +7551,10 @@ mod tests {
     /// republished under the same name (the tree is back to an indexed state) starts another
     /// overlay store; an entry carried over from the old chain pointed into a store GC collects.
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows refuses to replace a base pack a reader still maps; republishing one is not covered there"
+    )]
     fn a_shared_artifact_index_is_not_carried_into_a_republished_base() {
         let dir = tempdir().unwrap();
         let writer = FileSnapshotStorage::with_retention(dir.path(), 2);

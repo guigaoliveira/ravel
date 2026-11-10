@@ -1739,10 +1739,15 @@ mod tests {
         let runtime = tempdir().unwrap();
         let root = RootIdentity::discover(tempdir().unwrap().path()).unwrap();
         let located = RuntimeLayout::locate_in(runtime.path().into(), &root).unwrap();
-        assert!(
-            !located.directory.exists(),
-            "looking made the runtime directory"
-        );
+        // Where the temp directory is too deep for a socket path (macOS), the layout falls back
+        // to one short directory per user, which any earlier test or daemon may have made. Only
+        // a directory under this test's own base can show that looking created nothing.
+        if located.directory.starts_with(runtime.path()) {
+            assert!(
+                !located.directory.exists(),
+                "looking made the runtime directory"
+            );
+        }
         let served = RuntimeLayout::in_directory(runtime.path().into(), &root).unwrap();
         assert!(served.directory.is_dir());
         assert_eq!(located, served);
