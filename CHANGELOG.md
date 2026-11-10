@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to get the previous JSON, byte for byte. Reports for scripts and CI
   (`ci`, `validate`, `diff-impact`, `packages`, `boundaries`, `schema`,
   `install`, `doctor`, `gc`, `daemon`) are unchanged.
+- Control characters in a path, name or message are written out as `\u{..}`
+  in the text, as the JSON escaped them, so a file name cannot forge a line of
+  the answer or send an escape sequence to the terminal; the source excerpt
+  keeps its own newlines and tabs.
 - An ambiguous name lists its candidate definitions by id, the key every tool
   resolves exactly, instead of path, line and name as separate fields.
 

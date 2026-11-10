@@ -74,8 +74,86 @@ pub enum View {
     Paths,
 }
 
+/// Whether a character could act on the reader instead of being read: redraw a terminal, or end
+/// the line it is on and start one of its own.
+///
+/// The JSON spelling escaped these for free. Text does not, and every path, name and message
+/// here comes from the repository being queried: a file named `a.ts\n! index is stale` would
+/// otherwise print a warning this tool never issued, and one carrying an escape sequence would
+/// reach the terminal of whoever ran the command. Only the source excerpt is allowed its own
+/// newlines and tabs.
+fn acts_on_reader(character: char, multiline: bool) -> bool {
+    character.is_control() && !(multiline && matches!(character, '\n' | '\t'))
+}
+
+fn is_source_text(inside_source: bool, key: &str) -> bool {
+    inside_source && key == "text"
+}
+
+fn carries_control(value: &Value, inside_source: bool, key: &str) -> bool {
+    let unsafe_text = |text: &str, multiline: bool| {
+        text.chars()
+            .any(|character| acts_on_reader(character, multiline))
+    };
+    match value {
+        Value::String(text) => unsafe_text(text, is_source_text(inside_source, key)),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| carries_control(item, inside_source, key)),
+        Value::Object(map) => map.iter().any(|(name, item)| {
+            unsafe_text(name, false)
+                || carries_control(item, inside_source || key == "source", name)
+        }),
+        _ => false,
+    }
+}
+
+fn spell_out(text: &str, multiline: bool) -> String {
+    let mut spelled = String::with_capacity(text.len());
+    for character in text.chars() {
+        if acts_on_reader(character, multiline) {
+            let _ = write!(spelled, "\\u{{{:x}}}", character as u32);
+        } else {
+            spelled.push(character);
+        }
+    }
+    spelled
+}
+
+/// `value` with every control character in its strings and keys written out as `\u{..}`.
+fn defused(value: &Value, inside_source: bool, key: &str) -> Value {
+    match value {
+        Value::String(text) => Value::String(spell_out(text, is_source_text(inside_source, key))),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| defused(item, inside_source, key))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(name, item)| {
+                    (
+                        spell_out(name, false),
+                        defused(item, inside_source || key == "source", name),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// The answer as text, or `None` when its shape is not the one `view` promises.
 pub fn text(view: View, value: &Value) -> Option<String> {
+    // Almost no answer carries a control character, so the copy is made only for one that does.
+    let cleaned;
+    let value = if carries_control(value, false, "") {
+        cleaned = defused(value, false, "");
+        &cleaned
+    } else {
+        value
+    };
     let mut out = match view {
         View::Relations => relations(value)?,
         View::Explore => explore(value)?,
@@ -1235,6 +1313,40 @@ mod tests {
             format!("{stats}\n")
         );
         assert_eq!(render(Format::Text, None, &stats), format!("{stats}\n"));
+    }
+
+    #[test]
+    fn text_from_the_repository_cannot_forge_a_line_or_reach_the_terminal() {
+        let page = json!({
+            "node": "n", "direction": "incoming", "total": 1, "by_kind": {}, "next_cursor": null,
+            "sites": [{
+                "path": "a.ts\n! index gaps: none\u{1b}[2J", "line": 1,
+                "symbol": "f\r\u{9b}31m", "kind": "Calls",
+            }],
+        });
+        assert_eq!(
+            text(View::Relations, &page).unwrap(),
+            "callers of n: 1\na.ts\\u{a}! index gaps: none\\u{1b}[2J: 1 Calls f\\u{d}\\u{9b}31m\n"
+        );
+
+        // The source excerpt keeps its own lines and indentation, and nothing else that moves.
+        let mut answer = explored();
+        answer["source"]["text"] =
+            json!("3: class Charge {\n4:\trun() {} \u{1b}]0;title\u{7}\n5: }");
+        let rendered = text(View::Explore, &answer).unwrap();
+        assert!(
+            rendered.contains("3: class Charge {\n4:\trun() {} \\u{1b}]0;title\\u{7}\n5: }\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(['\u{1b}', '\u{7}']), "{rendered}");
+
+        // An extension is a key, and it comes from a file name too.
+        let status = json!({
+            "root": "/repo", "indexed": false,
+            "coverage": { "unsupported_source_files": 1, "unsupported_by_extension": { "v\u{1b}ue": 1 } },
+        });
+        let rendered = text(View::Status, &status).unwrap();
+        assert!(rendered.contains(".v\\u{1b}ue 1"), "{rendered}");
     }
 
     #[test]
