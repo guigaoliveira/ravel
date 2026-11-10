@@ -70,8 +70,9 @@ pub enum View {
     Names,
     Cycles,
     Cochanged,
-    /// A bare list of paths (`related-tests`).
+    /// A bare list of paths (`related-tests`, the files of a package).
     Paths,
+    Packages,
 }
 
 /// Whether a character could act on the reader instead of being read: redraw a terminal, or end
@@ -167,6 +168,7 @@ pub fn text(view: View, value: &Value) -> Option<String> {
         View::Cycles => cycles(value)?,
         View::Cochanged => cochanged(value)?,
         View::Paths => paths(value)?,
+        View::Packages => packages(value)?,
     };
     if !out.ends_with('\n') {
         out.push('\n');
@@ -944,6 +946,74 @@ fn cochanged(value: &Value) -> Option<String> {
     Some(out)
 }
 
+/// `name files`, with the commonest language list said once in the heading and repeated only on
+/// the rows that differ — in a TypeScript monorepo that is one word saved on almost every row.
+fn packages(value: &Value) -> Option<String> {
+    let packages = value.as_array()?;
+    if packages.is_empty() {
+        return Some("no packages\n".to_owned());
+    }
+    let languages: Vec<String> = packages
+        .iter()
+        .map(|package| {
+            let names: Vec<&str> = list(package, "languages")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            names.join(",")
+        })
+        .collect();
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for spelled in &languages {
+        match counts.iter_mut().find(|(known, _)| *known == spelled) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((spelled, 1)),
+        }
+    }
+    // The first seen wins a tie, so the heading does not depend on how the map iterates.
+    let mut usual = counts[0];
+    for candidate in &counts[1..] {
+        if candidate.1 > usual.1 {
+            usual = *candidate;
+        }
+    }
+    let usual = usual.0;
+    let mut out = format!("{} package(s), name and file count", packages.len());
+    if !usual.is_empty() {
+        let _ = write!(
+            out,
+            " ({usual}{})",
+            if counts.len() == 1 {
+                " in all"
+            } else {
+                " unless noted"
+            }
+        );
+    }
+    out.push_str(":\n");
+    for (package, spelled) in packages.iter().zip(&languages) {
+        let _ = write!(
+            out,
+            "{} {}",
+            str_of(package, "name")?,
+            num(package, "files")
+        );
+        if spelled != usual {
+            let _ = write!(
+                out,
+                " {}",
+                if spelled.is_empty() {
+                    "(no language)"
+                } else {
+                    spelled
+                }
+            );
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn paths(value: &Value) -> Option<String> {
     let paths = value.as_array()?;
     if paths.is_empty() {
@@ -1274,6 +1344,17 @@ mod tests {
             "cycle of 2: a, b\n"
         );
         assert_eq!(text(View::Names, &json!(["A", "B"])).unwrap(), "A\nB\n");
+        let api = json!({ "name": "api", "files": 9, "languages": ["typescript"] });
+        let web = json!({ "name": "web", "files": 2, "languages": ["typescript"] });
+        assert_eq!(
+            text(View::Packages, &json!([api, web])).unwrap(),
+            "2 package(s), name and file count (typescript in all):\napi 9\nweb 2\n"
+        );
+        let mixed = json!({ "name": "web", "files": 2, "languages": ["javascript", "typescript"] });
+        assert_eq!(
+            text(View::Packages, &json!([api, mixed])).unwrap(),
+            "2 package(s), name and file count (typescript unless noted):\napi 9\nweb 2 javascript,typescript\n"
+        );
         assert_eq!(
             text(View::Paths, &json!(["t/a.spec.ts"])).unwrap(),
             "t/a.spec.ts\n"
@@ -1300,6 +1381,7 @@ mod tests {
             View::Cycles,
             View::Cochanged,
             View::Paths,
+            View::Packages,
         ] {
             assert_eq!(text(view, &odd), None, "{view:?}");
             assert_eq!(
