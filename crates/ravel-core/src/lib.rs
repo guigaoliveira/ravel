@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod model;
 pub mod policy;
 pub mod query;
+pub mod render;
 pub mod resolver;
 pub mod scanner;
 pub mod search;

@@ -13,7 +13,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ravel_core::{
-    config::Flags, engine::WorkspaceEngine, graph::QueryLimits, health, query::WorkspaceQuery,
+    config::Flags,
+    engine::WorkspaceEngine,
+    graph::QueryLimits,
+    health,
+    query::WorkspaceQuery,
+    render::{Format, View},
     search::SearchKind,
 };
 use std::{mem::ManuallyDrop, path::PathBuf, time::Duration};
@@ -29,7 +34,13 @@ const CLI_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
-    /// Pretty-print JSON (default is compact — saves tokens for agents)
+    /// Print answers as JSON instead of compact text (also: `RAVEL_FORMAT=json`).
+    ///
+    /// Queries answer in a compact text meant to be read by an agent; the JSON carries the same
+    /// answer plus bookkeeping (ids, scores, byte counts) and is the format for scripts.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Pretty-print JSON for a human (implies `--json`)
     #[arg(long, global = true)]
     pretty: bool,
     #[command(subcommand)]
@@ -167,7 +178,7 @@ enum Command {
         /// Items per page (raise for full enumeration in one call)
         #[arg(long, default_value_t = 100)]
         page_size: usize,
-        /// Resume offset: pass the previous page's next_cursor
+        /// Resume offset: the N of the previous page's `more: cursor N` (`next_cursor` in JSON)
         #[arg(long, default_value_t = 0)]
         cursor: usize,
     },
@@ -324,6 +335,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let root = cli.root.canonicalize().unwrap_or(cli.root);
     let pretty = cli.pretty;
+    let output = Output {
+        format: if cli.json || pretty {
+            Format::Json
+        } else {
+            Format::from_env()
+        },
+        pretty,
+    };
     match cli.command {
         Some(Command::Init { no_index }) => {
             std::fs::create_dir_all(&root)?;
@@ -386,7 +405,7 @@ skip_sibling_emit = true
         Some(Command::Index) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let stats = engine.index()?;
-            emit_json(&stats, pretty)?;
+            emit_answer(&stats, View::Stats, output)?;
         }
         Some(Command::Sync { paths }) => {
             let abs: Vec<PathBuf> = paths
@@ -397,7 +416,7 @@ skip_sibling_emit = true
                 &root,
                 ravel_core::daemon::DaemonOperation::Sync { paths: abs.clone() },
             )? {
-                emit_json(&value, pretty)?;
+                emit_answer(&value, View::Stats, output)?;
                 return Ok(());
             }
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -406,17 +425,17 @@ skip_sibling_emit = true
             } else {
                 engine.sync(Some(&abs))?
             };
-            emit_json(&stats, pretty)?;
+            emit_answer(&stats, View::Stats, output)?;
         }
         Some(Command::Status) => {
             if let Some(value) =
                 daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Status)?
             {
-                emit_json(&value, pretty)?;
+                emit_answer(&value, View::Status, output)?;
                 return Ok(());
             }
             let engine = load_for_query(&root)?;
-            emit_json(&engine.status()?, pretty)?;
+            emit_answer(&engine.status()?, View::Status, output)?;
         }
         Some(Command::Context {
             query,
@@ -431,11 +450,15 @@ skip_sibling_emit = true
                     detail,
                 },
             )? {
-                emit_json(&value, pretty)?;
+                emit_answer(&value, View::Explore, output)?;
                 return Ok(());
             }
             let engine = load_for_query(&root)?;
-            emit_json(&engine.context_with_detail(&query, limit, detail)?, pretty)?;
+            emit_answer(
+                &engine.context_with_detail(&query, limit, detail)?,
+                View::Explore,
+                output,
+            )?;
         }
         Some(Command::Setup { claude, force: _ }) => {
             let loc = ravel_core::install::InstallLocation::Local;
@@ -529,10 +552,7 @@ skip_sibling_emit = true
             )?;
         }
         Some(Command::RelatedTests { path }) => {
-            emit_json(
-                &workspace_query(&root, WorkspaceQuery::RelatedTests { path })?,
-                pretty,
-            )?;
+            emit_query(&root, WorkspaceQuery::RelatedTests { path }, output)?;
         }
         Some(Command::CallersOf {
             node,
@@ -541,7 +561,7 @@ skip_sibling_emit = true
             scope,
             rollup,
         }) => {
-            emit_json(
+            emit_answer(
                 &reference_sites(
                     &root,
                     &node,
@@ -551,7 +571,8 @@ skip_sibling_emit = true
                     scope.as_deref(),
                     rollup.as_deref(),
                 )?,
-                pretty,
+                View::Relations,
+                output,
             )?;
         }
         Some(Command::CallsFrom {
@@ -561,7 +582,7 @@ skip_sibling_emit = true
             scope,
             rollup,
         }) => {
-            emit_json(
+            emit_answer(
                 &reference_sites(
                     &root,
                     &node,
@@ -571,7 +592,8 @@ skip_sibling_emit = true
                     scope.as_deref(),
                     rollup.as_deref(),
                 )?,
-                pretty,
+                View::Relations,
+                output,
             )?;
         }
         Some(Command::Query {
@@ -582,35 +604,31 @@ skip_sibling_emit = true
             page_size,
             cursor,
         }) => {
-            emit_json(
-                &workspace_query(
-                    &root,
-                    WorkspaceQuery::Reachable {
-                        node,
-                        reverse,
-                        limits: QueryLimits {
-                            depth,
-                            nodes,
-                            page_size,
-                            cursor,
-                            ..Default::default()
-                        },
+            emit_query(
+                &root,
+                WorkspaceQuery::Reachable {
+                    node,
+                    reverse,
+                    limits: QueryLimits {
+                        depth,
+                        nodes,
+                        page_size,
+                        cursor,
+                        ..Default::default()
                     },
-                )?,
-                pretty,
+                },
+                output,
             )?;
         }
         Some(Command::Search { query, kind, limit }) => {
-            emit_json(
-                &workspace_query(
-                    &root,
-                    WorkspaceQuery::Search {
-                        query,
-                        kind: kind.into(),
-                        limit,
-                    },
-                )?,
-                pretty,
+            emit_query(
+                &root,
+                WorkspaceQuery::Search {
+                    query,
+                    kind: kind.into(),
+                    limit,
+                },
+                output,
             )?;
         }
         Some(Command::Impact { node, depth, risk }) => {
@@ -627,43 +645,32 @@ skip_sibling_emit = true
                     limits,
                 }
             };
-            emit_json(&workspace_query(&root, query)?, pretty)?;
+            emit_query(&root, query, output)?;
         }
         Some(Command::Cycles { package, files }) => {
-            emit_json(
-                &workspace_query(&root, WorkspaceQuery::Cycles { package, files })?,
-                pretty,
-            )?;
+            emit_query(&root, WorkspaceQuery::Cycles { package, files }, output)?;
         }
         Some(Command::Hubs { limit, kind }) => {
-            emit_json(
-                &workspace_query(&root, WorkspaceQuery::Hubs { limit, kind })?,
-                pretty,
-            )?;
+            emit_query(&root, WorkspaceQuery::Hubs { limit, kind }, output)?;
         }
         Some(Command::Orphans { limit }) => {
-            emit_json(
-                &workspace_query(&root, WorkspaceQuery::Orphans { limit })?,
-                pretty,
-            )?;
+            emit_query(&root, WorkspaceQuery::Orphans { limit }, output)?;
         }
         Some(Command::Packages) => {
-            emit_json(&workspace_query(&root, WorkspaceQuery::Packages)?, pretty)?;
+            emit_query(&root, WorkspaceQuery::Packages, output)?;
         }
         Some(Command::DiffImpact { from, to, depth }) => {
-            emit_json(
-                &workspace_query(
-                    &root,
-                    WorkspaceQuery::DiffImpact {
-                        from,
-                        to,
-                        limits: QueryLimits {
-                            depth,
-                            ..Default::default()
-                        },
+            emit_query(
+                &root,
+                WorkspaceQuery::DiffImpact {
+                    from,
+                    to,
+                    limits: QueryLimits {
+                        depth,
+                        ..Default::default()
                     },
-                )?,
-                pretty,
+                },
+                output,
             )?;
         }
         Some(Command::Export { format, scope }) => {
@@ -694,16 +701,14 @@ skip_sibling_emit = true
             commits,
             min_cooccurrence,
         }) => {
-            emit_json(
-                &workspace_query(
-                    &root,
-                    WorkspaceQuery::Cochanged {
-                        file,
-                        commits,
-                        min_cooccurrence,
-                    },
-                )?,
-                pretty,
+            emit_query(
+                &root,
+                WorkspaceQuery::Cochanged {
+                    file,
+                    commits,
+                    min_cooccurrence,
+                },
+                output,
             )?;
         }
         Some(Command::Validate { limit }) => {
@@ -742,13 +747,13 @@ skip_sibling_emit = true
             )?;
         }
         Some(Command::Boundaries) => {
-            emit_json(&workspace_query(&root, WorkspaceQuery::Boundaries)?, pretty)?;
+            emit_query(&root, WorkspaceQuery::Boundaries, output)?;
         }
         Some(Command::Schema) => {
-            emit_json(&workspace_query(&root, WorkspaceQuery::Schema)?, pretty)?;
+            emit_query(&root, WorkspaceQuery::Schema, output)?;
         }
         Some(Command::Stats) => {
-            emit_json(&workspace_query(&root, WorkspaceQuery::Stats)?, pretty)?;
+            emit_query(&root, WorkspaceQuery::Stats, output)?;
         }
         Some(Command::Watch) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -974,9 +979,39 @@ sync [PATHS] → reindex edited files (queries auto-sync git-dirty files)
 search Q --kind prefix | query N --reverse | impact N --risk
 cycles | hubs --limit 10 | orphans --limit 10
 serve --mcp  → MCP server (5 primary tools; RAVEL_MCP_TOOLS=all for every tool)
-JSON compact default; --pretty humans only
+answers are compact text: `dir/` opens a directory, its files follow indented; --json for scripts
 Edit with agent editor — ravel never writes source
 "#
+}
+
+/// How this run spells its answers.
+#[derive(Debug, Clone, Copy)]
+struct Output {
+    format: Format,
+    pretty: bool,
+}
+
+/// Run one workspace query and print its answer in the form the query reads best in.
+fn emit_query(root: &std::path::Path, query: WorkspaceQuery, output: Output) -> anyhow::Result<()> {
+    let view = query.view();
+    let value = workspace_query(root, query)?;
+    match view {
+        Some(view) => emit_answer(&value, view, output),
+        None => emit_json(&value, output.pretty),
+    }
+}
+
+/// An answer an agent reads: compact text by default, the JSON on request, and the JSON as well
+/// when the value is not shaped the way its view expects — printing a guess would be worse.
+fn emit_answer(value: &impl serde::Serialize, view: View, output: Output) -> anyhow::Result<()> {
+    if output.format == Format::Text
+        && let Some(text) = ravel_core::render::text(view, &serde_json::to_value(value)?)
+    {
+        use std::io::Write;
+        std::io::stdout().lock().write_all(text.as_bytes())?;
+        return Ok(());
+    }
+    emit_json(value, output.pretty)
 }
 
 fn emit_json(value: &impl serde::Serialize, pretty: bool) -> anyhow::Result<()> {

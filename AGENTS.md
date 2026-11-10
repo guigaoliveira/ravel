@@ -30,7 +30,7 @@ Or from source: `cargo install --path crates/ravel-cli --locked` then `ravel ins
 1. **`context SYMBOL`** — search + callers + callees + impact (**one** call)
 2. Only if needed: `search`, `query --reverse`, `impact`, `cycles`, `hubs`, `endpoints`
 3. **Edit with the agent’s own editor** — ravel does not write source files
-4. JSON is **compact by default** (`--pretty` only for humans)
+4. Answers are **compact text by default** — a path once per file, `line Kind symbol` per site (`--json` for scripts, `--pretty` to indent it)
 5. MCP advertises **5 primary tools** only (`explore`, `callers_of`, `calls_from`, `status`, `sync`) — `RAVEL_MCP_TOOLS=all` if you need CI/export/hubs via MCP
 
 Avoid: multi-hop Grep/Glob/Read to rediscover imports.

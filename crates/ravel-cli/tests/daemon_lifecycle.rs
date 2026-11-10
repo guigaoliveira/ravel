@@ -583,7 +583,9 @@ fn an_mcp_session_recovers_when_its_daemon_is_killed() {
 
     let root = indexed_workspace("survivesKill");
     let binary = env!("CARGO_BIN_EXE_ravel");
+    // The JSON is what a client that parses tool results asks for; this one does.
     let mut mcp = Command::new(binary)
+        .env("RAVEL_FORMAT", "json")
         .arg("--root")
         .arg(root.path())
         .arg("mcp")

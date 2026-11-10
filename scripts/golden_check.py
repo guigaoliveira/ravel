@@ -11,11 +11,16 @@ Perf gate: every hot-path command must finish under the 200 ms ceiling
 """
 
 import json
+import os
 import string
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# These scripts parse and compare the JSON; queries print compact text unless asked.
+# The variable rather than `--json`, so a binary from before the flag still runs.
+os.environ["RAVEL_FORMAT"] = "json"
 
 CEILING_MS = 200.0
 HOT_COMMANDS = [

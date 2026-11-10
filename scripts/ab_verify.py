@@ -26,6 +26,10 @@ Results are compared after removing the copy's root path and per-generation ids 
 """
 import glob, json, os, shutil, statistics, subprocess, sys, time
 
+# These scripts parse and compare the JSON; queries print compact text unless asked.
+# The variable rather than `--json`, so a binary from before the flag still runs.
+os.environ["RAVEL_FORMAT"] = "json"
+
 args = sys.argv[1:]
 base, new, corpus, work = args[:4]
 rest = args[4:]
