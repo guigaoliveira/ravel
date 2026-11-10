@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-10
+
 A function-by-function review of the codebase. Every fix below has a regression
 test, and a new randomized walk (`tests/incremental_walk.rs`) checks that
 incremental sync publishes what a full index would after every edit.
