@@ -7,7 +7,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A function-by-function review of the codebase. Every fix below has a regression
+test, and a new randomized walk (`tests/incremental_walk.rs`) checks that
+incremental sync publishes what a full index would after every edit.
+
+### Upgrading
+- **The first sync after upgrading runs a full index, once.** Extraction and
+  resolution changed, and the snapshot id now covers the extractor version and
+  the tsconfig-derived resolver configuration. Sync used to keep every unchanged
+  file's old artifact, and re-indexing after a tsconfig change published new
+  edges under the old generation, so a running daemon never noticed.
+
+### Fixed — wrong or missing answers
+- **Undoing an edit no longer erases earlier edits.** Overlay packs, merged tiers
+  and artifact deltas were named from the generation key, which recurs when
+  content returns to an earlier state; a later publish overwrote files the live
+  manifest still read, and `callers-of` answered `total: 0`. Each publication now
+  names them uniquely. Packed chains also get their own artifact overlay store,
+  collected with the chain, instead of one file that grew forever.
+- **A root below the top of its repository** (a package in a monorepo) read git's
+  paths as if they were relative to itself: auto-sync never saw an edit,
+  `diff-impact` was always empty and `cochanged` named files outside the root.
+- **Incremental sync re-resolves what a full index would.** Adding or renaming a
+  member of an exported class, redeclaring a clause-exported name
+  (`export { foo }`), names forwarded by barrels (`export {…} from`, `export *`,
+  import-then-export), syncing `tsconfig.json`, and another process publishing
+  beside a daemon all left stale or missing edges.
+- **Extraction:** string literals inside exported values became fake re-export
+  sources; JavaScript classes got no `Extends` edges and their fields no symbols;
+  decorated constructor parameters (`@Inject() private svc`), decorated
+  `export default class`, `export declare`, defaulted destructuring
+  (`{ a = 1 }`, also through `require`) and for-of bindings were missed; object
+  literal methods became members of the enclosing class; exports inside
+  namespaces counted as file exports.
+- **Resolution:** class members shadowed imports of the same name; explicit
+  exports did not shadow `export *`, and `default` passed through it; imports
+  reached namespace members; `.d.ts` files were never probed and `./x.js`
+  preferred the emitted file over its TypeScript source; tsconfig `extends`
+  diamonds, inherited `paths`, `${configDir}`, a BOM or a comment-only file were
+  mishandled; a matched `paths` pattern still fell back to `baseUrl`.
+- **One ignore rule set** for `ravel index`, `sync` and the watchers. Anchored
+  `.ravelignore` patterns (`src/gen/`) now work in `ravel index`; `.ignore` files
+  and nested `.ravelignore` files are not read anywhere (see
+  [configuration](docs/config.md)). Watchers re-read the rules when they change,
+  and dirty discovery applies them, so an ignored tracked file no longer warns on
+  every answer. One unreadable directory no longer fails the whole index.
+- **Watchers index the files of a directory** that is created, renamed or moved,
+  and keep hearing when `debounce_ms` exceeds `max_batch_ms`.
+- **Analysis:** `impact` ranks everything reached before paging (the direct
+  dependents could be missing); `diff-impact` ranks across all changed files;
+  packages no longer depend on themselves (false `boundaries` findings, empty
+  `export`); `packages` and `files_in_package` name packages as the graph does;
+  hub ties, non-ASCII exact matches, depth truncation in cycles, `context`
+  candidate truncation and `related-tests` duplicates are fixed.
+
 ### Changed
+- `ravel impact X` without `--risk` walks what depends on `X`, as `--risk` and
+  the MCP tool always did, instead of what `X` depends on.
+- `ravel daemon stop` with MCP sessions attached leaves the daemon to them until
+  the last disconnects (`"sessions": N`), instead of wedging it.
+- `install`, `uninstall` and `setup` exit non-zero, and name the file, when an
+  agent could not be configured.
+
+### Fixed — install, CLI, daemon and MCP
+- Codex: `ravel install`/`uninstall` deleted the `[[tables]]` and indented
+  tables that followed `[mcp_servers.ravel]`; a rewrite that would change any
+  other setting is now refused.
+- `--location local` no longer edits the global Windsurf config; OpenCode's user
+  config is written where OpenCode reads it on every platform;
+  `CLAUDE_CONFIG_DIR` is honoured; symlinked configs are written through the
+  link with their mode; reinstalling no longer adds a blank line to agent
+  instruction files; the Cursor rule is written only inside a project.
+- `diff-impact` refuses a revision starting with `-`, which git read as an
+  option (`--output=<file>` wrote a file from a read-only tool).
+- The CLI answers in-process when no daemon runtime directory exists; looking for
+  a daemon no longer creates or chmods one; a daemon that fails to start says
+  why at once; a reply too large for a frame is refused with an error.
+- MCP accepts a page's `next_cursor` back as `cursor`, and refuses an unknown
+  `search_symbols` kind instead of searching exactly.
+- `RAVEL_TIMING=0` (or `false`, `off`, empty) leaves timing off.
+
+### Fixed — a barrel that imported a name and republished it resolved to nothing
+- **`export { X as Y }` with no `from` clause broke the chain.** The name being
+  republished is usually one the module *imported*, not one it declared, and the
+  resolver only looked for a local declaration — so it stopped at a file that never
+  defined `X`. Every consumer of the public name `Y` then got a file-to-file import
+  edge and no symbol edge at all, with nothing in the response saying so:
+  `ambiguous: false`, `authoritative_zero: true`. This is the dominant barrel shape
+  in NestJS-style monorepos. Measured on a 21,228-file corpus where one such alias is
+  used in 921 tracked files: `callers-of` on the canonical symbol went from **1 to
+  1,841** (921 `Decorates`, matching the 921 files exactly, plus 920 `Import`), and a
+  second aliased export went from **5 to 3,739**. Total edges **774,357 → 786,144**;
+  the index directory did not grow measurably (3.2 GiB before and after).
+  A local re-export is now rewritten into its equivalent
+  `export { X as Y } from '<the import specifier>'` at index time, so it reuses the
+  barrel walk that already existed rather than adding a second one. Namespace imports
+  are still skipped: `import * as NS` binds a module object, not a declaration.
+- **Requires one `ravel index`.** The storage schema is bumped to 18 so an index built
+  by an earlier version is refused with that instruction rather than quietly answering
+  from a graph that is missing those edges.
+
+### Fixed — a coverage probe that stopped early reported its floor as a total
+- **`walk_truncated: true` and `unsupported_source_files: 0` appeared in the same
+  response, and the zero was used to certify answers.** The probe walked the
+  filesystem under a 20,000-file cap; `unparsed_components` is derived from that walk,
+  and `authoritative_zero` required it to be zero — so on any large repository the
+  certification rested on a count that had stopped early. Where there is a git
+  worktree the file list now comes from `git ls-files` (same ignore rules, one process,
+  no cap), and the cap survives only as the non-git fallback. When a walk *is*
+  truncated it now blocks certification and appears in `degraded_by`.
+  Measured on the 21,228-file corpus: `walk_truncated` `true → false`, and
+  `unsupported_source_files: 0` is now a real total — independently confirmed against
+  `git ls-files`. Cold `status` stays at 110–120 ms. A clean small workspace still
+  answers `authoritative_zero: true`; the flag was added to make the signal honest, not
+  to switch it off.
+
+### Added — `explore` / `context` can disambiguate without a second call
+- **`--scope` (MCP: `scope`) on the one-call command.** `callers-of` and `calls-from`
+  already took it; the command whose whole purpose is answering in one hop did not, so
+  a name defined once per package forced the caller to copy a symbol id back. Measured
+  on the 21,228-file corpus: a service name matching **10 definitions across 10
+  packages** now resolves with `--scope apps/<name>/` and answers `n_callers` directly.
+  The three rules `callers-of` follows hold here too — the scope is matched against
+  every definition rather than the bounded preview, a scope matching nothing is
+  reported instead of quietly answering unscoped, and a set too large to examine
+  refuses to be scoped at all. Term-search candidates are scoped too, so the scope
+  cannot be bypassed by a match arriving through a different route.
+- **A scope that still matches several now says so.** It is a path *fragment*, so
+  `apps/banking` also matches `apps/banking-accounts`; the response used to report a
+  bare "ambiguous" and leave the reason to be guessed. It now names the surviving count
+  and the fix.
+
+### Changed — `cochanged` is bounded, ranked and honest about bulk commits
+- **A single file returned 6,910 entries as a bare JSON list**, with no `total`,
+  `truncated` or `cursor` — in a tool whose whole premise is cheap output. It is now a
+  page: `--limit` (default 20), `--cursor`, and the complete `total` always included.
+- **The 6,910 were not a ranking problem.** Measured: that file had been touched by
+  exactly **two** commits, of **6,989** and **20,903** files. A bulk edit couples
+  everything it touches with everything else. Commits above `--max-commit-files`
+  (default 500) are now skipped — chosen against the measured distribution of that
+  repository, where the median commit touches 8 files, p95 is 104 and p99 is 784. With
+  the threshold removed the old answer returns, and its top entries are `main.yml`,
+  `openapi-contract-check.yml` and `.oxlintrc.json`: CI configuration, ranked highest
+  for co-changing with a TypeScript exception class.
+- **Skipping can leave nothing, so the skip is part of the answer.** That file now
+  returns `total: 0` with `commits_skipped_as_bulk: 2` — an empty result that explains
+  itself instead of reading as "nothing co-changes with this file".
+- **Ranked by confidence, not raw count**: co-occurrences over commits considered
+  (`confidence_micros`), so a file that changes in every commit no longer outranks one
+  that changes *with this file specifically*.
+
+### Added — `status` says which part of the index is reclaimable
+- **A single `disk.bytes` total read as inherent cost.** It now carries
+  `reclaimable_generations` (how many generations past retention `ravel gc` would drop)
+  and `artifact_overlay_bytes` (the total size of the artifact overlay stores). Measured on a 21,228-file corpus: of **3.35 GB**, **1.27 GiB** was generations
+  past retention that `ravel gc` freed on demand — nothing in any response had said so,
+  so there was no reason to run it — and a further **1.27 GiB** is the overlay sidecar.
+
+### Known, measured, not yet fixed
+- Asking for the *public* name of such an alias still resolves only to an unrelated
+  declaration that happens to share it, and answers `ambiguous: false`. Symbol lookup
+  is keyed by declared names, so the alias is not a candidate. The edges are now
+  correct and reachable from the canonical symbol; the name is not yet.
+
+### Changed — queries answer in compact text instead of JSON
 - **Breaking for scripts:** queries now answer in compact text instead of JSON,
   on the CLI and over MCP. `callers-of`, `calls-from`, `explore`/`context`,
   `status`, `sync`, `index`, `stats`, `search`, `query`, `impact`, `hubs`,

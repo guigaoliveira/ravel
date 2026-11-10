@@ -18,6 +18,26 @@ impl Suppressions {
         format!("{}:{}:{}", finding.code, finding.from, finding.to)
     }
 }
+/// Extensions bundlers load as non-code assets: styles, images, fonts, media, data and documents,
+/// and a few other loader-handled formats. This is a list of what is known to be an asset, not
+/// "anything that is not a source extension": dotted module names are the norm (`./user.service`,
+/// `./app.module`), and reading their last segment as an asset extension hid every one of them that
+/// failed to resolve.
+const ASSET_EXTENSIONS: &[&str] = &[
+    "css", "scss", "sass", "less", "styl", "stylus", "pcss", "svg", "png", "jpg", "jpeg", "gif",
+    "webp", "avif", "ico", "bmp", "tif", "tiff", "woff", "woff2", "ttf", "otf", "eot", "mp3",
+    "mp4", "webm", "ogg", "wav", "flac", "aac", "m4a", "mov", "json", "json5", "jsonc", "yaml",
+    "yml", "toml", "csv", "tsv", "xml", "txt", "md", "mdx", "html", "htm", "graphql", "gql",
+    "wasm", "node", "glsl", "vert", "frag", "wgsl",
+];
+
+fn is_asset_extension(extension: &str) -> bool {
+    ASSET_EXTENSIONS
+        .iter()
+        .chain(crate::config::COMPONENT_SOURCE_EXTENSIONS)
+        .any(|asset| asset.eq_ignore_ascii_case(extension))
+}
+
 pub fn validate_snapshot(
     snapshot: &IndexSnapshot,
     suppressions: &Suppressions,
@@ -51,16 +71,17 @@ pub fn validate_snapshot(
         // unresolved import turned `validate` permanently red on any repo with dependencies -- and
         // buried the case this exists for under every npm import. Alias failures are reported by
         // `status.config_problems` instead, which can see the config that failed.
-        // A relative specifier naming a non-source file is an asset import (`./styles.css`,
-        // `./logo.svg`): it never resolves to a node in this graph and never should.
-        let asset_import = std::path::Path::new(edge.to.as_str())
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                !crate::config::DEFAULT_SOURCE_EXTENSIONS.contains(&extension)
-            });
+        // A relative specifier naming an asset (`./styles.css`, `./logo.svg`) or carrying a bundler
+        // loader query (`./icon.svg?react`, `./worker.ts?worker`) never resolves to a node in this
+        // graph and never should.
+        let asset_import = edge.to.contains('?')
+            || std::path::Path::new(edge.to.as_str())
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(is_asset_extension);
         let must_resolve = (edge.to.starts_with('.') || edge.to.starts_with('/')) && !asset_import;
-        if edge.kind == EdgeKind::Import
+        // A broken `export * from './gone'` loses edges exactly like a broken import does.
+        if matches!(edge.kind, EdgeKind::Import | EdgeKind::ReExport)
             && must_resolve
             && !matches!(edge.confidence, EdgeConfidence::Resolved { .. })
         {
@@ -68,9 +89,9 @@ pub fn validate_snapshot(
                 code: "unresolved_import".into(),
                 from: edge.from.clone(),
                 to: edge.to.clone(),
-                message:
-                    "relative import did not resolve to a file in the graph; its edges are missing"
-                        .into(),
+                message: "relative import or re-export did not resolve to a file in the graph; \
+                          its edges are missing"
+                    .into(),
             });
         }
         // No unconfigured `cross_package` finding.
@@ -215,6 +236,50 @@ mod tests {
             .map(|finding| finding.code)
             .collect();
         assert_eq!(codes, vec!["dangling_edge".to_string()]);
+    }
+
+    fn unresolved(from: &str, to: &str, kind: EdgeKind) -> crate::model::Edge {
+        crate::model::Edge {
+            kind,
+            confidence: EdgeConfidence::Unresolved {
+                score: 0.0,
+                reason: "x".into(),
+            },
+            ..resolved_import(from, to)
+        }
+    }
+
+    /// Dotted module names (`./user.service`) are code, not assets, and a broken re-export loses
+    /// edges exactly like a broken import does.
+    #[test]
+    fn unresolved_relative_imports_and_reexports_are_reported_but_assets_are_not() {
+        let from = "src/app.ts";
+        let snapshot = snapshot_of(
+            vec![artifact(from)],
+            vec![
+                unresolved(from, "./user.service", EdgeKind::Import),
+                unresolved(from, "./app.module", EdgeKind::Import),
+                unresolved(from, "./gone", EdgeKind::ReExport),
+                unresolved(from, "./missing.js", EdgeKind::Import),
+                unresolved(from, "./styles.module.css", EdgeKind::Import),
+                unresolved(from, "./logo.SVG", EdgeKind::Import),
+                unresolved(from, "./data.json", EdgeKind::Import),
+                unresolved(from, "./icon.svg?react", EdgeKind::Import),
+                unresolved(from, "./worker.ts?worker", EdgeKind::Import),
+                unresolved(from, "./App.vue", EdgeKind::Import),
+                unresolved(from, "react", EdgeKind::Import),
+                unresolved(from, "node:fs", EdgeKind::ReExport),
+            ],
+        );
+        let reported: Vec<_> = validate_snapshot(&snapshot, &Suppressions::default())
+            .into_iter()
+            .filter(|finding| finding.code == "unresolved_import")
+            .map(|finding| finding.to)
+            .collect();
+        assert_eq!(
+            reported,
+            ["./user.service", "./app.module", "./gone", "./missing.js"]
+        );
     }
 
     #[test]

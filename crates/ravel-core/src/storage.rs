@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 use thiserror::Error;
@@ -73,13 +73,18 @@ fn delta_component_ceiling(store_root: &Path) -> u64 {
 /// On-disk format identity. Bumping it makes a version mismatch loud -- both directions report an
 /// unsupported schema and rebuild -- rather than letting a reader silently return nothing from a
 /// layout it half-understands.
-pub(crate) const SCHEMA_VERSION: u32 = 17;
+pub(crate) const SCHEMA_VERSION: u32 = 18;
 /// Universe delta inside a structural overlay pack. Overlays used to store, under `meta/universe`,
 /// every touched name's complete definition list; they now store only the changed files' runs (see
 /// `ResolutionUniverseOverlay`). The new key keeps the two layouts from ever being decoded as each
 /// other: a reader that predates this finds no `meta/universe` in a new overlay and falls back to a
 /// tier that republishes a fresh base, and this reader does the same for an old overlay.
 const UNIVERSE_OVERLAY_KEY: &str = "meta/universe2";
+/// The one overlay store every packed chain used to share. Nothing referenced it, so no GC ever
+/// collected it and it grew with every sync for the life of the workspace. Chains now record a
+/// store of their own (`Manifest::artifact_overlay_store`); this one is still appended to by a
+/// chain that already wrote to it, and collected once no retained manifest can reference it.
+const LEGACY_ARTIFACT_OVERLAY_STORE: &str = "artifacts.overlay.store";
 const STRUCTURAL_SHARD_BITS: u8 = 12;
 const SYMBOL_META_SHARD_BITS: u8 = 8;
 const SYMBOL_META_SHARD_COUNT: usize = 1 << SYMBOL_META_SHARD_BITS;
@@ -114,6 +119,29 @@ static STRUCTURAL_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 // for a different temp `.ravel`.
 #[cfg(test)]
 static STRUCTURAL_FAILPOINT_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Test-only: runs once a whole-generation reader has read the manifest it answers from, so a test
+/// can publish the next generation in exactly that window. Gated on the armed store, like the
+/// failpoints above.
+#[cfg(test)]
+type ManifestReadHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static AFTER_MANIFEST_READ: std::sync::Mutex<Option<ManifestReadHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn after_manifest_read(root: &Path) {
+    let hook = {
+        let mut slot = AFTER_MANIFEST_READ.lock().unwrap();
+        if slot.as_ref().is_some_and(|(armed, _)| armed == root) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
 
 fn structural_publish_failpoint(stage: u8, path: &Path) -> Result<(), StorageError> {
     if STRUCTURAL_PUBLISH_FAILPOINT.load(Ordering::Relaxed) == stage {
@@ -212,6 +240,12 @@ pub struct Manifest {
     pub artifact_delta_weights: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_store: Option<String>,
+    /// Append-only file the artifact deltas over a packed `artifact_store` write changed artifacts
+    /// to: one per chain, so generation GC collects it with the last manifest that layers over it.
+    /// Absent on a packed manifest with deltas when they went to [`LEGACY_ARTIFACT_OVERLAY_STORE`]
+    /// -- written before this was recorded, or by a binary that drops the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_overlay_store: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_locator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +282,6 @@ pub(crate) struct StructuralPackBase {
 /// `begin_structural_pack_base`.
 pub(crate) struct StructuralPackStager {
     generation: String,
-    name: String,
     path: PathBuf,
     writer: StreamingGenerationPackWriter,
     /// Held for as long as the in-flight `.tmp-` file exists. Generation GC deletes every
@@ -727,7 +760,6 @@ impl StructuralPackStager {
     pub(crate) fn finish(self) -> Result<StagedStructuralPack, StorageError> {
         let Self {
             generation,
-            name,
             path,
             writer,
             // Bound, not dropped: `publish` renames the temp into place, so the GC barrier has to
@@ -735,10 +767,14 @@ impl StructuralPackStager {
             _generation_guard,
         } = self;
         writer.publish().map_err(|error| StorageError::Invalid {
-            path,
+            path: path.clone(),
             message: error.to_string(),
         })?;
-        Ok(StagedStructuralPack { generation, name })
+        Ok(StagedStructuralPack {
+            generation,
+            path,
+            promoted: false,
+        })
     }
 }
 
@@ -856,9 +892,31 @@ struct GraphAdjSectionOverlay {
     reverse_changes: BTreeMap<String, BTreeMap<String, Option<u32>>>,
 }
 
+/// A finished base pack waiting for the manifest that will reference it. Removed on drop unless
+/// promoted: generation GC never collects `staged-*` (it cannot tell one a writer is about to
+/// publish from one left behind), so a publication refused after staging -- a newer index's schema,
+/// a failed rename -- used to leave a full-size pack in `.ravel` for good.
 pub(crate) struct StagedStructuralPack {
     generation: String,
-    name: String,
+    path: PathBuf,
+    promoted: bool,
+}
+
+impl StagedStructuralPack {
+    /// Rename into place; dropping it afterwards leaves the file alone.
+    fn promote(&mut self, final_path: &Path) -> io::Result<()> {
+        atomic_replace(&self.path, final_path)?;
+        self.promoted = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedStructuralPack {
+    fn drop(&mut self) {
+        if !self.promoted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub(crate) struct StructuralOverlayRecords {
@@ -2164,14 +2222,14 @@ pub trait SnapshotStorage {
 pub struct FileSnapshotStorage {
     root: PathBuf,
     retention: usize,
-    manifest_cache: Mutex<Option<(std::time::SystemTime, Manifest)>>,
+    manifest_cache: Mutex<Option<(ManifestIdentity, Manifest)>>,
     /// Opened pack readers by file name. Opening one mmaps the file and decodes its
     /// whole directory — tens of thousands of entries on a large workspace — so doing
     /// it per record read made a batch of reads quadratic in the directory size.
     /// Packs are immutable once published, so a reader stays valid for its name.
     pack_readers: Mutex<std::collections::HashMap<String, Arc<GenerationPackReader>>>,
     /// Decoded artifact index, keyed by the component refs it was decoded from.
-    /// Those refs are content-addressed, so a matching key means identical bytes.
+    /// Those refs never name two different contents, so a matching key means identical bytes.
     /// Per-path lookups used to decode the whole index — tens of thousands of
     /// entries — once for every path asked about.
     artifact_index_cache: Arc<Mutex<Option<CachedArtifactIndex>>>,
@@ -2182,8 +2240,42 @@ pub struct FileSnapshotStorage {
     full_index_decodes: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Index component ref, the delta refs applied over it, and the decoded result.
-type CachedArtifactIndex = (String, Vec<String>, Option<Arc<ArtifactIndex>>);
+/// Which manifest file the manifest cache decoded. The mtime alone used to be the key, and coarse
+/// timestamps give two manifests written in one tick the same one: the next generation (another
+/// name), or the current one rewritten under its own name (compaction; a generation key that
+/// recurs). The inode tells apart a same-length rewrite, since manifests are replaced by rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestIdentity {
+    name: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl ManifestIdentity {
+    fn of(name: &str, metadata: &fs::Metadata) -> Self {
+        Self {
+            name: name.to_owned(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+        }
+    }
+}
+
+/// Index component ref, the overlay store its deltas were written to, the delta refs applied over
+/// it, and the decoded result.
+type CachedArtifactIndex = (
+    String,
+    Option<String>,
+    Vec<String>,
+    Option<Arc<ArtifactIndex>>,
+);
 
 /// A decoded artifact index that outlives the storage handle it was decoded through.
 ///
@@ -2340,6 +2432,10 @@ impl FileSnapshotStorage {
         for (_, _, manifest) in manifests.iter().take(keep) {
             reachable.extend(Self::manifest_component_paths(manifest));
         }
+        let overlay_stores_collectible = !manifests
+            .iter()
+            .take(keep)
+            .any(|(_, _, manifest)| Self::has_unrecorded_overlay_store(manifest));
         let mut report = GenerationGcReport {
             retained_manifests: retained_manifests.len(),
             ..GenerationGcReport::default()
@@ -2351,7 +2447,8 @@ impl FileSnapshotStorage {
             let name = entry.file_name().to_string_lossy().into_owned();
             let generation_artifact = name.starts_with("snapshot-")
                 || name.starts_with("store.tmp-")
-                || name.contains(".tmp-");
+                || name.contains(".tmp-")
+                || (overlay_stores_collectible && Self::is_artifact_overlay_store(&name));
             if !generation_artifact || reachable.contains(&name) {
                 continue;
             }
@@ -2394,6 +2491,7 @@ impl FileSnapshotStorage {
             manifest.hubs.as_deref(),
             manifest.artifact_index.as_deref(),
             manifest.artifact_store.as_deref(),
+            manifest.artifact_overlay_store.as_deref(),
             manifest.artifact_locator.as_deref(),
         ]
         .into_iter()
@@ -2428,13 +2526,19 @@ impl FileSnapshotStorage {
     fn acquire_artifact_read_lock(&self) -> Result<fs::File, StorageError> {
         fs::create_dir_all(&self.root).map_err(|source| self.io(source, self.root.clone()))?;
         let path = self.root.join("artifact-gc.lock");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|source| self.io(source, path.clone()))?;
+        // A shared lock needs the file to exist, not to be writable, and closing a handle opened
+        // for writing reaches a file watcher as a finished write -- once per artifact read. Same
+        // as `GenerationGuard`: only the first reader, which creates the file, opens it for writing.
+        let file = match fs::File::open(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path),
+            opened => opened,
+        }
+        .map_err(|source| self.io(source, path.clone()))?;
         crate::generation_gc::lock_shared_without_queueing(&file)
             .map_err(|source| self.io(source, path))?;
         Ok(file)
@@ -2549,7 +2653,66 @@ impl FileSnapshotStorage {
     fn locator_name(id: &str) -> String {
         format!("snapshot-{id}.artifacts.loc")
     }
-    /// The manifest as it is on disk right now, ignoring the mtime-keyed cache.
+
+    /// Stem for the files one publication writes whose bytes depend on the history behind it --
+    /// overlay packs, merged tiers, artifact deltas -- unique to that publication.
+    ///
+    /// The generation key is a digest of the tree's content, so undoing an edit brings an earlier
+    /// key back. Named from the key alone, such a file replaced one the current manifest still
+    /// listed: the overlay chain then composed the new records with themselves, and the artifact
+    /// deltas listed one file twice, both losing every edit before the undone one. Readers and the
+    /// shared artifact index cache take a name to mean fixed bytes, so a name is never written
+    /// twice rather than merely kept clear of the current manifest.
+    fn publication_name(generation: &str) -> String {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(generation.as_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        hasher.update(&SEQUENCE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        hasher.update(&now.as_nanos().to_le_bytes());
+        format!("{generation}.{}", &hasher.finalize().to_hex()[..16])
+    }
+
+    /// The store the next artifact delta over a packed base appends to, recorded in `manifest`
+    /// when its chain starts. Deliberately not named `snapshot-*`: a binary that predates the field
+    /// would otherwise collect it as unreachable while the chain still reads from it.
+    fn artifact_overlay_store(manifest: &mut Manifest) -> String {
+        if let Some(name) = &manifest.artifact_overlay_store {
+            return name.clone();
+        }
+        if !manifest.artifact_deltas.is_empty() {
+            // The chain already wrote to the shared store without recording it; keep it there.
+            return LEGACY_ARTIFACT_OVERLAY_STORE.to_owned();
+        }
+        let generation = manifest.snapshot_id.stable_key();
+        let name = format!(
+            "artifacts-{}.overlay.store",
+            Self::publication_name(&generation)
+        );
+        manifest.artifact_overlay_store = Some(name.clone());
+        name
+    }
+
+    /// A packed manifest with deltas but no recorded overlay store: they went to the legacy store,
+    /// or a binary that drops the field published over a chain that had one. Which overlay stores
+    /// it still reads from is then unknown without decoding its deltas.
+    fn has_unrecorded_overlay_store(manifest: &Manifest) -> bool {
+        manifest.artifact_overlay_store.is_none()
+            && !manifest.artifact_deltas.is_empty()
+            && manifest
+                .artifact_store
+                .as_deref()
+                .is_some_and(|store| store.contains('#'))
+    }
+
+    pub(crate) fn is_artifact_overlay_store(name: &str) -> bool {
+        name == LEGACY_ARTIFACT_OVERLAY_STORE
+            || (name.starts_with("artifacts-") && name.ends_with(".overlay.store"))
+    }
+    /// The manifest as it is on disk right now, ignoring the cache.
     fn read_manifest_uncached(&self) -> Result<Option<Manifest>, StorageError> {
         if !self.current_path().is_file() {
             return Ok(None);
@@ -2570,26 +2733,31 @@ impl FileSnapshotStorage {
         }
         let name = fs::read_to_string(self.current_path())
             .map_err(|source| self.io(source, self.current_path()))?;
-        let path = self.root.join(name.trim());
-        if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
-            if let Ok(cache) = self.manifest_cache.lock() {
-                if let Some((cached_mtime, manifest)) = cache.as_ref() {
-                    if *cached_mtime == mtime {
-                        return Ok(Some(manifest.clone()));
-                    }
-                }
-            }
+        let name = name.trim();
+        let path = self.root.join(name);
+        // Identity and bytes come from one handle: a manifest replaced in between can no longer be
+        // cached under the identity of the one it replaced.
+        let mut file = fs::File::open(&path).map_err(|source| self.io(source, path.clone()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| self.io(source, path.clone()))?;
+        let identity = ManifestIdentity::of(name, &metadata);
+        if let Ok(cache) = self.manifest_cache.lock()
+            && let Some((cached, manifest)) = cache.as_ref()
+            && *cached == identity
+        {
+            return Ok(Some(manifest.clone()));
         }
-        let bytes = fs::read(&path).map_err(|source| self.io(source, path.clone()))?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|source| self.io(source, path.clone()))?;
         let manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(|source| StorageError::Json {
                 path: path.clone(),
                 source,
             })?;
-        if let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) {
-            if let Ok(mut cache) = self.manifest_cache.lock() {
-                *cache = Some((mtime, manifest.clone()));
-            }
+        if let Ok(mut cache) = self.manifest_cache.lock() {
+            *cache = Some((identity, manifest.clone()));
         }
         Ok(Some(manifest))
     }
@@ -2613,10 +2781,13 @@ impl FileSnapshotStorage {
         &self,
         generation: String,
     ) -> Result<StructuralPackStager, StorageError> {
+        // `publish_packed_snapshot` refuses this too, but only after the whole pack is written.
+        self.ensure_not_a_downgrade()?;
         // Keep the staged pack outside generation GC until the manifest publication that will
         // reference it has completed. `attach_structural_pack_base` atomically promotes it.
-        let name = format!("staged-{generation}.structural.pack");
-        let path = self.root.join(&name);
+        let path = self
+            .root
+            .join(format!("staged-{generation}.structural.pack"));
         // Before the writer exists: the temp is created inside `new`, so the barrier has to be up
         // first. Lock order is `update.lock` -> `generation-gc.lock`, and the caller already holds
         // the update lock.
@@ -2628,7 +2799,6 @@ impl FileSnapshotStorage {
             })?;
         Ok(StructuralPackStager {
             generation,
-            name,
             path,
             writer,
             _generation_guard: generation_guard,
@@ -2638,7 +2808,7 @@ impl FileSnapshotStorage {
     #[cfg(test)]
     pub(crate) fn attach_structural_pack_base(
         &self,
-        staged: StagedStructuralPack,
+        mut staged: StagedStructuralPack,
     ) -> Result<(), StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
         let Some(mut manifest) = self.read_manifest()? else {
@@ -2654,9 +2824,9 @@ impl FileSnapshotStorage {
             });
         }
         let final_name = format!("snapshot-{}.structural.pack", staged.generation);
-        let staged_path = self.root.join(&staged.name);
         let final_path = self.root.join(&final_name);
-        atomic_replace(&staged_path, &final_path)
+        staged
+            .promote(&final_path)
             .map_err(|source| self.io(source, final_path.clone()))?;
         sync_parent_directory(&final_path).map_err(|source| self.io(source, self.root.clone()))?;
         manifest.structural_packs = Some(StructuralPackChain {
@@ -2677,9 +2847,11 @@ impl FileSnapshotStorage {
     pub(crate) fn publish_packed_snapshot(
         &self,
         snapshot: &IndexSnapshot,
-        staged: StagedStructuralPack,
+        mut staged: StagedStructuralPack,
     ) -> Result<(), StorageError> {
         let _generation_guard = self.acquire_generation_read_guard()?;
+        // Checked again: another binary may have published since staging began. Any refusal from
+        // here until the promotion drops `staged`, which removes the pack.
         self.ensure_not_a_downgrade()?;
         let id = snapshot.id.stable_key();
         if staged.generation != id {
@@ -2689,9 +2861,9 @@ impl FileSnapshotStorage {
             });
         }
         let final_name = format!("snapshot-{id}.pack");
-        let staged_path = self.root.join(staged.name);
         let final_path = self.root.join(&final_name);
-        atomic_replace(&staged_path, &final_path)
+        staged
+            .promote(&final_path)
             .map_err(|source| self.io(source, final_path.clone()))?;
         sync_parent_directory(&final_path).map_err(|source| self.io(source, self.root.clone()))?;
 
@@ -2745,6 +2917,7 @@ impl FileSnapshotStorage {
             artifact_deltas: Vec::new(),
             artifact_delta_weights: Vec::new(),
             artifact_store: Some(reference("artifact/")),
+            artifact_overlay_store: None,
             artifact_locator: None,
             artifact_state: Some(artifact_state),
             artifact_live_bytes: Some(artifact_live_bytes),
@@ -2914,13 +3087,22 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
-        let Some(chain) = manifest.structural_packs else {
+        self.structural_graph_base_in(&manifest)
+    }
+
+    /// `open_structural_graph_base` as of `manifest`, for a caller already answering from one
+    /// generation. The caller holds the generation guard.
+    fn structural_graph_base_in(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Option<IncrementalGraphState>, StorageError> {
+        let Some(chain) = &manifest.structural_packs else {
             return Ok(None);
         };
         if chain.current_snapshot != manifest.snapshot_id.stable_key() {
             return Ok(None);
         }
-        let path = self.root.join(chain.base);
+        let path = self.root.join(&chain.base);
         let reader = GenerationPackReader::open(&path).map_err(|error| StorageError::Invalid {
             path: path.clone(),
             message: error.to_string(),
@@ -2970,7 +3152,7 @@ impl FileSnapshotStorage {
             by_file.extend(shard.by_file);
         }
         // Apply each overlay's file section over the union, in chain order, before reconstruction.
-        for overlay_name in chain.overlays {
+        for overlay_name in &chain.overlays {
             let overlay_path = self.root.join(overlay_name);
             let overlay_reader = GenerationPackReader::open(&overlay_path).map_err(|error| {
                 StorageError::Invalid {
@@ -3058,11 +3240,12 @@ impl FileSnapshotStorage {
 
     fn write_structural_overlay_merge(
         &self,
-        generation: &str,
+        publication: &str,
         records: &StructuralOverlayRecords,
     ) -> Result<Option<String>, StorageError> {
+        // One publication merges into strictly heavier tiers, so the weight keeps its merges apart.
         let name = format!(
-            "snapshot-{generation}.structural-merge-{}.pack",
+            "snapshot-{publication}.structural-merge-{}.pack",
             records.weight
         );
         let path = self.root.join(&name);
@@ -3124,7 +3307,7 @@ impl FileSnapshotStorage {
     fn compact_structural_overlay_chain(
         &self,
         chain: &mut StructuralPackChain,
-        generation: &str,
+        publication: &str,
         mut current: StructuralOverlayRecords,
     ) -> Result<(), StorageError> {
         while chain.overlays.len() >= 2 {
@@ -3144,7 +3327,7 @@ impl FileSnapshotStorage {
                     },
                 )?,
             };
-            let Some(merged_name) = self.write_structural_overlay_merge(generation, &current)?
+            let Some(merged_name) = self.write_structural_overlay_merge(publication, &current)?
             else {
                 // The merged records would not fit under the read ceiling. Keeping the un-merged
                 // chain costs an extra hop per read; writing the merge would cost the whole index.
@@ -3170,6 +3353,7 @@ impl FileSnapshotStorage {
         &self,
         manifest: &mut Manifest,
         snapshot_id: &SnapshotId,
+        publication: &str,
         graph_overlay: &IncrementalGraphOverlay,
         universe_overlay: &ResolutionUniverseOverlay,
         reverse_overlay: &ReverseOverlaySet,
@@ -3185,8 +3369,7 @@ impl FileSnapshotStorage {
             });
         };
         let generation = snapshot_id.stable_key();
-        let sequence = chain.overlays.len();
-        let name = format!("snapshot-{generation}.structural-overlay-{sequence}.pack");
+        let name = format!("snapshot-{publication}.structural-overlay.pack");
         let path = self.root.join(&name);
         let mut writer =
             StreamingGenerationPackWriter::new(&path).map_err(|error| StorageError::Invalid {
@@ -3302,7 +3485,7 @@ impl FileSnapshotStorage {
         chain.overlays.push(name.clone());
         self.compact_structural_overlay_chain(
             chain,
-            &generation,
+            publication,
             StructuralOverlayRecords {
                 weight: 1,
                 graph: graph_overlay.clone(),
@@ -3378,7 +3561,8 @@ impl FileSnapshotStorage {
     ///
     /// Callers that resolve one path at a time (artifact loads, source-hash
     /// probes) otherwise decode the entire index per path. The key is the index
-    /// component ref plus the delta refs applied on top; all are content-addressed,
+    /// component ref plus the delta refs applied on top; the first names one
+    /// generation's bytes and a delta ref is never reused (`publication_name`),
     /// so an equal key guarantees equal bytes and a new generation misses.
     fn cached_artifact_index(
         &self,
@@ -3387,27 +3571,36 @@ impl FileSnapshotStorage {
         let Some(name) = manifest.artifact_index.as_ref() else {
             return Ok(None);
         };
+        let overlay_store = &manifest.artifact_overlay_store;
         let carried = {
             let mut slot = self.artifact_index_cache.lock().unwrap();
             match slot.as_ref() {
-                Some((cached_name, cached_deltas, cached))
+                Some((cached_name, _, cached_deltas, cached))
                     if cached_name == name && *cached_deltas == manifest.artifact_deltas =>
                 {
                     return Ok(cached.clone());
                 }
                 // Emptied while it is brought up to date, so that a lone owner changes it in
-                // place instead of copying it.
-                Some((cached_name, _, Some(_))) if cached_name == name => slot.take(),
+                // place instead of copying it. Only within one chain: a base republished under the
+                // same name starts another overlay store, and entries carried over from the old
+                // chain would point into one that GC has since collected.
+                Some((cached_name, cached_store, applied, Some(_)))
+                    if cached_name == name
+                        && (cached_store == overlay_store || applied.is_empty()) =>
+                {
+                    slot.take()
+                }
                 _ => None,
             }
         };
-        if let Some((_, applied, Some(mut cached))) = carried
+        if let Some((_, _, applied, Some(mut cached))) = carried
             && let Some(expected) = manifest.artifact_state
             && let Some(index) =
                 self.carry_artifact_index_forward(manifest, &applied, &mut cached, expected)?
         {
             *self.artifact_index_cache.lock().unwrap() = Some((
                 name.clone(),
+                overlay_store.clone(),
                 manifest.artifact_deltas.clone(),
                 Some(Arc::clone(&index)),
             ));
@@ -3419,6 +3612,7 @@ impl FileSnapshotStorage {
         let index = self.read_artifact_index(manifest)?.map(Arc::new);
         *self.artifact_index_cache.lock().unwrap() = Some((
             name.clone(),
+            overlay_store.clone(),
             manifest.artifact_deltas.clone(),
             index.clone(),
         ));
@@ -3581,7 +3775,18 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
-        if let Some(location) = self.current_artifact_location(&manifest, path)?
+        self.open_artifact_in(&manifest, path)
+    }
+
+    /// `open_artifact` as of `manifest`, for a caller already answering from one generation:
+    /// reading `CURRENT` again could land on a later one. The caller holds the generation guard and
+    /// the artifact read lock.
+    fn open_artifact_in(
+        &self,
+        manifest: &Manifest,
+        path: &str,
+    ) -> Result<Option<FileArtifact>, StorageError> {
+        if let Some(location) = self.current_artifact_location(manifest, path)?
             && location.store.is_some()
         {
             let index = ArtifactIndex {
@@ -3596,7 +3801,7 @@ impl FileSnapshotStorage {
         if let Some(store) = manifest.artifact_store.as_deref()
             && let Some((pack, prefix)) = store.split_once('#')
         {
-            let Some(index) = self.cached_artifact_index(&manifest)? else {
+            let Some(index) = self.cached_artifact_index(manifest)? else {
                 return Ok(None);
             };
             if !index.entries.contains_key(path) || index.tombstones.contains(path) {
@@ -3612,11 +3817,11 @@ impl FileSnapshotStorage {
                 }
             });
         }
-        let Some(location) = self.current_artifact_location(&manifest, path)? else {
+        let Some(location) = self.current_artifact_location(manifest, path)? else {
             return Ok(None);
         };
         let store = manifest.artifact_store.clone().or_else(|| {
-            self.read_artifact_index(&manifest)
+            self.read_artifact_index(manifest)
                 .ok()
                 .flatten()
                 .map(|index| index.store)
@@ -3634,10 +3839,15 @@ impl FileSnapshotStorage {
         self.read_artifact_at(&index, &location).map(Some)
     }
 
+    /// Write every artifact of `snapshot` into a fresh store, index and locator. `overrides` and
+    /// `tombstones` are recorded as given: the paths whose artifact differs from the manifest's
+    /// payload, and the ones of those deleted since -- empty when `snapshot` is the payload.
     fn write_initial_artifact_store(
         &self,
         id: &str,
         snapshot: &IndexSnapshot,
+        overrides: BTreeSet<String>,
+        tombstones: BTreeSet<String>,
     ) -> Result<(String, String, String, [u8; 32]), StorageError> {
         let store_path = self.artifact_store_path(id);
         let store_tmp = store_path.with_extension(format!("store.tmp-{}", std::process::id()));
@@ -3652,8 +3862,8 @@ impl FileSnapshotStorage {
                 .to_string_lossy()
                 .into_owned(),
             entries: BTreeMap::new(),
-            overrides: BTreeSet::new(),
-            tombstones: BTreeSet::new(),
+            overrides,
+            tombstones,
             state: [0; 32],
         };
         let mut locator_entries = Vec::with_capacity(snapshot.files.len());
@@ -3764,7 +3974,7 @@ impl FileSnapshotStorage {
                 })?;
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -3838,7 +4048,10 @@ impl FileSnapshotStorage {
             .to_hex()
             .to_string();
         let generation = snapshot_id.stable_key();
-        let delta_name = format!("snapshot-{generation}.artifact-delta.bin");
+        let delta_name = format!(
+            "snapshot-{}.artifact-delta.bin",
+            Self::publication_name(&generation)
+        );
         if manifest.artifact_delta_weights.len() != manifest.artifact_deltas.len() {
             return Ok(None);
         }
@@ -4008,7 +4221,7 @@ impl FileSnapshotStorage {
         let payload_id = self.payload_snapshot_id(&manifest).clone();
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -4110,7 +4323,8 @@ impl FileSnapshotStorage {
         }
 
         let id = snapshot.id.stable_key();
-        let delta_name = format!("snapshot-{id}.artifact-delta.bin");
+        let publication = Self::publication_name(&id);
+        let delta_name = format!("snapshot-{publication}.artifact-delta.bin");
         let delta_bytes = bincode::serialize(&delta).map_err(|source| StorageError::Bincode {
             path: self.root.join(&delta_name),
             source,
@@ -4195,6 +4409,7 @@ impl FileSnapshotStorage {
                 let staged = self.stage_structural_overlay_pack(
                     &mut manifest,
                     &snapshot.id,
+                    &publication,
                     graph_overlay,
                     universe_overlay,
                     reverse_overlay,
@@ -4332,7 +4547,7 @@ impl FileSnapshotStorage {
         let payload_id = self.payload_snapshot_id(&manifest).clone();
         let packed_store = store_name.contains('#');
         let write_store_name = if packed_store {
-            "artifacts.overlay.store".to_owned()
+            Self::artifact_overlay_store(&mut manifest)
         } else {
             store_name.clone()
         };
@@ -4450,10 +4665,12 @@ impl FileSnapshotStorage {
             path: self.root.join(format!("snapshot-{id}.stats.json")),
             source,
         })?;
-        let symbol_meta_name = format!("snapshot-{id}.symbol-meta-overlay.bin");
+        // Both are composed over every overlay since the base, so they depend on history too.
+        let publication = Self::publication_name(&id);
+        let symbol_meta_name = format!("snapshot-{publication}.symbol-meta-overlay.bin");
         self.atomic_write_bincode(&self.root.join(&symbol_meta_name), &symbol_meta_overlay)?;
         let search_name = if let Some(overlay) = &search_overlay {
-            let name = format!("snapshot-{id}.search-overlay.bin");
+            let name = format!("snapshot-{publication}.search-overlay.bin");
             self.atomic_write_bincode(&self.root.join(&name), overlay)?;
             Some(name)
         } else {
@@ -4463,6 +4680,7 @@ impl FileSnapshotStorage {
         let staged = self.stage_structural_overlay_pack(
             &mut manifest,
             snapshot_id,
+            &publication,
             graph_overlay,
             universe_overlay,
             reverse_overlay,
@@ -4594,9 +4812,22 @@ impl FileSnapshotStorage {
             files,
             edges: Vec::new(),
         };
+        // The payload still holds the base revisions, so the compacted index has to keep saying
+        // which paths differ from it. That set depends on the history, not only on the content,
+        // so the files are named per publication like any other history-dependent file.
+        let ArtifactIndex {
+            overrides,
+            tombstones,
+            ..
+        } = index;
         let generation = manifest.snapshot_id.stable_key();
-        let (artifact_index, artifact_store, artifact_locator, artifact_state) =
-            self.write_initial_artifact_store(&format!("{generation}-compact"), &compact_snapshot)?;
+        let (artifact_index, artifact_store, artifact_locator, artifact_state) = self
+            .write_initial_artifact_store(
+                &format!("{}-compact", Self::publication_name(&generation)),
+                &compact_snapshot,
+                overrides,
+                tombstones,
+            )?;
         manifest.artifact_index = Some(artifact_index);
         manifest.artifact_store = Some(artifact_store);
         manifest.artifact_locator = Some(artifact_locator);
@@ -4714,10 +4945,11 @@ impl FileSnapshotStorage {
     }
 
     fn ensure_not_a_downgrade(&self) -> Result<(), StorageError> {
-        // Deliberately bypasses the manifest cache. That cache is keyed on mtime, and coarse
-        // filesystem timestamps -- Windows in particular -- can return the previous manifest for one
-        // written in the same tick. A stale read here either refuses a legitimate upgrade or lets a
-        // real downgrade through, so this one check pays for a fresh read.
+        // Deliberately bypasses the manifest cache. Its key is metadata, and coarse filesystem
+        // timestamps -- Windows in particular, which has no inode in the key -- can still match the
+        // previous manifest for one rewritten in the same tick. A stale read here either refuses a
+        // legitimate upgrade or lets a real downgrade through, so this one check pays for a fresh
+        // read.
         let Some(existing) = self.read_manifest_uncached()? else {
             return Ok(());
         };
@@ -4765,6 +4997,8 @@ impl FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        after_manifest_read(&self.root);
         self.ensure_supported_schema(&manifest)?;
         if let Some(chain) = manifest
             .structural_packs
@@ -4845,7 +5079,7 @@ impl FileSnapshotStorage {
                     return Ok(Some(graph));
                 }
             }
-            if let Some(state) = self.open_structural_graph_base()? {
+            if let Some(state) = self.structural_graph_base_in(&manifest)? {
                 return Ok(Some(GraphIndex::from_edges(
                     &state.edges(),
                     manifest.snapshot_id.stable_key(),
@@ -5509,7 +5743,8 @@ impl SnapshotStorage for FileSnapshotStorage {
         };
         let artifact_task = || {
             let t = std::time::Instant::now();
-            let out = self.write_initial_artifact_store(&id, snapshot);
+            let out =
+                self.write_initial_artifact_store(&id, snapshot, BTreeSet::new(), BTreeSet::new());
             crate::timing::stage("publish.artifact_store", t, String::new);
             out
         };
@@ -5580,6 +5815,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             artifact_deltas: Vec::new(),
             artifact_delta_weights: Vec::new(),
             artifact_store: Some(artifact_store),
+            artifact_overlay_store: None,
             artifact_locator: Some(artifact_locator),
             artifact_state: Some(artifact_state),
             artifact_live_bytes: Some(artifact_live_bytes),
@@ -5605,6 +5841,10 @@ impl SnapshotStorage for FileSnapshotStorage {
         let Some(manifest) = self.read_manifest()? else {
             return Ok(None);
         };
+        // Everything below answers from this manifest; reading `CURRENT` again could mix in a
+        // generation published since.
+        #[cfg(test)]
+        after_manifest_read(&self.root);
         if manifest.schema_version != SCHEMA_VERSION {
             return Err(StorageError::Invalid {
                 path: self.current_path(),
@@ -5653,11 +5893,12 @@ impl SnapshotStorage for FileSnapshotStorage {
             let mut files = BTreeMap::new();
             for path in index.entries.keys() {
                 let artifact = if index.overrides.contains(path) {
-                    self.open_artifact(path)?
-                        .ok_or_else(|| StorageError::Invalid {
+                    self.open_artifact_in(&manifest, path)?.ok_or_else(|| {
+                        StorageError::Invalid {
                             path: base_path.clone(),
                             message: format!("missing overlaid artifact {path}"),
-                        })?
+                        }
+                    })?
                 } else {
                     let key = format!("artifact/{path}");
                     let bytes = reader
@@ -5680,7 +5921,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             if manifest.structural_packs.as_ref().is_some_and(|chain| {
                 !chain.overlays.is_empty()
                     && chain.current_snapshot == manifest.snapshot_id.stable_key()
-            }) && let Some(graph) = self.open_structural_graph_base()?
+            }) && let Some(graph) = self.structural_graph_base_in(&manifest)?
             {
                 edges = graph.edges();
             }
@@ -5723,7 +5964,7 @@ impl SnapshotStorage for FileSnapshotStorage {
             .structural_packs
             .as_ref()
             .is_some_and(|chain| chain.current_snapshot == manifest.snapshot_id.stable_key())
-            && let Some(graph) = self.open_structural_graph_base()?
+            && let Some(graph) = self.structural_graph_base_in(&manifest)?
         {
             // The incremental writer deliberately avoids rebuilding the global edge vector.
             // Materialize it only when the full-snapshot API explicitly asks for it.
@@ -6411,6 +6652,205 @@ mod tests {
         assert!(!reverse.tombstones.contains("changed.ts"));
     }
 
+    /// Undoing an edit brings an earlier generation key back. The merged tier written then used to
+    /// take the name of one the chain still held, so the chain composed the new records with
+    /// themselves and every edit before the undone one was lost.
+    #[test]
+    fn a_recurring_generation_key_keeps_the_overlays_it_chains() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot();
+        store.publish(&base).unwrap();
+        let staged = store
+            .stage_structural_pack_base(StructuralPackBase {
+                snapshot_id: base.id.stable_key(),
+                universe: ResolutionUniverse::default(),
+                reverse: ReverseShardSet {
+                    format_version: ReverseShardSet::FORMAT_VERSION,
+                    resolver_fingerprint: String::new(),
+                    shard_bits: 0,
+                    shards: BTreeMap::new(),
+                },
+                graph: IncrementalGraphState::default(),
+            })
+            .unwrap();
+        store.attach_structural_pack_base(staged).unwrap();
+
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        // Edit f0, f1, f2 in turn, then undo f2: the tree is back to the state after f1.
+        let steps = [
+            ("f0.ts", "state-0", true),
+            ("f1.ts", "state-1", true),
+            ("f2.ts", "state-2", true),
+            ("f2.ts", "state-1", false),
+        ];
+        let mut current = base;
+        for (path, state, upsert) in steps {
+            current.id.content_state = state.into();
+            let mut graph = IncrementalGraphOverlay::default();
+            if upsert {
+                graph.file_upserts.insert(path.into(), BTreeSet::new());
+            } else {
+                graph.file_tombstones.insert(path.into());
+            }
+            assert!(
+                store
+                    .publish_structural_overlay(
+                        &current,
+                        &BTreeSet::from([path.to_owned()]),
+                        Some((&graph, &ResolutionUniverseOverlay::default(), &reverse)),
+                        false,
+                        None,
+                    )
+                    .unwrap()
+            );
+        }
+
+        let manifest = store.read_manifest().unwrap().unwrap();
+        let chain = manifest.structural_packs.unwrap();
+        let distinct: BTreeSet<_> = chain.overlays.iter().collect();
+        assert_eq!(distinct.len(), chain.overlays.len(), "{:?}", chain.overlays);
+        let composed = chain
+            .overlays
+            .iter()
+            .map(|name| store.read_structural_overlay_records(name).unwrap().graph)
+            .reduce(compose_graph_overlay)
+            .unwrap();
+        for kept in ["f0.ts", "f1.ts"] {
+            assert!(composed.file_upserts.contains_key(kept), "{composed:?}");
+        }
+        assert!(!composed.file_upserts.contains_key("f2.ts"));
+    }
+
+    /// The content-only counterpart: an undo republished the artifact delta under the name of the
+    /// heavier tier the manifest still listed, so it was listed twice and the earlier edits vanished.
+    #[test]
+    fn a_recurring_generation_key_keeps_the_artifact_deltas_it_layers() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot_with_files(6);
+        store.publish(&base).unwrap();
+        for index in 1..=5 {
+            publish_body_edit(&store, &format!("src/file-{index}.ts"), index);
+        }
+        let revert = base.files["src/file-5.ts"].clone();
+        store
+            .publish_artifact_deltas(&[("src/file-5.ts".to_owned(), revert.clone())])
+            .unwrap()
+            .unwrap();
+
+        let manifest = store.read_manifest().unwrap().unwrap();
+        let distinct: BTreeSet<_> = manifest.artifact_deltas.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            manifest.artifact_deltas.len(),
+            "{:?}",
+            manifest.artifact_deltas
+        );
+        let current = store.open_current().unwrap().unwrap();
+        for index in 1..=4 {
+            let path = format!("src/file-{index}.ts");
+            let edited = crate::scanner::parse_source(
+                &path,
+                format!("export const value = 0; // revision {index}\n").as_bytes(),
+            );
+            assert_eq!(
+                current.files[&path].source_hash, edited.source_hash,
+                "{path}"
+            );
+            assert_eq!(
+                store.open_artifact(&path).unwrap().unwrap().source_hash,
+                edited.source_hash,
+                "{path}"
+            );
+        }
+        assert_eq!(current.files["src/file-5.ts"], revert);
+        assert_eq!(current.files["src/file-0.ts"], base.files["src/file-0.ts"]);
+    }
+
+    /// Names unique to one publication belong to the manifests that list them like any other:
+    /// once none of those is retained, GC collects them, and nothing else is left behind.
+    #[test]
+    fn per_publication_files_go_with_the_manifests_that_list_them() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let base = snapshot_with_files(2);
+        publish_packed(&store, &base);
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        let changed = BTreeSet::from(["src/file-1.ts".to_owned()]);
+        // Edits and undos, so both kinds of generation key keep recurring, and a full index halfway
+        // that ends the first chain.
+        for round in 0..24 {
+            if round == 12 {
+                let mut rebuilt = base.clone();
+                rebuilt.id.content_state = "rebuilt".into();
+                publish_packed(&store, &rebuilt);
+            }
+            if round % 3 == 2 {
+                let mut current = base.clone();
+                current.id.content_state = format!("structural-{}", round % 2);
+                let mut graph = IncrementalGraphOverlay::default();
+                graph
+                    .file_upserts
+                    .insert("src/file-1.ts".into(), BTreeSet::new());
+                assert!(
+                    store
+                        .publish_structural_overlay(
+                            &current,
+                            &changed,
+                            Some((&graph, &ResolutionUniverseOverlay::default(), &reverse)),
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                );
+            } else if round % 2 == 0 {
+                publish_body_edit(&store, "src/file-0.ts", 1);
+            } else {
+                store
+                    .publish_artifact_deltas(&[(
+                        "src/file-0.ts".to_owned(),
+                        base.files["src/file-0.ts"].clone(),
+                    )])
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        assert!(!store.gc_generations().unwrap().deferred_for_readers);
+
+        let names: BTreeSet<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "CURRENT" && !name.ends_with(".lock"))
+            .collect();
+        let manifests: Vec<_> = names
+            .iter()
+            .filter(|name| name.ends_with(".manifest.json"))
+            .collect();
+        assert!(manifests.len() <= 2, "{manifests:?}");
+        let mut listed: BTreeSet<String> = manifests.iter().map(|name| (*name).clone()).collect();
+        for name in &manifests {
+            let manifest: Manifest =
+                serde_json::from_slice(&fs::read(dir.path().join(name)).unwrap()).unwrap();
+            listed.extend(FileSnapshotStorage::manifest_component_paths(&manifest));
+        }
+        let leaked: Vec<_> = names.difference(&listed).collect();
+        assert!(leaked.is_empty(), "outlived every manifest: {leaked:?}");
+    }
+
     fn publish_body_edit(store: &FileSnapshotStorage, path: &str, revision: usize) {
         let source = format!("export const value = 0; // revision {revision}\n");
         let mut artifact = crate::scanner::parse_source(path, source.as_bytes());
@@ -6616,6 +7056,54 @@ mod tests {
             .expect("rebuilding an older index forward is how an upgrade lands");
     }
 
+    /// Generation GC never collects `staged-*`, so a full index refused after staging its base pack
+    /// used to leave the whole pack behind.
+    #[test]
+    fn a_refused_packed_publication_leaves_no_staged_pack_behind() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let first = snapshot_with_files(2);
+        publish_packed(&store, &first);
+        let mut next = first;
+        next.id.content_state = "next".into();
+        let leftovers = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("staged-"))
+                .collect::<Vec<_>>()
+        };
+        let index_becomes_newer = || {
+            let path = dir
+                .path()
+                .join(store.current_generation().unwrap().unwrap());
+            let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest.schema_version = SCHEMA_VERSION + 1;
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        };
+
+        // A newer binary publishes while this one stages: the refusal comes after the pack exists.
+        let mut stager = store
+            .begin_structural_pack_base(next.id.stable_key())
+            .unwrap();
+        stager.stage_snapshot(&next).unwrap();
+        let staged = stager.finish().unwrap();
+        assert_eq!(leftovers().len(), 1);
+        index_becomes_newer();
+        let error = store
+            .publish_packed_snapshot(&next, staged)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("newer Ravel"), "{error}");
+        assert_eq!(leftovers(), Vec::<String>::new());
+
+        // Already newer when staging would begin: refused before any of the pack is written.
+        let refused = store.begin_structural_pack_base(next.id.stable_key());
+        assert!(refused.is_err());
+        assert_eq!(leftovers(), Vec::<String>::new());
+    }
+
     #[test]
     fn every_cold_sidecar_rejects_old_schema_with_reindex_guidance() {
         let dir = tempdir().unwrap();
@@ -6645,6 +7133,195 @@ mod tests {
                 .all(|error| error.to_string().contains("run `ravel index`"))
         );
     }
+    /// A whole-generation read answers from the manifest it read first. `open_current` looked each
+    /// edited artifact up through `CURRENT` again, so a sync landing mid-read handed it the next
+    /// generation's file under this generation's id.
+    #[test]
+    fn a_snapshot_reads_one_generation_while_the_next_is_published() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        publish_packed(&store, &snapshot_with_files(2));
+        publish_body_edit(&store, "src/file-0.ts", 1);
+        let read_from = store.read_manifest().unwrap().unwrap();
+        let writer = dir.path().to_path_buf();
+        *AFTER_MANIFEST_READ.lock().unwrap() = Some((
+            dir.path().to_path_buf(),
+            Box::new(move || {
+                publish_body_edit(&FileSnapshotStorage::new(&writer), "src/file-0.ts", 2);
+            }),
+        ));
+
+        let snapshot = store.open_current().unwrap().unwrap();
+        assert!(
+            AFTER_MANIFEST_READ.lock().unwrap().is_none(),
+            "hook never ran"
+        );
+        assert_ne!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            read_from.snapshot_id
+        );
+        assert_eq!(snapshot.id, read_from.snapshot_id);
+        let revision_1 = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 1\n",
+        );
+        assert_eq!(
+            snapshot.files["src/file-0.ts"].source_hash,
+            revision_1.source_hash
+        );
+    }
+
+    /// The same for the graph: when the archived graph predates the generation, `open_graph`
+    /// rebuilds it from the structural chain, which it also read through `CURRENT` again.
+    #[test]
+    fn a_graph_reads_one_generation_while_the_next_is_published() {
+        let _failpoint_guard = STRUCTURAL_FAILPOINT_TEST_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let import = |to: &str| crate::model::Edge {
+            from: "src/a.ts".into(),
+            to: to.into(),
+            kind: crate::model::EdgeKind::Import,
+            confidence: crate::model::EdgeConfidence::Resolved {
+                score: 1.0,
+                reason: "test".into(),
+            },
+            type_only: false,
+            source_path: Some("src/a.ts".into()),
+            span: None,
+            provenance: crate::model::EdgeProvenance::Resolution,
+        };
+        let mut base = snapshot();
+        base.edges = vec![import("src/b.ts")];
+        let mut stager = store
+            .begin_structural_pack_base(base.id.stable_key())
+            .unwrap();
+        stager.stage_graph_edges(&base.edges).unwrap();
+        stager.stage_snapshot(&base).unwrap();
+        let staged = stager.finish().unwrap();
+        store.publish_packed_snapshot(&base, staged).unwrap();
+
+        let mut state = IncrementalGraphState::from_edges(&base.edges);
+        let mut retarget = |to: &str| {
+            state.replace_owned_files(BTreeMap::from([(
+                "src/a.ts".to_owned(),
+                Some(BTreeSet::from([crate::incremental_graph::OwnedEdge::from(
+                    &import(to),
+                )])),
+            )]))
+        };
+        let reverse = ReverseOverlaySet {
+            format_version: ReverseOverlaySet::FORMAT_VERSION,
+            resolver_fingerprint: String::new(),
+            shard_bits: 0,
+            shards: BTreeMap::new(),
+        };
+        let changed = BTreeSet::from(["src/a.ts".to_owned()]);
+        let mut read_from = base.clone();
+        read_from.id.content_state = "imports c".into();
+        let overlay = retarget("src/c.ts");
+        let universe = ResolutionUniverseOverlay::default();
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &read_from,
+                    &changed,
+                    Some((&overlay, &universe, &reverse)),
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        let mut next = base;
+        next.id.content_state = "imports d".into();
+        let next_overlay = retarget("src/d.ts");
+        let writer = dir.path().to_path_buf();
+        *AFTER_MANIFEST_READ.lock().unwrap() = Some((
+            dir.path().to_path_buf(),
+            Box::new(move || {
+                assert!(
+                    FileSnapshotStorage::new(&writer)
+                        .publish_structural_overlay(
+                            &next,
+                            &changed,
+                            Some((&next_overlay, &universe, &reverse)),
+                            false,
+                            None,
+                        )
+                        .unwrap()
+                );
+            }),
+        ));
+
+        let graph = store.open_graph().unwrap().unwrap();
+        assert!(
+            AFTER_MANIFEST_READ.lock().unwrap().is_none(),
+            "hook never ran"
+        );
+        assert_eq!(graph.snapshot_id(), read_from.id.stable_key());
+        assert_eq!(graph.neighbors_forward("src/a.ts"), vec!["src/c.ts"]);
+    }
+
+    /// The manifest cache was keyed on mtime alone, taken after the bytes were read. Where
+    /// timestamps are coarse, two generations published in one tick share an mtime, and the cache
+    /// kept answering with the first.
+    #[test]
+    fn the_manifest_cache_tells_manifests_written_in_one_tick_apart() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let first = snapshot_with_files(1);
+        store.publish(&first).unwrap();
+        let first_name = store.current_generation().unwrap().unwrap();
+        let tick = fs::metadata(dir.path().join(&first_name))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            first.id
+        );
+        let in_the_same_tick = |name: &str| {
+            fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+        };
+
+        // The next generation, published by another handle.
+        let mut second = first.clone();
+        second.id.content_state = "second".into();
+        FileSnapshotStorage::new(dir.path())
+            .publish(&second)
+            .unwrap();
+        let second_name = store.current_generation().unwrap().unwrap();
+        in_the_same_tick(&second_name);
+        assert_eq!(
+            store.read_manifest().unwrap().unwrap().snapshot_id,
+            second.id
+        );
+
+        // The current manifest rewritten under its own name (as compaction does), same length.
+        #[cfg(unix)]
+        {
+            let path = dir.path().join(&second_name);
+            let mut manifest: Manifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let flipped = if manifest.checksum.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            };
+            manifest.checksum.replace_range(..1, flipped);
+            atomic_write(&path, &serde_json::to_vec(&manifest).unwrap()).unwrap();
+            in_the_same_tick(&second_name);
+            assert_eq!(
+                store.read_manifest().unwrap().unwrap().checksum,
+                manifest.checksum
+            );
+        }
+    }
+
     #[test]
     fn checksum_corruption_is_rejected() {
         let dir = tempdir().unwrap();
@@ -6801,6 +7478,180 @@ mod tests {
         }
     }
 
+    /// The packed base `ravel index` publishes, without the structural sections a sync reads.
+    fn publish_packed(store: &FileSnapshotStorage, snapshot: &IndexSnapshot) {
+        let mut stager = store
+            .begin_structural_pack_base(snapshot.id.stable_key())
+            .unwrap();
+        stager.stage_snapshot(snapshot).unwrap();
+        let staged = stager.finish().unwrap();
+        store.publish_packed_snapshot(snapshot, staged).unwrap();
+    }
+
+    fn overlay_store_names(path: &Path) -> BTreeSet<String> {
+        fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with("overlay.store"))
+            .collect()
+    }
+
+    fn overlay_store_bytes(path: &Path) -> u64 {
+        overlay_store_names(path)
+            .iter()
+            .map(|name| fs::metadata(path.join(name)).unwrap().len())
+            .sum()
+    }
+
+    /// Every sync over a packed base appended to one `artifacts.overlay.store` that no manifest
+    /// named, so no GC collected it and no full index reset it: it grew for the life of the
+    /// workspace.
+    #[test]
+    fn a_packed_chains_overlay_store_is_collected_with_the_chain() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let mut base = snapshot_with_files(4);
+        publish_packed(&store, &base);
+        for revision in 1..=12 {
+            publish_body_edit(&store, &format!("src/file-{}.ts", revision % 4), revision);
+        }
+        let first_chain = overlay_store_bytes(dir.path());
+        assert!(first_chain > 0);
+
+        base.id.content_state = "rebuilt".into();
+        publish_packed(&store, &base);
+        for revision in 13..=15 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        let second_chain = overlay_store_bytes(dir.path());
+        assert!(
+            second_chain < first_chain,
+            "the first chain's store outlived it: {first_chain} -> {second_chain} bytes in {:?}",
+            overlay_store_names(dir.path())
+        );
+        let manifest = store.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([manifest.artifact_overlay_store.unwrap()])
+        );
+        let edited = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 15\n",
+        );
+        let current = store.open_current().unwrap().unwrap();
+        assert_eq!(
+            current.files["src/file-0.ts"].source_hash,
+            edited.source_hash
+        );
+        assert_eq!(current.files["src/file-1.ts"], base.files["src/file-1.ts"]);
+    }
+
+    /// A decoded index is carried forward only within the chain it was decoded from. A base
+    /// republished under the same name (the tree is back to an indexed state) starts another
+    /// overlay store; an entry carried over from the old chain pointed into a store GC collects.
+    #[test]
+    fn a_shared_artifact_index_is_not_carried_into_a_republished_base() {
+        let dir = tempdir().unwrap();
+        let writer = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let base = snapshot_with_files(3);
+        publish_packed(&writer, &base);
+        let shared = SharedArtifactIndex::default();
+        let sharing = || {
+            FileSnapshotStorage::with_retention(dir.path(), 2).with_shared_artifact_index(&shared)
+        };
+
+        // Edit and revert file-1: its entry now lives in this chain's overlay store.
+        publish_body_edit(&writer, "src/file-1.ts", 1);
+        writer
+            .publish_artifact_deltas(&[(
+                "src/file-1.ts".to_owned(),
+                base.files["src/file-1.ts"].clone(),
+            )])
+            .unwrap()
+            .unwrap();
+        let manifest = writer.read_manifest().unwrap().unwrap();
+        sharing().cached_artifact_index(&manifest).unwrap().unwrap();
+
+        publish_packed(&writer, &base);
+        for revision in 2..=3 {
+            publish_body_edit(&writer, "src/file-2.ts", revision);
+        }
+        let reader = sharing();
+        assert_eq!(
+            reader.open_artifact("src/file-1.ts").unwrap().unwrap(),
+            base.files["src/file-1.ts"]
+        );
+        let manifest = writer.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            *reader.cached_artifact_index(&manifest).unwrap().unwrap(),
+            FileSnapshotStorage::new(dir.path())
+                .read_artifact_index(&manifest)
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    /// A manifest with deltas that does not name its overlay store -- written before the field
+    /// existed, or by a binary that drops it -- may read from any of them, so GC keeps them all
+    /// for as long as one is retained, and collects them once none is.
+    #[test]
+    fn overlay_stores_outlive_a_retained_manifest_that_does_not_name_its_own() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::with_retention(dir.path(), 2);
+        let mut base = snapshot_with_files(2);
+        publish_packed(&store, &base);
+        publish_body_edit(&store, "src/file-0.ts", 1);
+        let recorded = store
+            .read_manifest()
+            .unwrap()
+            .unwrap()
+            .artifact_overlay_store
+            .unwrap();
+
+        // Stand in for an older binary rewriting the manifest without the field.
+        let current = dir
+            .path()
+            .join(store.current_generation().unwrap().unwrap());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_overlay_store");
+        fs::write(&current, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        store.clear_manifest_cache();
+        // The chain keeps writing where its unrecorded deltas went.
+        publish_body_edit(&store, "src/file-1.ts", 2);
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([recorded.clone(), LEGACY_ARTIFACT_OVERLAY_STORE.to_owned()])
+        );
+        store.gc_generations().unwrap();
+        assert_eq!(overlay_store_names(dir.path()).len(), 2);
+        for (path, revision) in [("src/file-0.ts", 1), ("src/file-1.ts", 2)] {
+            let edited = crate::scanner::parse_source(
+                path,
+                format!("export const value = 0; // revision {revision}\n").as_bytes(),
+            );
+            assert_eq!(
+                store.open_artifact(path).unwrap().unwrap().source_hash,
+                edited.source_hash
+            );
+        }
+
+        base.id.content_state = "rebuilt".into();
+        publish_packed(&store, &base);
+        for revision in 3..=4 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        let manifest = store.read_manifest().unwrap().unwrap();
+        assert_eq!(
+            overlay_store_names(dir.path()),
+            BTreeSet::from([manifest.artifact_overlay_store.unwrap()])
+        );
+    }
+
     #[test]
     fn artifact_store_amplification_compacts_and_respects_retention() {
         let dir = tempdir().unwrap();
@@ -6834,6 +7685,55 @@ mod tests {
             b"export const value = 0; // revision 64\n",
         );
         assert_eq!(artifact.source_hash, expected.source_hash);
+    }
+
+    /// Compaction folds the deltas into a fresh artifact index but leaves the payload -- the base's
+    /// full snapshot -- in place. The new index forgot which paths differ from that payload, so
+    /// `open_current` answered each edited file with its base revision and kept deleted ones.
+    #[test]
+    fn compaction_keeps_the_edits_and_deletions_layered_over_the_payload() {
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        let base = snapshot_with_files(3);
+        store.publish(&base).unwrap();
+        let mut current = base.clone();
+        current.files.remove("src/file-2.ts");
+        current.id.content_state = "file-2 deleted".into();
+        assert!(
+            store
+                .publish_structural_overlay(
+                    &current,
+                    &BTreeSet::from(["src/file-2.ts".to_owned()]),
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        for revision in 1..=4 {
+            publish_body_edit(&store, "src/file-0.ts", revision);
+        }
+        assert!(store.compact_artifacts_if_amplified(1, 3).unwrap());
+        assert!(
+            store
+                .read_manifest()
+                .unwrap()
+                .unwrap()
+                .artifact_deltas
+                .is_empty()
+        );
+
+        let snapshot = store.open_current().unwrap().unwrap();
+        let edited = crate::scanner::parse_source(
+            "src/file-0.ts",
+            b"export const value = 0; // revision 4\n",
+        );
+        assert_eq!(
+            snapshot.files["src/file-0.ts"].source_hash,
+            edited.source_hash
+        );
+        assert!(!snapshot.files.contains_key("src/file-2.ts"));
+        assert_eq!(snapshot.files["src/file-1.ts"], base.files["src/file-1.ts"]);
     }
 
     #[test]
@@ -6883,6 +7783,34 @@ mod tests {
                 .unwrap()
         );
         worker.join().unwrap();
+    }
+
+    /// Every artifact read takes this shared lock, and closing a handle that was opened for writing
+    /// reaches a file watcher as a finished write -- the same fix `GenerationGuard` already has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_artifact_read_lock_is_taken_through_a_read_only_handle() {
+        use std::os::fd::AsRawFd;
+        const O_RDONLY: u32 = 0;
+        const O_RDWR: u32 = 2;
+        let access_mode = |file: &fs::File| {
+            let info =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .unwrap();
+            u32::from_str_radix(flags.trim(), 8).unwrap() & 0o3
+        };
+        let dir = tempdir().unwrap();
+        let store = FileSnapshotStorage::new(dir.path());
+        // The first reader creates the file, which needs a write-capable open; later ones do not.
+        drop(store.acquire_artifact_read_lock().unwrap());
+        let reader = store.acquire_artifact_read_lock().unwrap();
+        assert_eq!(access_mode(&reader), O_RDONLY);
+        drop(reader);
+        let compactor = store.acquire_artifact_gc_lock().unwrap();
+        assert_eq!(access_mode(&compactor), O_RDWR);
     }
 
     #[test]
@@ -7043,6 +7971,7 @@ mod tests {
             artifact_deltas: vec!["snapshot-overlay.pack#artifact/delta".into()],
             artifact_delta_weights: vec![1],
             artifact_store: None,
+            artifact_overlay_store: None,
             artifact_locator: None,
             artifact_state: None,
             artifact_live_bytes: None,

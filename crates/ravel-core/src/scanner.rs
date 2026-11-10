@@ -18,7 +18,9 @@ use std::{
 use thiserror::Error;
 use tree_sitter::{Node, Parser};
 
-pub const EXTRACTOR_VERSION: &str = "ts-js-structural-v4";
+/// Part of every snapshot id: a sync after it changes re-indexes, so an index never mixes
+/// artifacts extracted by two versions. Bump it whenever extraction output changes.
+pub const EXTRACTOR_VERSION: &str = "ts-js-structural-v5";
 pub const GRAMMAR_VERSION: &str = "tree-sitter-typescript-0.23+javascript-0.25";
 static EXTRACTOR_VERSION_SHARED: LazyLock<Arc<str>> =
     LazyLock::new(|| Arc::from(EXTRACTOR_VERSION));
@@ -507,24 +509,57 @@ fn extract_node(
     .flatten();
     let enclosing = scoped_owner.as_ref().or(enclosing);
 
-    let is_branch = matches!(
-        kind,
-        "if_statement"
-            | "else_clause"
-            | "for_statement"
-            | "for_in_statement"
-            | "while_statement"
-            | "do_statement"
-            | "switch_case"
-            | "switch_default"
-            | "catch_clause"
-            | "ternary_expression"
-            | "conditional_type"
-    ) || matches!(kind, "binary_expression" if is_logical_binary(node));
-    if is_branch {
-        if let Some((cyc, cog)) = complexity {
+    // Object literals, inline object types and class expressions that no declaration names start
+    // a new member scope: a method inside them is not a member of the class whose method they sit
+    // in. `const C = class {}` keeps the owner its declarator gave it.
+    let detached_owner = (matches!(kind, "object" | "object_type")
+        || (matches!(kind, "class" | "class_expression")
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind() != "variable_declarator")))
+    .then(|| {
+        enclosing
+            .filter(|owner| owner.member_owner.is_some())
+            .cloned()
+            .map(|mut owner| {
+                owner.member_owner = None;
+                owner
+            })
+    })
+    .flatten();
+    let enclosing = detached_owner.as_ref().or(enclosing);
+
+    // `else if` and `else` continue the `if` they belong to: `else if` is one more decision and
+    // `else` none, each adds one unnested cognitive point, and neither nests its body any deeper
+    // than the first branch's.
+    let else_if = kind == "if_statement"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "else_clause");
+    let is_branch = (!else_if
+        && matches!(
+            kind,
+            "if_statement"
+                | "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_case"
+                | "switch_default"
+                | "catch_clause"
+                | "ternary_expression"
+                | "conditional_type"
+        ))
+        || matches!(kind, "binary_expression" if is_logical_binary(node));
+    if let Some((cyc, cog)) = complexity {
+        if is_branch {
             *cyc = cyc.saturating_add(1);
             *cog = cog.saturating_add(1 + nesting);
+        } else if else_if {
+            *cyc = cyc.saturating_add(1);
+            *cog = cog.saturating_add(1);
+        } else if kind == "else_clause" && !has_named_child_of_kind(node, &["if_statement"]) {
+            *cog = cog.saturating_add(1);
         }
     }
     let next_nesting = if is_branch { nesting + 1 } else { nesting };
@@ -537,7 +572,9 @@ fn extract_node(
     }
 
     if kind == "export_statement" {
-        exports.push(extract_export(node, source));
+        if is_module_level(node) {
+            exports.push(extract_export(node, source));
+        }
         let declaration = node.child_by_field_name("declaration");
         let declaration_id = declaration.map(|n| n.id());
         let symbols_before_declaration = symbols.len();
@@ -799,6 +836,14 @@ fn extract_node(
                 push_heritage(node, source, from, EdgeKind::Extends, refs);
                 return;
             }
+            // tree-sitter-javascript has no `extends_clause`: its heritage is `extends <expression>`
+            // directly. The expression is still walked below, so a computed base (`Mixin(Base)`)
+            // keeps its call edge.
+            "class_heritage"
+                if !has_named_child_of_kind(node, &["extends_clause", "implements_clause"]) =>
+            {
+                push_heritage(node, source, from, EdgeKind::Extends, refs);
+            }
             "implements_clause" => {
                 push_heritage(node, source, from, EdgeKind::Implements, refs);
                 return;
@@ -823,6 +868,27 @@ fn extract_node(
             }
             _ => {}
         }
+    }
+
+    // `export declare function f(): T;` exports what `declare` wraps.
+    if kind == "ambient_declaration" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            extract_node(
+                child,
+                path,
+                source,
+                symbols,
+                imports,
+                exports,
+                refs,
+                complexity,
+                enclosing,
+                next_nesting,
+                exported,
+            );
+        }
+        return;
     }
 
     if matches!(
@@ -882,7 +948,7 @@ fn extract_node(
     }
 
     if matches!(kind, "required_parameter" | "optional_parameter")
-        && is_parameter_property(node, source)
+        && is_parameter_property(node)
         && enclosing
             .and_then(|owner| owner.member_owner.as_ref())
             .is_some()
@@ -968,7 +1034,10 @@ fn extract_node(
                 .and_then(|owner| owner.member_owner.as_ref())
                 .is_some())
     {
-        let name_node = node.child_by_field_name("name");
+        // tree-sitter-javascript names a class field `property`, not `name`.
+        let name_node = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"));
         let static_name = name_node
             .and_then(|name| static_name(name, source))
             .or_else(|| exported.then(|| "default".to_owned()));
@@ -1219,8 +1288,16 @@ fn extract_variable_declaration(
             // A destructuring initializer belongs to the declaration as a whole. Attribute it to
             // the first static binding only to avoid duplicate graph edges.
             if index == 0 {
-                let parent_comp = complexity.take();
+                // A function or class value is its own complexity unit. Any other initializer
+                // (`const x = a ? 1 : 2`) is part of the enclosing function's control flow.
+                let own_unit = matches!(symbol_kind, "function" | "class");
+                let parent_comp = if own_unit { complexity.take() } else { None };
                 let mut declaration_comp = (symbol_kind == "function").then_some((1u32, 0u32));
+                let walk_comp = if own_unit {
+                    &mut declaration_comp
+                } else {
+                    &mut *complexity
+                };
                 let value_to_walk = commonjs_specifier.is_none().then_some(value).flatten();
                 for child in [declarator.child_by_field_name("type"), value_to_walk]
                     .into_iter()
@@ -1234,7 +1311,7 @@ fn extract_variable_declaration(
                         imports,
                         exports,
                         refs,
-                        &mut declaration_comp,
+                        walk_comp,
                         Some(&owner),
                         nesting,
                         false,
@@ -1246,7 +1323,9 @@ fn extract_variable_declaration(
                         cognitive: if cog == 0 { 1 } else { cog },
                     });
                 }
-                *complexity = parent_comp;
+                if own_unit {
+                    *complexity = parent_comp;
+                }
             }
         }
     }
@@ -1348,14 +1427,21 @@ fn collect_import_clause(
 fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
     let text = node_text(node, source).trim_start();
     let type_only = has_leading_keywords(text, &["export", "type"]);
+    // Both grammars put a `from` clause's module in the `source` field. Any other string in the
+    // statement belongs to an exported value (`export const URL = '...'`), not to a re-export.
     let specifier = node
         .child_by_field_name("source")
-        .map(|source_node| unquote(node_text(source_node, source)))
-        .or_else(|| last_string(node, source));
+        .map(|source_node| unquote(node_text(source_node, source)));
+    // The `default` keyword token, not the text: decorators are children of the export statement
+    // and precede it (`@Component() export default class Foo {}`).
+    let is_default = {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| child.kind() == "default")
+    };
     let mut bindings = Vec::new();
     if let Some(declaration) = node.child_by_field_name("declaration") {
         let names = declared_names(declaration, source);
-        let is_default = text.starts_with("export default");
         for (name, name_span) in names {
             bindings.push(ExportBinding {
                 local: name.clone(),
@@ -1421,7 +1507,7 @@ fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
             span: span(node),
         });
     }
-    if bindings.is_empty() && text.starts_with("export default") {
+    if bindings.is_empty() && is_default {
         let local = node
             .child_by_field_name("value")
             .and_then(|value| expression_name(value, source))
@@ -1441,6 +1527,21 @@ fn extract_export(node: Node<'_>, source: &[u8]) -> Export {
         span: span(node),
         bindings,
     }
+}
+
+/// An export inside `namespace X { }` or `declare module 'm' { }` exports from that namespace or
+/// module, not from the file. Those bodies are the only statement blocks an export can sit in, so
+/// any enclosing block means the statement is not a module export. Walking ancestors rather than
+/// requiring a `program` parent keeps top-level exports that error recovery wrapped in `ERROR`.
+fn is_module_level(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "statement_block" {
+            return false;
+        }
+        ancestor = current.parent();
+    }
+    true
 }
 
 fn require_specifier(call: Node<'_>, source: &[u8]) -> Option<String> {
@@ -1508,6 +1609,14 @@ fn commonjs_import_bindings(pattern: Node<'_>, source: &[u8]) -> Vec<ImportBindi
             let mut bindings = Vec::new();
             let mut cursor = pattern.walk();
             for child in pattern.named_children(&mut cursor) {
+                // `{ a = 1 }` binds `a` exactly as `{ a }` does; the default is only a fallback.
+                let child = match child.kind() {
+                    "object_assignment_pattern" => match child.child_by_field_name("left") {
+                        Some(left) => left,
+                        None => continue,
+                    },
+                    _ => child,
+                };
                 match child.kind() {
                     "shorthand_property_identifier_pattern" => {
                         let name = node_text(child, source).to_owned();
@@ -1617,16 +1726,25 @@ fn extract_commonjs_export(node: Node<'_>, source: &[u8]) -> Option<Export> {
     })
 }
 
-fn is_parameter_property(node: Node<'_>, source: &[u8]) -> bool {
-    let text = node_text(node, source).trim_start();
-    text.starts_with("public ")
-        || text.starts_with("private ")
-        || text.starts_with("protected ")
-        || text.starts_with("readonly ")
-        || text.starts_with("override ")
+/// A modifier makes a constructor parameter a class property. Read from the parameter's own child
+/// tokens, not its text: decorators come first (`@Inject(X) private readonly svc: Svc`), which is
+/// exactly how NestJS/Angular declare injected dependencies.
+fn is_parameter_property(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "accessibility_modifier" | "override_modifier" | "readonly"
+        )
+    })
 }
 
 fn declared_names(node: Node<'_>, source: &[u8]) -> Vec<(String, Span)> {
+    if node.kind() == "ambient_declaration" {
+        return first_named_child(node)
+            .map(|declaration| declared_names(declaration, source))
+            .unwrap_or_default();
+    }
     if matches!(
         node.kind(),
         "lexical_declaration" | "variable_declaration" | "using_declaration"
@@ -1659,7 +1777,9 @@ fn collect_binding_names(node: Node<'_>, source: &[u8], result: &mut Vec<(String
                 collect_binding_names(value, source, result);
             }
         }
-        "assignment_pattern" => {
+        // `object_assignment_pattern` is a defaulted shorthand inside an object pattern
+        // (`{ data = [] }`); the bound name is on the left either way.
+        "assignment_pattern" | "object_assignment_pattern" => {
             if let Some(left) = node.child_by_field_name("left") {
                 collect_binding_names(left, source, result);
             }
@@ -1728,6 +1848,13 @@ fn collect_scope_bindings(node: Node<'_>, source: &[u8]) -> BTreeSet<String> {
         && let Some(parameter) = node.child_by_field_name("parameter")
     {
         add_pattern(parameter);
+    }
+    // `for (const x of xs)` declares `x`; `for (x of xs)` (no `kind`) assigns an outer binding.
+    if node.kind() == "for_in_statement"
+        && node.child_by_field_name("kind").is_some()
+        && let Some(left) = node.child_by_field_name("left")
+    {
+        add_pattern(left);
     }
     result
 }
@@ -1979,6 +2106,12 @@ fn first_static_child_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find_map(|child| static_name(child, source))
+}
+
+fn has_named_child_of_kind(node: Node<'_>, kinds: &[&str]) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| kinds.contains(&child.kind()))
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -2437,6 +2570,20 @@ export default Service;
     }
 
     #[test]
+    fn commonjs_destructuring_with_a_default_binds_the_name() {
+        let artifact = parse_source(
+            "legacy.cjs",
+            b"const { Service = null, helper: alias = noop } = require('./services');\n",
+        );
+        let bindings: Vec<_> = artifact.imports[0]
+            .bindings
+            .iter()
+            .map(|binding| (binding.imported.as_str(), binding.local.as_str()))
+            .collect();
+        assert_eq!(bindings, [("Service", "Service"), ("helper", "alias")]);
+    }
+
+    #[test]
     fn extracts_commonjs_imports_and_exports_without_dynamic_require_false_positives() {
         let source = br#"
 const Package = require('./package');
@@ -2670,6 +2817,37 @@ export /* public surface */ type
     }
 
     #[test]
+    fn exported_values_do_not_reexport_the_string_literals_they_contain() {
+        let artifact = parse_source(
+            "constants.tsx",
+            br#"
+export const API_URL = 'https://api.example.com';
+export const DOCS = './a';
+export default function Widget() { return <div className="box" />; }
+export default 'label';
+export { real } from './real';
+export * from "./all";
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let specifiers: Vec<_> = artifact
+            .exports
+            .iter()
+            .map(|export| export.specifier.as_deref())
+            .collect();
+        assert_eq!(
+            specifiers,
+            vec![None, None, None, None, Some("./real"), Some("./all")],
+            "{:?}",
+            artifact.exports
+        );
+    }
+
+    #[test]
     fn class_expressions_anonymous_defaults_type_queries_and_override_properties_are_extracted() {
         let artifact = parse_source(
             "expressions.ts",
@@ -2741,6 +2919,261 @@ type Remote = import('./remote').Thing;
     }
 
     #[test]
+    fn exports_inside_namespaces_and_ambient_modules_are_not_file_exports() {
+        let artifact = parse_source(
+            "declarations.ts",
+            br#"
+namespace Tools { export function work() {} }
+declare module 'm' { export function g(): void; export default function h(): void; }
+export function top() {}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let exported: Vec<_> = artifact
+            .exports
+            .iter()
+            .flat_map(|export| &export.bindings)
+            .map(|binding| binding.exported.as_str())
+            .collect();
+        assert_eq!(exported, vec!["top"], "{:?}", artifact.exports);
+        assert!(has_symbol(&artifact, "Tools.work", "function_declaration"));
+    }
+
+    #[test]
+    fn exported_ambient_declarations_are_exported() {
+        let artifact = parse_source(
+            "api.d.ts",
+            br#"
+export declare function f(): number;
+export declare class K { m(): void; }
+export declare const c: number;
+declare function local(): void;
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let exported = |name: &str| {
+            artifact
+                .symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .map(|symbol| symbol.exported)
+        };
+        for name in ["f", "K", "c"] {
+            assert_eq!(
+                exported(name),
+                Some(true),
+                "{name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert_eq!(exported("K.m"), Some(false));
+        assert_eq!(exported("local"), Some(false));
+        let bindings: BTreeSet<_> = artifact
+            .exports
+            .iter()
+            .flat_map(|export| &export.bindings)
+            .filter(|binding| binding.kind == ExportBindingKind::Declaration)
+            .map(|binding| binding.exported.as_str())
+            .collect();
+        assert_eq!(
+            bindings,
+            ["K", "c", "f"].into_iter().collect(),
+            "{:?}",
+            artifact.exports
+        );
+    }
+
+    #[test]
+    fn decorated_default_exports_keep_their_default_binding() {
+        for (source, local) in [
+            (&b"@Component({})\nexport default class Foo {}\n"[..], "Foo"),
+            (&b"@Component({})\nexport default class {}\n"[..], "default"),
+        ] {
+            let artifact = parse_source("component.ts", source);
+            assert!(
+                artifact.diagnostics.is_empty(),
+                "{:?}",
+                artifact.diagnostics
+            );
+            let bindings: Vec<_> = artifact
+                .exports
+                .iter()
+                .flat_map(|export| &export.bindings)
+                .map(|binding| {
+                    (
+                        binding.local.as_str(),
+                        binding.exported.as_str(),
+                        binding.kind.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                bindings,
+                vec![(local, "default", ExportBindingKind::Default)],
+                "{:?}",
+                artifact.exports
+            );
+        }
+    }
+
+    #[test]
+    fn decorated_constructor_parameter_properties_are_class_members() {
+        let artifact = parse_source(
+            "controller.ts",
+            br#"
+class Ctl {
+  constructor(
+    @Inject(TOKEN) private readonly svc: Svc,
+    @Optional() public other?: Other,
+    plain: Plain,
+    readonly flag: Flag,
+  ) {}
+  run() { this.svc.doIt(); }
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for name in ["Ctl.svc", "Ctl.other", "Ctl.flag"] {
+            assert!(
+                has_symbol(&artifact, name, "property"),
+                "missing {name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(!has_symbol(&artifact, "Ctl.plain", "property"));
+        let has_ref = |from: &str, to: &str, kind: EdgeKind| {
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == from
+                    && reference.to == to
+                    && reference.kind == kind
+            })
+        };
+        assert!(
+            has_ref("Ctl.svc", "Inject", EdgeKind::Decorates),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(has_ref("Ctl.svc", "Svc", EdgeKind::TypeOf));
+        assert!(has_ref("Ctl.other", "Optional", EdgeKind::Decorates));
+    }
+
+    #[test]
+    fn nested_object_literal_and_unbound_class_methods_are_not_members_of_the_enclosing_class() {
+        let artifact = parse_source(
+            "store.ts",
+            br#"
+class Store {
+  subscribe() {
+    const handle = { unsubscribe() { cleanup(); } };
+    register(class { inner() {} });
+    const Bound = class { method() {} };
+    const typed = value as { probe(): void };
+    this.unsubscribe();
+    return handle;
+  }
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for fake in ["Store.unsubscribe", "Store.inner", "Store.probe"] {
+            assert!(
+                !artifact
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.qualified_name == fake),
+                "{fake} is not a member of Store; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(has_symbol(
+            &artifact,
+            "Store.subscribe.Bound.method",
+            "method"
+        ));
+        assert!(
+            artifact
+                .symbol_refs
+                .iter()
+                .any(|reference| reference.to == "cleanup" && reference.kind == EdgeKind::Calls),
+            "{:?}",
+            artifact.symbol_refs
+        );
+    }
+
+    #[test]
+    fn javascript_class_fields_are_members() {
+        let artifact = parse_source(
+            "widget.jsx",
+            b"class W { handleClick = () => new Base(); static count = 0; #secret = 1; }",
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        for name in ["W.handleClick", "W.count", "W.#secret"] {
+            assert!(
+                has_symbol(&artifact, name, "property"),
+                "missing {name}; symbols={:?}",
+                artifact.symbols
+            );
+        }
+        assert!(
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == "W.handleClick"
+                    && reference.to == "Base"
+                    && reference.kind == EdgeKind::Instantiates
+            }),
+            "{:?}",
+            artifact.symbol_refs
+        );
+    }
+
+    #[test]
+    fn javascript_class_heritage_emits_extends_edges() {
+        let artifact = parse_source(
+            "classes.jsx",
+            b"class Child extends Base {}\nclass Other extends ns.Base {}\nconst Mixed = class extends Mixin(Base) {};",
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let has_ref = |from: &str, to: &str, kind: EdgeKind| {
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == from
+                    && reference.to == to
+                    && reference.kind == kind
+            })
+        };
+        assert!(
+            has_ref("Child", "Base", EdgeKind::Extends),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(has_ref("Other", "ns.Base", EdgeKind::Extends));
+        // A computed base has no static name, but the call that computes it is still a consumer.
+        assert!(has_ref("Mixed", "Mixin", EdgeKind::Calls));
+    }
+
+    #[test]
     fn lexical_and_type_parameter_shadowing_suppress_false_global_references() {
         let artifact = parse_source(
             "shadow.ts",
@@ -2768,6 +3201,35 @@ function outer() {
         assert!(artifact.symbol_refs.iter().any(|reference| {
             reference_owner(&artifact, reference) == "outer" && reference.to == "helper"
         }));
+    }
+
+    #[test]
+    fn for_in_and_for_of_declarations_shadow_imports() {
+        let artifact = parse_source(
+            "loops.ts",
+            br#"
+import { validate, check, pick, reset } from './v';
+function run(validators: Array<() => void>, table: object, pairs: any[]) {
+  for (const validate of validators) validate();
+  for (let check in table) check();
+  for (const [pick] of pairs) pick();
+  for (reset of validators) reset();
+}
+"#,
+        );
+        assert!(
+            artifact.diagnostics.is_empty(),
+            "{:?}",
+            artifact.diagnostics
+        );
+        let calls: BTreeSet<_> = artifact
+            .symbol_refs
+            .iter()
+            .filter(|reference| reference.kind == EdgeKind::Calls)
+            .map(|reference| reference.to.as_str())
+            .collect();
+        // `for (reset of ...)` assigns the outer binding; only a declaring head shadows.
+        assert_eq!(calls, ["reset"].into_iter().collect(), "{calls:?}");
     }
 
     #[test]
@@ -2865,6 +3327,41 @@ const [first, , third = fallback] = values;
     }
 
     #[test]
+    fn defaulted_object_destructuring_binds_and_shadows_its_names() {
+        let artifact = parse_source(
+            "defaults.ts",
+            br#"
+import { helper } from './helper';
+function useIt() { const { data = [], nested: { deep } = {} } = useQuery(); return data; }
+function f({ helper = () => 2 }) { helper(); }
+"#,
+        );
+        assert!(
+            has_symbol(&artifact, "useIt.data", "constant"),
+            "{:?}",
+            artifact.symbols
+        );
+        assert!(has_symbol(&artifact, "useIt.deep", "constant"));
+        assert!(
+            artifact.symbol_refs.iter().any(|reference| {
+                reference_owner(&artifact, reference) == "useIt.data"
+                    && reference.to == "useQuery"
+                    && reference.kind == EdgeKind::Calls
+            }),
+            "{:?}",
+            artifact.symbol_refs
+        );
+        assert!(
+            !artifact
+                .symbol_refs
+                .iter()
+                .any(|reference| reference.to == "helper"),
+            "{:?}",
+            artifact.symbol_refs
+        );
+    }
+
+    #[test]
     fn complexity_counts_nested_branches() {
         let src = br#"
 export function f(a: number) {
@@ -2882,6 +3379,41 @@ export function f(a: number) {
         assert!(c.cyclomatic >= 3, "cyclomatic={}", c.cyclomatic);
         // outer if (+1) + nested if (+1+nesting) → cognitive ≥ 3
         assert!(c.cognitive >= 3, "cognitive={}", c.cognitive);
+    }
+
+    #[test]
+    fn complexity_counts_else_if_chains_once_and_local_initializer_branches() {
+        let art = parse_source(
+            "chains.ts",
+            br#"
+export function chain(a: number) {
+  if (a > 0) { return 1; } else if (a > 1) { return 2; } else if (a > 2) { return 3; } else { return 4; }
+}
+export function nestedInElseIf(a: number) {
+  if (a > 0) {
+    return 1;
+  } else if (a > 1) {
+    if (a > 2) { return 2; }
+  }
+  return 0;
+}
+export function ternary(a: number) { const x = a ? 1 : 2; return x; }
+"#,
+        );
+        let complexity = |name: &str| {
+            let symbol = art
+                .symbols
+                .iter()
+                .find(|s| s.qualified_name == name)
+                .unwrap();
+            let c = symbol.complexity.as_ref().unwrap();
+            (c.cyclomatic, c.cognitive)
+        };
+        // Three decisions; `if`, two `else if` and `else` each add one cognitive point, unnested.
+        assert_eq!(complexity("chain"), (4, 4));
+        // The `if` in the `else if` body sits one level deep, like one in the first branch.
+        assert_eq!(complexity("nestedInElseIf"), (4, 4));
+        assert_eq!(complexity("ternary"), (2, 1));
     }
 
     #[test]
