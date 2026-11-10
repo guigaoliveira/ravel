@@ -64,8 +64,8 @@ pub enum WorkspaceQuery {
 }
 
 impl WorkspaceQuery {
-    /// How this query's answer reads as text, for the ones an agent asks often enough that the
-    /// spelling matters. The rest stay JSON: they are reports for scripts and CI.
+    /// How this query's answer reads as text. Every query has one; the `Option` is for a caller
+    /// that holds a query added later without a view, which then prints as JSON.
     pub fn view(&self) -> Option<crate::render::View> {
         use crate::render::View;
         match self {
@@ -81,12 +81,12 @@ impl WorkspaceQuery {
             // The same report `impact --risk` gives, rooted at a diff instead of a symbol.
             Self::DiffImpact { .. } => Some(View::Impact),
             Self::Packages => Some(View::Packages),
-            Self::NodeDetail { .. }
-            | Self::Ci { .. }
-            | Self::ExportDot
-            | Self::Validate { .. }
-            | Self::Boundaries
-            | Self::Schema => None,
+            Self::NodeDetail { .. } => Some(View::Symbol),
+            Self::Ci { .. } => Some(View::Ci),
+            // The graph itself rather than the envelope that carried it as one escaped string.
+            Self::ExportDot => Some(View::Dot),
+            Self::Validate { .. } | Self::Boundaries => Some(View::Findings),
+            Self::Schema => Some(View::Schema),
         }
     }
 

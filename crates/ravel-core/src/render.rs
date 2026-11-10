@@ -73,6 +73,17 @@ pub enum View {
     /// A bare list of paths (`related-tests`, the files of a package).
     Paths,
     Packages,
+    /// `schema`: counts by node and edge kind.
+    Schema,
+    /// Policy findings, bare (`boundaries`) or as a bounded report (`validate`).
+    Findings,
+    Ci,
+    /// One symbol's record (MCP `node_detail`).
+    Symbol,
+    /// `doctor`: the index status and how each agent is wired.
+    Doctor,
+    /// A DOT graph, printed as the graph.
+    Dot,
 }
 
 /// Whether a character could act on the reader instead of being read: redraw a terminal, or end
@@ -149,7 +160,8 @@ fn defused(value: &Value, inside_source: bool, key: &str) -> Value {
 pub fn text(view: View, value: &Value) -> Option<String> {
     // Almost no answer carries a control character, so the copy is made only for one that does.
     let cleaned;
-    let value = if carries_control(value, false, "") {
+    // A DOT graph is lines of its own, like a source excerpt; its arm spells out the rest.
+    let value = if view != View::Dot && carries_control(value, false, "") {
         cleaned = defused(value, false, "");
         &cleaned
     } else {
@@ -169,6 +181,12 @@ pub fn text(view: View, value: &Value) -> Option<String> {
         View::Cochanged => cochanged(value)?,
         View::Paths => paths(value)?,
         View::Packages => packages(value)?,
+        View::Schema => schema(value)?,
+        View::Findings => findings(value)?,
+        View::Ci => ci(value)?,
+        View::Symbol => symbol(value)?,
+        View::Doctor => doctor(value)?,
+        View::Dot => spell_out(str_of(value, "content")?, true),
     };
     if !out.ends_with('\n') {
         out.push('\n');
@@ -1014,6 +1032,159 @@ fn packages(value: &Value) -> Option<String> {
     Some(out)
 }
 
+/// `Calls 12, Import 40`, in the order the map holds them.
+fn counts_line(counts: Option<&Value>) -> String {
+    let parts: Vec<String> = counts
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(name, count)| format!("{name} {count}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.join(", ")
+}
+
+fn schema(value: &Value) -> Option<String> {
+    value.get("node_kinds")?.as_object()?;
+    Some(format!(
+        "{} files, {} edges, {} packages\nnodes: {}\nedges: {}\n",
+        num(value, "files"),
+        num(value, "edges"),
+        num(value, "packages"),
+        counts_line(value.get("node_kinds")),
+        counts_line(value.get("edge_kinds")),
+    ))
+}
+
+fn write_findings(out: &mut String, findings: &[Value]) -> Option<()> {
+    for finding in findings {
+        let _ = writeln!(
+            out,
+            "{}: {} -> {}: {}",
+            str_of(finding, "code")?,
+            str_of(finding, "from").unwrap_or("?"),
+            str_of(finding, "to").unwrap_or("?"),
+            str_of(finding, "message").unwrap_or_default()
+        );
+    }
+    Some(())
+}
+
+fn findings(value: &Value) -> Option<String> {
+    let mut out = String::new();
+    if let Some(bare) = value.as_array() {
+        if bare.is_empty() {
+            return Some("no findings\n".to_owned());
+        }
+        let _ = writeln!(out, "{} finding(s):", bare.len());
+        write_findings(&mut out, bare)?;
+        return Some(out);
+    }
+    let listed = value.get("findings")?.as_array()?;
+    let total = num(value, "total");
+    if total == 0 {
+        return Some("no findings\n".to_owned());
+    }
+    let _ = write!(
+        out,
+        "{total} finding(s): {}",
+        counts_line(value.get("by_code"))
+    );
+    if flag(value, "truncated") || (listed.len() as u64) < total {
+        let _ = write!(out, "; first {} listed", listed.len());
+    }
+    out.push('\n');
+    write_findings(&mut out, listed)?;
+    Some(out)
+}
+
+fn ci(value: &Value) -> Option<String> {
+    let passed = value.get("passed")?.as_bool()?;
+    let mut out = format!(
+        "ci {}: {} files, {} edges, {} cycle(s) (largest {}), {} policy finding(s), {} orphan(s)\n",
+        if passed { "passed" } else { "FAILED" },
+        num(value, "files"),
+        num(value, "edges"),
+        num(value, "cycles"),
+        num(value, "max_cycle_size"),
+        num(value, "policy_findings"),
+        num(value, "orphans"),
+    );
+    for finding in list(value, "findings").iter().filter_map(Value::as_str) {
+        let _ = writeln!(out, "! {finding}");
+    }
+    Some(out)
+}
+
+fn symbol(value: &Value) -> Option<String> {
+    let id = str_of(value, "id")?;
+    let span = value.get("span")?;
+    // Spans count lines from zero; every other answer counts them from one.
+    let mut out = format!(
+        "{}: {}{}, lines {}-{}\nid {id}\n",
+        str_of(value, "qualified_name")
+            .or_else(|| str_of(value, "name"))
+            .unwrap_or("?"),
+        if flag(value, "exported") {
+            "exported "
+        } else {
+            ""
+        },
+        str_of(value, "kind").unwrap_or("symbol"),
+        num(span, "start_line") + 1,
+        num(span, "end_line") + 1,
+    );
+    if let Some(complexity) = value
+        .get("complexity")
+        .filter(|complexity| complexity.is_object())
+    {
+        let _ = writeln!(out, "complexity: {}", counts_line(Some(complexity)));
+    }
+    Some(out)
+}
+
+fn doctor(value: &Value) -> Option<String> {
+    let mut out = status(value.get("index")?)?;
+    let _ = writeln!(out, "binary: {}", str_of(value, "binary").unwrap_or("?"));
+    let agents = value.get("agents")?;
+    let mut absent = Vec::new();
+    for agent in list(agents, "supported") {
+        let name = str_of(agent, "id").unwrap_or("?");
+        if !flag(agent, "detected") {
+            absent.push(name);
+            continue;
+        }
+        let wired: Vec<String> = agent
+            .get("wired")
+            .and_then(Value::as_object)
+            .map(|wired| {
+                wired
+                    .iter()
+                    .filter(|(_, on)| on.as_bool() == Some(true))
+                    .map(|(what, _)| what.replace('_', " "))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{name}: {}",
+            if wired.is_empty() {
+                "detected, NOT wired".to_owned()
+            } else {
+                wired.join(", ")
+            }
+        );
+    }
+    if !absent.is_empty() {
+        let _ = writeln!(out, "not detected: {}", absent.join(", "));
+    }
+    if let Some(hint) = str_of(agents, "hint") {
+        let _ = writeln!(out, "{hint}");
+    }
+    Some(out)
+}
+
 fn paths(value: &Value) -> Option<String> {
     let paths = value.as_array()?;
     if paths.is_empty() {
@@ -1344,6 +1515,90 @@ mod tests {
             "cycle of 2: a, b\n"
         );
         assert_eq!(text(View::Names, &json!(["A", "B"])).unwrap(), "A\nB\n");
+        assert_eq!(
+            text(
+                View::Schema,
+                &json!({
+                    "format_version": 1, "snapshot_id": "s", "files": 2, "edges": 5, "packages": 1,
+                    "node_kinds": { "class_declaration": 1, "function": 3 },
+                    "edge_kinds": { "Calls": 4, "Import": 1 },
+                })
+            )
+            .unwrap(),
+            "2 files, 5 edges, 1 packages\nnodes: class_declaration 1, function 3\nedges: Calls 4, Import 1\n"
+        );
+        let finding = json!({ "code": "layer", "from": "ui/a.ts", "to": "db/b.ts", "message": "ui must not import db" });
+        assert_eq!(
+            text(View::Findings, &json!([finding])).unwrap(),
+            "1 finding(s):\nlayer: ui/a.ts -> db/b.ts: ui must not import db\n"
+        );
+        assert_eq!(
+            text(View::Findings, &json!({ "total": 7, "by_code": { "layer": 7 }, "findings": [finding], "truncated": true })).unwrap(),
+            "7 finding(s): layer 7; first 1 listed\nlayer: ui/a.ts -> db/b.ts: ui must not import db\n"
+        );
+        assert_eq!(
+            text(
+                View::Findings,
+                &json!({ "total": 0, "by_code": {}, "findings": [], "truncated": false })
+            )
+            .unwrap(),
+            "no findings\n"
+        );
+        assert_eq!(text(View::Findings, &json!([])).unwrap(), "no findings\n");
+        assert_eq!(
+            text(
+                View::Ci,
+                &json!({
+                    "passed": false, "snapshot_id": "s", "files": 2, "edges": 5, "cycles": 1,
+                    "max_cycle_size": 3, "policy_findings": 0, "orphans": 4,
+                    "findings": ["cycle of 3 exceeds the threshold of 2"],
+                })
+            )
+            .unwrap(),
+            "ci FAILED: 2 files, 5 edges, 1 cycle(s) (largest 3), 0 policy finding(s), 4 orphan(s)\n\
+             ! cycle of 3 exceeds the threshold of 2\n"
+        );
+        assert_eq!(
+            text(View::Symbol, &json!({
+                "id": "symbol://a.ts#value:A.run", "name": "run", "qualified_name": "A.run",
+                "kind": "method_definition", "exported": false,
+                "span": { "start_byte": 0, "end_byte": 9, "start_line": 4, "start_column": 0, "end_line": 8, "end_column": 1 },
+                "complexity": { "cyclomatic": 3, "cognitive": 5 },
+            }))
+            .unwrap(),
+            "A.run: method_definition, lines 5-9\nid symbol://a.ts#value:A.run\ncomplexity: cognitive 5, cyclomatic 3\n"
+        );
+        assert_eq!(
+            text(
+                View::Dot,
+                &json!({ "format": "dot", "content": "digraph {\n  a -> b;\n}\n" })
+            )
+            .unwrap(),
+            "digraph {\n  a -> b;\n}\n"
+        );
+        let report = json!({
+            "index": { "root": "/repo", "indexed": false, "binary_version": "1.2.3" },
+            "binary": "/bin/ravel",
+            "agents": {
+                "detected_agents": ["claude", "codex"], "hint": "ravel install", "project": "/repo",
+                "ravel_bin": "/bin/ravel",
+                "supported": [
+                    { "id": "claude", "label": "Claude Code", "detected": true, "wired": { "mcp_global": true, "mcp_local": false, "skill_global": true, "skill_local": null } },
+                    { "id": "codex", "label": "Codex", "detected": true, "wired": { "mcp_global": false, "mcp_local": false } },
+                    { "id": "cursor", "label": "Cursor", "detected": false, "wired": {} },
+                ],
+            },
+        });
+        assert_eq!(
+            text(View::Doctor, &report).unwrap(),
+            "ravel 1.2.3 @ /repo: NOT indexed\n\
+             parses: ; auto-sync off (mode ?); not a git repository\n\
+             binary: /bin/ravel\n\
+             claude: mcp global, skill global\n\
+             codex: detected, NOT wired\n\
+             not detected: cursor\n\
+             ravel install\n"
+        );
         let api = json!({ "name": "api", "files": 9, "languages": ["typescript"] });
         let web = json!({ "name": "web", "files": 2, "languages": ["typescript"] });
         assert_eq!(
@@ -1382,6 +1637,12 @@ mod tests {
             View::Cochanged,
             View::Paths,
             View::Packages,
+            View::Schema,
+            View::Findings,
+            View::Ci,
+            View::Symbol,
+            View::Doctor,
+            View::Dot,
         ] {
             assert_eq!(text(view, &odd), None, "{view:?}");
             assert_eq!(

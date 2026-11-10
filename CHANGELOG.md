@@ -21,9 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (24.9k to 10.5k); `callers-of` on a symbol with 103 references went from
   4906 tokens to 1784, where `rg -n` on the same name prints 4570. Pass
   `--json` (new global flag; `--pretty` implies it) or set `RAVEL_FORMAT=json`
-  to get the previous JSON, byte for byte. Reports for scripts and CI
-  (`ci`, `validate`, `boundaries`, `schema`,
-  `install`, `doctor`, `gc`, `daemon`) are unchanged.
+  to get the previous JSON, byte for byte. `ci`, `validate`, `boundaries`,
+  `schema` and `doctor` print the same compact text, and `export_dot` over MCP
+  returns the graph itself instead of a JSON envelope around it — a CI step
+  that parses `ci` or `validate` must pass `--json` too; their exit codes are
+  unchanged. Only the reports of commands that change the machine stay JSON:
+  `install`, `uninstall`, `gc` and `daemon`.
 - Control characters in a path, name or message are written out as `\u{..}`
   in the text, as the JSON escaped them, so a file name cannot forge a line of
   the answer or send an escape sequence to the terminal; the source excerpt
