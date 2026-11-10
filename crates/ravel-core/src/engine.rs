@@ -7956,6 +7956,16 @@ mod agent_context_tests {
             engine.sync(Some(std::slice::from_ref(&source))).unwrap();
         }
 
+        // A sync leaves collection to a background pass, and that pass removes overlay stores no
+        // manifest names. Let it finish before measuring and before planting one below, or the two
+        // readings straddle it.
+        while engine
+            .inner
+            .maintenance_scheduled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            std::thread::yield_now();
+        }
         let disk = engine.status().unwrap()["disk"].clone();
         assert!(disk["bytes"].as_u64().unwrap() > 0, "{disk}");
         assert!(
