@@ -87,10 +87,10 @@ What it writes:
 
 | Agent | Global config | Local config | Instructions |
 |-------|---------------|--------------|--------------|
-| Claude Code | `~/.claude.json` `mcpServers` | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` (local: `.claude/skills/ravel/`) |
-| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if `.cursor/` exists |
+| Claude Code | `~/.claude.json` `mcpServers` (`$CLAUDE_CONFIG_DIR/.claude.json` when set) | `.mcp.json` | `CLAUDE.md` / `AGENTS.md`; skill in `~/.claude/skills/ravel/` or `$CLAUDE_CONFIG_DIR/skills/ravel/` (local: `.claude/skills/ravel/`) |
+| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` | `.cursor/rules/ravel.mdc` if the project has `.cursor/` |
 | Codex | `$CODEX_HOME/config.toml` (default `~/.codex`) | `.codex/config.toml` (trusted projects) | `AGENTS.md`; skill in `~/.agents/skills/ravel/` (local: `.agents/skills/ravel/`) |
-| OpenCode | `~/.config/opencode/opencode.json` | `opencode.json` | `AGENTS.md` |
+| OpenCode | `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME/opencode/` when set; same on macOS and Windows) | `opencode.json` | `AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` | `GEMINI.md` if present |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | — | — |
 | VS Code | user `mcp.json` | `.vscode/mcp.json` | — |
@@ -114,6 +114,11 @@ Re-running `ravel install` (after an upgrade or a move) refreshes the command an
 arguments and keeps everything else you added to the `ravel` entry: `env`,
 timeouts, tool allow-lists, per-tool approvals.
 
+A config Ravel cannot parse — JSON with comments or trailing commas, for
+example — is left untouched and reported as an `error` action naming the file,
+and the command exits non-zero once the report is printed. An empty config file
+counts as an empty object.
+
 The `AGENTS.md` block is written into the directory you run the installer from
 only when it is a project (it has `.git`, `package.json`, `tsconfig.json` or
 `jsconfig.json`) or when you pass `--location local`; a global install run from
@@ -128,7 +133,8 @@ equivalent `claude mcp add` / `codex mcp add` one-liner.
 Claude Code specifics:
 
 - A global install adds `mcp__ravel__*` to the `permissions.allow` list in
-  `~/.claude/settings.json`, creating the file when Claude Code has not written
+  `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that is
+  set), creating the file when Claude Code has not written
   one yet, so Ravel's tools run without a prompt per call. `--no-permissions`
   skips it. Project installs do not touch permissions: a
   `.claude/settings.local.json` created by anything other than Claude Code is

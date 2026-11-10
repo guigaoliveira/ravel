@@ -941,26 +941,53 @@ fn cycles(value: &Value) -> Option<String> {
 }
 
 fn cochanged(value: &Value) -> Option<String> {
-    let entries = value.as_array()?;
-    if entries.is_empty() {
+    // A daemon from before the answer was paged sends the bare list.
+    let (entries, page) = match value.as_array() {
+        Some(entries) => (entries.as_slice(), None),
+        None => (value.get("entries")?.as_array()?.as_slice(), Some(value)),
+    };
+    let mut out = String::new();
+    if let Some(page) = page {
+        let _ = write!(
+            out,
+            "{} file(s) changed with it, over {} commit(s)",
+            num(page, "total"),
+            num(page, "commits_considered")
+        );
+        // Otherwise an empty answer reads as "nothing changes with this file" when every commit
+        // that touched it was a mass edit.
+        match num(page, "commits_skipped_as_bulk") {
+            0 => {}
+            skipped => {
+                let _ = write!(out, " ({skipped} bulk commit(s) skipped)");
+            }
+        }
+        if (entries.len() as u64) < num(page, "total") {
+            let _ = write!(out, ", {} shown", entries.len());
+        }
+        if let Some(next) = page.get("next_cursor").and_then(Value::as_u64) {
+            let _ = write!(out, "; more: cursor {next}");
+        }
+        out.push_str(if entries.is_empty() {
+            "\n"
+        } else {
+            " — commits together, share of them:\n"
+        });
+    } else if entries.is_empty() {
         return Some("no co-changed files\n".to_owned());
     }
-    let mut out = String::new();
-    let mut index = 0;
-    while index < entries.len() {
-        let count = num(&entries[index], "cooccurrence_count");
-        let run = entries[index..]
-            .iter()
-            .take_while(|entry| num(entry, "cooccurrence_count") == count)
-            .count();
-        let _ = writeln!(out, "changed together in {count} commit(s):");
-        let paths: Option<Vec<(&str, String)>> = entries[index..index + run]
-            .iter()
-            .map(|entry| Some((str_of(entry, "file")?, String::new())))
-            .collect();
-        write_paths(&mut out, &paths?);
-        index += run;
-    }
+    // Ranked by confidence, so the order is kept and each row carries its own numbers.
+    let rows: Option<Vec<(&str, String)>> = entries
+        .iter()
+        .map(|entry| {
+            let mut numbers = format!(" {}", num(entry, "cooccurrence_count"));
+            if let Some(confidence) = entry.get("confidence_micros").and_then(Value::as_u64) {
+                let _ = write!(numbers, " {}%", (confidence + 5_000) / 10_000);
+            }
+            Some((str_of(entry, "file")?, numbers))
+        })
+        .collect();
+    write_paths(&mut out, &rows?);
     Some(out)
 }
 
@@ -1492,7 +1519,7 @@ mod tests {
                 ])
             )
             .unwrap(),
-            "changed together in 3 commit(s):\na/\n x.ts\n y.ts\nchanged together in 2 commit(s):\nb.ts\n"
+            "a/\n x.ts 3\n y.ts 3\nb.ts 2\n"
         );
         assert_eq!(
             text(View::Search, &json!([
@@ -1513,6 +1540,27 @@ mod tests {
         assert_eq!(
             text(View::Cycles, &json!([{ "members": ["a", "b"], "size": 2 }])).unwrap(),
             "cycle of 2: a, b\n"
+        );
+        let page = json!({
+            "entries": [
+                { "file": "a/x.ts", "cooccurrence_count": 3, "confidence_micros": 600_000 },
+                { "file": "a/y.ts", "cooccurrence_count": 2, "confidence_micros": 333_333 },
+            ],
+            "total": 9, "truncated": true, "next_cursor": 2,
+            "commits_considered": 5, "commits_skipped_as_bulk": 1,
+        });
+        assert_eq!(
+            text(View::Cochanged, &page).unwrap(),
+            "9 file(s) changed with it, over 5 commit(s) (1 bulk commit(s) skipped), 2 shown; \
+             more: cursor 2 — commits together, share of them:\na/\n x.ts 3 60%\n y.ts 2 33%\n"
+        );
+        let empty = json!({
+            "entries": [], "total": 0, "truncated": false, "next_cursor": null,
+            "commits_considered": 0, "commits_skipped_as_bulk": 4,
+        });
+        assert_eq!(
+            text(View::Cochanged, &empty).unwrap(),
+            "0 file(s) changed with it, over 0 commit(s) (4 bulk commit(s) skipped)\n"
         );
         assert_eq!(text(View::Names, &json!(["A", "B"])).unwrap(), "A\nB\n");
         assert_eq!(

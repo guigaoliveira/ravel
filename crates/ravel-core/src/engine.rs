@@ -115,9 +115,9 @@ struct EngineInner {
     /// files exist on disk, which has nothing to do with which index generation is
     /// published, so invalidating it on publish re-walked for no reason.
     unsupported_sources: Mutex<Option<CoverageProbe>>,
-    /// The one number of that walk `degradation` reads -- how many component-format sources it saw --
-    /// under the same TTL, so answering a relation query does not run the full probe.
-    component_sources: Mutex<Option<(std::time::Instant, usize)>>,
+    /// Component-source count and truncation under the same TTL, so answering a relation query
+    /// does not run the full probe or certify a count from a walk that stopped early.
+    component_sources: Mutex<Option<(std::time::Instant, (usize, bool))>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -135,6 +135,10 @@ struct EngineInner {
     /// Most recent background/explicit update failure. Queries may keep serving the last
     /// complete snapshot, but agents must be told that freshness is no longer guaranteed.
     last_update_error: Mutex<Option<String>>,
+    /// A doubt only a full index settles (a lost dirty record). Kept apart from
+    /// `last_update_error` because the sync that raises it then succeeds, and a successful sync
+    /// clears that one: the warning was erased before any answer could carry it.
+    needs_reindex: Mutex<Option<String>>,
     /// `CURRENT` generation observed by this process. Each MCP client may run its own server.
     observed_generation: Mutex<Option<String>>,
     structural_cache: Mutex<Option<(String, Arc<StructuralPackReader>)>>,
@@ -742,6 +746,21 @@ enum NodeResolution {
     NotFound,
 }
 
+/// `path` relative to `root`, spelled the way a full walk spells it: `/`-separated, with no `.` or
+/// empty segments. `./src/a.ts`, `src//a.ts` and the absolute path are one file, and spelled
+/// verbatim the first two entered the index as a second copy of it. `None` outside `root`.
+fn workspace_relative(root: &Path, path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.strip_prefix(root).ok()?.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// The path embedded in a symbol id (`symbol://<path>#<kind>:<qualified>`). Used to group outgoing
 /// relations by where the referenced symbol lives rather than by the caller's own file.
 fn symbol_id_path(id: &str) -> Option<&str> {
@@ -927,16 +946,42 @@ fn symbol_name_set_changed<'a>(
     })
 }
 
+/// The symbols of `artifact` another file can resolve to: exported declarations, their members
+/// (`Svc.make` is reached through `Svc`), and locals an export clause names (`export { foo }`,
+/// `export default foo`). Filtering on `exported` alone saw only the first kind, so adding,
+/// renaming or removing a static method, or redeclaring a clause-exported function, re-resolved
+/// none of the files that use it, and they kept edges to symbols that no longer existed.
+fn public_symbols(
+    artifact: &crate::model::FileArtifact,
+) -> impl Iterator<Item = &crate::model::Symbol> {
+    let root = |qualified: &str| qualified.split('.').next().unwrap_or(qualified).to_owned();
+    let roots: BTreeSet<String> = artifact
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.exported)
+        .map(|symbol| root(&symbol.qualified_name))
+        .chain(
+            artifact
+                .exports
+                .iter()
+                .filter(|export| export.specifier.is_none())
+                .flat_map(|export| &export.bindings)
+                .map(|binding| binding.local.clone()),
+        )
+        .collect();
+    artifact
+        .symbols
+        .iter()
+        .filter(move |symbol| symbol.exported || roots.contains(&root(&symbol.qualified_name)))
+}
+
 fn public_resolution_contract_changed(
     old: Option<&crate::model::FileArtifact>,
     new: Option<&crate::model::FileArtifact>,
 ) -> bool {
     match (old, new) {
         (Some(old), Some(new)) => {
-            let same_symbols = old
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.exported)
+            let same_symbols = public_symbols(old)
                 .map(|symbol| {
                     (
                         symbol.id.as_str(),
@@ -945,18 +990,14 @@ fn public_resolution_contract_changed(
                         symbol.kind.as_ref(),
                     )
                 })
-                .eq(new
-                    .symbols
-                    .iter()
-                    .filter(|symbol| symbol.exported)
-                    .map(|symbol| {
-                        (
-                            symbol.id.as_str(),
-                            symbol.name.as_str(),
-                            symbol.qualified_name.as_str(),
-                            symbol.kind.as_ref(),
-                        )
-                    }));
+                .eq(public_symbols(new).map(|symbol| {
+                    (
+                        symbol.id.as_str(),
+                        symbol.name.as_str(),
+                        symbol.qualified_name.as_str(),
+                        symbol.kind.as_ref(),
+                    )
+                }));
             let same_exports = old
                 .exports
                 .iter()
@@ -1008,10 +1049,7 @@ fn changed_export_names(
     new: Option<&crate::model::FileArtifact>,
 ) -> ContractChange {
     fn symbol_keys(artifact: &crate::model::FileArtifact) -> BTreeMap<String, String> {
-        artifact
-            .symbols
-            .iter()
-            .filter(|symbol| symbol.exported)
+        public_symbols(artifact)
             .map(|symbol| {
                 (
                     format!(
@@ -1114,6 +1152,53 @@ fn imports_depend_on_names(
         })
 }
 
+/// The names `artifact` exports on behalf of another module whose `names` changed: a named
+/// re-export of one of them (under its alias), each of them but `default` through `export *`, the
+/// namespace through `export * as ns`, and an imported one exported again (`import { y } from
+/// './a'; export { y }`). The importers of `artifact` bind those names through it, so they are as
+/// affected as the importers of the module that changed.
+fn forwarded_names(
+    artifact: &crate::model::FileArtifact,
+    names: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    use crate::model::{ExportBindingKind, ImportBindingKind};
+    let imported_locals: BTreeSet<&str> = artifact
+        .imports
+        .iter()
+        .flat_map(|import| &import.bindings)
+        .filter(|binding| match binding.kind {
+            ImportBindingKind::Namespace | ImportBindingKind::ImportEquals => true,
+            ImportBindingKind::Default => names.contains("default"),
+            ImportBindingKind::Named => names.contains(&binding.imported),
+        })
+        .map(|binding| binding.local.as_str())
+        .collect();
+    let mut forwarded = BTreeSet::new();
+    for export in &artifact.exports {
+        for binding in &export.bindings {
+            if export.specifier.is_none() {
+                if imported_locals.contains(binding.local.as_str()) {
+                    forwarded.insert(binding.exported.clone());
+                }
+                continue;
+            }
+            match binding.kind {
+                ExportBindingKind::Star => {
+                    forwarded.extend(names.iter().filter(|name| *name != "default").cloned());
+                }
+                ExportBindingKind::Namespace => {
+                    forwarded.insert(binding.exported.clone());
+                }
+                _ if names.contains(&binding.local) => {
+                    forwarded.insert(binding.exported.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    forwarded
+}
+
 /// Shared, cloneable workspace engine with in-memory snapshot and graph caching.
 /// All query methods use `&self` (interior mutability via Mutex).
 /// Cloning is cheap (`Arc` bump) and shares the same cache.
@@ -1150,6 +1235,7 @@ impl WorkspaceEngine {
                 dirty_paths_cache: Mutex::new(None),
                 update_lock: Mutex::new(()),
                 last_update_error: Mutex::new(None),
+                needs_reindex: Mutex::new(None),
                 observed_generation: Mutex::new(None),
                 structural_cache: Mutex::new(None),
                 maintenance_scheduled: AtomicBool::new(false),
@@ -1244,6 +1330,9 @@ impl WorkspaceEngine {
         let result = self.index_unlocked();
         crate::timing::stage("index.total", index_start, String::new);
         self.finish_update("index", &result);
+        if result.is_ok() {
+            *self.inner.needs_reindex.lock().unwrap() = None;
+        }
         result
     }
 
@@ -1404,12 +1493,10 @@ impl WorkspaceEngine {
                 // A truncated record silently meaning "nothing was ever synced dirty" restores the
                 // exact phantom-edit state this mechanism exists to prevent. Say so, and drop the
                 // unusable file so the next sync starts a clean record.
-                self.record_update_error(
-                    "dirty-synced record",
-                    &format!(
-                        "{error}; re-run `ravel index` to be certain the index matches the tree"
-                    ),
-                );
+                *self.inner.needs_reindex.lock().unwrap() = Some(format!(
+                    "dirty-synced record: {error}; re-run `ravel index` to be certain the index \
+                     matches the tree"
+                ));
                 let _ = std::fs::remove_file(&path);
                 BTreeSet::new()
             }
@@ -1651,7 +1738,12 @@ impl WorkspaceEngine {
     }
 
     fn last_update_error(&self) -> Option<String> {
-        self.inner.last_update_error.lock().unwrap().clone()
+        self.inner
+            .last_update_error
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.inner.needs_reindex.lock().unwrap().clone())
     }
 
     fn acquire_workspace_update_lock(&self) -> Result<File, EngineError> {
@@ -1698,6 +1790,21 @@ impl WorkspaceEngine {
         Ok(file)
     }
 
+    /// The `config_hash` of a snapshot id: this workspace's configuration, the extractor that
+    /// produced its artifacts, and the resolver configuration its edges were resolved with. Without
+    /// the resolver, re-indexing after a tsconfig change published different edges under the same
+    /// generation, so an engine holding the old graph saw nothing new and kept answering from it.
+    /// Without the extractor, a sync kept every unchanged file's artifact from the old extractor.
+    fn snapshot_config_hash(&self, resolver: &crate::resolver::ResolverConfig) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.inner.config_hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(crate::scanner::EXTRACTOR_VERSION.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(crate::resolver::resolver_fingerprint(resolver).as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
     fn refresh_external_generation(&self) -> Result<(), EngineError> {
         let generation = self.storage().current_generation()?;
         let mut observed = self.inner.observed_generation.lock().unwrap();
@@ -1736,6 +1843,11 @@ impl WorkspaceEngine {
     }
 
     fn sync_unlocked(&self, only_paths: Option<&[PathBuf]>) -> Result<IndexStats, EngineError> {
+        // Another process may have published since this engine last looked -- a CLI `ravel index`
+        // beside a daemon does. The caches below are advanced by the delta this sync publishes, so
+        // they must hold the generation it starts from; advanced from an older one they stayed
+        // wrong for good, because the publication then marked them current.
+        self.refresh_external_generation()?;
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let extensions = crate::config::effective_extensions(&self.config);
         if let Some(paths) = only_paths {
@@ -1795,11 +1907,7 @@ impl WorkspaceEngine {
                         if absolute.exists() {
                             return None;
                         }
-                        let rel = absolute
-                            .strip_prefix(&self.root)
-                            .unwrap_or(absolute.as_path())
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let rel = workspace_relative(&self.root, &absolute)?;
                         Some((path, rel))
                     })
                     .collect();
@@ -1881,6 +1989,17 @@ impl WorkspaceEngine {
         crate::timing::stage("sync.prepare_paths", sync_start, || {
             format!("paths={}", paths.len())
         });
+        // Resolution reads tsconfig, and a changed one re-points imports in files nobody edited.
+        // Every tier below re-resolves only what changed, so after such a change the sync is a full
+        // index: `sync tsconfig.json` returned the old stats as if it had applied the new aliases.
+        // A new extractor is the same: the tiers below would keep every unchanged file's old
+        // artifact.
+        if storage.read_manifest()?.is_some_and(|manifest| {
+            manifest.snapshot_id.config_hash
+                != self.snapshot_config_hash(&load_tsconfig(&self.root))
+        }) {
+            return self.index_unlocked();
+        }
         if fast_noop {
             if let Ok(Some(stats)) = storage.open_stats() {
                 return Ok(stats);
@@ -2252,35 +2371,91 @@ impl WorkspaceEngine {
         > = std::cell::RefCell::new(BTreeMap::new());
         let mut open_failed = false;
         let mut skipped_importers = 0usize;
-        let mut affected = reader.affected_files(
-            contract_changed_paths
-                .iter()
-                .map(|(path, all)| (path.as_str(), *all)),
-            changed_symbols.iter().map(String::as_str),
-            |importer| {
-                if changed_paths.contains(importer) {
-                    return true;
-                }
+        // A file that re-exports a changed name passes the change on: its importers bind the name
+        // through it, yet they do not import the file that changed. Each such re-exporter is a
+        // contract change of the names it forwards, so the search repeats until it finds no new
+        // one -- a barrel's importers were left with edges to symbols that had moved or gone.
+        /// Past this many barrel levels the full rebuild tier is the cheaper answer.
+        const MAX_FORWARDING_ROUNDS: usize = 16;
+        // Runs `look` on the artifact at `path`, if there is one, opening it once for every round
+        // and for the subset below.
+        let with_artifact =
+            |path: &str,
+             open_failed: &mut bool,
+             look: &mut dyn FnMut(&crate::model::FileArtifact)| {
                 let mut opened = opened_artifacts.borrow_mut();
-                let artifact = match opened.entry(importer.to_owned()) {
+                let artifact = match opened.entry(path.to_owned()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        match storage.open_artifact(importer) {
+                        match storage.open_artifact(path) {
                             Ok(artifact) => entry.insert(artifact),
                             Err(_) => {
-                                open_failed = true;
-                                return true;
+                                *open_failed = true;
+                                return;
                             }
                         }
                     }
                 };
-                let depends = artifact
-                    .as_ref()
-                    .is_none_or(|artifact| imports_depend_on_names(artifact, &changed_symbols));
-                skipped_importers += usize::from(!depends);
-                depends
-            },
-        );
+                if let Some(artifact) = artifact {
+                    look(artifact);
+                }
+            };
+        let mut rounds = 0;
+        let mut affected = loop {
+            let mut forwarders: Vec<(String, BTreeSet<String>)> = Vec::new();
+            let affected = reader.affected_files(
+                contract_changed_paths
+                    .iter()
+                    .map(|(path, all)| (path.as_str(), *all)),
+                changed_symbols.iter().map(String::as_str),
+                |importer| {
+                    if changed_paths.contains(importer) {
+                        return true;
+                    }
+                    let mut depends = true;
+                    with_artifact(importer, &mut open_failed, &mut |artifact| {
+                        let forwarded = forwarded_names(artifact, &changed_symbols);
+                        if !forwarded.is_empty() {
+                            forwarders.push((importer.to_owned(), forwarded));
+                        }
+                        depends = imports_depend_on_names(artifact, &changed_symbols);
+                    });
+                    skipped_importers += usize::from(!depends);
+                    depends
+                },
+            );
+            // Importers taken whole (`all`) never reach the filter above; look at them here.
+            for path in &affected {
+                if changed_paths.contains(path) || contract_changed_paths.contains_key(path) {
+                    continue;
+                }
+                with_artifact(path, &mut open_failed, &mut |artifact| {
+                    let forwarded = forwarded_names(artifact, &changed_symbols);
+                    if !forwarded.is_empty() {
+                        forwarders.push((path.clone(), forwarded));
+                    }
+                });
+            }
+            let mut grew = false;
+            for (path, forwarded) in forwarders {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    contract_changed_paths.entry(path)
+                {
+                    entry.insert(false);
+                    grew = true;
+                }
+                for name in forwarded {
+                    grew |= changed_symbols.insert(name);
+                }
+            }
+            if !grew || open_failed {
+                break affected;
+            }
+            rounds += 1;
+            if rounds > MAX_FORWARDING_ROUNDS {
+                return Ok(None);
+            }
+        };
         affected.extend(changed_paths.iter().cloned());
         crate::timing::stage("delta.affected_files", affected_start, || {
             format!(
@@ -2446,7 +2621,7 @@ impl WorkspaceEngine {
         snapshot_id.revision = identity.revision;
         snapshot_id.content_state = content_state;
         snapshot_id.grammar_version = crate::scanner::GRAMMAR_VERSION.into();
-        snapshot_id.config_hash = self.inner.config_hash.clone();
+        snapshot_id.config_hash = self.snapshot_config_hash(&resolver_config);
         let generation = snapshot_id.stable_key();
         let stats = IndexStats {
             files: changes
@@ -2656,9 +2831,6 @@ impl WorkspaceEngine {
         if paths.is_empty() {
             return Ok((true, Vec::new()));
         }
-        let root_str = self.root.to_string_lossy().replace('\\', "/");
-        let root_str = root_str.replace("/./", "/");
-        let root_str = root_str.trim_end_matches('/').to_owned();
         let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         // Reading a batch of edited files is independent per path. `collect` on an
         // indexed parallel iterator keeps input order, so the prepared list stays
@@ -2673,12 +2845,7 @@ impl WorkspaceEngine {
                     } else {
                         self.root.join(path)
                     };
-                    let path_str = path.to_string_lossy().replace('\\', "/");
-                    let Some(rel) = path_str.strip_prefix(&root_str).and_then(|relative| {
-                        let relative = relative.trim_start_matches('/');
-                        (!relative.starts_with("../") && relative != "..")
-                            .then_some(relative.to_owned())
-                    }) else {
+                    let Some(rel) = workspace_relative(&self.root, &path) else {
                         return Err(EngineError::PathOutsideWorkspace {
                             root: self.root.clone(),
                             path,
@@ -2704,6 +2871,13 @@ impl WorkspaceEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?
         };
+        // `src/a.ts` and `/root/src/a.ts` in one batch are one file. Prepared twice, its old and
+        // new hashes went into the content state twice and cancelled out.
+        let mut seen = BTreeSet::new();
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, relative, ..)| seen.insert(relative.clone()))
+            .collect();
         let generation_started = std::time::Instant::now();
         let has_generation = storage.current_generation()?.is_some();
         crate::timing::stage(
@@ -2772,6 +2946,7 @@ impl WorkspaceEngine {
     ) -> Result<IndexStats, EngineError> {
         // Works without git — identity falls back to path + "nogit".
         let identity = self.worktree_identity_cached();
+        let resolver = load_tsconfig(&self.root);
         let content_state = content_state_override.unwrap_or_else(|| {
             // Per-file digests combine by XOR, which is associative and
             // commutative, so the fold parallelizes without changing the result.
@@ -2803,7 +2978,7 @@ impl WorkspaceEngine {
             content_state,
             schema_version: INDEX_SCHEMA_VERSION,
             grammar_version: crate::scanner::GRAMMAR_VERSION.into(),
-            config_hash: self.inner.config_hash.clone(),
+            config_hash: self.snapshot_config_hash(&resolver),
         };
         let storage = self.storage();
         let (edges, staged_pack) = if overlay_paths.is_some()
@@ -2811,7 +2986,6 @@ impl WorkspaceEngine {
         {
             (edges, None)
         } else {
-            let resolver = load_tsconfig(&self.root);
             let resolve_start = std::time::Instant::now();
             let (resolved_edges, traces, universe) =
                 resolve_edges_with_structural_data(&self.root, &files, &resolver);
@@ -2911,12 +3085,13 @@ impl WorkspaceEngine {
     ///
     /// A flat read of the storage directory — dozens of entries, not a tree walk — so
     /// `status` stays cheap.
-    fn index_footprint(home: &std::path::Path) -> (u64, usize) {
+    fn index_footprint(home: &std::path::Path) -> (u64, usize, u64) {
         let Ok(entries) = std::fs::read_dir(home) else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let mut bytes = 0u64;
         let mut generations = 0usize;
+        let mut artifact_overlay_bytes = 0u64;
         for entry in entries.flatten() {
             let Ok(metadata) = entry.metadata() else {
                 continue;
@@ -2926,13 +3101,20 @@ impl WorkspaceEngine {
                 if entry
                     .file_name()
                     .to_str()
+                    .is_some_and(FileSnapshotStorage::is_artifact_overlay_store)
+                {
+                    artifact_overlay_bytes += metadata.len();
+                }
+                if entry
+                    .file_name()
+                    .to_str()
                     .is_some_and(|name| name.ends_with(".manifest.json"))
                 {
                     generations += 1;
                 }
             }
         }
-        (bytes, generations)
+        (bytes, generations, artifact_overlay_bytes)
     }
 
     fn file_diagnostics(&self, limit: usize) -> Vec<serde_json::Value> {
@@ -3008,11 +3190,15 @@ impl WorkspaceEngine {
         // Only the formats that carry TypeScript. A Python build script or a vendored `.h` does not
         // reference TS symbols, so counting them made every query on any polyglot repo report its
         // zeros as unreliable forever -- destroying the signal in the opposite direction.
-        let hidden_references = self.component_sources_cached();
+        let (hidden_references, walk_truncated) = self.component_sources_cached();
         serde_json::json!({
             "config_problems": config_problems,
             "unparsed_files": unparsed_files,
             "unparsed_components": hidden_references,
+            // A count gathered under a cap is a floor, not a total -- including the count of
+            // component formats above, which is what `unparsed_components: 0` claims to be. Where
+            // the probe stopped early, no zero it produced can certify anything.
+            "walk_truncated": u64::from(walk_truncated),
         })
     }
 
@@ -3020,9 +3206,14 @@ impl WorkspaceEngine {
     fn index_is_undegraded(&self, degradation: &serde_json::Value) -> bool {
         // Every key must exist and be zero. A missing key reads as `Null`, whose `as_u64()` is
         // `None` -- which is why a rename that missed this list made every workspace degraded.
-        ["config_problems", "unparsed_files", "unparsed_components"]
-            .iter()
-            .all(|key| degradation[key].as_u64() == Some(0))
+        [
+            "config_problems",
+            "unparsed_files",
+            "unparsed_components",
+            "walk_truncated",
+        ]
+        .iter()
+        .all(|key| degradation[key].as_u64() == Some(0))
     }
 
     /// Starts the component-source walk behind `degradation` on its own thread, for a process
@@ -3230,7 +3421,7 @@ impl WorkspaceEngine {
         // means the footprint is a multiple of one index — surprising enough to be
         // worth stating rather than leaving to be discovered by a full disk.
         let mark = std::time::Instant::now();
-        let (disk_bytes, generations) = Self::index_footprint(&home);
+        let (disk_bytes, generations, artifact_overlay_bytes) = Self::index_footprint(&home);
         crate::timing::stage("status.footprint", mark, String::new);
         // The stats already count the files that carry a diagnostic. Naming them means decoding
         // the whole artifact index, so a workspace where that count is zero -- nearly all of them
@@ -3279,6 +3470,12 @@ impl WorkspaceEngine {
                 "bytes": disk_bytes,
                 "generations": generations,
                 "retention": self.config.storage.retention,
+                // A total alone reads as inherent cost. Measured on a 21,228-file corpus: of
+                // 3.35 GB, 1.27 GiB was generations past retention that `ravel gc` frees on
+                // demand, and another 1.27 GiB was the artifact overlay sidecar. Neither was
+                // visible, so there was nothing to act on.
+                "reclaimable_generations": generations.saturating_sub(self.config.storage.retention),
+                "artifact_overlay_bytes": artifact_overlay_bytes,
             },
             "stats": stats,
             "git_repo": git,
@@ -3389,14 +3586,19 @@ impl WorkspaceEngine {
     /// relation pages, and every total. `detail = true` restores the full
     /// payload for a human reading the CLI output.
     pub fn context(&self, query: &str, limit: usize) -> Result<serde_json::Value, EngineError> {
-        self.context_with_detail(query, limit, false)
+        self.context_with_detail(query, limit, false, None)
     }
 
+    /// `scope` is a path fragment that narrows *which definition* the answer is about, exactly as
+    /// `callers-of --scope` does. The one-call command was the only one without it, so a name that
+    /// matched ten definitions in ten different packages forced the caller into a second round trip
+    /// to copy an id back -- the round trip this command exists to avoid.
     pub fn context_with_detail(
         &self,
         query: &str,
         limit: usize,
         detail: bool,
+        scope: Option<&str>,
     ) -> Result<serde_json::Value, EngineError> {
         /// Hard cap on the relation page: keeps one-shot output bounded for
         /// agents. Totals beyond this must route to the paginated walk.
@@ -3478,8 +3680,32 @@ impl WorkspaceEngine {
         });
         crate::timing::stage("context.graph_rank_meta", after_terms, String::new);
         let candidates_started = std::time::Instant::now();
-        let (exact_identity, exact_identity_total) =
-            symbol_runtime.exact_id_or_qualified(query, limit);
+        let scope = scope.map(str::trim).filter(|value| !value.is_empty());
+        // A scope has to be matched against every definition, not against the bounded preview:
+        // filtering the preview would pick one of an arbitrary `limit` and return it shaped like a
+        // successful answer. Same rule and same bound as `resolve_graph_node_outcome`.
+        let fetch = if scope.is_some() {
+            SCOPE_MATCH_LIMIT
+        } else {
+            limit
+        };
+        let (fetched, fetched_total) = symbol_runtime.exact_id_or_qualified(query, fetch);
+        // Even `SCOPE_MATCH_LIMIT` can be exceeded. The definition left after filtering a partial
+        // set may not be the only one that would have matched, so no scope can be resolved from it.
+        let scope_unusable = scope.is_some() && fetched_total > fetched.len();
+        let in_scope = |path: &str| scope.is_none_or(|fragment| path.contains(fragment));
+        let (exact_identity, exact_identity_total) = match scope {
+            Some(_) if !scope_unusable => {
+                let kept: Vec<_> = fetched
+                    .into_iter()
+                    .filter(|entry| in_scope(&entry.path))
+                    .collect();
+                let total = kept.len();
+                (kept, total)
+            }
+            _ => (fetched, fetched_total),
+        };
+        let scope_matched_none = scope.is_some() && !scope_unusable && exact_identity.is_empty();
         let exact_primary = (exact_identity_total == 1).then(|| exact_identity[0].clone());
         let required_terms = crate::search::query_tokens(query);
         let mut candidates = Vec::new();
@@ -3523,7 +3749,12 @@ impl WorkspaceEngine {
             ($entry:expr, $hit:expr) => {{
                 let entry = $entry;
                 let hit = $hit;
-                if seen_ids.insert(entry.id.clone()) {
+                // Term evidence is scoped too, otherwise a scope that excluded every exact match
+                // would still produce a primary from somewhere else entirely.
+                if !in_scope(&entry.path) {
+                    // Skipped, not counted: a definition outside the scope is not a candidate the
+                    // caller declined to see, it is one they said they were not asking about.
+                } else if seen_ids.insert(entry.id.clone()) {
                     *candidate_counts.entry(entry.name.clone()).or_default() += 1;
                     candidate_total += 1;
                     if candidates.len() < limit {
@@ -3564,7 +3795,19 @@ impl WorkspaceEngine {
             probe_entries_for += 1;
             let (entries, total) = symbol_runtime.entries_for(&hit.value, remaining);
             if total > entries.len() {
-                let omitted = total - entries.len();
+                // Count only definitions no earlier step holds. The exact identity or an earlier
+                // hit may already have counted some this probe leaves out, and counting them again
+                // reported a lone definition as one shown of two.
+                let returned_counted = entries
+                    .iter()
+                    .filter(|entry| seen_ids.contains(&entry.id))
+                    .count();
+                let counted_elsewhere = candidate_counts
+                    .get(&hit.value)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(returned_counted);
+                let omitted = (total - entries.len()).saturating_sub(counted_elsewhere);
                 candidate_total += omitted;
                 *candidate_counts.entry(hit.value.clone()).or_default() += omitted;
             }
@@ -3783,6 +4026,23 @@ impl WorkspaceEngine {
         }
         let undegraded = self.index_is_undegraded(&degradation);
         let mut warnings = Vec::<String>::new();
+        if let Some(fragment) = scope {
+            if scope_unusable {
+                warnings.push(format!(
+                    "scope `{fragment}` was not applied: more definitions of `{query}` matched than could be examined; narrow the query"
+                ));
+            } else if scope_matched_none {
+                warnings.push(format!(
+                    "no definition of `{query}` lies under scope `{fragment}`"
+                ));
+            } else if exact_identity_total > 1 {
+                // The scope is a path *fragment*, so `apps/pay` also matches `apps/payments-api`.
+                // Saying how many survived turns a puzzling "still ambiguous" into an obvious fix.
+                warnings.push(format!(
+                    "scope `{fragment}` still matches {exact_identity_total} definitions; extend it (a trailing `/` excludes sibling directories that share the prefix)"
+                ));
+            }
+        }
         // Checked before ambiguity, not after. Two definitions of some *other* symbol do not make
         // the queried name exist, and "ambiguous symbol name" asserts the opposite -- it reads as
         // confirmation that the name is real and appears in several places.
@@ -3984,7 +4244,7 @@ impl WorkspaceEngine {
     /// How many component-format sources (`.vue`, `.svelte`, `.astro`) the coverage walk sees, which
     /// is all `degradation` reads of it. A fresh full probe already holds the number; otherwise this
     /// walks without classifying every other file, and keeps the result for the same TTL.
-    fn component_sources_cached(&self) -> usize {
+    fn component_sources_cached(&self) -> (usize, bool) {
         let from_full_probe = |counts: &BTreeMap<String, usize>| -> usize {
             crate::config::COMPONENT_SOURCE_EXTENSIONS
                 .iter()
@@ -3994,7 +4254,7 @@ impl WorkspaceEngine {
         if let Some((walked_at, counts)) = self.inner.unsupported_sources.lock().unwrap().as_ref()
             && walked_at.elapsed() < COVERAGE_TTL
         {
-            return from_full_probe(&counts.0);
+            return (from_full_probe(&counts.0), counts.2);
         }
         let mut cache = self.inner.component_sources.lock().unwrap();
         if let Some((walked_at, count)) = cache.as_ref()
@@ -4002,7 +4262,7 @@ impl WorkspaceEngine {
         {
             return *count;
         }
-        let count = crate::config::component_source_count(&self.config, COVERAGE_WALK_BUDGET);
+        let count = crate::config::component_source_probe(&self.config, COVERAGE_WALK_BUDGET);
         *cache = Some((std::time::Instant::now(), count));
         count
     }
@@ -4058,6 +4318,16 @@ impl WorkspaceEngine {
         scope: Option<&str>,
     ) -> NodeResolution {
         if graph.contains_node(node) {
+            return NodeResolution::Resolved(node.to_owned());
+        }
+        // An indexed file that no edge touches -- it imports nothing and nothing imports it -- is
+        // not a graph node, but it exists: "nothing depends on it" is the answer, not "no such name".
+        if self
+            .file_hashes_cached()
+            .ok()
+            .flatten()
+            .is_some_and(|hashes| hashes.contains(node))
+        {
             return NodeResolution::Resolved(node.to_owned());
         }
         let Ok(Some(runtime)) = self.symbol_meta_runtime() else {
@@ -4617,15 +4887,13 @@ impl WorkspaceEngine {
             return Ok(list.in_package(package));
         }
         let snapshot = self.snapshot()?;
-        let prefix = format!("/{package}/");
-        let mut files: Vec<_> = snapshot
+        // `files` is a BTreeMap, so its keys are already sorted.
+        Ok(snapshot
             .files
             .keys()
-            .filter(|path| path.contains(&prefix))
+            .filter(|path| crate::graph::package_name(path) == package)
             .cloned()
-            .collect();
-        files.sort();
-        Ok(files)
+            .collect())
     }
     fn storage_path(&self) -> PathBuf {
         self.root.join(&self.config.storage.home)
@@ -4726,21 +4994,32 @@ impl WorkspaceEngine {
         }
         let asked = std::time::Instant::now();
         let discovery = self.dirty_discovery();
-        let extensions = crate::config::effective_extensions(&self.config);
-        // A failed listing is not remembered: for the next few milliseconds it would read as clean.
-        let paths: Vec<PathBuf> = crate::git::changed_paths_with(&self.root, &discovery)
-            .ok()?
-            .into_iter()
-            .filter(|p| {
-                self.config.is_source_with_extensions(p, &extensions) && !self.config.is_noise(p)
-            })
-            .collect();
+        let paths =
+            self.indexable_sources(crate::git::changed_paths_with(&self.root, &discovery).ok()?);
         *self.inner.dirty_cache.lock().unwrap() = Some(DirtyListing {
             asked,
             kept: std::time::Instant::now(),
             paths: paths.clone(),
         });
         Some(paths)
+    }
+
+    /// The members of `paths` a full index would collect. Git lists every tracked file it sees
+    /// changed, whatever `.ravelignore` or a later `.gitignore` says; filtered by extension and noise
+    /// alone, such a file asked for a sync that then refused it, on every query, and each answer
+    /// carried that refusal as a warning.
+    fn indexable_sources(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        if paths.is_empty() {
+            return paths;
+        }
+        let extensions = crate::config::effective_extensions(&self.config);
+        let ignore = crate::config::IgnoreChain::new(&self.config);
+        paths
+            .into_iter()
+            .filter(|path| {
+                crate::config::watched_path_is_indexable(&self.config, &ignore, &extensions, path)
+            })
+            .collect()
     }
 
     fn dirty_discovery(&self) -> crate::git::DirtyDiscovery {
@@ -4803,7 +5082,6 @@ impl WorkspaceEngine {
                 .to_string_lossy()
                 .replace('\\', "/")
         };
-        let extensions = crate::config::effective_extensions(&self.config);
         let wanted: Vec<String> = relative.iter().cloned().collect();
         #[cfg(test)]
         self.inner.dirty_path_checks.fetch_add(1, Ordering::Relaxed);
@@ -4812,12 +5090,10 @@ impl WorkspaceEngine {
         else {
             return relative;
         };
-        let dirty: BTreeSet<_> = changed
+        // One rule set decides what is indexable, for the walk, sync and the watchers alike.
+        let dirty: BTreeSet<_> = self
+            .indexable_sources(changed)
             .into_iter()
-            .filter(|path| {
-                self.config.is_source_with_extensions(path, &extensions)
-                    && !self.config.is_noise(path)
-            })
             .map(|path| workspace_relative(&path))
             .filter(|path| relative.contains(path))
             .collect();
@@ -4962,6 +5238,7 @@ impl WorkspaceEngine {
         };
         crate::timing::stage("autosync.open_hashes", hashes_started, String::new);
         // Compare only dirty paths against sidecar (small reads).
+        let max_bytes = self.config.parser.max_file_size_kb.saturating_mul(1024);
         let mut need_sync = false;
         let mut settled: BTreeSet<String> = BTreeSet::new();
         for path in &dirty {
@@ -4983,7 +5260,17 @@ impl WorkspaceEngine {
                     break;
                 }
                 Some(old) => {
-                    let Ok(bytes) = std::fs::read(path) else {
+                    let bytes = std::fs::metadata(path)
+                        .ok()
+                        .filter(|metadata| metadata.len() <= max_bytes)
+                        .and_then(|_| std::fs::read(path).ok());
+                    let Some(bytes) = bytes else {
+                        // Over the size limit or unreadable. When the index already holds it that
+                        // way (an empty hash), a sync could only write the same artifact again --
+                        // and hashing the file against "" asked for one on every query.
+                        if old.is_empty() {
+                            continue;
+                        }
                         need_sync = true;
                         break;
                     };
@@ -5036,9 +5323,17 @@ impl WorkspaceEngine {
         let paths = crate::git::changed_paths_between(&self.root, Some(from_ref), _to_ref)
             .map_err(|e| EngineError::Git(e.to_string()))?;
         let graph = self.graph()?;
+        // Each changed file's whole ranking is merged, then ranked and paged once. Merging each
+        // file's first page instead dropped whatever ranked below it there, however high it
+        // ranked overall, and counted only what was kept.
+        let walk_limits = QueryLimits {
+            cursor: 0,
+            page_size: usize::MAX,
+            ..limits.clone()
+        };
         let mut merged: std::collections::BTreeMap<String, analysis::ImpactItem> =
             std::collections::BTreeMap::new();
-        let mut truncated = false;
+        let mut walk_truncated = false;
         let mut reason = None;
         let snapshot_id = graph.snapshot_id().to_owned();
         for path in paths {
@@ -5048,8 +5343,8 @@ impl WorkspaceEngine {
             if !graph.contains_node(&path_str) {
                 continue;
             }
-            let report = analysis::impact_with_risk(&graph, &path_str, limits)?;
-            truncated |= report.truncated;
+            let report = analysis::impact_with_risk(&graph, &path_str, &walk_limits)?;
+            walk_truncated |= !report.exact;
             if report.reason.is_some() {
                 reason = report.reason;
             }
@@ -5064,16 +5359,28 @@ impl WorkspaceEngine {
                     .or_insert(item);
             }
         }
-        // `merged` is a BTreeMap keyed by symbol → `into_values()` is already symbol-sorted.
-        let affected: Vec<_> = merged.into_values().collect();
+        let mut affected: Vec<_> = merged.into_values().collect();
+        affected.sort_by(|a, b| {
+            (a.risk, std::cmp::Reverse(a.score), &a.symbol).cmp(&(
+                b.risk,
+                std::cmp::Reverse(b.score),
+                &b.symbol,
+            ))
+        });
+        let total_affected = affected.len();
+        let start = limits.cursor.min(total_affected);
+        let end = start.saturating_add(limits.page_size).min(total_affected);
+        let more = end < total_affected;
+        affected.truncate(end);
+        affected.drain(..start);
         Ok(ImpactReport {
             root: format!("diff:{from_ref}"),
             snapshot_id,
-            total_affected: affected.len(),
-            exact: !truncated,
+            total_affected,
+            exact: !walk_truncated,
             affected,
-            truncated,
-            reason,
+            truncated: walk_truncated || more,
+            reason: reason.or_else(|| more.then(|| "page_size".into())),
         })
     }
 
@@ -5098,14 +5405,26 @@ impl WorkspaceEngine {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn cochanged(
         &self,
         file: &str,
         commits: usize,
         min_cooccurrence: u32,
-    ) -> Result<Vec<crate::git::CoChangeEntry>, EngineError> {
-        crate::git::cochanged(&self.root, file, commits, min_cooccurrence)
-            .map_err(|e| EngineError::Git(e.to_string()))
+        max_commit_files: usize,
+        limit: usize,
+        cursor: usize,
+    ) -> Result<crate::git::CoChangePage, EngineError> {
+        crate::git::cochanged(
+            &self.root,
+            file,
+            commits,
+            min_cooccurrence,
+            max_commit_files,
+            limit,
+            cursor,
+        )
+        .map_err(|e| EngineError::Git(e.to_string()))
     }
 
     /// Candidate test paths for a source file (existence checked on disk).
@@ -5210,6 +5529,65 @@ mod resident_sync_tests {
                 .iter()
                 .any(|relation| relation["kind"] == "Calls")
         );
+    }
+
+    #[test]
+    fn a_sync_after_another_process_published_starts_from_that_publication() {
+        // The resident engine (a daemon's) holds a warm graph. Another process (a CLI `ravel
+        // index`) publishes a caller of `answer` without going through it.
+        let (root, resident, _service) = fixture();
+        let warm = resident.graph().unwrap();
+        drop(warm);
+        std::fs::write(
+            root.path().join("caller.ts"),
+            "import { answer } from './service';\nexport const again = answer();\n",
+        )
+        .unwrap();
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+
+        // The resident engine's next sync must build on that publication.
+        let other = root.path().join("other.ts");
+        std::fs::write(&other, "export const unrelated = 1;\n").unwrap();
+        resident.sync_resident(Some(&[other])).unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        let names = |engine: &WorkspaceEngine| {
+            let graph = engine.graph().unwrap();
+            (
+                graph.edge_count(),
+                graph
+                    .node_names()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>(),
+            )
+        };
+        assert_eq!(names(&resident), names(&fresh));
+        assert!(names(&resident).1.contains("caller.ts"));
+    }
+
+    #[test]
+    fn every_spelling_of_a_path_syncs_the_one_file() {
+        let (root, engine, service) = fixture();
+        std::fs::write(
+            &service,
+            "export const answer = () => 42;\nexport const second = 2;\n",
+        )
+        .unwrap();
+        let stats = engine
+            .sync(Some(&[
+                PathBuf::from("./service.ts"),
+                PathBuf::from(".//service.ts"),
+                service.clone(),
+            ]))
+            .unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert_eq!(stats, fresh.index().unwrap());
+        let found = engine.search_raw("second", SearchKind::Exact, 10).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]
@@ -5973,6 +6351,182 @@ mod watch_gate_tests {
 }
 
 #[cfg(test)]
+mod resolver_config_tests {
+    use super::*;
+
+    const ALIASED: &str =
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["src/*"] } } }"#;
+
+    /// `main.ts` imports `target` through an alias that the tsconfig does not define yet.
+    fn fixture() -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/lib")).unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("src/lib/target.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/main.ts"),
+            "import { target } from '@app/lib/target';\nexport const value = target();\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    #[test]
+    fn syncing_the_tsconfig_resolves_with_it() {
+        let (root, engine) = fixture();
+        let before = engine.stats().unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), ALIASED).unwrap();
+        let synced = engine
+            .sync(Some(&[root.path().join("tsconfig.json")]))
+            .unwrap();
+
+        let fresh = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        assert_eq!(synced, fresh.index().unwrap());
+        assert!(synced.edges > before.edges, "{before:?} -> {synced:?}");
+    }
+
+    #[test]
+    fn a_reindex_after_a_tsconfig_change_is_a_new_generation() {
+        let (root, resident) = fixture();
+        let warm = resident.graph().unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), ALIASED).unwrap();
+        WorkspaceEngine::load(root.path(), &Flags::default())
+            .unwrap()
+            .index()
+            .unwrap();
+        let fresh = resident.graph().unwrap();
+        assert_ne!(fresh.snapshot_id(), warm.snapshot_id());
+        assert!(fresh.edge_count() > warm.edge_count());
+    }
+}
+
+#[cfg(test)]
+mod context_candidate_tests {
+    use super::*;
+
+    fn engine_with(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceEngine) {
+        let root = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            std::fs::write(root.path().join(name), text).unwrap();
+        }
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        (root, engine)
+    }
+
+    #[test]
+    fn a_lone_definition_is_not_reported_as_truncated() {
+        let (_root, engine) = engine_with(&[("a.ts", "export function qux() { return 1; }\n")]);
+        let context = engine.context("qux", 1).unwrap();
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(context["truncation"]["candidates"], false, "{context:#}");
+    }
+
+    #[test]
+    fn definitions_past_the_limit_are_still_reported_as_truncated() {
+        let (_root, engine) = engine_with(&[
+            ("a.ts", "export function qux() { return 1; }\n"),
+            ("b.ts", "export function qux() { return 2; }\n"),
+        ]);
+        let context = engine.context("qux", 1).unwrap();
+        assert_eq!(context["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(context["truncation"]["candidates"], true, "{context:#}");
+    }
+}
+
+#[cfg(test)]
+mod diff_impact_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git must be available for this test");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// target ← z ← a0..a4: the diff touches `target`, whose only direct dependent is `z`.
+    #[test]
+    fn a_diff_is_ranked_and_counted_whole_before_it_is_paged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("target.ts"), "export const t = 1;\n").unwrap();
+        std::fs::write(
+            root.join("z.ts"),
+            "import { t } from './target';\nexport const z = t;\n",
+        )
+        .unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                root.join(format!("a{i}.ts")),
+                "import { z } from './z';\nexport const a = z;\n",
+            )
+            .unwrap();
+        }
+        git(root, &["init", "-q", "."]);
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "one"]);
+        std::fs::write(root.join("target.ts"), "export const t = 2;\n").unwrap();
+        git(root, &["commit", "-qam", "two"]);
+        let engine = WorkspaceEngine::load(root, &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let limits = QueryLimits {
+            page_size: 2,
+            ..Default::default()
+        };
+        let report = engine.diff_impact("HEAD~1", None, &limits).unwrap();
+        assert_eq!(report.total_affected, 6, "{report:?}");
+        assert_eq!(report.affected.len(), 2);
+        assert_eq!(report.affected[0].symbol, "z.ts");
+        assert!(report.exact);
+        assert!(report.truncated);
+    }
+}
+
+#[cfg(test)]
+mod edgeless_file_tests {
+    use super::*;
+
+    #[test]
+    fn an_indexed_file_no_edge_touches_resolves_to_itself() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("x.ts"),
+            "function g() { return 1; }\nexport function f() { return g(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("lone.ts"), "export const lone = 1;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let graph = engine.graph().unwrap();
+        for file in ["x.ts", "lone.ts"] {
+            assert!(
+                matches!(
+                    engine.resolve_graph_node_outcome(&graph, file, None),
+                    NodeResolution::Resolved(ref id) if id == file
+                ),
+                "{file}"
+            );
+        }
+        assert!(matches!(
+            engine.resolve_graph_node_outcome(&graph, "missing.ts", None),
+            NodeResolution::NotFound
+        ));
+    }
+}
+
+#[cfg(test)]
 mod dirty_record_tests {
     use super::*;
 
@@ -6018,6 +6572,45 @@ mod dirty_record_tests {
             format!("export const {} = {value};\n", &name[..1]),
         )
         .unwrap();
+    }
+
+    /// A tracked file that an ignore file excludes is outside the index, so editing it is not a
+    /// change the index has to absorb.
+    #[test]
+    fn a_tracked_file_the_ignore_files_exclude_is_not_dirty() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("legacy")).unwrap();
+        std::fs::write(root.join("legacy/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join(".ravelignore"), "legacy/\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "legacy"]);
+        let indexed = engine.index().unwrap();
+        assert_eq!(indexed.files, 3);
+
+        std::fs::write(root.join("legacy/x.ts"), "export const x = 2;\n").unwrap();
+        assert_eq!(engine.auto_sync_if_dirty().unwrap(), None);
+        assert_eq!(engine.last_update_error(), None);
+        assert_eq!(engine.sync(None).unwrap(), indexed);
+    }
+
+    /// A dirty file over the size limit is indexed once, with its diagnostic. Its content can never
+    /// reach the index, so it must not look changed to every query after that.
+    #[test]
+    fn a_dirty_file_too_large_to_index_is_synced_once() {
+        let (dir, mut engine) = fixture();
+        engine.config.parser.max_file_size_kb = 1;
+        std::fs::write(
+            dir.path().join("big.ts"),
+            format!("export const big = '{}';\n", "x".repeat(3000)),
+        )
+        .unwrap();
+        assert!(engine.auto_sync_if_dirty().unwrap().is_some());
+        let published = engine.storage().current_generation().unwrap();
+        for _ in 0..2 {
+            assert_eq!(engine.auto_sync_if_dirty().unwrap(), None);
+        }
+        assert_eq!(engine.storage().current_generation().unwrap(), published);
     }
 
     /// The record carries exactly the synced paths that are still uncommitted, however many other
@@ -6119,6 +6712,27 @@ mod dirty_record_tests {
             .sync(Some(&[root.join("fresh.ts"), root.join("c.ts")]))
             .unwrap();
         assert_eq!(record(&engine), ["c.ts", "fresh.ts"]);
+    }
+
+    /// A lost record leaves the index unverifiable until a full index. The warning must outlive the
+    /// sync that discovered the loss -- that sync succeeds -- and go away once `index` has run.
+    #[test]
+    fn a_lost_dirty_record_is_reported_until_a_full_index() {
+        let (dir, engine) = fixture();
+        let root = dir.path();
+        edit(root, "a.ts", 2);
+        engine.sync(Some(&[root.join("a.ts")])).unwrap();
+        std::fs::write(engine.dirty_synced_path(), b"[\"a.t").unwrap();
+
+        edit(root, "b.ts", 2);
+        engine.sync(Some(&[root.join("b.ts")])).unwrap();
+        let warning = engine.last_update_error().expect("the loss is reported");
+        assert!(warning.contains("re-run `ravel index`"), "{warning}");
+        engine.sync(Some(&[root.join("c.ts")])).unwrap();
+        assert!(engine.last_update_error().is_some());
+
+        engine.index().unwrap();
+        assert_eq!(engine.last_update_error(), None);
     }
 
     /// A record that did not change is not written again: it costs two fsyncs and the file on
@@ -7318,6 +7932,194 @@ mod agent_context_tests {
         assert!(
             broken["hint"].as_str().unwrap().contains("tsconfig.json"),
             "and named first, before anything about freshness: {broken:?}"
+        );
+    }
+
+    /// Disk cost has to say which part is reclaimable.
+    ///
+    /// A single total reads as inherent. Measured on a 21,228-file corpus: of 3.35 GB, 1.27 GiB was
+    /// generations past retention that `ravel gc` frees on demand -- and nothing in the response
+    /// said so, so there was no reason to run it.
+    #[test]
+    fn status_says_how_much_disk_is_reclaimable() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("service.ts");
+        std::fs::write(&source, "export const value = 0;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        for revision in 1..=5 {
+            std::fs::write(
+                &source,
+                format!("export function value{revision}() {{ return {revision}; }}\n"),
+            )
+            .unwrap();
+            engine.sync(Some(std::slice::from_ref(&source))).unwrap();
+        }
+
+        // A sync leaves collection to a background pass, and that pass removes overlay stores no
+        // manifest names. Let it finish before measuring and before planting one below, or the two
+        // readings straddle it.
+        while engine
+            .inner
+            .maintenance_scheduled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            std::thread::yield_now();
+        }
+        let disk = engine.status().unwrap()["disk"].clone();
+        assert!(disk["bytes"].as_u64().unwrap() > 0, "{disk}");
+        assert!(
+            disk["reclaimable_generations"].is_u64(),
+            "the count `ravel gc` would drop must be reported: {disk}"
+        );
+        assert!(
+            disk["artifact_overlay_bytes"].is_u64(),
+            "the overlay sidecar is a distinct cost and must be named: {disk}"
+        );
+        assert!(
+            disk["artifact_overlay_bytes"].as_u64().unwrap() > 0,
+            "{disk}"
+        );
+        let home = root.path().join(&engine.config.storage.home);
+        std::fs::write(home.join("artifacts.overlay.store"), [0u8; 17]).unwrap();
+        let with_legacy = engine.status().unwrap()["disk"].clone();
+        assert_eq!(
+            with_legacy["artifact_overlay_bytes"].as_u64().unwrap(),
+            disk["artifact_overlay_bytes"].as_u64().unwrap() + 17,
+        );
+    }
+
+    /// The one-call command can disambiguate without a second call.
+    ///
+    /// A common service name matches a definition per package, and `context` had no way to say
+    /// which one -- forcing the caller to copy a symbol id back, which is the round trip this
+    /// command exists to remove. The three rules `callers-of --scope` already follows hold here
+    /// too, and the third is the one worth a test: a scope matching nothing must say so rather than
+    /// quietly answering as if it were absent.
+    #[test]
+    fn context_scope_picks_one_definition_and_admits_when_it_matches_none() {
+        let root = tempfile::tempdir().unwrap();
+        for package in ["alpha", "beta"] {
+            let dir = root.path().join("apps").join(package).join("src");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("handler.ts"),
+                "export class Handler { run() { return 1; } }\n",
+            )
+            .unwrap();
+        }
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let unscoped = engine.context("Handler", 10).unwrap();
+        assert_eq!(
+            unscoped["ambiguous"], true,
+            "two packages define it: {unscoped}"
+        );
+
+        let scoped = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta"))
+            .unwrap();
+        assert_eq!(scoped["ambiguous"], false, "{scoped}");
+        assert_eq!(
+            scoped["detail"]["path"], "apps/beta/src/handler.ts",
+            "the scope must decide which definition, not merely filter the preview: {scoped}"
+        );
+
+        // A fragment also matches a sibling that shares the prefix, which is the trap worth naming.
+        std::fs::create_dir_all(root.path().join("apps/beta-legacy/src")).unwrap();
+        std::fs::write(
+            root.path().join("apps/beta-legacy/src/handler.ts"),
+            "export class Handler { run() { return 2; } }\n",
+        )
+        .unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+        let prefix_collision = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta"))
+            .unwrap();
+        assert!(
+            prefix_collision["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("still matches 2")),
+            "a fragment that keeps two definitions must say so: {prefix_collision}"
+        );
+        let disambiguated = engine
+            .context_with_detail("Handler", 10, false, Some("apps/beta/"))
+            .unwrap();
+        assert_eq!(disambiguated["ambiguous"], false, "{disambiguated}");
+
+        let missed = engine
+            .context_with_detail("Handler", 10, false, Some("apps/gamma"))
+            .unwrap();
+        assert!(
+            missed["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap_or_default().contains("apps/gamma")),
+            "a scope that matches nothing must be reported, not ignored: {missed}"
+        );
+        assert!(
+            missed["detail"].is_null(),
+            "and it must not answer about some other definition: {missed}"
+        );
+    }
+
+    /// The key has to be emitted, not just consulted.
+    ///
+    /// `index_is_undegraded` treats a missing key as degraded, which fails safe -- and would have
+    /// made every workspace permanently degraded had `degradation()` not carried it. That is the
+    /// regression this pair of tests brackets: one proves truncation blocks certification, this one
+    /// proves a clean workspace still certifies.
+    #[test]
+    fn a_complete_probe_still_certifies() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+        engine.index().unwrap();
+
+        let degradation = engine.degradation();
+        assert_eq!(
+            degradation["walk_truncated"].as_u64(),
+            Some(0),
+            "a workspace this small cannot truncate: {degradation}"
+        );
+        assert!(engine.index_is_undegraded(&degradation), "{degradation}");
+    }
+
+    /// A probe that stopped early cannot certify anything, including its own zeros.
+    ///
+    /// `unparsed_components` is gathered by the coverage probe, so when the probe is capped that
+    /// zero means "did not finish looking", not "nothing to find" -- and it was being read as the
+    /// latter to set `authoritative_zero`. Testing the predicate directly rather than by building a
+    /// workspace past the cap: the cap is 20,000 files, and the contract is what matters.
+    #[test]
+    fn a_truncated_coverage_probe_cannot_certify_a_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = WorkspaceEngine::load(root.path(), &Flags::default()).unwrap();
+
+        let clean = serde_json::json!({
+            "config_problems": 0,
+            "unparsed_files": 0,
+            "unparsed_components": 0,
+            "walk_truncated": 0,
+        });
+        assert!(
+            engine.index_is_undegraded(&clean),
+            "a complete probe that found nothing must still certify"
+        );
+
+        let mut truncated = clean.clone();
+        truncated["walk_truncated"] = serde_json::json!(1);
+        assert!(
+            !engine.index_is_undegraded(&truncated),
+            "every other counter is zero, but they were counted under a cap"
         );
     }
 

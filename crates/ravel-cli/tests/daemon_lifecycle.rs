@@ -427,6 +427,7 @@ fn a_lease_answers_queries_without_taking_another_connection() {
             query: "leaseBase".into(),
             limit: 5,
             detail: false,
+            scope: None,
         })
         .unwrap();
     assert!(context.contains("leaseBase"), "{context}");
@@ -511,6 +512,255 @@ fn a_lease_refuses_lifecycle_operations_and_keeps_serving() {
     drop(lease);
     drop(daemon.stdin.take());
     assert!(daemon.wait().unwrap().success());
+}
+
+/// A daemon started the way `daemon start` starts one (not transient), killed if the test ends
+/// before it exits on its own.
+struct PersistentDaemon(std::process::Child);
+
+impl PersistentDaemon {
+    fn start(root: &Path) -> Self {
+        let daemon = Self(
+            Command::new(env!("CARGO_BIN_EXE_ravel"))
+                .arg("--root")
+                .arg(root)
+                .arg("daemon-serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let client = ravel_core::daemon::DaemonClient::for_root(root).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_ready() {
+            assert!(Instant::now() < deadline, "daemon never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon
+    }
+
+    fn exits_within(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.0.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+}
+
+impl Drop for PersistentDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn stop_leaves_the_daemon_to_its_sessions_until_the_last_one_ends() {
+    use ravel_core::daemon::DaemonOperation;
+
+    let root = indexed_workspace("stopShared");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let mut daemon = PersistentDaemon::start(root.path());
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    // An MCP session holds a lease on the daemon `daemon start` began.
+    let session = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+
+    let stop = command(binary, root.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    // Still serving everyone: the session, the CLI, and a session that joins now. A stop that
+    // shut down under the session left a daemon that refused every call and could not exit.
+    assert!(
+        session.call_text(DaemonOperation::Status).is_ok(),
+        "the session lost its daemon to `stop`"
+    );
+    assert!(
+        client.call(DaemonOperation::Status).is_ok(),
+        "the daemon refused a call after `stop`"
+    );
+    let context = command(binary, root.path(), &["context", "stopShared"]);
+    assert!(
+        context.status.success() && String::from_utf8_lossy(&context.stdout).contains("stopShared"),
+        "{}",
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let status = command(binary, root.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        true
+    );
+    let joined = acquire_lease_until(&client, Instant::now() + Duration::from_secs(2));
+    drop(joined);
+
+    // `start` takes it back, and then the daemon outlives the session.
+    assert!(
+        command(binary, root.path(), &["daemon", "start"])
+            .status
+            .success()
+    );
+    drop(session);
+    assert!(
+        !daemon.exits_within(Duration::from_millis(300)),
+        "a daemon started again exited with its session"
+    );
+
+    // Stopped again with a session attached, it exits once that session ends.
+    let session = acquire_lease_until(&client, Instant::now() + Duration::from_secs(5));
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+    assert!(
+        !daemon.exits_within(Duration::from_millis(200)),
+        "`stop` ended the daemon under its session"
+    );
+    drop(session);
+    assert!(
+        daemon.exits_within(Duration::from_secs(5)),
+        "a stopped daemon outlived its last session"
+    );
+}
+
+#[test]
+fn a_daemon_that_cannot_start_says_why_without_waiting_out_the_deadline() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+    // A configuration the daemon refuses at startup.
+    fs::write(
+        root.path().join(".ravel.toml"),
+        "[watch]\nmax_batch_ms = 0\n",
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_ravel");
+
+    let start = command(binary, root.path(), &["daemon", "start"]);
+    let stderr = String::from_utf8_lossy(&start.stderr);
+    assert!(!start.status.success(), "the daemon cannot have started");
+    // The reason is only read while waiting for the daemon, so finding it here also means the
+    // wait ended when the daemon did, not at the deadline ("daemon did not become ready").
+    assert!(
+        stderr.contains("max_batch_ms"),
+        "the reason the daemon gave was lost: {stderr}"
+    );
+}
+
+/// `daemon start` while the previous daemon is still draining its connections after `stop`: it
+/// refuses with "shutting down", and is gone a moment later.
+#[cfg(unix)]
+#[test]
+fn start_waits_out_a_daemon_that_is_shutting_down_and_starts_another() {
+    /// Stops whichever daemon serves the root when the test ends, however it ends.
+    struct StopOnDrop<'a>(&'a Path);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = command(env!("CARGO_BIN_EXE_ravel"), self.0, &["daemon", "stop"]);
+        }
+    }
+
+    let root = indexed_workspace("restarted");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let _stop = StopOnDrop(root.path());
+    let mut old = PersistentDaemon::start(root.path());
+    // A connection that has not said anything yet keeps the stopped daemon draining.
+    let identity = ravel_core::daemon::RootIdentity::discover(root.path()).unwrap();
+    let layout = ravel_core::daemon::RuntimeLayout::locate(&identity).unwrap();
+    let ravel_core::daemon::LocalEndpoint::Unix(socket) = &layout.endpoint;
+    let idle = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    assert!(
+        command(binary, root.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+    let client = ravel_core::daemon::DaemonClient::for_root(root.path()).unwrap();
+    match client.call(ravel_core::daemon::DaemonOperation::Status) {
+        Err(error) if error.is_shutting_down() => {}
+        other => panic!("expected a daemon still draining, got {other:?}"),
+    }
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(idle);
+    });
+
+    let start = command(binary, root.path(), &["daemon", "start"]);
+    release.join().unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        old.exits_within(Duration::from_secs(5)),
+        "the stopped daemon never left"
+    );
+    let status = command(binary, root.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        true,
+        "no daemon took its place"
+    );
+}
+
+/// Looking for a daemon must not make or change the runtime directory a daemon would be found in:
+/// only a daemon about to serve does that. A directory that is missing, or not this process's to
+/// change, then broke every query instead of meaning "no daemon".
+#[cfg(target_os = "linux")]
+#[test]
+fn looking_for_a_daemon_leaves_the_runtime_directory_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = indexed_workspace("lookedFor");
+    let binary = env!("CARGO_BIN_EXE_ravel");
+    let run = |runtime: &Path, args: &[&str]| {
+        Command::new(binary)
+            .arg("--root")
+            .arg(root.path())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .output()
+            .unwrap()
+    };
+
+    let empty = tempdir().unwrap();
+    let status = run(empty.path(), &["daemon", "status"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["running"],
+        false
+    );
+    assert!(
+        run(empty.path(), &["context", "lookedFor"])
+            .status
+            .success()
+    );
+    assert!(
+        !empty.path().join("ravel").exists(),
+        "a client made the runtime directory"
+    );
+
+    let shared = tempdir().unwrap();
+    let directory = shared.path().join("ravel");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(run(shared.path(), &["daemon", "status"]).status.success());
+    assert!(
+        run(shared.path(), &["context", "lookedFor"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "a client changed the runtime directory's permissions"
+    );
 }
 
 /// Process ids of the daemons serving `root`, found the way an operator would: by command line.

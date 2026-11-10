@@ -660,13 +660,16 @@ impl GraphIndex {
             relation_ids.sort_unstable_by_key(&relation_key);
         }
         let edge_count = relations.len();
+        let forward = Adjacency::from_rows(forward);
+        let reverse = Adjacency::from_rows(reverse);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
 
         // Neighbor order is not required for correct query pages (items are sorted).
         Self {
             nodes,
             node_index,
-            forward: Adjacency::from_rows(forward),
-            reverse: Adjacency::from_rows(reverse),
+            forward,
+            reverse,
             edge_count,
             relations,
             forward_relation_ids: Adjacency::from_rows(forward_relation_ids),
@@ -676,10 +679,26 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id,
             package_graph: OnceLock::new(),
         }
+    }
+
+    /// Nodes no edge touches. Only a file named as the `source_path` of its symbols' edges is
+    /// interned without one. An incremental overlay never creates such a node and retires any
+    /// whose edges it removes, so a graph built in one go leaves them inactive too; otherwise
+    /// `contains_node`, `node_names` and `node_count` would depend on how the graph was built.
+    /// The name stays interned, since relations name their `source_path` through it.
+    fn edgeless_nodes(
+        node_count: usize,
+        forward: &Adjacency,
+        reverse: &Adjacency,
+    ) -> BTreeSet<u32> {
+        (0..node_count)
+            .filter(|&id| forward.list(id).is_empty() && reverse.list(id).is_empty())
+            .map(|id| id as u32)
+            .collect()
     }
 
     pub fn from_compact(compact: CompactGraph) -> Self {
@@ -697,11 +716,14 @@ impl GraphIndex {
             node_index.insert(&nodes, id as u32);
         }
         let edge_count = compact.edge_count as usize;
+        let forward = Adjacency::from_rows(compact.forward);
+        let reverse = Adjacency::from_rows(compact.reverse);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
         Self {
             nodes,
             node_index,
-            forward: Adjacency::from_rows(compact.forward),
-            reverse: Adjacency::from_rows(compact.reverse),
+            forward,
+            reverse,
             edge_count,
             relations: compact.relations,
             forward_relation_ids: Adjacency::from_rows(compact.forward_relation_ids),
@@ -711,7 +733,7 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id: compact.snapshot_id,
             package_graph: OnceLock::new(),
         }
@@ -747,11 +769,14 @@ impl GraphIndex {
         for id in 0..nodes.len() {
             node_index.insert(&nodes, id as u32);
         }
+        let forward = expand(&archived.forward_offsets, &archived.forward_values);
+        let reverse = expand(&archived.reverse_offsets, &archived.reverse_values);
+        let inactive_nodes = Self::edgeless_nodes(nodes.len(), &forward, &reverse);
         Self {
             nodes,
             node_index,
-            forward: expand(&archived.forward_offsets, &archived.forward_values),
-            reverse: expand(&archived.reverse_offsets, &archived.reverse_values),
+            forward,
+            reverse,
             edge_count: archived.edge_count.to_native() as usize,
             relations: archived
                 .relations
@@ -774,7 +799,7 @@ impl GraphIndex {
             relation_overlay_nodes: BTreeSet::new(),
             overlay_forward_relations: BTreeMap::new(),
             overlay_reverse_relations: BTreeMap::new(),
-            inactive_nodes: BTreeSet::new(),
+            inactive_nodes,
             snapshot_id: archived.snapshot_id.to_string(),
             package_graph: OnceLock::new(),
         }
@@ -1195,13 +1220,21 @@ impl GraphIndex {
             .collect()
     }
 
+    /// Every package, in dependency order when the package graph is acyclic and by name when it
+    /// is not: callers enumerate packages with this, and a cycle must not hide them all.
     pub fn package_order(&self) -> Vec<String> {
         let graph = self.package_graph();
-        toposort(graph, None)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|index| graph[index].clone())
-            .collect()
+        match toposort(graph, None) {
+            Ok(order) => order
+                .into_iter()
+                .map(|index| graph[index].clone())
+                .collect(),
+            Err(_) => {
+                let mut names: Vec<String> = graph.node_weights().cloned().collect();
+                names.sort();
+                names
+            }
+        }
     }
 
     /// Package→package edges. O(P + E_pkg) — independent of symbol-node count.
@@ -1366,7 +1399,9 @@ impl GraphIndex {
                             idx
                         }
                     };
-                    if seen_edges.insert((from_index, to_index)) {
+                    // An import inside one package is not a dependency between packages. As a
+                    // self-loop it made every package "depend on" itself, and made `toposort` fail.
+                    if from_index != to_index && seen_edges.insert((from_index, to_index)) {
                         package_graph.add_edge(from_index, to_index, ());
                     }
                 }
@@ -1430,13 +1465,15 @@ impl GraphIndex {
                 reason = Some("deadline".into());
                 break;
             }
+            // A node reached again past the limit (a cycle back to the root) cuts nothing, so the
+            // visited check runs first: only an unvisited node beyond the limit is a truncation.
+            if seen.contains(&current) {
+                continue;
+            }
             if depth > limits.depth {
                 truncated = true;
                 reason = Some("depth".into());
                 break;
-            }
-            if seen.contains(&current) {
-                continue;
             }
             // Enforce hard budgets before admitting work. The previous post-insert checks
             // reported `visited_nodes = limit + 1` / `visited_edges = limit + 1`.
@@ -1693,14 +1730,16 @@ fn file_name(node: &str) -> String {
         .to_owned()
 }
 
-fn package_name(path: &str) -> String {
+/// The package a file (or a `symbol://` node in it) belongs to. Every package-level answer --
+/// cycles, export, boundaries, `packages`, `files_in_package` -- must use this one definition, or
+/// a name one of them reports matches nothing in another.
+pub(crate) fn package_name(path: &str) -> String {
     let path = path
         .strip_prefix("symbol://")
         .and_then(|value| value.split_once('#').map(|(path, _)| path))
         .unwrap_or(path);
     // No intermediate Vec: return the segment after the first apps|libs|packages
-    // marker, else the first segment, else "workspace". `split` is lazy/zero-alloc.
-    let first = path.split('/').next();
+    // marker, else the first segment. `split` is lazy/zero-alloc.
     let mut scan = path.split('/');
     while let Some(part) = scan.next() {
         if matches!(part, "apps" | "libs" | "packages") {
@@ -1709,9 +1748,7 @@ fn package_name(path: &str) -> String {
             }
         }
     }
-    first
-        .map(str::to_owned)
-        .unwrap_or_else(|| "workspace".into())
+    path.split('/').next().unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]
@@ -1894,6 +1931,46 @@ mod tests {
         }
     }
 
+    /// A file whose only edges join its own symbols is interned as their `source_path` but no
+    /// edge touches it. An overlay never creates that node, so a graph built in one go -- fresh
+    /// or loaded from either persisted form -- must not count it as one either. Its name still
+    /// labels the relations it owns.
+    #[test]
+    fn a_node_no_edge_touches_is_absent_however_the_graph_was_built() {
+        let mut call = edge("symbol://x.ts#value:f", "symbol://x.ts#value:g");
+        call.kind = EdgeKind::Calls;
+        call.source_path = Some("x.ts".into());
+        let edges = vec![call, import("a.ts", "b.ts")];
+        let built = GraphIndex::from_edges(&edges, "snap".into());
+        let compact = built.to_compact();
+        let bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&FlatCompactGraph::from_compact(compact.clone()))
+                .unwrap();
+        let archived =
+            rkyv::access::<ArchivedFlatCompactGraph, rkyv::rancor::Error>(&bytes).unwrap();
+        let expected = [
+            "a.ts",
+            "b.ts",
+            "symbol://x.ts#value:f",
+            "symbol://x.ts#value:g",
+        ];
+        for graph in [
+            built,
+            GraphIndex::from_compact(compact),
+            GraphIndex::from_archived_flat(archived),
+        ] {
+            let mut names: Vec<&str> = graph.node_names().collect();
+            names.sort();
+            assert_eq!(names, expected);
+            assert_eq!(graph.node_count(), expected.len());
+            assert!(!graph.contains_node("x.ts"));
+            assert_eq!(graph.node_id("x.ts"), None);
+            let (sites, total) = graph.direct_relations_limit("symbol://x.ts#value:g", true, 10);
+            assert_eq!(total, 1);
+            assert_eq!(sites[0].source_path.as_deref(), Some("x.ts"));
+        }
+    }
+
     /// Applying an overlay used to scan the whole adjacency once per changed
     /// neighbour; it now partitions and makes a single pass. Adds and removes landing
     /// in the same batch are where a partitioned rewrite goes wrong, so cover that
@@ -2030,6 +2107,40 @@ mod tests {
         }
     }
 
+    /// An import edge as the resolver writes it: owned by the importing file.
+    fn import(from: &str, to: &str) -> Edge {
+        Edge {
+            source_path: Some(from.into()),
+            ..edge(from, to)
+        }
+    }
+
+    #[test]
+    fn imports_inside_a_package_are_not_dependencies_between_packages() {
+        let edges = vec![
+            import("packages/core/src/a.ts", "packages/core/src/b.ts"),
+            import("packages/web/src/main.ts", "packages/core/src/a.ts"),
+        ];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        assert_eq!(graph.package_edges(), [("web".into(), "core".into())]);
+        assert_eq!(graph.package_order(), ["web", "core"]);
+        assert!(graph.package_cycles().is_empty());
+    }
+
+    #[test]
+    fn every_package_is_listed_even_when_packages_form_a_cycle() {
+        let edges = vec![
+            import("apps/x/a.ts", "apps/y/b.ts"),
+            import("apps/y/b.ts", "apps/x/a.ts"),
+            import("apps/z/c.ts", "apps/x/a.ts"),
+        ];
+        let graph = GraphIndex::from_edges(&edges, "snapshot".into());
+        assert_eq!(graph.package_order(), ["x", "y", "z"]);
+        let dot = crate::analysis::export_package_dot(&graph);
+        assert!(dot.contains("\"x\" [fillcolor"), "{dot}");
+        assert!(dot.contains("\"z\" [style=rounded]"), "{dot}");
+    }
+
     #[test]
     fn reverse_walk_is_bounded_and_cycles_are_detected() {
         let graph = graph();
@@ -2041,6 +2152,27 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.visited_nodes, 1);
         assert_eq!(graph.package_cycles().len(), 1);
+    }
+
+    /// Only a node the walk has not reached can be cut by the depth limit. `a ↔ b` at depth 1
+    /// queues `a` again one level past the limit; that cut nothing and is not a truncation.
+    #[test]
+    fn depth_limit_truncates_only_when_an_unvisited_node_lies_beyond_it() {
+        let cycle = GraphIndex::from_edges(&[edge("a", "b"), edge("b", "a")], "s".into());
+        let limits = QueryLimits {
+            depth: 1,
+            ..Default::default()
+        };
+        let page = cycle.callers_of("a", &limits, None).unwrap();
+        assert_eq!(page.items, ["b"]);
+        assert!(!page.truncated, "{page:?}");
+        assert_eq!(page.reason, None);
+
+        let chain = GraphIndex::from_edges(&[edge("b", "a"), edge("c", "b")], "s".into());
+        let page = chain.callers_of("a", &limits, None).unwrap();
+        assert_eq!(page.items, ["b"]);
+        assert!(page.truncated, "{page:?}");
+        assert_eq!(page.reason.as_deref(), Some("depth"));
     }
 
     #[test]

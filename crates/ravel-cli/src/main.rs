@@ -73,6 +73,10 @@ enum Command {
         /// Full payload: every similar spelling and the blast-radius sample
         #[arg(long)]
         detail: bool,
+        /// Path fragment picking one definition when a name matches several. Narrows which
+        /// definition resolves; it does not filter the relations of one already resolved.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Deprecated: `ravel install --location local` (add `--target claude` for `--claude`).
     ///
@@ -189,6 +193,7 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Blast radius: everything that depends on this symbol, transitively
     Impact {
         node: String,
         #[arg(long, default_value_t = 32)]
@@ -243,6 +248,15 @@ enum Command {
         commits: usize,
         #[arg(long, default_value_t = 2)]
         min_cooccurrence: u32,
+        /// Entries per page (complete `total` always included)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
+        /// Skip commits touching more files than this: a mass rename couples everything it
+        /// touches with everything else, which is noise rather than co-change
+        #[arg(long, default_value_t = ravel_core::git::DEFAULT_MAX_COMMIT_FILES)]
+        max_commit_files: usize,
     },
     Validate {
         /// Max findings listed (complete per-code counts always included)
@@ -441,6 +455,7 @@ skip_sibling_emit = true
             query,
             limit,
             detail,
+            scope,
         }) => {
             if let Some(value) = daemon_call_if_running(
                 &root,
@@ -448,6 +463,7 @@ skip_sibling_emit = true
                     query: query.clone(),
                     limit,
                     detail,
+                    scope: scope.clone(),
                 },
             )? {
                 emit_answer(&value, View::Explore, output)?;
@@ -455,7 +471,7 @@ skip_sibling_emit = true
             }
             let engine = load_for_query(&root)?;
             emit_answer(
-                &engine.context_with_detail(&query, limit, detail)?,
+                &engine.context_with_detail(&query, limit, detail, scope.as_deref())?,
                 View::Explore,
                 output,
             )?;
@@ -480,6 +496,7 @@ skip_sibling_emit = true
             let report = ravel_core::install::install_agents(&opts)?;
             emit_json(&report, pretty)?;
             eprintln!("note: `ravel setup` is deprecated; use `ravel install --location local`");
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Install {
             target,
@@ -515,6 +532,7 @@ skip_sibling_emit = true
                 };
                 let report = ravel_core::install::install_agents(&opts)?;
                 emit_json(&report, pretty)?;
+                fail_on_agent_errors(&report)?;
             }
         }
         Some(Command::Uninstall {
@@ -537,6 +555,7 @@ skip_sibling_emit = true
             };
             let report = ravel_core::install::uninstall_agents(&opts)?;
             emit_json(&report, pretty)?;
+            fail_on_agent_errors(&report)?;
         }
         Some(Command::Doctor) => {
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
@@ -640,9 +659,11 @@ skip_sibling_emit = true
             let query = if risk {
                 WorkspaceQuery::Impact { node, limits }
             } else {
+                // The walk `--risk` scores: what depends on `node`, the blast radius of changing
+                // it. The forward walk answers the opposite question — what `node` itself needs.
                 WorkspaceQuery::Reachable {
                     node,
-                    reverse: false,
+                    reverse: true,
                     limits,
                 }
             };
@@ -701,6 +722,9 @@ skip_sibling_emit = true
             file,
             commits,
             min_cooccurrence,
+            limit,
+            cursor,
+            max_commit_files,
         }) => {
             emit_query(
                 &root,
@@ -708,6 +732,9 @@ skip_sibling_emit = true
                     file,
                     commits,
                     min_cooccurrence,
+                    max_commit_files,
+                    limit: limit.max(1),
+                    cursor,
                 },
                 output,
             )?;
@@ -795,10 +822,14 @@ skip_sibling_emit = true
                     Err(ravel_core::watch::WatchError::Timeout) => continue,
                     Err(error) => return Err(error.into()),
                 };
+                let rules_changed = ravel_core::watch::changes_ignore_rules(&result);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
                 let cfg = &engine.config;
-                let paths: Vec<_> = result
+                let mut paths: Vec<_> = result
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|p| {
                         ravel_core::config::watched_path_is_indexable(
                             cfg,
@@ -807,11 +838,29 @@ skip_sibling_emit = true
                             p,
                         )
                     })
+                    .cloned()
                     .collect();
-                if paths.is_empty() && !result.needs_reconcile {
+                let mut needs_reconcile = result.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                if !needs_reconcile {
+                    match ravel_core::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &result,
+                        cfg.watch.max_batch_paths.saturating_sub(paths.len()),
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
+                if paths.is_empty() && !needs_reconcile && !rules_changed {
                     continue;
                 }
-                let stats = if result.needs_reconcile || paths.is_empty() {
+                let stats = if rules_changed {
+                    // Which files belong in the index changed, not what any of them holds.
+                    engine.index()?
+                } else if needs_reconcile || paths.is_empty() {
                     engine.reconcile()?
                 } else {
                     engine.sync(Some(&paths))?
@@ -835,10 +884,19 @@ skip_sibling_emit = true
                 emit_json(&serde_json::json!({ "running": running }), pretty)?;
             }
             DaemonAction::Stop => {
-                let stopped =
-                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?
-                        .is_some();
-                emit_json(&serde_json::json!({ "stopped": stopped }), pretty)?;
+                let reply =
+                    daemon_call_if_running(&root, ravel_core::daemon::DaemonOperation::Shutdown)?;
+                // A daemon MCP sessions still lease stays for them and exits after the last one
+                // disconnects; say how many it waits for rather than claim it is gone.
+                let sessions = reply
+                    .as_ref()
+                    .and_then(|reply| reply.get("sessions"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                emit_json(
+                    &serde_json::json!({ "stopped": reply.is_some(), "sessions": sessions }),
+                    pretty,
+                )?;
             }
         },
         Some(Command::DaemonServe { transient }) => ravel_core::daemon::serve(&root, transient)?,
@@ -858,6 +916,17 @@ skip_sibling_emit = true
         None => emit_json(&health(), pretty)?,
     }
     Ok(())
+}
+
+/// The report is printed either way; an agent that could not be configured also fails the run,
+/// so a script or CI step does not read a half-done install as success.
+fn fail_on_agent_errors(report: &ravel_core::install::InstallReport) -> anyhow::Result<()> {
+    match report.errors() {
+        0 => Ok(()),
+        failed => anyhow::bail!(
+            "{failed} agent(s) could not be updated; see the `error` actions in the report"
+        ),
+    }
 }
 
 fn serve_mcp(root: &std::path::Path) -> anyhow::Result<()> {
@@ -949,14 +1018,25 @@ fn daemon_call_if_running(
     root: &std::path::Path,
     operation: ravel_core::daemon::DaemonOperation,
 ) -> anyhow::Result<Option<serde_json::Value>> {
+    // No runtime directory to look for a daemon in (HOME and XDG_RUNTIME_DIR unset, or it cannot
+    // be created) means none is reachable: answer in-process, as when none is running.
+    let Ok(client) = ravel_core::daemon::DaemonClient::for_root(root) else {
+        return Ok(None);
+    };
+    daemon_answer(client.call(operation))
+}
+
+/// The daemon's answer, or `None` to answer in-process instead: when it could not be reached, and
+/// when it refused the request unrun because it is stopping — a race with its idle exit, not a
+/// failure of the question.
+fn daemon_answer(
+    reply: Result<serde_json::Value, ravel_core::daemon::DaemonCallError>,
+) -> anyhow::Result<Option<serde_json::Value>> {
     use ravel_core::daemon::DaemonCallError;
-    let client = ravel_core::daemon::DaemonClient::for_root(root)?;
-    match client.call(operation) {
+    match reply {
         Ok(value) => Ok(Some(value)),
         Err(DaemonCallError::Transport(_)) => Ok(None),
-        // A transient daemon draining after its last session refuses new work. That says nothing
-        // about the question, which this process can answer on its own as if none were running.
-        Err(DaemonCallError::Remote(error)) if error.contains("shutting down") => Ok(None),
+        Err(error) if error.is_shutting_down() => Ok(None),
         Err(DaemonCallError::Remote(error)) => anyhow::bail!(error),
     }
 }
@@ -1027,4 +1107,25 @@ fn emit_json(value: &impl serde::Serialize, pretty: bool) -> anyhow::Result<()> 
     }
     out.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_core::daemon::DaemonCallError;
+
+    #[test]
+    fn a_daemon_that_is_stopping_or_unreachable_is_answered_in_process() {
+        let refused = DaemonCallError::Remote("daemon is shutting down".into());
+        assert!(refused.is_shutting_down());
+        assert!(daemon_answer(Err(refused)).unwrap().is_none());
+        let unreachable = DaemonCallError::Transport(std::io::ErrorKind::NotFound.into());
+        assert!(daemon_answer(Err(unreachable)).unwrap().is_none());
+
+        let failed = DaemonCallError::Remote("nothing in the index is named `x`".into());
+        let error = daemon_answer(Err(failed)).unwrap_err().to_string();
+        assert_eq!(error, "nothing in the index is named `x`");
+        let value = serde_json::json!({ "ok": true });
+        assert_eq!(daemon_answer(Ok(value.clone())).unwrap(), Some(value));
+    }
 }

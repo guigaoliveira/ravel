@@ -77,7 +77,7 @@ pub struct ReferenceSitesRequest {
     /// Sites per page (default 50).
     pub limit: Option<usize>,
     /// Resume offset: the N of the previous page's `more: cursor N`.
-    pub cursor: Option<usize>,
+    pub cursor: Option<PageCursor>,
     /// Path fragment that picks one definition when a bare name matches several — cheaper than
     /// copying a candidate id back. Only narrows which definition is resolved; it does not filter
     /// the sites of a symbol that already resolved.
@@ -87,6 +87,69 @@ pub struct ReferenceSitesRequest {
     /// every site. Each bucket carries its edge count and its count of distinct files.
     pub rollup: Option<String>,
 }
+/// Where a page of sites starts. A page hands out its successor as `next_cursor`, a string, and the
+/// tool asks for exactly that back; refusing the string (the offset alone was accepted, as a number)
+/// failed every request for a second page. Either spelling is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCursor(usize);
+
+impl From<PageCursor> for usize {
+    fn from(cursor: PageCursor) -> Self {
+        cursor.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PageCursor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected, Visitor};
+
+        struct Offset;
+        impl Visitor<'_> for Offset {
+            type Value = PageCursor;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("the previous page's next_cursor")
+            }
+
+            fn visit_u64<E: Error>(self, value: u64) -> Result<PageCursor, E> {
+                usize::try_from(value)
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: Error>(self, value: i64) -> Result<PageCursor, E> {
+                match u64::try_from(value) {
+                    Ok(value) => self.visit_u64(value),
+                    Err(_) => Err(E::invalid_value(Unexpected::Signed(value), &self)),
+                }
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<PageCursor, E> {
+                value
+                    .parse()
+                    .map(PageCursor)
+                    .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(Offset)
+    }
+}
+
+impl schemars::JsonSchema for PageCursor {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PageCursor".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": ["string", "integer"] })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct QueryRequest {
     pub root: Option<String>,
@@ -115,6 +178,10 @@ pub struct ExploreRequest {
     /// sample. Off by default: the concise response carries the resolved symbol,
     /// the candidates, the relation pages and every total.
     pub detail: Option<bool>,
+    /// Path fragment picking one definition when a name matches several — the same
+    /// flag `callers_of` takes. Use it instead of a second call when the first one
+    /// comes back with candidates.
+    pub scope: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SymbolDetailRequest {
@@ -154,6 +221,12 @@ pub struct CoChangeRequest {
     pub file: String,
     pub commits: Option<usize>,
     pub min_cooccurrence: Option<u32>,
+    /// Entries per page. Defaults to 20 — a single file in a real monorepo can co-change
+    /// with thousands, almost all of them through bulk commits.
+    pub limit: Option<usize>,
+    pub cursor: Option<usize>,
+    /// Commits touching more files than this are skipped as bulk edits. Defaults to 500.
+    pub max_commit_files: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -361,10 +434,7 @@ impl RavelMcp {
 /// that reply like a transport failure so the client respawns instead of
 /// surfacing "daemon is shutting down" to the agent.
 fn should_respawn_after(error: &crate::daemon::DaemonCallError) -> bool {
-    match error {
-        crate::daemon::DaemonCallError::Transport(_) => true,
-        crate::daemon::DaemonCallError::Remote(message) => message.contains("shutting down"),
-    }
+    matches!(error, crate::daemon::DaemonCallError::Transport(_)) || error.is_shutting_down()
 }
 
 /// Drop schema keys a model gains nothing from. Clients hand `inputSchema` to the model as
@@ -425,6 +495,7 @@ impl RavelMcp {
                     query: request.query.clone(),
                     limit,
                     detail: request.detail.unwrap_or(false),
+                    scope: request.scope.clone(),
                 },
             ),
         )
@@ -521,12 +592,25 @@ impl RavelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_symbols(&self, Parameters(request): Parameters<SearchRequest>) -> ToolReply {
-        let kind = match request.kind.as_deref() {
+        // Anything else is refused: run as an exact search, `contains` or a misspelling came back as
+        // an ordinary-looking "nothing found". Case is forgiven; it cannot change which kind is meant.
+        let kind = match request
+            .kind
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("exact") => SearchKind::Exact,
             Some("prefix") => SearchKind::Prefix,
             Some("fuzzy") => SearchKind::Fuzzy,
             Some("regex") => SearchKind::Regex,
             Some("terms") => SearchKind::Terms,
-            _ => SearchKind::Exact,
+            Some(_) => {
+                return Err(error_json(format!(
+                    "unknown search kind `{}`; supported: exact, prefix, fuzzy, regex, terms",
+                    request.kind.unwrap_or_default()
+                )));
+            }
         };
         self.call_query(
             request.root.as_deref(),
@@ -598,7 +682,7 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "List files belonging to a package (by path prefix)",
+        description = "List files belonging to a package (a name from list_packages)",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn files_in_package(&self, Parameters(request): Parameters<PackageRequest>) -> ToolReply {
@@ -704,7 +788,7 @@ impl RavelMcp {
     }
 
     #[tool(
-        description = "Files that co-change with a path in recent git history",
+        description = "Files that co-change with a path in recent git history, paged and ranked by confidence. Bulk commits are skipped and counted in commits_skipped_as_bulk.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn cochanged(&self, Parameters(request): Parameters<CoChangeRequest>) -> ToolReply {
@@ -714,6 +798,11 @@ impl RavelMcp {
                 file: request.file,
                 commits: request.commits.unwrap_or(100),
                 min_cooccurrence: request.min_cooccurrence.unwrap_or(2),
+                max_commit_files: request
+                    .max_commit_files
+                    .unwrap_or(crate::git::DEFAULT_MAX_COMMIT_FILES),
+                limit: request.limit.unwrap_or(20).max(1),
+                cursor: request.cursor.unwrap_or(0),
             },
         )
     }
@@ -757,7 +846,7 @@ async fn reference_sites_tool(
     reverse: bool,
 ) -> ToolReply {
     let limit = request.limit.unwrap_or(50).max(1);
-    let cursor = request.cursor.unwrap_or(0);
+    let cursor = request.cursor.map_or(0, usize::from);
     // An unrecognised rollup is refused rather than silently ignored: returning a normal page for
     // `rollup: "directory-ish"` looks like the grouping was applied and came out flat. The daemon
     // checks it too; checking here first keeps the refusal off the wire.
@@ -985,6 +1074,72 @@ mod tests {
             .expect("follower did not take over after leader exit");
         drop(replacement);
         follower.join().unwrap();
+    }
+
+    /// The answer of a tool whose work never waits (these engine calls block instead).
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the tool waited"),
+        }
+    }
+
+    #[test]
+    fn a_search_kind_that_is_not_one_is_refused_not_run_as_exact() {
+        // Refused before any workspace is consulted, so the refusal needs no daemon to be seen.
+        // Silently searching for the exact spelling instead answered "nothing found".
+        let server = RavelMcp::with_mode(McpToolMode::All);
+        for kind in ["contains", "substring", ""] {
+            let refused = ready(server.search_symbols(Parameters(SearchRequest {
+                root: None,
+                query: "prefixTarg".into(),
+                kind: Some(kind.into()),
+                limit: None,
+            })))
+            .unwrap_err();
+            assert!(refused.contains("exact"), "{kind:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_page_cursor_is_taken_back_as_next_cursor_spells_it() {
+        let cursor = |value: serde_json::Value| {
+            serde_json::from_value::<ReferenceSitesRequest>(
+                serde_json::json!({ "node": "x", "cursor": value }),
+            )
+            .map(|request| request.cursor.map(usize::from))
+        };
+        // `next_cursor` is a string; the tool says to pass it back as `cursor`.
+        assert_eq!(cursor(serde_json::json!("50")).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::json!(50)).unwrap(), Some(50));
+        assert_eq!(cursor(serde_json::Value::Null).unwrap(), None);
+        for refused in [
+            serde_json::json!("next"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(cursor(refused.clone()).is_err(), "{refused} was accepted");
+        }
+        let absent =
+            serde_json::from_value::<ReferenceSitesRequest>(serde_json::json!({ "node": "x" }));
+        assert!(absent.unwrap().cursor.is_none());
+
+        // And clients that check arguments against the schema let either spelling through.
+        let server = RavelMcp::with_mode(McpToolMode::Primary);
+        for tool in ["callers_of", "calls_from"] {
+            let schema = &server.tool_router.map[tool].attr.input_schema;
+            let types = &schema["properties"]["cursor"]["type"];
+            for spelling in ["string", "integer"] {
+                assert!(
+                    types
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|kind| kind == spelling)),
+                    "{tool} cursor does not admit a {spelling}: {types}"
+                );
+            }
+        }
     }
 
     #[test]

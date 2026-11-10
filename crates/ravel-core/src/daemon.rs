@@ -38,10 +38,19 @@ const DAEMON_READY_POLL_FIRST: Duration = Duration::from_millis(1);
 /// connection's own thread within milliseconds; one that does not (stopped by a terminal's job
 /// control, or wedged) must not hang every client that queues behind it.
 const DAEMON_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many daemons one wait may start: the first, and a few more for when the daemon that kept
+/// them from starting goes away meanwhile.
+const DAEMON_START_ATTEMPTS: usize = 4;
+/// How much of a daemon's standard error a failed start reports.
+const DAEMON_STDERR_LIMIT: u64 = 16 * 1024;
+/// What a daemon says when another one already serves its workspace.
+const ALREADY_RUNNING: &str = "a Ravel daemon already owns this workspace";
 const DEFAULT_DAEMON_MIN_CONNECTIONS: usize = 8;
 const DEFAULT_DAEMON_CONNECTIONS_PER_CPU: usize = 4;
 const DEFAULT_DAEMON_MAX_LEASES: usize = 32;
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A daemon's answer while it drains its last connections before exiting.
+const SHUTTING_DOWN: &str = "daemon is shutting down";
 
 fn max_connections() -> usize {
     std::env::var("RAVEL_DAEMON_MAX_CONNECTIONS")
@@ -125,11 +134,27 @@ pub struct RuntimeLayout {
 }
 
 impl RuntimeLayout {
+    /// The layout a daemon about to serve `root` binds, its directory created private to this user.
     pub fn for_root(root: &RootIdentity) -> io::Result<Self> {
         Self::in_directory(runtime_base()?, root)
     }
 
     pub fn in_directory(base: PathBuf, root: &RootIdentity) -> io::Result<Self> {
+        Self::build(base, root, true)
+    }
+
+    /// Where a daemon serving `root` would be, with nothing created or changed: a client only looks.
+    /// Making the directory (and setting its permissions) to find out whether a daemon runs broke
+    /// every query where that directory was missing or not this process's to change.
+    pub fn locate(root: &RootIdentity) -> io::Result<Self> {
+        Self::locate_in(runtime_base()?, root)
+    }
+
+    pub fn locate_in(base: PathBuf, root: &RootIdentity) -> io::Result<Self> {
+        Self::build(base, root, false)
+    }
+
+    fn build(base: PathBuf, root: &RootIdentity, create: bool) -> io::Result<Self> {
         let short = root.as_str().get(..32).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid daemon root identity")
         })?;
@@ -144,15 +169,17 @@ impl RuntimeLayout {
             let directory = base.join("ravel");
             let projected = directory.join(format!("{short}.sock"));
             if projected.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
-                short_unix_runtime_directory(&base)?
+                short_unix_runtime_directory(&base, create)?
             } else {
                 directory
             }
         };
         #[cfg(not(unix))]
         let directory = base.join("ravel");
-        std::fs::create_dir_all(&directory)?;
-        restrict_runtime_directory(&directory)?;
+        if create {
+            std::fs::create_dir_all(&directory)?;
+            restrict_runtime_directory(&directory)?;
+        }
         let singleton_lock = directory.join(format!("{short}.lock"));
         #[cfg(unix)]
         let endpoint = {
@@ -178,7 +205,7 @@ impl RuntimeLayout {
 }
 
 #[cfg(unix)]
-fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
+fn short_unix_runtime_directory(base: &Path, create: bool) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     // Unix socket limits apply to the pathname passed to bind, even when the user's private
@@ -186,11 +213,17 @@ fn short_unix_runtime_directory(base: &Path) -> io::Result<PathBuf> {
     // that private runtime base; the directory is subsequently verified and restricted to 0700.
     let uid = std::fs::metadata(base)?.uid();
     let directory = PathBuf::from(format!("/tmp/ravel-{uid}"));
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&directory)?;
-    let metadata = std::fs::symlink_metadata(&directory)?;
+    if create {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)?;
+    }
+    // Verified even when only looking: a socket in a directory someone else made is not ours.
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => return Ok(directory),
+        metadata => metadata?,
+    };
     if !metadata.file_type().is_dir() || metadata.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -311,6 +344,9 @@ pub enum DaemonOperation {
         /// wire shape readable by a peer that predates the field.
         #[serde(default)]
         detail: bool,
+        /// Path fragment narrowing which definition the answer is about.
+        #[serde(default)]
+        scope: Option<String>,
     },
     Sync {
         paths: Vec<PathBuf>,
@@ -366,7 +402,7 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn for_root(root: &Path) -> io::Result<Self> {
         let root = RootIdentity::discover(root)?;
-        let layout = RuntimeLayout::for_root(&root)?;
+        let layout = RuntimeLayout::locate(&root)?;
         Ok(Self { root, layout })
     }
 
@@ -499,19 +535,20 @@ pub fn ensure_running(
     // answers `NotFound`. Two concurrent `daemon start` runs then failed with a bare
     // "The system cannot find the file specified" instead of sharing the daemon that was right
     // there. The operation itself proves reachability, so ask for it directly.
-    if transient {
-        if let Ok(lease) = client.acquire_lease() {
-            return Ok((client, Some(lease)));
+    let mut last_refusal = None;
+    let mut reachable = match reach(&client, transient) {
+        Ok(lease) => return Ok((client, lease)),
+        Err(DaemonCallError::Transport(_)) => false,
+        // The daemon answered and refused: that is a real answer, not a startup race. Unless it
+        // is only on its way out, which a fresh daemon answers once it is gone.
+        Err(error @ DaemonCallError::Remote(_)) if !transient && !error.is_shutting_down() => {
+            return Err(error);
         }
-    } else {
-        match client.call(DaemonOperation::PromotePersistent) {
-            Ok(_) => return Ok((client, None)),
-            // The daemon answered and refused: that is a real answer, not a startup race.
-            Err(error @ DaemonCallError::Remote(_)) => return Err(error),
-            // Not reachable (yet). Fall through to start one and poll.
-            Err(DaemonCallError::Transport(_)) => {}
+        Err(error) => {
+            last_refusal = Some(error);
+            true
         }
-    }
+    };
     let executable = std::env::current_exe().map_err(DaemonCallError::Transport)?;
     // A long-lived server keeps running from a deleted inode after its package is replaced on disk,
     // and the daemon endpoint is version-scoped, so it cannot borrow the new build's daemon either.
@@ -529,56 +566,137 @@ pub fn ensure_running(
             ),
         )));
     }
-    let mut command = std::process::Command::new(executable);
-    // Own process group: the daemon outlives and is shared beyond the client that spawned it, so
-    // the terminal's job control for that client (Ctrl+Z, Ctrl+C) must not stop or kill it.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command
-        .arg("--root")
-        .arg(root)
-        .arg("daemon-serve")
-        .args(transient.then_some("--transient"))
-        .stdin(if transient {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(DaemonCallError::Transport)?;
     let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
     let mut poll = DAEMON_READY_POLL_FIRST;
-    while std::time::Instant::now() < deadline {
-        if transient {
-            if let Ok(lease) = client.acquire_lease() {
-                drop(child.stdin.take());
-                return Ok((client, Some(lease)));
+    let mut starting: Option<StartingDaemon> = None;
+    let mut starts = 0;
+    loop {
+        // Start one while nothing answers: at first, and again when the daemon that kept ours from
+        // starting -- one that was shutting down, say -- has gone without another taking its place.
+        if starting.is_none() && !reachable && starts < DAEMON_START_ATTEMPTS {
+            starting = Some(StartingDaemon::spawn(&executable, root, transient)?);
+            starts += 1;
+        }
+        match reach(&client, transient) {
+            // Dropping the child closes a transient daemon's bootstrap pipe, which only ends it
+            // while it holds no lease.
+            Ok(lease) => return Ok((client, lease)),
+            // Still coming up, or another process won singleton startup and has not armed a
+            // listener instance yet. Keep polling until the deadline.
+            Err(DaemonCallError::Transport(_)) => reachable = false,
+            Err(error @ DaemonCallError::Remote(_)) if !transient && !error.is_shutting_down() => {
+                return Err(error);
             }
-        } else {
-            match client.call(DaemonOperation::PromotePersistent) {
-                Ok(_) => return Ok((client, None)),
-                Err(error @ DaemonCallError::Remote(_)) => return Err(error),
-                // Still coming up, or another process won singleton startup and has not armed a
-                // listener instance yet. Keep polling until the deadline.
-                Err(DaemonCallError::Transport(_)) => {}
+            Err(error) => {
+                reachable = true;
+                last_refusal = Some(error);
             }
         }
-        if child
-            .try_wait()
-            .map_err(DaemonCallError::Transport)?
-            .is_some()
+        if let Some(daemon) = starting.as_mut()
+            && let Some(status) = daemon
+                .child
+                .try_wait()
+                .map_err(DaemonCallError::Transport)?
         {
-            // Another process may have won singleton startup; keep polling its endpoint.
+            let said = daemon.stderr();
+            // Losing the singleton race to another process is how concurrent starts share one
+            // daemon: keep polling its endpoint. Anything else will not come right by waiting --
+            // a configuration error, say -- and the reason is in what the daemon said.
+            if !status.success() && !said.contains(ALREADY_RUNNING) {
+                return Err(DaemonCallError::Transport(io::Error::other(
+                    if said.is_empty() {
+                        format!("the daemon exited during startup ({status})")
+                    } else {
+                        format!("the daemon exited during startup ({status}): {said}")
+                    },
+                )));
+            }
+            starting = None;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(poll);
         poll = (poll * 2).min(DAEMON_READY_POLL);
     }
     Err(DaemonCallError::Transport(io::Error::new(
         io::ErrorKind::TimedOut,
-        "daemon did not become ready",
+        match last_refusal {
+            Some(refusal) => format!("daemon did not become ready: {refusal}"),
+            None => "daemon did not become ready".to_owned(),
+        },
     )))
+}
+
+/// What the caller came for: a lease on the daemon, or (persistent) its promotion.
+fn reach(
+    client: &DaemonClient,
+    transient: bool,
+) -> Result<Option<DaemonClientLease>, DaemonCallError> {
+    if transient {
+        client.acquire_lease().map(Some)
+    } else {
+        client
+            .call(DaemonOperation::PromotePersistent)
+            .map(|_| None)
+    }
+}
+
+/// A daemon this process started, until it is serving or gone.
+struct StartingDaemon {
+    child: std::process::Child,
+    /// Its standard error. A daemon that cannot start says why there and exits; with the stream
+    /// thrown away, a configuration error looked like a daemon that was merely slow, and surfaced
+    /// seconds later as "did not become ready". A file rather than a pipe, because a daemon that
+    /// does start outlives this process and must be able to keep writing to it.
+    stderr: File,
+}
+
+impl StartingDaemon {
+    fn spawn(executable: &Path, root: &Path, transient: bool) -> Result<Self, DaemonCallError> {
+        let stderr = tempfile::tempfile().map_err(DaemonCallError::Transport)?;
+        let mut command = std::process::Command::new(executable);
+        // Own process group: the daemon outlives and is shared beyond the client that spawned it,
+        // so the terminal's job control for that client (Ctrl+Z, Ctrl+C) must not stop or kill it.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command
+            .arg("--root")
+            .arg(root)
+            .arg("daemon-serve")
+            .args(transient.then_some("--transient"))
+            .stdin(if transient {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr.try_clone().map_err(DaemonCallError::Transport)?)
+            .spawn()
+            .map_err(DaemonCallError::Transport)?;
+        Ok(Self { child, stderr })
+    }
+
+    fn stderr(&mut self) -> String {
+        use std::io::Seek;
+        let mut said = String::new();
+        if self.stderr.rewind().is_ok() {
+            let _ = (&mut self.stderr)
+                .take(DAEMON_STDERR_LIMIT)
+                .read_to_string(&mut said);
+        }
+        startup_error(&said).to_owned()
+    }
+}
+
+/// The error a daemon printed on its way out, without the backtrace `RUST_BACKTRACE` adds to it.
+fn startup_error(stderr: &str) -> &str {
+    let said = stderr
+        .split("\nStack backtrace:")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    said.strip_prefix("Error: ").unwrap_or(said)
 }
 
 /// Keeps the daemon alive for as long as it is held. When the daemon is new enough it also answers
@@ -627,6 +745,14 @@ pub enum DaemonCallError {
     Remote(String),
 }
 
+impl DaemonCallError {
+    /// The daemon is about to exit. Not an answer to the question asked: it is gone in a moment,
+    /// and the caller does best to ask a fresh one.
+    pub fn is_shutting_down(&self) -> bool {
+        matches!(self, Self::Remote(message) if message == SHUTTING_DOWN)
+    }
+}
+
 fn invalid_protocol(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -640,7 +766,7 @@ pub fn serve(root: &Path, transient: bool) -> anyhow::Result<()> {
     let identity = RootIdentity::discover(&root)?;
     let layout = RuntimeLayout::for_root(&identity)?;
     let Some(_lease) = DaemonLease::try_acquire(&layout.singleton_lock)? else {
-        anyhow::bail!("a Ravel daemon already owns this workspace");
+        anyhow::bail!(ALREADY_RUNNING);
     };
     let name = match &layout.endpoint {
         #[cfg(unix)]
@@ -665,6 +791,7 @@ pub fn serve(root: &Path, transient: bool) -> anyhow::Result<()> {
         persistent: AtomicBool::new(!transient),
         shutdown: AtomicBool::new(false),
         leases: AtomicUsize::new(0),
+        lifecycle: Mutex::new(()),
         inflight_requests: AtomicUsize::new(0),
         active_connections: AtomicUsize::new(0),
         max_connections: max_connections(),
@@ -732,10 +859,12 @@ fn spawn_bootstrap_monitor(state: Arc<DaemonState>) {
                     Ok(_) => continue,
                 }
             }
+            let lifecycle = state.lifecycle();
             if state.leases.load(Ordering::Acquire) == 0
                 && !state.persistent.load(Ordering::Acquire)
             {
                 state.shutdown.store(true, Ordering::Release);
+                drop(lifecycle);
                 wake_if_drained(&state);
             }
         });
@@ -745,12 +874,25 @@ struct DaemonState {
     persistent: AtomicBool,
     shutdown: AtomicBool,
     leases: AtomicUsize,
+    /// Held while granting or ending a lease, promoting or stopping the daemon. Each of those reads
+    /// what another changes -- a lease granted just as `stop` found none held, or `start` promoting
+    /// a daemon as its last lease ends -- and deciding them one at a time is what keeps
+    /// `shutdown` and a held lease from ever being true together.
+    lifecycle: Mutex<()>,
     inflight_requests: AtomicUsize,
     active_connections: AtomicUsize,
     max_connections: usize,
     max_leases: usize,
     request_timeout: Duration,
     wake_endpoint: LocalEndpoint,
+}
+
+impl DaemonState {
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 struct ConnectionGuard<'a>(&'a DaemonState);
@@ -912,6 +1054,7 @@ fn spawn_daemon_watcher(
                     Err(crate::watch::WatchError::Timeout) => crate::watch::CoalescedChange {
                         paths: Vec::new(),
                         needs_reconcile: false,
+                        structural: Vec::new(),
                     },
                     Err(crate::watch::WatchError::Closed) => return,
                     Err(error) => {
@@ -921,7 +1064,7 @@ fn spawn_daemon_watcher(
                 };
                 let mut paths: std::collections::BTreeSet<_> = batch
                     .paths
-                    .into_iter()
+                    .iter()
                     .filter(|path| {
                         crate::config::watched_path_is_indexable(
                             &engine.config,
@@ -930,11 +1073,36 @@ fn spawn_daemon_watcher(
                             path,
                         )
                     })
+                    .cloned()
                     .collect();
+                let rules_changed = crate::watch::changes_ignore_rules(&batch);
+                if rules_changed {
+                    batch_ignore.forget_rules();
+                }
+                let mut needs_reconcile = batch.needs_reconcile;
+                // A directory that appears or moves is reported alone, without the files in it.
+                // Together they stay within the batch bound, as the paths alone always did.
+                if !needs_reconcile {
+                    match crate::watch::sources_behind_directories(
+                        &engine,
+                        &batch_ignore,
+                        &extensions,
+                        &batch,
+                        max_batch_paths.saturating_sub(paths.len()),
+                    ) {
+                        Some(unnamed) => paths.extend(unnamed),
+                        None => needs_reconcile = true,
+                    }
+                }
                 if watch_leader.is_none() {
+                    // Not the leader: keep what was seen for the moment this daemon takes over. A
+                    // change to the ignore rules cannot be kept as paths, so it becomes a full index.
                     if !deferred_overflow {
                         deferred.extend(paths);
-                        if batch.needs_reconcile || deferred.len() > max_batch_paths.max(1) {
+                        if needs_reconcile
+                            || rules_changed
+                            || deferred.len() > max_batch_paths.max(1)
+                        {
                             deferred.clear();
                             deferred_overflow = true;
                         }
@@ -942,21 +1110,19 @@ fn spawn_daemon_watcher(
                     continue;
                 }
                 paths.append(&mut deferred);
-                if !batch.needs_reconcile && !deferred_overflow && paths.is_empty() {
+                if !needs_reconcile && !rules_changed && !deferred_overflow && paths.is_empty() {
                     continue;
                 }
                 let paths: Vec<_> = paths.into_iter().collect();
                 let _request = RequestGuard::new(&state);
                 crate::timing::note("watch.batch", || {
-                    format!(
-                        "paths={} needs_reconcile={}",
-                        paths.len(),
-                        batch.needs_reconcile
-                    )
+                    format!("paths={} needs_reconcile={needs_reconcile}", paths.len())
                 });
-                let result = if deferred_overflow {
+                let result = if deferred_overflow || rules_changed {
+                    // More was missed than was kept, or which files belong in the index changed,
+                    // not what any of them holds.
                     engine.index()
-                } else if batch.needs_reconcile {
+                } else if needs_reconcile {
                     if paths.is_empty() {
                         engine.reconcile()
                     } else {
@@ -1011,12 +1177,9 @@ fn handle_connection(
     };
     if matches!(operation, DaemonOperation::Lease) {
         let lease = match LeaseGuard::try_new(state) {
-            Some(lease) => lease,
-            None => {
-                write_frame(
-                    stream,
-                    &WireResponse::Error("daemon lease limit reached".into()),
-                )?;
+            Ok(lease) => lease,
+            Err(refusal) => {
+                write_frame(stream, &WireResponse::Error(refusal.into()))?;
                 return Ok(false);
             }
         };
@@ -1032,10 +1195,7 @@ fn handle_connection(
         return Ok(false);
     }
     if state.shutdown.load(Ordering::Acquire) && !matches!(operation, DaemonOperation::Shutdown) {
-        write_frame(
-            stream,
-            &WireResponse::Error("daemon is shutting down".into()),
-        )?;
+        write_frame(stream, &WireResponse::Error(SHUTTING_DOWN.into()))?;
         return Ok(false);
     }
     serve_operation(stream, engine, state, operation)
@@ -1080,10 +1240,7 @@ fn serve_lease(
             continue;
         }
         if state.shutdown.load(Ordering::Acquire) {
-            write_frame(
-                stream,
-                &WireResponse::Error("daemon is shutting down".into()),
-            )?;
+            write_frame(stream, &WireResponse::Error(SHUTTING_DOWN.into()))?;
             return Ok(());
         }
         serve_operation(stream, engine, state, operation)?;
@@ -1096,7 +1253,7 @@ fn serve_operation(
     state: &DaemonState,
     operation: DaemonOperation,
 ) -> io::Result<bool> {
-    let shutdown = matches!(operation, DaemonOperation::Shutdown);
+    let mut shutdown = false;
     let operation_kind = OperationKind::of(&operation);
     let request_guard = RequestGuard::new(state);
     let response: Result<Value, String> = match operation {
@@ -1105,8 +1262,9 @@ fn serve_operation(
             query,
             limit,
             detail,
+            scope,
         } => engine
-            .context_with_detail(&query, limit, detail)
+            .context_with_detail(&query, limit, detail, scope.as_deref())
             .map_err(|error| error.to_string()),
         DaemonOperation::Sync { paths } => engine
             .sync_resident((!paths.is_empty()).then_some(paths.as_slice()))
@@ -1148,15 +1306,33 @@ fn serve_operation(
         DaemonOperation::Analysis(query) => query.execute(engine),
         DaemonOperation::Lease => unreachable!(),
         DaemonOperation::PromotePersistent => {
-            state.persistent.store(true, Ordering::Release);
-            Ok(serde_json::json!({ "persistent": true }))
+            let _lifecycle = state.lifecycle();
+            // Its last lease may have ended since the connection was let in. Promoting it now
+            // would answer `start` with a daemon that is about to exit.
+            if state.shutdown.load(Ordering::Acquire) {
+                Err(SHUTTING_DOWN.to_owned())
+            } else {
+                state.persistent.store(true, Ordering::Release);
+                Ok(serde_json::json!({ "persistent": true }))
+            }
         }
-        DaemonOperation::Shutdown => Ok(serde_json::json!({ "shutdown": true })),
+        DaemonOperation::Shutdown => {
+            let _lifecycle = state.lifecycle();
+            // `stop` undoes `start`: the daemon no longer stays for the CLI. Sessions that hold a
+            // lease keep it, exactly as they keep a transient daemon, until the last disconnects.
+            // Shutting down under them instead left a daemon that refused every call and could
+            // not exit while they were connected, and stopping it outright would only make each
+            // of them start another.
+            state.persistent.store(false, Ordering::Release);
+            let sessions = state.leases.load(Ordering::Acquire);
+            if sessions == 0 {
+                state.shutdown.store(true, Ordering::Release);
+                shutdown = true;
+            }
+            Ok(serde_json::json!({ "shutdown": true, "sessions": sessions }))
+        }
     };
-    match response {
-        Ok(value) => write_frame(stream, &WireResponse::Value(value))?,
-        Err(error) => write_frame(stream, &WireResponse::Error(error.to_string()))?,
-    }
+    write_reply(stream, response)?;
     if matches!(operation_kind, OperationKind::Sync | OperationKind::Query) {
         // After the reply is on the wire, so the collection never adds to the latency the agent
         // sees. A sync's working set is freed by now; so is a query's -- and a query for a name
@@ -1164,7 +1340,6 @@ fn serve_operation(
         crate::release_memory();
     }
     if shutdown {
-        state.shutdown.store(true, Ordering::Release);
         drop(request_guard);
         wake_if_drained(state);
     }
@@ -1193,18 +1368,30 @@ impl OperationKind {
 struct LeaseGuard<'a>(&'a DaemonState);
 
 impl<'a> LeaseGuard<'a> {
-    fn try_new(state: &'a DaemonState) -> Option<Self> {
-        try_reserve(&state.leases, state.max_leases).then(|| Self(state))
+    /// The lease, or why it is refused.
+    fn try_new(state: &'a DaemonState) -> Result<Self, &'static str> {
+        let _lifecycle = state.lifecycle();
+        // A lease on a daemon that is on its way out would keep it from ever leaving, refusing
+        // every call meanwhile. Refused, the client starts a fresh daemon once this one is gone.
+        if state.shutdown.load(Ordering::Acquire) {
+            return Err(SHUTTING_DOWN);
+        }
+        if !try_reserve(&state.leases, state.max_leases) {
+            return Err("daemon lease limit reached");
+        }
+        Ok(Self(state))
     }
 }
 
 impl Drop for LeaseGuard<'_> {
     fn drop(&mut self) {
+        let lifecycle = self.0.lifecycle();
         if self.0.leases.fetch_sub(1, Ordering::AcqRel) == 1
             && !self.0.persistent.load(Ordering::Acquire)
         {
             self.0.shutdown.store(true, Ordering::Release);
         }
+        drop(lifecycle);
         wake_if_drained(self.0);
     }
 }
@@ -1226,6 +1413,11 @@ fn set_request_read_timeout(
 }
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
+    writer.write_all(&encode_frame(value)?)
+}
+
+/// A frame ready to send, or `InvalidInput` when it is over [`MAX_FRAME_BYTES`].
+fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     // The length prefix and the payload leave in one write. Two writes are two syscalls and, on a
     // stream socket, wake the reader twice: once for four bytes, once for the rest.
     let mut frame = Vec::with_capacity(512);
@@ -1237,6 +1429,27 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Resu
         .filter(|_| payload_len <= MAX_FRAME_BYTES)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame too large"))?;
     frame[..4].copy_from_slice(&len.to_le_bytes());
+    Ok(frame)
+}
+
+/// Send an operation's answer. One too large for a frame is answered with an error the caller can
+/// act on. Closing the connection instead read, to a session holding a lease, as a daemon that had
+/// died: it started another lease and asked the same question all over again.
+fn write_reply(writer: &mut impl Write, response: Result<Value, String>) -> io::Result<()> {
+    let response = match response {
+        Ok(value) => WireResponse::Value(value),
+        Err(error) => WireResponse::Error(error),
+    };
+    let frame = match encode_frame(&response) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            encode_frame(&WireResponse::Error(format!(
+                "the answer is larger than the {} MiB a daemon reply can carry; ask for fewer \
+                 results (a lower `limit`)",
+                MAX_FRAME_BYTES >> 20
+            )))?
+        }
+        frame => frame?,
+    };
     writer.write_all(&frame)
 }
 
@@ -1363,6 +1576,7 @@ mod tests {
             persistent: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
             leases: AtomicUsize::new(0),
+            lifecycle: Mutex::new(()),
             inflight_requests: AtomicUsize::new(0),
             active_connections: AtomicUsize::new(0),
             max_connections: 8,
@@ -1518,6 +1732,25 @@ mod tests {
                 .unwrap()
                 .endpoint
         );
+    }
+
+    #[test]
+    fn locating_a_daemon_creates_nothing_and_finds_where_one_would_serve() {
+        let runtime = tempdir().unwrap();
+        let root = RootIdentity::discover(tempdir().unwrap().path()).unwrap();
+        let located = RuntimeLayout::locate_in(runtime.path().into(), &root).unwrap();
+        // Where the temp directory is too deep for a socket path (macOS), the layout falls back
+        // to one short directory per user, which any earlier test or daemon may have made. Only
+        // a directory under this test's own base can show that looking created nothing.
+        if located.directory.starts_with(runtime.path()) {
+            assert!(
+                !located.directory.exists(),
+                "looking made the runtime directory"
+            );
+        }
+        let served = RuntimeLayout::in_directory(runtime.path().into(), &root).unwrap();
+        assert!(served.directory.is_dir());
+        assert_eq!(located, served);
     }
 
     #[cfg(unix)]
@@ -1683,6 +1916,96 @@ mod tests {
         let value = serde_json::Value::String("x".repeat(MAX_FRAME_BYTES));
         let error = write_frame(&mut Refuses, &value).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The bookkeeping of a daemon with nobody connected. Its wake endpoint leads nowhere.
+    fn idle_state(persistent: bool) -> DaemonState {
+        DaemonState {
+            persistent: AtomicBool::new(persistent),
+            shutdown: AtomicBool::new(false),
+            leases: AtomicUsize::new(0),
+            lifecycle: Mutex::new(()),
+            inflight_requests: AtomicUsize::new(0),
+            active_connections: AtomicUsize::new(0),
+            max_connections: 8,
+            max_leases: 2,
+            request_timeout: Duration::from_secs(1),
+            #[cfg(unix)]
+            wake_endpoint: LocalEndpoint::Unix(tempdir().unwrap().path().join("gone.sock")),
+            #[cfg(windows)]
+            wake_endpoint: LocalEndpoint::WindowsPipe(r"\\.\pipe\ravel-test-gone".into()),
+        }
+    }
+
+    #[test]
+    fn a_daemon_on_its_way_out_grants_no_lease() {
+        let state = idle_state(false);
+        let lease = LeaseGuard::try_new(&state).unwrap();
+        drop(lease);
+        assert!(
+            state.shutdown.load(Ordering::Acquire),
+            "a transient daemon ends with its last lease"
+        );
+        // A lease now would keep it from ever leaving while it refuses every call.
+        assert_eq!(LeaseGuard::try_new(&state).err(), Some(SHUTTING_DOWN));
+        assert_eq!(state.leases.load(Ordering::Acquire), 0);
+
+        let state = idle_state(true);
+        let _held = [
+            LeaseGuard::try_new(&state).unwrap(),
+            LeaseGuard::try_new(&state).unwrap(),
+        ];
+        assert_eq!(
+            LeaseGuard::try_new(&state).err(),
+            Some("daemon lease limit reached")
+        );
+    }
+
+    #[test]
+    fn a_failed_start_reports_the_error_not_the_backtrace() {
+        let printed = "Error: invalid config `watch` = 0: max_batch_ms must be greater than zero\n\n\
+                       Stack backtrace:\n   0: anyhow::error\n   1: main\n";
+        assert_eq!(
+            startup_error(printed),
+            "invalid config `watch` = 0: max_batch_ms must be greater than zero"
+        );
+        let chained = "Error: daemon\n\nCaused by:\n    disk full\n";
+        assert_eq!(
+            startup_error(chained),
+            "daemon\n\nCaused by:\n    disk full"
+        );
+        assert_eq!(startup_error(""), "");
+    }
+
+    #[test]
+    fn a_daemon_that_is_shutting_down_says_so_in_words_clients_recognise() {
+        assert!(DaemonCallError::Remote(SHUTTING_DOWN.into()).is_shutting_down());
+        assert!(!DaemonCallError::Remote("no such symbol".into()).is_shutting_down());
+        assert!(!DaemonCallError::Transport(io::Error::other(SHUTTING_DOWN)).is_shutting_down());
+    }
+
+    #[test]
+    fn an_answer_too_large_for_a_frame_is_refused_in_words_not_by_hanging_up() {
+        let mut wire = Vec::new();
+        let huge = serde_json::Value::String("x".repeat(MAX_FRAME_BYTES));
+        write_reply(&mut wire, Ok(huge)).unwrap();
+        match read_frame::<WireResponse>(&mut wire.as_slice()).unwrap() {
+            WireResponse::Error(message) => assert!(message.contains("limit"), "{message}"),
+            other => panic!("expected an error the caller can act on, got {other:?}"),
+        }
+
+        let mut wire = Vec::new();
+        write_reply(&mut wire, Ok(serde_json::json!({ "sites": [] }))).unwrap();
+        write_reply(&mut wire, Err("no such symbol".into())).unwrap();
+        let mut frames = wire.as_slice();
+        assert_eq!(
+            read_frame::<WireResponse>(&mut frames).unwrap(),
+            WireResponse::Value(serde_json::json!({ "sites": [] }))
+        );
+        assert_eq!(
+            read_frame::<WireResponse>(&mut frames).unwrap(),
+            WireResponse::Error("no such symbol".into())
+        );
     }
 
     #[test]
