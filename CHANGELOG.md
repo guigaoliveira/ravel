@@ -174,17 +174,18 @@ incremental sync publishes what a full index would after every edit.
 - **Breaking for scripts:** queries now answer in compact text instead of JSON,
   on the CLI and over MCP. `callers-of`, `calls-from`, `explore`/`context`,
   `status`, `sync`, `index`, `stats`, `search`, `query`, `impact`, `hubs`,
-  `orphans`, `cycles`, `cochanged` and `related-tests` print a path once per
+  `orphans`, `cycles`, `cochanged`, `related-tests`, `packages` and
+  `diff-impact` print a path once per
   file, a shared directory once per group of files, and each reference as
   `line Kind symbol`; warnings (an index gap, an unapplied scope, a failed
   sync, a walk that stopped early) are lines starting with `!`, and a partial
   page says so in its header (`sites 1-100; more: cursor 100`). Measured on a 24.6k-file
   workspace over 20 representative calls the answers take 58% fewer tokens
   (24.9k to 10.5k); `callers-of` on a symbol with 103 references went from
-  4906 tokens to 1784, where `rg -n` on the same name prints 4454. Pass
+  4906 tokens to 1784, where `rg -n` on the same name prints 4570. Pass
   `--json` (new global flag; `--pretty` implies it) or set `RAVEL_FORMAT=json`
   to get the previous JSON, byte for byte. Reports for scripts and CI
-  (`ci`, `validate`, `diff-impact`, `packages`, `boundaries`, `schema`,
+  (`ci`, `validate`, `boundaries`, `schema`,
   `install`, `doctor`, `gc`, `daemon`) are unchanged.
 - Control characters in a path, name or message are written out as `\u{..}`
   in the text, as the JSON escaped them, so a file name cannot forge a line of
