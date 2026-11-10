@@ -77,11 +77,11 @@ impl WorkspaceQuery {
             Self::Hubs { .. } => Some(View::Hubs),
             Self::Orphans { .. } => Some(View::Names),
             Self::Cochanged { .. } => Some(View::Cochanged),
-            Self::RelatedTests { .. } => Some(View::Paths),
-            Self::Packages
-            | Self::NodeDetail { .. }
-            | Self::FilesInPackage { .. }
-            | Self::DiffImpact { .. }
+            Self::RelatedTests { .. } | Self::FilesInPackage { .. } => Some(View::Paths),
+            // The same report `impact --risk` gives, rooted at a diff instead of a symbol.
+            Self::DiffImpact { .. } => Some(View::Impact),
+            Self::Packages => Some(View::Packages),
+            Self::NodeDetail { .. }
             | Self::Ci { .. }
             | Self::ExportDot
             | Self::Validate { .. }
