@@ -561,13 +561,14 @@ skip_sibling_emit = true
             let engine = WorkspaceEngine::load(&root, &Flags::default())?;
             let status = engine.status()?;
             let agents = ravel_core::install::doctor_agents(&root);
-            emit_json(
+            emit_answer(
                 &serde_json::json!({
                     "index": status,
                     "agents": agents,
                     "binary": ravel_core::install::resolve_ravel_bin().display().to_string(),
                 }),
-                pretty,
+                View::Doctor,
+                output,
             )?;
         }
         Some(Command::RelatedTests { path }) => {
@@ -712,7 +713,7 @@ skip_sibling_emit = true
                     cycle_threshold,
                 },
             )?;
-            emit_json(&report, pretty)?;
+            emit_answer(&report, View::Ci, output)?;
             if report["passed"] == false {
                 std::process::exit(1);
             }
@@ -741,7 +742,7 @@ skip_sibling_emit = true
         Some(Command::Validate { limit }) => {
             let report = workspace_query(&root, WorkspaceQuery::Validate { limit })?;
             let total = report["total"].as_u64().unwrap_or(0);
-            emit_json(&report, pretty)?;
+            emit_answer(&report, View::Findings, output)?;
             if total > 0 {
                 anyhow::bail!("index validation failed with {total} finding(s)");
             }

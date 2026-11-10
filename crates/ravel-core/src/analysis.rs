@@ -522,6 +522,29 @@ fn package_from_path(path: &str) -> String {
 /// Complexity: **O(P + E_pkg)** via collapsed `package_graph`, independent of symbol-node
 /// count. Works for any graph size (1e3 or 1e9 symbols) as long as package count fits RAM.
 /// No silent node-scan caps — completeness is structural, not budgeted.
+/// A package name as the inside of a DOT quoted string.
+///
+/// The name is a directory's, so it is whatever someone called a directory: a quote would close
+/// the string and let the rest be read as DOT, and a newline would start a line of its own in
+/// whatever prints the graph. Quote and backslash are escaped as DOT reads them; control
+/// characters are written out.
+fn dot_quoted(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len());
+    for character in name.chars() {
+        match character {
+            '"' | '\\' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            control if control.is_control() => {
+                quoted.push_str(&format!("\\\\u{{{:x}}}", control as u32));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted
+}
+
 pub fn export_package_dot(graph: &GraphIndex) -> String {
     let cycles: HashSet<String> = graph.package_cycles().into_iter().flatten().collect();
     let mut lines = vec![
@@ -535,10 +558,14 @@ pub fn export_package_dot(graph: &GraphIndex) -> String {
         } else {
             "style=rounded"
         };
-        lines.push(format!("  \"{pkg}\" [{color}];"));
+        lines.push(format!("  \"{}\" [{color}];", dot_quoted(&pkg)));
     }
     for (a, b) in graph.package_edges() {
-        lines.push(format!("  \"{a}\" -> \"{b}\";"));
+        lines.push(format!(
+            "  \"{}\" -> \"{}\";",
+            dot_quoted(&a),
+            dot_quoted(&b)
+        ));
     }
     lines.push("}".into());
     lines.join("\n")
@@ -651,6 +678,15 @@ pub fn ci_report(
 mod tests {
     use super::*;
     use crate::graph::GraphIndex;
+
+    #[test]
+    fn a_package_name_cannot_close_its_dot_string_or_start_a_line() {
+        assert_eq!(dot_quoted("apps/users"), "apps/users");
+        assert_eq!(
+            dot_quoted("a\" -> \"b\\\n}\u{1b}[2J"),
+            "a\\\" -> \\\"b\\\\\\\\u{a}}\\\\u{1b}[2J"
+        );
+    }
     use crate::model::{Edge, EdgeConfidence, EdgeKind, IndexSnapshot, SnapshotId};
     use std::collections::BTreeMap;
 
