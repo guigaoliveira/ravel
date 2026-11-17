@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-17
+
+### Fixed
+- **Another repository below the root is no longer indexed.** `ravel index`,
+  `sync` and the watchers descended into directories holding their own `.git`,
+  which git never enters. A linked worktree parked inside the project -- Claude
+  Code keeps them in `.claude/worktrees/<name>` -- was indexed as a full copy:
+  one workspace with six such copies reported 10,927 files as healthy while
+  every symbol had seven definitions and `callers-of` refused with "ambiguous".
+  Independent clones and linked worktrees are now skipped whole when the root is
+  in a repository; submodules are still indexed, and a root that is in no
+  repository (a folder of checkouts) is still indexed whole. A `.git` directory
+  without `HEAD` is not taken for a repository, as git does not take it.
+- **`status` names indexed files that belong to another repository.** An index
+  built before this fix keeps those copies until a full index, since sync only
+  revisits changed paths. `status` now counts them per repository under
+  `coverage.nested_repositories` and says to run `ravel index`.
+
 ## [2.0.0] - 2026-11-10
 
 A function-by-function review of the codebase. Every fix below has a regression

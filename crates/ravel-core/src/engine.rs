@@ -85,6 +85,9 @@ type CoverageProbe = (
     Arc<(BTreeMap<String, usize>, usize, bool)>,
 );
 
+/// Indexed files per other repository below the root, keyed by its directory relative to the root.
+type NestedRepositories = BTreeMap<String, usize>;
+
 /// Long enough that a burst of tool calls walks once, short enough that a
 /// workspace gaining a new language is noticed within the same session.
 const COVERAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -118,6 +121,10 @@ struct EngineInner {
     /// Component-source count and truncation under the same TTL, so answering a relation query
     /// does not run the full probe or certify a count from a walk that stopped early.
     component_sources: Mutex<Option<(std::time::Instant, (usize, bool))>>,
+    /// Indexed files that sit in another repository below the root, per repository, for the
+    /// snapshot it was computed from. Reading the file list decodes the artifact index, so `status`
+    /// does it once per published generation.
+    nested_repositories: Mutex<Option<(String, Arc<NestedRepositories>)>>,
     /// Cached "is this a git repo?" — avoid probing every tool call.
     git_repo: Mutex<Option<(crate::git::GitMetadataFingerprint, bool)>>,
     worktree_identity: Mutex<
@@ -1228,6 +1235,7 @@ impl WorkspaceEngine {
                 file_hashes_cache: Mutex::new(None),
                 unsupported_sources: Mutex::new(None),
                 component_sources: Mutex::new(None),
+                nested_repositories: Mutex::new(None),
                 git_repo: Mutex::new(None),
                 worktree_identity: Mutex::new(None),
                 config_hash,
@@ -1945,7 +1953,7 @@ impl WorkspaceEngine {
                     return Err(EngineError::Unresolved {
                         message: format!(
                             "none of the {} requested path(s) is an indexable source in this workspace \
-                             (wrong path, unsupported extension, or excluded by gitignore/noise rules)",
+                             (wrong path, unsupported extension, excluded by gitignore/noise rules, or inside another repository below the root)",
                             p.len()
                         ),
                     });
@@ -3458,6 +3466,14 @@ impl WorkspaceEngine {
         let indexed_files = stats.as_ref().map_or(0, |stats| stats.files);
         let (unsupported_counts, supported_seen, walk_truncated) = unsupported.as_ref();
         let unsupported_total: usize = unsupported_counts.values().sum();
+        let mark = std::time::Instant::now();
+        let nested = if has {
+            self.indexed_nested_repositories_cached(manifest.as_ref())
+        } else {
+            Arc::default()
+        };
+        crate::timing::stage("status.nested_repositories", mark, String::new);
+        let nested_files: usize = nested.values().sum();
         let dominant_unsupported = unsupported_counts
             .iter()
             .max_by_key(|(_, count)| **count)
@@ -3498,6 +3514,9 @@ impl WorkspaceEngine {
                 // The walk is budgeted, so these are a floor, not a census. Saying so keeps the
                 // number from being quoted as fact.
                 "walk_truncated": walk_truncated,
+                // Files indexed from other repositories below the root (worktrees, clones), per
+                // repository: copies that the walk no longer enters and `ravel index` drops.
+                "nested_repositories": nested.as_ref(),
             },
             "binary_version": crate::VERSION,
             "diagnostics": diagnostics,
@@ -3539,6 +3558,18 @@ impl WorkspaceEngine {
                 // Named before anything about freshness: an index built with an unparsed tsconfig is
                 // internally consistent and quietly missing every aliased edge.
                 format!("{} Fix it and run `ravel index`.", problem.message)
+            } else if nested_files > 0 {
+                // Named before parse failures and freshness: each copy repeats the project's
+                // symbols, so names answer "ambiguous" and callers are counted once per copy.
+                let shown: Vec<&str> = nested.keys().take(3).map(String::as_str).collect();
+                let more = nested.len().saturating_sub(shown.len());
+                let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+                format!(
+                    "{nested_files} indexed file(s) belong to {} other repositor{} below the root ({}{more}), copies the index walk no longer enters. Run `ravel index` to drop them.",
+                    nested.len(),
+                    if nested.len() == 1 { "y" } else { "ies" },
+                    shown.join(", "),
+                )
             } else if failed_files > 0 && !only_recovered_syntax_errors {
                 // Named before freshness: those files contribute no symbols and no edges, so every
                 // answer about what they contain is short by however much they held.
@@ -4217,6 +4248,39 @@ impl WorkspaceEngine {
         *self.inner.search_cache.lock().unwrap() = None;
         *self.inner.symbol_meta_cache.lock().unwrap() = None;
         *self.inner.file_hashes_cache.lock().unwrap() = None;
+    }
+
+    /// [`crate::config::indexed_nested_repositories`] for the published snapshot, cached per
+    /// snapshot. Empty when nothing is indexed or the file list cannot be read.
+    fn indexed_nested_repositories_cached(
+        &self,
+        manifest: Option<&crate::storage::Manifest>,
+    ) -> Arc<NestedRepositories> {
+        let Some(manifest) = manifest else {
+            return Arc::default();
+        };
+        let key = manifest.snapshot_id.stable_key();
+        let mut cache = self.inner.nested_repositories.lock().unwrap();
+        if let Some((cached_key, found)) = cache.as_ref()
+            && *cached_key == key
+        {
+            return Arc::clone(found);
+        }
+        let found = Arc::new(
+            self.storage()
+                .open_file_list()
+                .ok()
+                .flatten()
+                .map(|list| {
+                    crate::config::indexed_nested_repositories(
+                        &self.root,
+                        list.paths.iter().map(String::as_str),
+                    )
+                })
+                .unwrap_or_default(),
+        );
+        *cache = Some((key, Arc::clone(&found)));
+        found
     }
 
     /// Unsupported-source counts, re-walked at most once per TTL.

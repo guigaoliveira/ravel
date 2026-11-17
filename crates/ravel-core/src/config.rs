@@ -78,6 +78,8 @@ pub struct ParserConfig {
 ///    up to the top of the repository (above the project root too), deepest first, then the
 ///    repository's `.git/info/exclude`
 /// 4. The project root's `.ravelignore` if present (gitignore syntax), below the git rules
+/// 5. When the root is in a git repository, any other repository below it -- a clone or a linked
+///    worktree such as `.claude/worktrees/<name>`, not a submodule -- as git itself does
 ///
 /// `.ignore` files, global gitignore and `.ravelignore` files below the root are not read. The index
 /// walk and the single-path check behind `sync` and the watchers ([`IgnoreChain`]) apply exactly
@@ -787,7 +789,9 @@ pub fn unsupported_source_counts(
 /// - the root `.ravelignore`, below both.
 ///
 /// `.ignore` files, global gitignore and `.ravelignore` files below the root are not read. A
-/// directory these rules exclude hides everything in it, as in git.
+/// directory these rules exclude hides everything in it, as in git. So does another repository
+/// below a root that is itself in one -- a clone or a linked worktree, not a submodule
+/// ([`is_nested_repository`]).
 fn source_walk(config: &Config) -> ignore::Walk {
     let root = &config.project.root;
     let mut builder = ignore::WalkBuilder::new(root);
@@ -813,13 +817,16 @@ fn source_walk(config: &Config) -> ignore::Walk {
     // `node_modules` altogether -- and away from whatever in there it cannot read.
     let use_builtin = config.ignore.use_builtin_dirs;
     let extra_dirs = config.ignore.dirs.clone();
+    let skip_nested = root_is_in_repository(root);
     builder.filter_entry(move |entry| {
         entry.depth() == 0
-            || !is_noise_component(
+            || !(is_noise_component(
                 std::path::Component::Normal(entry.file_name()),
                 use_builtin,
                 &extra_dirs,
-            )
+            ) || skip_nested
+                && entry.file_type().is_some_and(|kind| kind.is_dir())
+                && is_nested_repository(entry.path()))
     });
     builder.build()
 }
@@ -880,6 +887,9 @@ pub struct IgnoreChain {
     /// up to and including the top of the repository holding the root. Empty when the root is the
     /// top of its repository, or in none. Fixed when the chain is built.
     ancestors: Vec<PathBuf>,
+    /// The root lies in a git repository, so another repository below it hides its whole tree, as
+    /// it does from the walk ([`is_nested_repository`]).
+    skip_nested: bool,
     per_directory: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<DirectoryRules>>>,
 }
 
@@ -899,6 +909,69 @@ fn is_repository_top(directory: &Path) -> bool {
     directory.join(".git").exists() || directory.join(".jj").exists()
 }
 
+/// Whether `root` lies in a git repository: only then is a repository below it someone else's.
+/// A root that is just a folder of checkouts (`~/work` holding several clones) is indexed whole.
+///
+/// Asked of the canonical root, so the walk (handed the root as configured, `.` included) and
+/// [`IgnoreChain`] (which canonicalizes it) reach the same answer.
+fn root_is_in_repository(root: &Path) -> bool {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    canonical
+        .ancestors()
+        .any(|directory| git_marker(directory).is_some())
+}
+
+/// What `directory/.git` is, when git would take it for one: a git directory (it holds `HEAD`)
+/// or a `gitdir:` pointer file, with the git dir it names. An empty `.git` directory left by some
+/// tool is neither, and git does not stop at it.
+enum GitMarker {
+    Directory,
+    Pointer(PathBuf),
+}
+
+fn git_marker(directory: &Path) -> Option<GitMarker> {
+    let marker = directory.join(".git");
+    let metadata = fs::symlink_metadata(&marker).ok()?;
+    if metadata.is_dir() {
+        return marker
+            .join("HEAD")
+            .is_file()
+            .then_some(GitMarker::Directory);
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+    let pointer = fs::read_to_string(&marker).ok()?;
+    let git_dir = pointer.lines().next()?.strip_prefix("gitdir: ")?.trim();
+    Some(GitMarker::Pointer(directory.join(git_dir)))
+}
+
+/// A directory below the root that git treats as another repository and never descends into: an
+/// independent clone (`.git` is a directory) or a linked worktree (`.git` is a file pointing to a
+/// git dir that has a `commondir`). Agents park whole worktrees of the same project under the root
+/// -- Claude Code's `.claude/worktrees/<name>` -- and indexing them put every symbol in the graph
+/// several times over, so each name answered "ambiguous". `git status` shows such a directory as
+/// one untracked entry and stops there; so does the walk.
+///
+/// A submodule is kept: its `.git` file names a git dir under the superproject's `modules/`, with
+/// no `commondir`, and its sources are part of the project being indexed.
+fn is_nested_repository(directory: &Path) -> bool {
+    match git_marker(directory) {
+        Some(GitMarker::Directory) => true,
+        // A worktree whose main repository moved, or was made in a container under another path,
+        // still names a directory under some `worktrees/`; a submodule's never does.
+        Some(GitMarker::Pointer(git_dir)) => {
+            git_dir.join("commondir").is_file()
+                || !git_dir.exists()
+                    && git_dir
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "worktrees")
+        }
+        None => false,
+    }
+}
+
 /// The directory holding `info/exclude` for the repository whose `.git` is `marker`: `.git`
 /// itself, or -- for a linked worktree, whose `.git` is a file -- the common directory it points
 /// to. A submodule's `.git` file names no common directory, and the walk reads no exclude for it.
@@ -911,6 +984,39 @@ fn git_common_dir(marker: &Path) -> Option<PathBuf> {
     let git_dir = marker.parent()?.join(git_dir);
     let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
     Some(git_dir.join(common.lines().next()?))
+}
+
+/// The other repositories below `root` that hold any of `indexed` (paths relative to the root,
+/// `/`-separated), with how many each holds, keyed by their directory relative to the root.
+///
+/// The walk no longer enters them, but an index built before it stopped still lists their files,
+/// and sync never revisits paths that did not change: `status` names them so `ravel index` drops
+/// them. Empty when the root is in no repository, where nothing below it is another's.
+pub fn indexed_nested_repositories<'a>(
+    root: &Path,
+    indexed: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, usize> {
+    let mut found = BTreeMap::new();
+    if !root_is_in_repository(root) {
+        return found;
+    }
+    let mut verdicts: BTreeMap<String, bool> = BTreeMap::new();
+    for path in indexed {
+        let mut end = 0;
+        while let Some(offset) = path[end..].find('/') {
+            end += offset;
+            let directory = &path[..end];
+            let nested = *verdicts
+                .entry(directory.to_owned())
+                .or_insert_with(|| is_nested_repository(&root.join(directory)));
+            if nested {
+                *found.entry(directory.to_owned()).or_default() += 1;
+                break;
+            }
+            end += 1;
+        }
+    }
+    found
 }
 
 impl IgnoreChain {
@@ -936,6 +1042,7 @@ impl IgnoreChain {
             }
         }
         Self {
+            skip_nested: root_is_in_repository(&root),
             root,
             root_as_given: config.project.root.clone(),
             gitignore_enabled,
@@ -1077,7 +1184,21 @@ impl IgnoreChain {
         inside.push(self.rules_for(&directory));
         for name in parents {
             directory.push(name);
+            // Below another repository nothing is the workspace's, whatever its rules say. Asked
+            // afresh rather than cached with the rules: `git worktree add` creates the directory
+            // before it writes `.git`, and a verdict read in between would admit the whole copy.
+            if self.skip_nested && is_nested_repository(&directory) {
+                return true;
+            }
             inside.push(self.rules_for(&directory));
+        }
+        // The path itself, when it is such a directory: the walk prunes it, so the watcher must
+        // not descend into it either.
+        if self.skip_nested
+            && let Some(last) = names.last()
+            && is_nested_repository(&directory.join(last))
+        {
+            return true;
         }
         let above: Vec<_> = self
             .ancestors
@@ -1734,6 +1855,178 @@ mod tests {
             !IgnoreChain::new(&config).is_ignored(&source),
             "the watcher must keep it too"
         );
+    }
+
+    /// A repository holding, below its root, a linked worktree (`.git` file with a `commondir`), an
+    /// independent clone (`.git` directory) and a submodule (`.git` file into `modules/`).
+    fn tree_with_nested_repositories(root: &Path) {
+        write_tree(
+            root,
+            &[
+                (".git/HEAD", "ref: refs/heads/main\n"),
+                (".git/worktrees/copy/commondir", "../..\n"),
+                (".git/modules/sub/HEAD", "ref: refs/heads/main\n"),
+                ("src/a.ts", "export const a = 1;"),
+                (
+                    ".claude/worktrees/copy/.git",
+                    "gitdir: ../../../.git/worktrees/copy\n",
+                ),
+                (".claude/worktrees/copy/src/a.ts", "export const a = 1;"),
+                ("vendor/clone/.git/HEAD", "ref: refs/heads/main\n"),
+                ("vendor/clone/lib.ts", "export {}"),
+                ("libs/sub/.git", "gitdir: ../../.git/modules/sub\n"),
+                ("libs/sub/s.ts", "export {}"),
+            ],
+        );
+    }
+
+    #[test]
+    fn another_repository_below_the_root_is_not_indexed_but_a_submodule_is() {
+        let dir = tempdir().unwrap();
+        tree_with_nested_repositories(dir.path());
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        let relative: Vec<_> = discover_files(&config)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            relative,
+            vec![PathBuf::from("libs/sub/s.ts"), PathBuf::from("src/a.ts")],
+            "the worktree copy and the clone stay out, the submodule stays in"
+        );
+        // Sync and the watchers must reach the same verdict, or one event re-admits the copy.
+        let chain = IgnoreChain::new(&config);
+        for (path, ignored) in [
+            ("src/a.ts", false),
+            ("libs/sub/s.ts", false),
+            (".claude/worktrees/copy/src/a.ts", true),
+            (".claude/worktrees/copy/src/new.ts", true),
+            ("vendor/clone/lib.ts", true),
+        ] {
+            assert_eq!(chain.is_ignored(&dir.path().join(path)), ignored, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_watcher_sees_a_worktree_whose_git_file_arrived_after_its_directory() {
+        let dir = tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                (".git/HEAD", "ref: refs/heads/main\n"),
+                (".git/worktrees/late/commondir", "../..\n"),
+                (".claude/worktrees/late/src/a.ts", "export {}"),
+            ],
+        );
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        let chain = IgnoreChain::new(&config);
+        let copy = dir.path().join(".claude/worktrees/late");
+        // Asked before `.git` exists, as `git worktree add` creates the directory first.
+        assert!(!chain.is_ignored(&copy.join("src/a.ts")));
+        fs::write(copy.join(".git"), "gitdir: ../../../.git/worktrees/late\n").unwrap();
+        assert!(chain.is_ignored(&copy.join("src/a.ts")), "no stale verdict");
+        assert!(
+            chain.is_ignored(&copy),
+            "the directory itself, which the walk prunes"
+        );
+    }
+
+    #[test]
+    fn a_worktree_whose_repository_moved_is_still_another_repository() {
+        let dir = tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                (".git/HEAD", "ref: refs/heads/main\n"),
+                ("w/.git", "gitdir: /nowhere/repo/.git/worktrees/w\n"),
+                ("w/a.ts", "export {}"),
+                ("src/b.ts", "export {}"),
+            ],
+        );
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        assert_eq!(discover_files(&config).unwrap().len(), 1);
+        assert!(IgnoreChain::new(&config).is_ignored(&dir.path().join("w/a.ts")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_reached_through_a_link_skips_the_same_repositories() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        write_tree(&real, &[(".git/HEAD", "ref: refs/heads/main\n")]);
+        // A package below the top of the repository, reached through a link outside it: only the
+        // canonical root shows that it is in a repository.
+        let package = real.join("pkg");
+        tree_with_nested_repositories(&package);
+        fs::remove_dir_all(package.join(".git")).unwrap();
+        write_tree(&real, &[(".git/worktrees/copy/commondir", "../..\n")]);
+        fs::write(
+            package.join(".claude/worktrees/copy/.git"),
+            "gitdir: ../../../../.git/worktrees/copy\n",
+        )
+        .unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&package, &link).unwrap();
+        let mut config = Config::default();
+        config.project.root = link.clone();
+        let relative: Vec<_> = discover_files(&config)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.strip_prefix(&link).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            relative,
+            vec![PathBuf::from("libs/sub/s.ts"), PathBuf::from("src/a.ts")]
+        );
+        let chain = IgnoreChain::new(&config);
+        assert!(chain.is_ignored(&link.join(".claude/worktrees/copy/src/a.ts")));
+        assert!(!chain.is_ignored(&link.join("src/a.ts")));
+    }
+
+    #[test]
+    fn status_names_the_repositories_an_older_index_still_holds() {
+        let dir = tempdir().unwrap();
+        tree_with_nested_repositories(dir.path());
+        let found = indexed_nested_repositories(
+            dir.path(),
+            [
+                "src/a.ts",
+                ".claude/worktrees/copy/src/a.ts",
+                ".claude/worktrees/copy/src/b.ts",
+                "vendor/clone/lib.ts",
+                "libs/sub/s.ts",
+            ],
+        );
+        assert_eq!(
+            found.into_iter().collect::<Vec<_>>(),
+            vec![
+                (".claude/worktrees/copy".to_owned(), 2),
+                ("vendor/clone".to_owned(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_of_checkouts_outside_any_repository_is_indexed_whole() {
+        let dir = tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                ("one/.git/HEAD", "ref: refs/heads/main\n"),
+                ("one/a.ts", "export {}"),
+                ("two/.git/HEAD", "ref: refs/heads/main\n"),
+                ("two/b.ts", "export {}"),
+            ],
+        );
+        let mut config = Config::default();
+        config.project.root = dir.path().to_path_buf();
+        assert_eq!(discover_files(&config).unwrap().len(), 2);
+        assert!(!IgnoreChain::new(&config).is_ignored(&dir.path().join("two/b.ts")));
+        assert!(indexed_nested_repositories(dir.path(), ["two/b.ts"]).is_empty());
     }
 
     fn write_tree(root: &Path, files: &[(&str, &str)]) {
