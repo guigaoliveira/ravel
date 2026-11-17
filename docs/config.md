@@ -21,6 +21,13 @@ inside a repository), deeper files first, then the repository's `.git/info/exclu
 project root's `.ravelignore`. A directory these rules exclude hides everything in it. `.ignore`
 files, the global gitignore and `.ravelignore` files below the root are not read.
 
+When the root is in a git repository, another repository below it is skipped whole, as `git status`
+skips it: an independent clone (its `.git` is a directory) or a linked worktree (its `.git` file
+points into another repository's `worktrees/`), such as the copies Claude Code keeps in
+`.claude/worktrees/`. Submodules are still indexed. A root that is in no repository -- a folder
+holding several checkouts -- is indexed whole. To leave out anything else, list it in
+`.ravelignore`, for example `.claude/worktrees/`.
+
 ## Git: optional, performance-first
 
 | Operation | Needs git? | Role |

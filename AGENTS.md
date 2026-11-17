@@ -41,6 +41,7 @@ CLI is often **cheaper in tokens** than MCP (no tool schema). MCP wins for **war
 
 - **Languages (auto):** `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs` — no language list required.
 - **Always ignored:** `node_modules`, `dist`, `build`, `coverage`, `.git`, `.next`, `.turbo`, `.ravel`, …  
+- **Other repositories below the root** (clones, linked worktrees such as `.claude/worktrees/*`) are skipped, as git skips them; submodules are kept. Anything else: `.ravelignore`.
 - **Entry points (auto):** application entry files/controllers, `main.ts` / `bootstrap` — not reported as orphans.
 - **Storage:** `.ravel/` sidecars — cold search/query without loading full snapshot.
 
